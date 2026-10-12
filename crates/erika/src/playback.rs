@@ -5312,6 +5312,19 @@ impl VideoPlaybackEngine {
     ) -> Result<Option<TimedVideoFrame>> {
         let paused_seek_preview =
             self.state == PlaybackRunState::Paused && self.paused_seek_frame_pending;
+        if paused_seek_preview && self.session.video_decode_suspended {
+            // Background audio-only playback suspends video decoding, and a
+            // suspended decoder can never produce the preview frame: pumping
+            // for it would discard every remaining video packet at the 2 ms
+            // paused rate -- a full file scan for an HTTP source. Give the
+            // preview up; a foreground resume that wants the frame seeks again.
+            self.paused_seek_frame_pending = false;
+            trace::log(format!(
+                "[erika-playback-trace] stage=paused_seek_frame_abandoned reason=video_decode_suspended target={}",
+                trace::duration_label(self.video_seek_floor),
+            ));
+            return Ok(None);
+        }
         if self.state != PlaybackRunState::Playing && !paused_seek_preview {
             return Ok(None);
         }
@@ -5608,6 +5621,19 @@ impl VideoPlaybackEngine {
                 self.pending_audio.is_some(),
                 self.session.has_queued_audio_frames(),
             ) {
+                return Ok(());
+            }
+            if self.state == PlaybackRunState::Paused && self.paused_seek_frame_pending {
+                // The preview pump ran a paused seek to the end of the media.
+                // The user's session is paused, not finished: abandon the
+                // preview instead of flipping a paused session into Ended,
+                // which would publish a spurious end-of-media and turn the
+                // next play() into a rewind-from-ended full reopen.
+                self.paused_seek_frame_pending = false;
+                trace::log(format!(
+                    "[erika-playback-trace] stage=paused_seek_frame_abandoned reason=eof target={}",
+                    trace::duration_label(self.video_seek_floor),
+                ));
                 return Ok(());
             }
             self.eof = true;
@@ -7063,6 +7089,77 @@ mod tests {
         assert!(video_pts >= target);
         assert!(audio_pts >= target);
         assert!(audio_pts - target <= Duration::from_millis(34));
+    }
+
+    #[test]
+    fn playback_fixture_paused_seek_past_the_last_frame_stays_paused() {
+        let mut engine = playback_fixture_engine();
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let _ = next_fixture_video_at(&mut engine, t0);
+
+        let paused_at = t0 + Duration::from_millis(500);
+        engine.pause_at(paused_at);
+        // The fixture is 8 s long and its frames end before the target, so
+        // every decoded frame is seek preroll and the preview pump reaches
+        // demux EOF without ever presenting a frame. Audio output stays off
+        // so the queued tail audio is discarded at EOF instead of stalling it.
+        let target = Duration::from_secs(8);
+        engine.seek_at(target, paused_at).unwrap();
+        engine.set_audio_output_active(false);
+
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert_eq!(engine.media_time_at(paused_at), target);
+
+        let mut ticks = 0;
+        while engine.has_pending_paused_seek_frame() {
+            let _ = engine
+                .tick_at(paused_at + Duration::from_millis(ticks))
+                .unwrap();
+            ticks += 1;
+            assert!(
+                ticks < 2000,
+                "the preview pump must reach the abandonment path"
+            );
+            assert_eq!(
+                engine.state(),
+                PlaybackRunState::Paused,
+                "a paused session must not become Ended while only seeking"
+            );
+            assert_eq!(
+                engine.media_time_at(paused_at + Duration::from_millis(ticks)),
+                target
+            );
+        }
+        assert!(ticks > 0);
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+    }
+
+    #[test]
+    fn playback_fixture_suspended_decode_abandons_the_paused_seek_preview() {
+        let mut engine = playback_fixture_engine();
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let _ = next_fixture_video_at(&mut engine, t0);
+
+        let paused_at = t0 + Duration::from_millis(500);
+        engine.pause_at(paused_at);
+        let target = Duration::from_millis(5_125);
+        engine.seek_at(target, paused_at).unwrap();
+        engine.set_video_decode_suspended(true);
+
+        assert!(engine.has_pending_paused_seek_frame());
+        let tick = engine.tick_at(paused_at + Duration::from_secs(60)).unwrap();
+        assert!(tick.is_none());
+        assert!(
+            !engine.has_pending_paused_seek_frame(),
+            "a suspended decoder can never produce the preview"
+        );
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert_eq!(
+            engine.media_time_at(paused_at + Duration::from_secs(60)),
+            target
+        );
     }
 
     #[test]
