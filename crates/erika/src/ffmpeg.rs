@@ -5095,9 +5095,14 @@ unsafe fn mastering_display_metadata(
     let min_luminance_nits = has_luminance
         .then(|| rational_to_positive_f32(metadata.min_luminance))
         .flatten();
+    // Sub-nit max luminance is a known broken-master sentinel (0.0001 nit
+    // from some encoders): left in place it compares below every target
+    // peak and silently disables HDR tone mapping. Sub-nit *min* luminance
+    // is legitimate, so only the peak is floored.
     let max_luminance_nits = has_luminance
         .then(|| rational_to_positive_f32(metadata.max_luminance))
-        .flatten();
+        .flatten()
+        .filter(|peak| *peak >= 1.0);
 
     if display_primaries.is_none()
         && white_point.is_none()
@@ -6157,6 +6162,29 @@ mod tests {
 
     fn rational(num: i32, den: i32) -> sys::AVRational {
         sys::AVRational { num, den }
+    }
+
+    #[test]
+    fn frame_rejects_degenerate_mastering_display_peaks() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe {
+            let mastering = sys::av_mastering_display_metadata_create_side_data(frame.ptr);
+            assert!(!mastering.is_null());
+            (*mastering).has_luminance = 1;
+            // Min luminance genuinely lives at sub-nit values, while the same
+            // kind of fraction in max luminance is the known broken-master
+            // sentinel that must not become the tone-map source peak.
+            (*mastering).min_luminance = rational(1, 10000);
+            (*mastering).max_luminance = rational(1, 10000);
+        }
+
+        let metadata = frame.hdr_metadata().unwrap();
+        let mastering = metadata.mastering_display.unwrap();
+        assert_eq!(
+            mastering.max_luminance_nits, None,
+            "a sub-nit mastering peak is not usable metadata"
+        );
+        assert_close(mastering.min_luminance_nits.unwrap(), 0.0001);
     }
 
     #[test]
