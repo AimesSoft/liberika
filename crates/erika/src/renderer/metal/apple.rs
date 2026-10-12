@@ -1305,9 +1305,14 @@ impl MetalRendererImpl {
         };
 
         let source_color = frame.pipeline.source;
+        // Captures are 8-bit SDR RGBA. Render through the SDR target so an
+        // HDR source tone maps into [0,1] instead of writing extended-linear
+        // values that the readback would clamp, and keep the packed-alpha
+        // input mode so transparent-video captures rebuild their alpha.
+        let capture_output_mode = MetalOutputMode::Sdr;
         frame.pipeline = frame
             .pipeline
-            .with_target(metal_target_color(self.output_mode, source_color));
+            .with_target(metal_target_color(capture_output_mode, source_color));
 
         let layout = VideoPresentationLayout::aspect_fit(
             frame.frame.info.width as u32,
@@ -1317,10 +1322,10 @@ impl MetalRendererImpl {
         );
 
         unsafe {
-            let metal_format = metal_pixel_format(self.drawable_pixel_format);
+            let capture_pixel_format = metal_pixel_format(MetalDrawablePixelFormat::Bgra8Unorm);
             let descriptor =
                 MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                    metal_format,
+                    capture_pixel_format,
                     width as usize,
                     height as usize,
                     false,
@@ -1376,8 +1381,8 @@ impl MetalRendererImpl {
                 source_transfer: transfer_code(frame.pipeline.source.transfer),
                 target_transfer: transfer_code(frame.pipeline.target.transfer),
                 tone_map: frame.pipeline.tone_map_uniform_code(),
-                edr_output: self.output_mode.is_edr() as u32,
-                _reserved0: 0,
+                edr_output: capture_output_mode.is_edr() as u32,
+                _reserved0: self.video_alpha_mode as u32,
                 _reserved1: 0,
                 rect: layout.target_rect,
                 viewport: layout.video_viewport(),
@@ -1447,10 +1452,7 @@ impl MetalRendererImpl {
             }
             encoder.endEncoding();
 
-            let bytes_per_pixel = match self.drawable_pixel_format {
-                MetalDrawablePixelFormat::Bgra8Unorm => 4usize,
-                MetalDrawablePixelFormat::Rgba16Float => 8usize,
-            };
+            let bytes_per_pixel = 4usize; // capture target is BGRA8Unorm
             let row_bytes = width as usize * bytes_per_pixel;
             let buffer_len = row_bytes * height as usize;
             let readback = self
@@ -1495,7 +1497,7 @@ impl MetalRendererImpl {
                 raw,
                 width as usize,
                 height as usize,
-                self.drawable_pixel_format,
+                MetalDrawablePixelFormat::Bgra8Unorm,
             ))
         }
     }

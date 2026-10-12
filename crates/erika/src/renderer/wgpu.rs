@@ -2720,6 +2720,12 @@ impl WgpuRenderer {
                 PlayerError::Renderer(format!("stage=ohos_native_image_conversion reason={error}"))
             })?;
         let Some(texture) = texture else {
+            // The NativeImage could not produce a texture this tick. Keeping
+            // the previous frame on screen is correct, but the drop must stay
+            // observable instead of silently mimicking a successful import.
+            crate::trace::log(
+                "[erika-wgpu-trace] stage=ohos_native_image_conversion result=texture_not_ready",
+            );
             return Ok(());
         };
         let uniforms = self

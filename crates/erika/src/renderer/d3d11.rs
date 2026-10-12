@@ -1328,6 +1328,26 @@ impl D3d11Renderer {
         self.set_device(frame_device, context)
     }
 
+    /// Drops the renderer state when the GPU device is gone (TDR, driver
+    /// reset, adapter change) so the next call rebuilds everything through
+    /// `ensure_default_device` -> `set_device`, which already re-creates the
+    /// device-bound pipeline, swapchain, and targets. Without this probe a
+    /// removed device poisons every later call: errors repeat forever while
+    /// the host believes playback is alive.
+    fn drop_device_if_removed(&mut self) {
+        let removed = self
+            .state
+            .as_ref()
+            .is_some_and(|state| unsafe { state.device.GetDeviceRemovedReason() }.is_err());
+        if removed {
+            self.current_video = None;
+            self.danmaku_atlas_cache = None;
+            self.flutter_scene = None;
+            self.state = None;
+            eprintln!("erika d3d11: GPU device removed; renderer will rebuild on the next frame");
+        }
+    }
+
     fn set_device(&mut self, device: ID3D11Device, context: ID3D11DeviceContext) -> Result<()> {
         if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
             unsafe {
@@ -2478,8 +2498,13 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        self.drop_device_if_removed();
         if frame.frame.d3d11va_texture().is_some() {
-            return self.import_d3d11va_frame(frame);
+            let result = self.import_d3d11va_frame(frame);
+            if result.is_err() {
+                self.stats.import_failures += 1;
+            }
+            return result;
         }
         if frame.frame.has_hw_frames_context() {
             self.stats.hardware_video_frames += 1;
@@ -2504,6 +2529,7 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        self.drop_device_if_removed();
         self.render_video(context)
     }
 

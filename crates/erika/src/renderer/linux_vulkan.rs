@@ -10,6 +10,8 @@ use std::{
 
 type Api = wgpu::hal::api::Vulkan;
 
+const LINUX_DIRECT_DROP_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
 unsafe extern "C" {
     fn erika_linux_vk_create(
         instance: u64,
@@ -155,9 +157,12 @@ impl Drop for LinuxDirectFrame {
         for plane in &self.planes {
             plane.destroy();
         }
+        // Bounded wait, mirroring the Android renderer teardown: an unbounded
+        // poll here let a stalled GPU (driver bug, VT switch) hang the render
+        // thread forever on the seek/track-change that dropped this frame.
         if let Err(error) = self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
-            timeout: None,
+            timeout: Some(LINUX_DIRECT_DROP_POLL_TIMEOUT),
         }) {
             crate::trace::diagnostic(format!("Linux direct frame GPU wait: {error}"));
         }
