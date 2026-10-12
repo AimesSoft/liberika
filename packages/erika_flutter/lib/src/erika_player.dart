@@ -1893,6 +1893,14 @@ class ErikaPlayer {
     }
     final event = ErikaPlayerEvent.fromMap(rawEvent);
     final controller = _controllers[event.playerId];
-    controller?.add(event);
+    if (controller == null || controller.isClosed) {
+      return;
+    }
+    try {
+      controller.add(event);
+    } on StateError {
+      // dispose() closed the controller between the check and the add: the
+      // event belongs to a player that no longer exists.
+    }
   }
 }

@@ -88,6 +88,7 @@ class ApiAlignmentTests(unittest.TestCase):
 #include <cassert>
 #include <cstdint>
 #include <map>
+#include <atomic>
 #include "erika.h"
 using napi_env = void*;
 using napi_callback_info = void*;
@@ -103,6 +104,7 @@ double GetDouble(napi_env, napi_value v) { return v; }
 napi_value Int64(napi_env, int64_t v) { return static_cast<double>(v); }
 struct OhosPlayer { ErikaPresenterHandle* presenter; void* window; };
 std::map<int64_t, OhosPlayer> g_players;
+std::atomic<int64_t> g_next_player_id{1};
 ErikaPresenterConfig captured;
 int creates = 0;
 extern "C" ErikaPresenterHandle* erika_presenter_create_with_config(ErikaPresenterConfig c) {
@@ -115,7 +117,12 @@ extern "C" ErikaPresenterHandle* erika_presenter_create_with_config(ErikaPresent
 int main() {
   for (size_t count : {size_t(3), size_t(4)}) {
     supplied = count;
-    assert(NativeCreate(nullptr, nullptr) == 16);
+    const int64_t previous_id = g_next_player_id.load();
+    const int64_t player_id = NativeCreate(nullptr, nullptr);
+    // Successful creates hand out the process-wide monotonic id, not the
+    // presenter pointer, so a destroyed player's reused address cannot be
+    // mistaken for a live id.
+    assert(player_id > 0 && player_id == previous_id);
     assert(captured.output_mode == 2 && captured.edr_headroom == 4.0f);
     assert(captured.luma_upscaler == 3);
     assert(captured.video_alpha_mode == (count == 4 ? 1 : 0));

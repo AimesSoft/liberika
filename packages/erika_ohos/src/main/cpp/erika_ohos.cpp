@@ -3,6 +3,7 @@
 #include <napi/native_api.h>
 #include <native_window/external_window.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -19,6 +20,9 @@ struct OhosPlayer {
 };
 
 std::unordered_map<int64_t, OhosPlayer> g_players;
+// Process-wide monotonic ids: a destroyed player's reused allocation must
+// never collide with an id an ArkTS caller still holds.
+std::atomic<int64_t> g_next_player_id{1};
 
 napi_value Null(napi_env env) {
   napi_value value = nullptr;
@@ -115,7 +119,7 @@ napi_value NativeCreate(napi_env env, napi_callback_info info) {
   if (presenter == nullptr) {
     return Int64(env, 0);
   }
-  const auto player_id = static_cast<int64_t>(reinterpret_cast<uintptr_t>(presenter));
+  const auto player_id = g_next_player_id.fetch_add(1, std::memory_order_relaxed);
   g_players.emplace(player_id, OhosPlayer{presenter, nullptr});
   return Int64(env, player_id);
 }

@@ -22,6 +22,11 @@ use crate::source::source_from_uri_with_options;
 
 const AVERROR_EOF: i32 = -541_478_725;
 
+/// Upper bound on the frames one GIF export may produce (ten minutes at the
+/// 60 fps maximum). The export is synchronous, so an absurd start/end section
+/// would otherwise encode silently for hours.
+const GIF_EXPORT_MAX_FRAME_COUNT: u64 = 36_000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GifExportOptions {
     pub input: MediaRequest,
@@ -100,6 +105,13 @@ pub enum ExportError {
     Source(String),
     #[error("FFmpeg error: {0}")]
     Ffmpeg(String),
+    #[error(
+        "GIF export would produce {target_frame_count} frames, above the limit of {max_frame_count}"
+    )]
+    TooManyFrames {
+        target_frame_count: u64,
+        max_frame_count: u64,
+    },
     #[error("I/O error for {path}: {message}")]
     Io { path: PathBuf, message: String },
 }
@@ -293,6 +305,18 @@ fn validate_options(options: &GifExportOptions) -> Result<()> {
         return Err(ExportError::InvalidOptions(
             "loop_count must be -1, 0, or a positive 16-bit value".to_string(),
         ));
+    }
+    // fps and dimensions are already bounded, so the remaining runaway is the
+    // export length: an unbounded section would encode frames for hours
+    // before its synchronous caller noticed.
+    let target_frame_count = ((options.end - options.start).as_secs_f64()
+        * options.frames_per_second as f64)
+        .ceil() as u64;
+    if target_frame_count > GIF_EXPORT_MAX_FRAME_COUNT {
+        return Err(ExportError::TooManyFrames {
+            target_frame_count,
+            max_frame_count: GIF_EXPORT_MAX_FRAME_COUNT,
+        });
     }
     Ok(())
 }
@@ -821,6 +845,26 @@ mod tests {
         options.end = Duration::from_secs(1);
         options.frames_per_second = 61;
         assert!(validate_options(&options).is_err());
+    }
+
+    #[test]
+    fn options_reject_a_section_above_the_frame_count_limit() {
+        let mut options = GifExportOptions::new(
+            "/tmp/input.mp4",
+            "/tmp/output.gif",
+            Duration::ZERO,
+            Duration::from_secs(601),
+        );
+        options.frames_per_second = 60;
+        let error = validate_options(&options)
+            .expect_err("a ten-minute-plus section must not reach the encoder");
+        assert!(matches!(
+            error,
+            ExportError::TooManyFrames {
+                target_frame_count: 36_060,
+                max_frame_count: 36_000
+            }
+        ));
     }
 
     #[test]
