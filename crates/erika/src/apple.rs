@@ -789,7 +789,11 @@ pub mod coreaudio {
                 target,
                 read_result.frames,
             );
-            if read_result.underflow_frames > 0 {
+            // Declare silence only when the ring supplied nothing at all. A
+            // partial read still carries real samples in the buffer head, and
+            // marking the whole callback silent lets the HAL discard them
+            // (mirrors the WASAPI check `read_result.frames == 0`).
+            if read_result.frames == 0 {
                 args.flags
                     .insert(render_callback::ActionFlags::OUTPUT_IS_SILENCE);
             }
