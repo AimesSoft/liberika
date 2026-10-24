@@ -764,14 +764,14 @@ enum MediaCodecFallbackTarget {
     Software,
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaCodecSeekRoute {
     Surface,
     ByteBuffer,
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 impl MediaCodecSeekRoute {
     fn decoder_config(self) -> DecoderConfig {
         match self {
@@ -780,8 +780,6 @@ impl MediaCodecSeekRoute {
         }
     }
 
-    // Read by the Android seek reopen; tests build it everywhere.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     fn as_str(self) -> &'static str {
         match self {
             Self::Surface => "surface_ahardwarebuffer",
@@ -6248,7 +6246,7 @@ fn mediacodec_fallback_target(
     }
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 fn mediacodec_seek_route(
     active_backend: Option<DecoderBackend>,
     uses_surface: bool,
