@@ -1217,6 +1217,7 @@ impl Decoder {
                 }
                 .is_null());
         unsafe { sys::av_dict_free(&mut codec_options) };
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
         let mut open_result = check(open_code, "avcodec_open2");
         #[cfg(target_os = "android")]
         if open_result.is_ok()
@@ -1424,6 +1425,7 @@ impl Decoder {
                 }
             };
         }
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
         let mut frame = Frame::alloc(self.time_base)?;
         let code = unsafe { sys::avcodec_receive_frame(self.context, frame.ptr) };
         if code == av_error(EAGAIN) {
@@ -2172,6 +2174,7 @@ impl Frame {
     }
 
     pub fn try_clone_ref(&self) -> Result<Self> {
+        #[cfg_attr(not(any(target_os = "android", target_env = "ohos")), allow(unused_mut))]
         let mut frame = Frame::alloc(self.time_base)?;
         check(
             unsafe { sys::av_frame_ref(frame.ptr, self.ptr) },

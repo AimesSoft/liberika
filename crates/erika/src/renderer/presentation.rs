@@ -4,6 +4,7 @@
 //! mapping so video, subtitles, and danmaku stay aligned across Metal,
 //! Direct3D 11, and wgpu surfaces.
 
+#[cfg(any(target_os = "windows", feature = "wgpu"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PresentationRect {
     pub(crate) x: f32,
@@ -51,6 +52,7 @@ impl PresentationLayout {
         }
     }
 
+    #[cfg(any(target_os = "windows", feature = "wgpu"))]
     pub(crate) fn presentation_rect(self) -> PresentationRect {
         PresentationRect {
             x: self.target_rect[0],
