@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fixed a danmaku memory spike when comments contain characters the embedded
+  fallback font does not cover, such as emoji. The danmaku system font
+  fallback now checks character coverage with zero-copy lookups before
+  loading a face and keeps a bounded set of fallback faces resident with LRU
+  eviction while preserving the existing font fallback order, so a single
+  uncovered character no longer copies every system font (about 1.65 GB in
+  the reported macOS case) into memory.
 - Enabled native subtitle supersampling by default. Subtitle and danmaku
   supersampling now default to on in both native and Web backends, with the
   existing size limits, native subtitle CPU fallback and explicit opt-out
