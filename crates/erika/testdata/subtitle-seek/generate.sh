@@ -11,4 +11,8 @@ ffmpeg -hide_banner -loglevel error -nostdin \
 ffmpeg -hide_banner -loglevel error -nostdin \
   -f lavfi -i "$video" -i track-a.srt -i track-b.srt \
   -map 0:v -map 1:0 -map 2:0 "${common[@]}" -y two-tracks.mkv
-shasum -a 256 long.mkv two-tracks.mkv long.srt track-a.srt track-b.srt > SHA256SUMS
+ffmpeg -hide_banner -loglevel error -nostdin \
+  -f lavfi -i "$video" -i switch-a.srt -i switch-b.srt \
+  -map 0:v -map 1:0 -map 2:0 "${common[@]}" -y switch-track.mkv
+shasum -a 256 long.mkv two-tracks.mkv switch-track.mkv long.srt track-a.srt track-b.srt \
+  switch-a.srt switch-b.srt > SHA256SUMS

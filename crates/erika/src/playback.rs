@@ -1863,6 +1863,10 @@ impl PlaybackSession {
     ) -> Result<Option<DecodedSubtitleFrame>> {
         let previous = self.info.selected_subtitle_track;
         self.select_subtitle_track_internal(track_id)?;
+        // The new track's cue that is on right now began before the switch,
+        // and the demuxer is already past it: read it back like a seek to
+        // here would, so it shows at once, playing or paused.
+        self.backfill_embedded_subtitle(media_time);
         Ok(clear_subtitle_frame(previous, media_time))
     }
 
@@ -9937,5 +9941,50 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("track 2 has a cue at 40-50 s, but none arrived after switching at 40 s");
+    }
+
+    fn open_switch_track_session() -> PlaybackSession {
+        let request = MediaRequest::new(subtitle_seek_fixture("switch-track.mkv"));
+        let config = PlaybackSessionConfig {
+            video_decode: VideoDecodePreference::Software,
+            ..Default::default()
+        };
+        PlaybackSession::open(&request, config).unwrap()
+    }
+
+    #[test]
+    fn switching_track_shows_the_cue_that_is_on_at_the_switch() {
+        let mut session = open_switch_track_session();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        session.select_subtitle_track(Some(2), target).unwrap();
+        for _ in 0..500 {
+            session.video_frames.clear();
+            session.audio_frames.clear();
+            session.pump_once(PlaybackPumpDemand::Video).unwrap();
+            if let Some(frame) = session.next_subtitle_frame(target).unwrap() {
+                assert_eq!(frame.start, Some(Duration::from_secs(35)));
+                assert_eq!(frame.end, Some(Duration::from_secs(45)));
+                assert_eq!(frame.track_id, 2);
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("track 2's 35-45 s cue is on at 40 s but never showed after switching");
+    }
+
+    #[test]
+    fn switching_track_while_paused_shows_the_cue_at_once() {
+        let mut session = open_switch_track_session();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        // Nothing is pumped: a paused player only asks for the subtitle.
+        session.select_subtitle_track(Some(2), target).unwrap();
+        let frame = session
+            .next_subtitle_frame(target)
+            .unwrap()
+            .expect("the cue on at the switch must be there without playing");
+        assert_eq!(frame.start, Some(Duration::from_secs(35)));
+        assert_eq!(frame.end, Some(Duration::from_secs(45)));
     }
 }
