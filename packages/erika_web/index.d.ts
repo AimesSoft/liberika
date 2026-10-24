@@ -11,6 +11,8 @@ export interface DanmakuOptions {
   blockBottom?: boolean;
   blockScroll?: boolean;
   mergeDuplicates?: boolean;
+  /** Paint each comment in a stable color from the colorful sending palette. */
+  randomColors?: boolean;
 }
 export interface Track {
   id: number;
@@ -86,7 +88,8 @@ export class Player extends EventTarget {
   selectSubtitle(id: number | null): Promise<void>;
   addSubtitle(assSrtOrVtt: string): Promise<void>;
   addDanmaku(xmlOrJson: string): Promise<number>;
-  sendDanmaku(text: string): Promise<void>;
+  /** Shows the viewer's own comment, bordered; `color` is 0xRRGGBB (white by default). */
+  sendDanmaku(text: string, color?: number): Promise<void>;
   capture(width?: number): Promise<Blob>;
   close(): Promise<void>;
   addFont(name: string, data: ArrayBuffer | Uint8Array): Promise<void>;

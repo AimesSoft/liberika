@@ -6737,6 +6737,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "android")]
     #[test]
     fn mediacodec_seek_reopens_the_active_surface_or_bytebuffer_route() {
         assert_eq!(

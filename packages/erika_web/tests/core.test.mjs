@@ -168,8 +168,14 @@ test('appending comments preserves mounted tracks and invalid input is atomic', 
     assert.equal(d.frame(1, 1280, 720, 1, 0).groups.length, 32);
     assert.throws(() => d.append('{'));
     assert.equal(d.frame(1, 1280, 720, 1, 1).groups.length, 32);
-    d.send('own comment', 0);
-    assert.equal(d.frame(1, 1280, 720, 1, 2).groups.length, 48);
+    d.send('own comment', 0, 0xfe0502);
+    // The viewer's comment adds its red text and its white border.
+    const own = d.frame(1, 1280, 720, 1, 2).groups;
+    assert.equal(own.length, 64);
+    const paints = [];
+    for (let i = 0; i < own.length; i += 16) paints.push(Array.from(own.subarray(i + 2, i + 5)));
+    assert.ok(paints.some(([r, g, b]) => r === 1 && g === 1 && b === 1));
+    assert.ok(paints.some(([r, g, b]) => Math.abs(r - 0xfe / 255) < 1e-6 && Math.abs(g - 5 / 255) < 1e-6 && Math.abs(b - 2 / 255) < 1e-6));
     d.load('[]');
     assert.equal(d.frame(1, 1280, 720, 1, 3).groups.length, 0);
   } finally { d.free(); }

@@ -284,8 +284,8 @@ export class Player extends EventTarget {
   addDanmaku(text) {
     return this.request("danmaku", { text });
   }
-  sendDanmaku(text) {
-    return this.request("sendDanmaku", { text, seconds: this.currentTime });
+  sendDanmaku(text, color) {
+    return this.request("sendDanmaku", { text, color, seconds: this.currentTime });
   }
   capture(width) {
     return this.request("capture", { width, seconds: this.currentTime });
