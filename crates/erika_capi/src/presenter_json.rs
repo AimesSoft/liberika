@@ -287,6 +287,13 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
         "[track]",
     ),
     method(
+        "chapters",
+        P,
+        "Container chapters on the playback timeline; mediaOpen is false when no media is open.",
+        NONE,
+        "{chapters:[{index,title,startMs,endMs}], mediaOpen}",
+    ),
+    method(
         "trackSelection",
         P,
         "Selected track ids.",
@@ -711,6 +718,7 @@ pub(crate) unsafe fn invoke(
             )
         }),
         "tracks" => unsafe { tracks_json(handle) },
+        "chapters" => unsafe { chapters_json(handle) },
         "loadDanmakuFile" => {
             let uri = required_c_string(required_string(args, "uri")?, "uri")?;
             status_value(unsafe { erika_presenter_load_danmaku_file(handle, uri.as_ptr()) })
@@ -1040,6 +1048,31 @@ unsafe fn tracks_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String
             })
             .collect(),
     ))
+}
+
+unsafe fn chapters_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
+    if handle.is_null() {
+        return Err("presenter handle is null".to_string());
+    }
+    let presenter = unsafe { &*handle };
+    let player = presenter.presenter.player();
+    let chapters = player
+        .chapters()
+        .into_iter()
+        .enumerate()
+        .map(|(index, chapter)| {
+            json!({
+                "index": index,
+                "title": chapter.title,
+                "startMs": chapter.start.as_millis().min(u64::MAX as u128),
+                "endMs": chapter.end.map(|end| end.as_millis().min(u64::MAX as u128)),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "chapters": chapters,
+        "mediaOpen": player.has_open_media(),
+    }))
 }
 
 unsafe fn danmaku_tracks_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
@@ -1847,6 +1880,55 @@ mod tests {
             .find(|entry| entry["name"] == "exportFrame")
             .unwrap();
         assert_eq!(export["scope"], "global");
+    }
+
+    #[test]
+    fn chapters_report_container_timeline_and_explain_no_media() {
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+
+        let before = invoke(handle, c"chapters", "{}");
+        assert_eq!(before["ok"], true, "{before}");
+        assert_eq!(before["value"]["mediaOpen"], false);
+        assert_eq!(before["value"]["chapters"], json!([]));
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../erika/testdata/chapters/chapters.mkv");
+        let uri = path.to_string_lossy().into_owned();
+        let opened = invoke(handle, c"open", &json!({"uri": uri}).to_string());
+        assert_eq!(opened["ok"], true, "{opened}");
+
+        let report = invoke(handle, c"chapters", "{}");
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["value"]["mediaOpen"], true);
+        let chapters = report["value"]["chapters"].as_array().unwrap();
+        assert_eq!(chapters.len(), 6);
+        assert_eq!(
+            chapters[1],
+            json!({
+                "index": 1,
+                "title": "OP",
+                "startMs": 10_000,
+                "endMs": 20_000,
+            })
+        );
+        assert_eq!(
+            chapters[5],
+            json!({
+                "index": 5,
+                "title": "Preview",
+                "startMs": 50_000,
+                "endMs": 60_000,
+            })
+        );
+
+        let closed = invoke(handle, c"close", "{}");
+        assert_eq!(closed["ok"], true, "{closed}");
+        let after = invoke(handle, c"chapters", "{}");
+        assert_eq!(after["value"]["mediaOpen"], false);
+        assert_eq!(after["value"]["chapters"], json!([]));
+
+        unsafe { erika_presenter_destroy(handle) };
     }
 
     #[test]
