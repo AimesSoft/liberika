@@ -1,15 +1,8 @@
 Pod::Spec.new do |s|
   erika_cabi_symbols = %w[
     erika_danmaku_track_info_free
-    erika_export_frame
     erika_export_gif
-    erika_frame_export_result_free
-    erika_frame_export_session_close
-    erika_frame_export_session_frame
-    erika_frame_export_session_open
     erika_last_error_message
-    erika_log_read_json
-    erika_presenter_get_diagnostics_json
     erika_presenter_invoke_json
     erika_string_free
     erika_presenter_add_danmaku_track_file
@@ -60,6 +53,20 @@ Pod::Spec.new do |s|
     erika_track_info_free
     erika_subtitle_memory_font_status_free
   ]
+  # Entry points the plugin looks up only if the native library has them.
+  # The pinned native artifacts (native_artifacts.properties) predate them;
+  # a source build or a newer library has them. The build phase force-links
+  # the ones the library it produced defines (erika_optional_ldflags.rsp).
+  # They move to erika_cabi_symbols in the release whose artifacts ship them.
+  erika_cabi_optional_symbols = %w[
+    erika_export_frame
+    erika_frame_export_result_free
+    erika_frame_export_session_close
+    erika_frame_export_session_frame
+    erika_frame_export_session_open
+    erika_log_read_json
+    erika_presenter_get_diagnostics_json
+  ]
   erika_cabi_undefined_flags = erika_cabi_symbols
     .map { |symbol| "-Wl,-u,_#{symbol}" }
     .join(' ')
@@ -86,7 +93,7 @@ Flutter tvOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI
     :name => 'Build Erika C ABI',
     :execution_position => :before_compile,
     :input_files => ['${BUILT_PRODUCTS_DIR}/erika_capi_phony'],
-    :output_files => ['${PODS_TARGET_SRCROOT}/native/liberika_capi.a'],
+    :output_files => ['${PODS_TARGET_SRCROOT}/native/liberika_capi.a', '${PODS_TARGET_SRCROOT}/native/erika_optional_ldflags.rsp'],
     :script => <<-SCRIPT
 set -eu
 
@@ -191,6 +198,17 @@ if [ ! -f "$OUTPUT_LIB" ]; then
   echo "error: Erika C ABI static library not found: $OUTPUT_LIB" >&2
   exit 1
 fi
+# Force-link only the optional entry points this library actually defines:
+# forcing one it lacks fails the link, and leaving out one it has lets dead
+# stripping drop it before the plugin's dlsym looks for it.
+OPTIONAL_LDFLAGS="$PODS_TARGET_SRCROOT/native/erika_optional_ldflags.rsp"
+DEFINED_SYMBOLS="$(nm -gU "$OUTPUT_LIB" 2>/dev/null | awk '{print $NF}')"
+: > "$OPTIONAL_LDFLAGS"
+for symbol in #{erika_cabi_optional_symbols.join(' ')}; do
+  if printf '%s\\n' "$DEFINED_SYMBOLS" | grep -qx "_$symbol"; then
+    printf -- '-Wl,-u,_%s\\n' "$symbol" >> "$OPTIONAL_LDFLAGS"
+  fi
+done
 if [ -f "$OBJROOT/XCBuildData/build.db" ]; then
   ln -fs "$OBJROOT/XCBuildData/build.db" "$BUILT_PRODUCTS_DIR/erika_capi_phony"
 fi
@@ -199,6 +217,6 @@ fi
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'EXCLUDED_ARCHS[sdk=appletvsimulator*]' => 'i386',
-    'OTHER_LDFLAGS' => "$(inherited) \"$(PODS_TARGET_SRCROOT)/native/liberika_capi.a\" #{erika_cabi_undefined_flags} -framework AVFoundation -framework AudioToolbox -framework MediaPlayer -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework Foundation -liconv -lbz2 -lz",
+    'OTHER_LDFLAGS' => "$(inherited) \"$(PODS_TARGET_SRCROOT)/native/liberika_capi.a\" #{erika_cabi_undefined_flags} \"@$(PODS_TARGET_SRCROOT)/native/erika_optional_ldflags.rsp\" -framework AVFoundation -framework AudioToolbox -framework MediaPlayer -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework CoreText -framework CoreFoundation -framework CoreGraphics -framework Foundation -liconv -lbz2 -lz",
   }
 end
