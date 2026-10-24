@@ -14,8 +14,8 @@ provides an `XComponent` surface id through `attachSurface()` and drives
 ohpm install erika
 ```
 
-As of 2026-10-02, the public OHPM version is 0.1.9. The 0.2.1 package has been
-submitted for review; this checkout documents the 0.2.1 SDK.
+As of 2026-10-25, the public OHPM version is the approved 0.2.1 package.
+This checkout documents the 0.3.0 SDK, which requires OHPM review after upload.
 
 ## Player configuration
 

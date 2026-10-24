@@ -1,6 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-25
+
+### Default behavior changes
+
+- Enabled subtitle and danmaku supersampling by default; explicit opt-out
+  settings remain available.
+- Software video decoding now uses FFmpeg frame/slice threading by default;
+  `ERIKA_VIDEO_DECODE_THREADS=1` restores single-threaded decoding.
+
+### Playback and SDK updates
+
+- Fixed subtitles during paused seeks and track switches, including long cues
+  spanning the seek position (#171).
+- Added container chapters through `invokeJson('chapters')` (#172).
+- iOS/tvOS force-link only optional entry points actually present in the
+  selected native archive, retaining compatibility with older runtimes (#170).
+- Added playback-start failure reasons to native traces, fixed ordinary HTTP
+  tail read failures becoming playback errors (#169), and bounded system-font
+  fallback memory without hiding previously visible symbols (#173).
+- Renamed the project to liberika; the `erika_flutter` package name is unchanged.
+
 
 - Added `ErikaPlayer.getDiagnosticsSnapshot()`, `getLogs()` and
   `invokeJson()`. They return JSON maps from the native engine for automated
@@ -24,9 +44,8 @@
   macOS, a background isolate per session on the FFI platforms).
   `ErikaExportedFrame.toneMapped` says whether an HDR source was tone mapped to
   SDR. `ERIKA_FLUTTER_LIBRARY` points the FFI exports at a library under test.
-- The iOS and tvOS podspecs force-link the export, diagnostics and JSON
-  functions so a static link keeps them for the plugin's and Dart's lookups in
-  the running executable.
+- The iOS and tvOS podspecs retain available export, diagnostics and JSON
+  functions for the plugin's and Dart's lookups in the running executable.
 - The macOS build phase checks that an `ERIKA_MACOS_CAPI_DYLIB` override has
   every architecture being built and says which library it bundles.
 

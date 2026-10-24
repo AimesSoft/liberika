@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-25
+
+### Default behavior changes
+
+- Enabled subtitle and danmaku supersampling by default; explicit opt-out
+  settings remain available.
+- Software video decoding now uses FFmpeg frame/slice threading by default;
+  `ERIKA_VIDEO_DECODE_THREADS=1` restores single-threaded decoding.
+
+### Playback and SDK updates
+
+- Added native diagnostics, redacted logs, discoverable JSON invocation and
+  headless frame export, including sessions and HDR-to-SDR tone mapping.
+- Exposed container chapters through presenter JSON (`chapters`, #172).
+- Fixed paused seek and subtitle-track switching, including active long cues
+  (#171), and kept pending pause intent during asynchronous playback changes.
+- Added playback-start failure reasons to traces and handle ordinary HTTP tail
+  failures as EOF without masking range/entity verification errors (#169).
+- Bounded system fallback-font memory while preserving visible glyphs (#173).
+- Improved wgpu compatibility with GLES varying limits and avoided unsupported
+  cooperative-matrix discovery on HarmonyOS emulators.
+- Updated to the matching 0.3.0 native runtime. The project is now named
+  liberika; the ArkTS/OHPM package remains `erika`. iOS/tvOS optional-symbol
+  linking is fixed in the shared native release (#170).
+
 
 ## 0.2.1
 

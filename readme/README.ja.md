@@ -13,7 +13,7 @@
 
 ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて liberika 内部で完結します。
 
-現在のリリースは **0.2.1** です。[ドキュメント一覧](../docs/README.md) からガイドを選べます。
+現在のリリースは **0.3.0** です。[ドキュメント一覧](../docs/README.md) からガイドを選べます。
 
 **MKV 内の ASS 字幕と添付フォントを使って、ブラウザーで直接再生できます。**
 現在のソースには [Web / WASM バックエンド](../docs/web.md) が含まれ、Erika Web に
@@ -35,16 +35,16 @@ HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは
 
 | ホスト | インストール / 入口 | ガイド |
 |---|---|---|
-| ブラウザー / JavaScript / TypeScript | 現在のソースで `cargo run -p xtask -- web build` | [Web 組み込み・配信（英語）](../docs/web.md) |
-| Flutter | `flutter pub add erika_flutter`（0.2.1） | [プラグイン](../packages/erika_flutter/README.ja.md) |
-| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加、0.2.1 以降 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| ブラウザー / JavaScript / TypeScript | `liberika-web-0.3.0.zip` またはソースビルド | [Web 組み込み・配信（英語）](../docs/web.md) |
+| Flutter | `flutter pub add erika_flutter`（0.3.0） | [プラグイン](../packages/erika_flutter/README.ja.md) |
+| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加、0.3.0 以降 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
-| Rust | Git 依存を `v0.2.1` に固定 | [ビルド](../docs/building.ja.md) |
+| Rust | Git 依存を `v0.3.0` に固定 | [ビルド](../docs/building.ja.md) |
 | Linux | システム FFmpeg 8 とパッチ済み libass、ソースビルド | [Linux](../docs/linux.md) |
 
-2026-10-02 時点の OHPM 公開版は 0.1.9、0.2.1 は審査に提出済みです。
-ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1) にあります。
+2026-10-25 時点の OHPM 公開版は審査済みの 0.2.1 です。0.3.0 は upload 後に審査が必要です。
+ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.0) にあります。
 
 ### ブラウザー
 
@@ -56,7 +56,8 @@ python3 scripts/serve_web.py
 
 `http://127.0.0.1:18765` でサンプルを開けます。`target/web/` のランタイムを配信し、
 `Player.create({ canvas })` と `player.open(fileOrURL)` で独自の UI に組み込みます。
-Web 版は現在のソースからビルドでき、npm には未公開です。音声・映像コーデックは
+Release の `liberika-web-0.3.0.zip` は `index.html` デモを含みます。
+全体を展開し HTTPS または localhost で配信できます。ソースビルドも可能で、npm には未公開です。音声・映像コーデックは
 ブラウザーの WebCodecs 対応範囲に依存します。依存、サンプル、Erika への組み込みは
 [ブラウザーガイド（英語）](../docs/web.md) を参照してください。
 
@@ -81,7 +82,7 @@ Windows HDR10 にはネイティブ映像サーフェスを使います。選択
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.2.1" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.0" }
 ```
 
 ```rust
@@ -107,7 +108,7 @@ player.play()?;
 | Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | 4 ABI バンドル、Flutter |
 | OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 バンドル、Flutter、OHPM |
 | Linux（実験的） | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust、C ABI、Flutter ソースビルド |
-| ブラウザー | WebCodecs | WebGL2 / Canvas | Web Audio | 現在のソースから JS / WASM パッケージをビルド |
+| ブラウザー | WebCodecs | WebGL2 / Canvas | Web Audio | Release の Web archive または JS / WASM ソースビルド |
 
 サーフェスと HDR の対応は [プラットフォーム表](../docs/platform_matrix.zh.md) にまとめています。
 ブラウザー版は現在 SDR 出力で、Chrome で検証済みです。HTTPS または localhost、

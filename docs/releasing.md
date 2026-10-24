@@ -11,16 +11,16 @@ A normal release starts with one core `vX.Y.Z` tag. GitHub Actions publishes the
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p erika -p erika_capi
-cargo clippy -p erika -p erika_capi --all-targets -- -D warnings
+cargo test --locked -p erika -p erika_capi
+cargo clippy --locked -p erika --all-targets --all-features --no-deps
 cd packages/erika_flutter
 dart pub publish --dry-run
 ```
 
-3. Tag the release commit. The version below is an example for the next release; replace it with the intended version:
+3. Set `[workspace.package].version` in `Cargo.toml` to the release version and run `cargo update -w`; commit `Cargo.lock` with it. The Release workflow rejects tags that differ from the Cargo version. Run `Release` manually on this commit and confirm all platform builds pass before tagging. Tag the release commit. The version below is an example for the next release; replace it with the intended version:
 
 ```sh
-VERSION=0.2.2
+VERSION=0.3.0
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -29,12 +29,12 @@ git push origin "v${VERSION}"
 
 ## Automated pipeline
 
-[release.yml](../.github/workflows/release.yml) builds platforms in parallel. iOS, tvOS, and Android build independent architecture slices and then assemble their archives; macOS arm64/x64 outputs form the universal bundle. The workflow creates a GitHub Release with 13 native/Flutter archives and `SHA256SUMS`.
+[release.yml](../.github/workflows/release.yml) builds platforms in parallel. iOS, tvOS, and Android build independent architecture slices and then assemble their archives; macOS arm64/x64 outputs form the universal bundle. The workflow creates a GitHub Release with 13 native/Flutter archives, the Web archive, and `SHA256SUMS`.
 
 [release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) then:
 
 - Updates Flutter/OHPM versions and `native_artifacts.properties` with the uploaded checksums, committing the metadata to `main`.
-- Creates the internal `erika_flutter-vX.Y.Z` tag to trigger [Flutter OIDC publishing](../.github/workflows/flutter-package.yml).
+- Creates the internal `erika_flutter-vX.Y.Z` tag to trigger [Flutter OIDC publishing](../.github/workflows/pub-publish.yml).
 - Builds the ArkTS HAR and uploads it to OHPM.
 - Assembles the Swift XCFramework, appends it to the core Release and `SHA256SUMS`, and dispatches liberika-swift to update, test, and publish its matching version.
 
@@ -44,7 +44,7 @@ A manual `Release` run through `workflow_dispatch` checks the builds and stores 
 
 ## Release artifacts
 
-A complete release contains 14 ZIPs plus `SHA256SUMS`:
+A complete release contains 15 ZIPs plus `SHA256SUMS`:
 
 | Platform | Archive naming | Count |
 |---|---|---|
@@ -54,6 +54,7 @@ A complete release contains 14 ZIPs plus `SHA256SUMS`:
 | Android | `erika-capi-android.zip` | 1 |
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
+| Web / WASM | `liberika-web-X.Y.Z.zip` | 1 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI bundles include the library, `include/erika.h`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, dependency license texts, and a `MANIFEST.txt` with the tag/commit. iOS/tvOS contain device + simulator XCFramework slices. The combined Android bundle contains static/shared libraries and matching `libc++_shared.so` for four ABIs. Flutter Android bundles contain one ABI's shared runtime each.
