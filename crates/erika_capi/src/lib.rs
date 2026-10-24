@@ -1314,8 +1314,13 @@ pub unsafe extern "C" fn erika_play(handle: *mut ErikaHandle) -> ErikaStatus {
     with_handle_mut(handle, |handle| {
         capi_trace(format!("fn=erika_play handle={handle:p}"));
         let status = status_from_player_result(handle.player.play());
+        let reason = if status == ErikaStatus::Ok {
+            String::new()
+        } else {
+            LAST_ERROR.with(|slot| slot.borrow().clone().unwrap_or_default())
+        };
         capi_trace(format!(
-            "fn=erika_play.done handle={handle:p} status={status:?}"
+            "fn=erika_play.done handle={handle:p} status={status:?} {reason}"
         ));
         status
     })

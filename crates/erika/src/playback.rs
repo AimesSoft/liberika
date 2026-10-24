@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -830,6 +831,15 @@ pub struct PlaybackSession {
     video_frames: VecDeque<DecodedVideoFrame>,
     audio_frames: VecDeque<PcmAudioFrame>,
     subtitle_frames: VecDeque<DecodedSubtitleFrame>,
+    subtitle_backfill: Option<SubtitleBackfill>,
+    /// After a seek, the cues on at its target were read back (see
+    /// [`SubtitleBackfill`]): what the stream delivers that starts at or
+    /// before it is already among them.
+    subtitle_backfilled_until: Option<Duration>,
+    /// The position of a seek whose backfill had to leave out the cues that
+    /// began before its window because the track's cue index was still being
+    /// built; they are added from the index once it is complete.
+    subtitle_backfill_catch_up: Option<Duration>,
     pending_video_packets: VecDeque<ffmpeg::Packet>,
     video_fallback_waiting_for_keyframe: bool,
     audio_seek_waiting_for_valid_packet: bool,
@@ -1376,6 +1386,9 @@ impl PlaybackSession {
             video_frames: VecDeque::new(),
             audio_frames: VecDeque::new(),
             subtitle_frames: VecDeque::new(),
+            subtitle_backfill: None,
+            subtitle_backfilled_until: None,
+            subtitle_backfill_catch_up: None,
             pending_video_packets: VecDeque::new(),
             video_fallback_waiting_for_keyframe: false,
             audio_seek_waiting_for_valid_packet: false,
@@ -1754,6 +1767,7 @@ impl PlaybackSession {
         {
             return Ok(None);
         }
+        self.finish_subtitle_backfill(media_time);
         self.pump_external_subtitles(selected_track, media_time)?;
         Ok(self.pop_ready_subtitle(media_time))
     }
@@ -1849,6 +1863,10 @@ impl PlaybackSession {
     ) -> Result<Option<DecodedSubtitleFrame>> {
         let previous = self.info.selected_subtitle_track;
         self.select_subtitle_track_internal(track_id)?;
+        // The new track's cue that is on right now began before the switch,
+        // and the demuxer is already past it: read it back like a seek to
+        // here would, so it shows at once, playing or paused.
+        self.backfill_embedded_subtitle(media_time);
         Ok(clear_subtitle_frame(previous, media_time))
     }
 
@@ -1875,6 +1893,11 @@ impl PlaybackSession {
             }
         }
         self.subtitle_frames.clear();
+        // The read-back state belongs to the track that was selected when the
+        // seek happened: the new track's cues that start at or before that
+        // position are not among it and must not be dropped as already read.
+        self.subtitle_backfilled_until = None;
+        self.subtitle_backfill_catch_up = None;
         // All embedded subtitle streams are selected when the main demuxer is
         // opened (and whenever an audio selection rebuilds its selection).
         // Do not touch the asynchronous demux selection for a subtitle-only
@@ -1984,9 +2007,114 @@ impl PlaybackSession {
         for external in &mut self.external_subtitles {
             external.seek(position)?;
         }
+        self.backfill_embedded_subtitle(position);
         self.audio_resampler = None;
         self.reset_eof_drain_state();
         Ok(())
+    }
+
+    /// The cues on at [`position`] that began before the stream's seek
+    /// landed on its keyframe: the demuxer starts reading at that keyframe,
+    /// so a cue that began a moment before it would only show from the next
+    /// one. Read from the file again, the subtitle stream alone; what is on
+    /// at [`position`] goes in front of what the stream delivers. A cue that
+    /// began long before (a sign, a song's lyrics) is found through the
+    /// track's cue index, see [`SubtitleCueIndex`]; while that is still being
+    /// built only the cues of the last [`SUBTITLE_BACKFILL_WINDOW`] are read
+    /// back, and [`Self::finish_subtitle_backfill`] adds the rest once the
+    /// index is complete. Local files only: a network source is not read
+    /// twice for this, and keeps what the stream delivers.
+    fn backfill_embedded_subtitle(&mut self, position: Duration) {
+        self.subtitle_backfilled_until = None;
+        self.subtitle_backfill_catch_up = None;
+        let Some(track_id) = self.info.selected_subtitle_track else {
+            self.subtitle_backfill = None;
+            return;
+        };
+        let Some(decoder) = self.subtitle_decoder.as_ref() else {
+            self.subtitle_backfill = None;
+            return;
+        };
+        let stream_index = decoder.stream_index();
+        if !subtitle_backfill_source_is_local(&self.info.uri) {
+            return;
+        }
+        if self
+            .subtitle_backfill
+            .as_ref()
+            .is_none_or(|backfill| backfill.stream_index != stream_index)
+        {
+            self.subtitle_backfill = SubtitleBackfill::open(&self.info.uri, stream_index);
+        }
+        let Some(backfill) = self.subtitle_backfill.as_mut() else {
+            return;
+        };
+        let main = self.subtitle_decoder.as_ref().expect("checked above");
+        match backfill.active_at(position, main, track_id) {
+            Ok(read_back) => {
+                self.subtitle_backfilled_until = Some(position);
+                if read_back.earlier_cues_pending {
+                    self.subtitle_backfill_catch_up = Some(position);
+                }
+                for frame in read_back.frames {
+                    self.subtitle_frames.push_back(frame);
+                }
+                trim_subtitle_queue(&mut self.subtitle_frames, self.queue_limits.subtitle_frames);
+            }
+            Err(error) => {
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!(
+                        "Erika subtitle backfill at {:.3}s failed: {error}",
+                        position.as_secs_f64()
+                    ),
+                );
+                self.subtitle_backfill = None;
+            }
+        }
+    }
+
+    /// Adds the cues that began before the backfill window of the last seek
+    /// and are still on at `media_time`, once the track's cue index is
+    /// complete. Nothing to do (and nothing blocked on) before that.
+    fn finish_subtitle_backfill(&mut self, media_time: Duration) {
+        let Some(position) = self.subtitle_backfill_catch_up else {
+            return;
+        };
+        let (Some(track_id), Some(main), Some(backfill)) = (
+            self.info.selected_subtitle_track,
+            self.subtitle_decoder.as_ref(),
+            self.subtitle_backfill.as_mut(),
+        ) else {
+            self.subtitle_backfill_catch_up = None;
+            return;
+        };
+        match backfill.earlier_active_at(position, main, track_id) {
+            Ok(EarlierCues::Scanning) => {}
+            Ok(EarlierCues::Unavailable) => self.subtitle_backfill_catch_up = None,
+            Ok(EarlierCues::Frames(frames)) => {
+                self.subtitle_backfill_catch_up = None;
+                // They began before everything queued, so they go first; a
+                // cue that has ended by now is not worth showing.
+                for frame in frames
+                    .into_iter()
+                    .filter(|frame| frame.end.is_none_or(|end| end > media_time))
+                    .rev()
+                {
+                    self.subtitle_frames.push_front(frame);
+                }
+            }
+            Err(error) => {
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!(
+                        "Erika subtitle catch-up at {:.3}s failed: {error}",
+                        position.as_secs_f64()
+                    ),
+                );
+                self.subtitle_backfill_catch_up = None;
+            }
+        }
     }
 
     #[cfg(target_os = "android")]
@@ -2556,8 +2684,17 @@ impl PlaybackSession {
                 .as_mut()
                 .expect("subtitle decoder exists");
             if let Some(frame) = decoder.decode_packet(&packet)? {
-                self.subtitle_frames.push_back(frame);
-                trim_subtitle_queue(&mut self.subtitle_frames, self.queue_limits.subtitle_frames);
+                let read_back = self
+                    .subtitle_backfilled_until
+                    .zip(frame.start)
+                    .is_some_and(|(until, start)| start <= until);
+                if !read_back {
+                    self.subtitle_frames.push_back(frame);
+                    trim_subtitle_queue(
+                        &mut self.subtitle_frames,
+                        self.queue_limits.subtitle_frames,
+                    );
+                }
             }
         }
         Ok(())
@@ -3625,6 +3762,347 @@ fn select_ready_subtitle(
 
 fn decoded_subtitle_start(frame: &DecodedSubtitleFrame) -> Duration {
     frame.start.unwrap_or(Duration::ZERO)
+}
+
+/// How far before a seek's target the backfill starts reading.
+const SUBTITLE_BACKFILL_WINDOW: Duration = Duration::from_secs(15);
+
+fn subtitle_backfill_source_is_local(uri: &str) -> bool {
+    match uri.split_once("://") {
+        None => uri.starts_with('/') || uri.chars().nth(1) == Some(':'),
+        Some((scheme, _)) => scheme.eq_ignore_ascii_case("file"),
+    }
+}
+
+/// What a backfill found at a seek's target.
+struct BackfilledCues {
+    frames: Vec<DecodedSubtitleFrame>,
+    /// The cue index was not complete, so cues that began before the window
+    /// may be missing; ask [`SubtitleBackfill::earlier_active_at`] later.
+    earlier_cues_pending: bool,
+}
+
+enum EarlierCues {
+    /// The index is still being built.
+    Scanning,
+    /// There is no index to ask (it failed, or the source has none).
+    Unavailable,
+    Frames(Vec<DecodedSubtitleFrame>),
+}
+
+/// A second reader of the media file with only the selected subtitle
+/// stream on, to read the cues that are on at a seek's target.
+struct SubtitleBackfill {
+    demuxer: Demuxer,
+    decoder: SubtitleDecoder,
+    stream_index: i32,
+    index: Option<SubtitleCueIndex>,
+}
+
+impl SubtitleBackfill {
+    fn open(uri: &str, stream_index: i32) -> Option<Self> {
+        let source = source_from_uri_with_hint(uri, crate::core::MediaSourceHint::Auto).ok()?;
+        let mut demuxer = Demuxer::open_source(source).ok()?;
+        let decoder = demuxer.open_subtitle_decoder(stream_index).ok()?;
+        demuxer
+            .set_stream_selection(StreamSelection::only([stream_index]))
+            .ok()?;
+        Some(Self {
+            demuxer,
+            decoder,
+            stream_index,
+            index: SubtitleCueIndex::start(uri, stream_index),
+        })
+    }
+
+    /// The frames whose cues are on at `position`. With a complete cue index
+    /// (or one that has been built past `position`) they all come from it.
+    /// Otherwise the stream is read from [`SUBTITLE_BACKFILL_WINDOW`] before
+    /// `position`, which finds every cue that began in the window.
+    fn active_at(
+        &mut self,
+        position: Duration,
+        main: &SubtitleDecoder,
+        track_id: i64,
+    ) -> Result<BackfilledCues> {
+        self.decoder.share_ass_track_with(main);
+        let window_start = position.saturating_sub(SUBTITLE_BACKFILL_WINDOW);
+        if let Some(index) = &self.index {
+            let packets = index.lock();
+            if packets.covers(position) {
+                self.decoder.flush();
+                let frames = decode_active(
+                    &mut self.decoder,
+                    packets.candidates(position, window_start, CueScope::All),
+                    position,
+                    track_id,
+                )?;
+                return Ok(BackfilledCues {
+                    frames,
+                    earlier_cues_pending: false,
+                });
+            }
+        }
+        self.demuxer.seek(window_start)?;
+        self.decoder.flush();
+        let mut active = Vec::new();
+        while let Some(packet) = self.demuxer.read_packet()? {
+            if packet
+                .pts()
+                .and_then(|pts| pts.as_duration())
+                .is_some_and(|pts| pts > position)
+            {
+                break;
+            }
+            if let Some(frame) = self.decoder.decode_packet(&packet)?
+                && cue_is_active_at(&frame, position)
+            {
+                active.push(frame.with_track_id(track_id));
+            }
+        }
+        Ok(BackfilledCues {
+            frames: active,
+            earlier_cues_pending: self.index.as_ref().is_some_and(|index| !index.failed()),
+        })
+    }
+
+    /// The cues that began before the window of an [`Self::active_at`] that
+    /// ran while the index was incomplete and are on at `position`.
+    fn earlier_active_at(
+        &mut self,
+        position: Duration,
+        main: &SubtitleDecoder,
+        track_id: i64,
+    ) -> Result<EarlierCues> {
+        let Some(index) = &self.index else {
+            return Ok(EarlierCues::Unavailable);
+        };
+        let packets = index.lock();
+        if packets.failed() {
+            return Ok(EarlierCues::Unavailable);
+        }
+        if !packets.complete() {
+            return Ok(EarlierCues::Scanning);
+        }
+        self.decoder.share_ass_track_with(main);
+        self.decoder.flush();
+        let window_start = position.saturating_sub(SUBTITLE_BACKFILL_WINDOW);
+        let frames = decode_active(
+            &mut self.decoder,
+            packets.candidates(position, window_start, CueScope::BeforeWindow),
+            position,
+            track_id,
+        )?;
+        Ok(EarlierCues::Frames(frames))
+    }
+}
+
+fn cue_is_active_at(frame: &DecodedSubtitleFrame, position: Duration) -> bool {
+    frame.start.is_none_or(|start| start <= position) && frame.end.is_none_or(|end| end > position)
+}
+
+fn decode_active<'a>(
+    decoder: &mut SubtitleDecoder,
+    packets: impl Iterator<Item = &'a ffmpeg::Packet>,
+    position: Duration,
+    track_id: i64,
+) -> Result<Vec<DecodedSubtitleFrame>> {
+    let mut active = Vec::new();
+    for packet in packets {
+        if let Some(frame) = decoder.decode_packet(packet)?
+            && cue_is_active_at(&frame, position)
+        {
+            active.push(frame.with_track_id(track_id));
+        }
+    }
+    Ok(active)
+}
+
+/// Which of the indexed cues a query wants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CueScope {
+    /// Every cue on at the position.
+    All,
+    /// Only those that began before the backfill window.
+    BeforeWindow,
+}
+
+/// Every packet of one subtitle stream of a local file, read once by a
+/// background thread the first time a seek needs it. Subtitle packets are
+/// small (a few hundred bytes a cue), so a whole film's worth fits in memory,
+/// and a cue that began at any time before a seek's target is found by
+/// looking at the packets' times, however long it has been on screen.
+///
+/// The container's own index is no help: Matroska cues point at video
+/// keyframes, and nothing in the format says how long before a position a
+/// cue may have started. The scan reads the file once through the
+/// subtitle-only demuxer, so it costs sequential I/O but no decoding; it
+/// never runs on the playback thread, and the queries only take the lock for
+/// the few packets they decode. While it runs, [`SubtitleBackfill`] falls
+/// back to the window read and adds the earlier cues when the scan is done.
+/// A scan that fails or outgrows [`SUBTITLE_CUE_INDEX_BYTE_LIMIT`] leaves the
+/// window read as the only backfill. Dropping the index stops the scan.
+struct SubtitleCueIndex {
+    shared: Arc<SubtitleCueIndexShared>,
+}
+
+struct SubtitleCueIndexShared {
+    cancelled: AtomicBool,
+    state: Mutex<IndexedCues>,
+}
+
+#[derive(Default)]
+struct IndexedCues {
+    packets: Vec<ffmpeg::Packet>,
+    bytes: usize,
+    /// The latest packet start seen: the scan has read everything up to it.
+    scanned_until: Duration,
+    status: CueScanStatus,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum CueScanStatus {
+    #[default]
+    Scanning,
+    Complete,
+    Failed,
+}
+
+/// The packets kept at most, so a hostile or odd file cannot grow the index
+/// without bound. Ordinary subtitle tracks are a few hundred KiB.
+const SUBTITLE_CUE_INDEX_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+
+impl SubtitleCueIndex {
+    /// Starts the scan of a local file's stream; `None` for any other
+    /// source, which is not read a second time.
+    fn start(uri: &str, stream_index: i32) -> Option<Self> {
+        if !subtitle_backfill_source_is_local(uri) {
+            return None;
+        }
+        let shared = Arc::new(SubtitleCueIndexShared {
+            cancelled: AtomicBool::new(false),
+            state: Mutex::new(IndexedCues::default()),
+        });
+        let scan = Arc::clone(&shared);
+        let uri = uri.to_string();
+        thread::Builder::new()
+            .name("erika-subtitle-index".into())
+            .spawn(move || {
+                let status = match scan_subtitle_cues(&uri, stream_index, &scan) {
+                    Ok(true) => CueScanStatus::Complete,
+                    Ok(false) => return,
+                    Err(_) => CueScanStatus::Failed,
+                };
+                let mut state = scan.state.lock().unwrap_or_else(|e| e.into_inner());
+                if status == CueScanStatus::Failed {
+                    state.packets = Vec::new();
+                }
+                state.status = status;
+            })
+            .ok()?;
+        Some(Self { shared })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, IndexedCues> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn failed(&self) -> bool {
+        self.lock().failed()
+    }
+
+    #[cfg(test)]
+    fn wait_until_scanned(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.lock().complete() {
+            assert!(Instant::now() < deadline, "the cue scan did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for SubtitleCueIndex {
+    fn drop(&mut self) {
+        self.shared.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reads all packets of the stream into `shared`. `Ok(false)` when stopped.
+fn scan_subtitle_cues(
+    uri: &str,
+    stream_index: i32,
+    shared: &SubtitleCueIndexShared,
+) -> Result<bool> {
+    let source = source_from_uri_with_hint(uri, crate::core::MediaSourceHint::Auto)?;
+    let mut demuxer = Demuxer::open_source(source)?;
+    demuxer.set_stream_selection(StreamSelection::only([stream_index]))?;
+    while let Some(packet) = demuxer.read_packet()? {
+        if shared.cancelled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let Some(start) = packet.pts().and_then(|pts| pts.as_duration()) else {
+            continue;
+        };
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.bytes += packet.size() + std::mem::size_of::<ffmpeg::Packet>();
+        if state.bytes > SUBTITLE_CUE_INDEX_BYTE_LIMIT {
+            state.packets = Vec::new();
+            state.status = CueScanStatus::Failed;
+            return Ok(false);
+        }
+        state.scanned_until = state.scanned_until.max(start);
+        state.packets.push(packet);
+    }
+    Ok(!shared.cancelled.load(Ordering::Relaxed))
+}
+
+impl IndexedCues {
+    fn complete(&self) -> bool {
+        self.status == CueScanStatus::Complete
+    }
+
+    fn failed(&self) -> bool {
+        self.status == CueScanStatus::Failed
+    }
+
+    /// Whether every packet that starts at or before `position` is in.
+    fn covers(&self, position: Duration) -> bool {
+        match self.status {
+            CueScanStatus::Complete => true,
+            CueScanStatus::Scanning => self.scanned_until > position,
+            CueScanStatus::Failed => false,
+        }
+    }
+
+    /// The packets that may hold a cue on at `position`, in file order: those
+    /// that started before it and last past it, and, for packets that carry
+    /// no duration (a bitmap cue ends where the next packet says), those from
+    /// the backfill window, like the window read.
+    fn candidates(
+        &self,
+        position: Duration,
+        window_start: Duration,
+        scope: CueScope,
+    ) -> impl Iterator<Item = &ffmpeg::Packet> {
+        self.packets.iter().filter(move |packet| {
+            let Some(start) = packet.pts().and_then(|pts| pts.as_duration()) else {
+                return false;
+            };
+            if start > position || (scope == CueScope::BeforeWindow && start >= window_start) {
+                return false;
+            }
+            match packet
+                .duration_seconds()
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            {
+                Some(duration) => start.saturating_add(duration) > position,
+                None => scope == CueScope::All && start >= window_start,
+            }
+        })
+    }
 }
 
 struct ExternalSubtitleSession {
@@ -5375,7 +5853,11 @@ impl VideoPlaybackEngine {
     }
 
     pub fn tick_subtitle(&mut self) -> Result<Option<TimedSubtitleFrame>> {
-        if self.state != PlaybackRunState::Playing {
+        // Paused too: the cue on at a paused seek's frame is delivered with it.
+        if !matches!(
+            self.state,
+            PlaybackRunState::Playing | PlaybackRunState::Paused
+        ) {
             return Ok(None);
         }
         let media_time = self.media_time();
@@ -6411,6 +6893,18 @@ mod tests {
         for value in [None, Some(""), Some("auto"), Some("cuda")] {
             assert_eq!(software_forced_by(value), None);
         }
+    }
+
+    #[test]
+    fn subtitle_backfill_reads_local_files_only() {
+        assert!(subtitle_backfill_source_is_local("/Users/a/b.mkv"));
+        assert!(subtitle_backfill_source_is_local("file:///Users/a/b.mkv"));
+        assert!(subtitle_backfill_source_is_local("C:\\media\\b.mkv"));
+        assert!(!subtitle_backfill_source_is_local("https://host/b.mkv"));
+        assert!(!subtitle_backfill_source_is_local("smb://host/b.mkv"));
+        assert!(!subtitle_backfill_source_is_local(
+            "fd://12?offset=0&length=9"
+        ));
     }
 
     #[test]
@@ -9309,5 +9803,188 @@ mod tests {
         assert_eq!(diagnostics.record_el_frame(), 1);
         assert_eq!(diagnostics.record_unavailable_frame(), 3);
         assert_eq!(diagnostics.record_el_frame(), 2);
+    }
+
+    fn subtitle_seek_fixture(name: &str) -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/subtitle-seek")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn long_cue_fixture() -> (String, SubtitleDecoder) {
+        let path = subtitle_seek_fixture("long.mkv");
+        let main = Demuxer::open_path(&path)
+            .unwrap()
+            .open_subtitle_decoder(1)
+            .unwrap();
+        (path, main)
+    }
+
+    #[test]
+    fn backfill_keeps_long_cue() {
+        let (path, main) = long_cue_fixture();
+        let mut backfill = SubtitleBackfill::open(&path, 1).unwrap();
+        backfill.index.as_ref().unwrap().wait_until_scanned();
+        let read_back = backfill
+            .active_at(Duration::from_secs(40), &main, 1)
+            .unwrap();
+        assert!(
+            !read_back.frames.is_empty(),
+            "LONG covers 0-50 s and must be recovered at 40 s"
+        );
+        assert!(!read_back.earlier_cues_pending);
+        // A cue that ended before the target is not among them.
+        let read_back = backfill
+            .active_at(Duration::from_secs(55), &main, 1)
+            .unwrap();
+        assert!(read_back.frames.is_empty());
+    }
+
+    #[test]
+    fn backfill_adds_cues_before_the_window_when_the_scan_finishes() {
+        let (path, main) = long_cue_fixture();
+        let mut backfill = SubtitleBackfill::open(&path, 1).unwrap();
+        let index = backfill.index.as_ref().unwrap();
+        index.wait_until_scanned();
+        // Go back to a scan that has not got anywhere yet.
+        {
+            let mut state = index.lock();
+            state.status = CueScanStatus::Scanning;
+            state.scanned_until = Duration::ZERO;
+        }
+        let target = Duration::from_secs(40);
+        let read_back = backfill.active_at(target, &main, 1).unwrap();
+        assert!(read_back.earlier_cues_pending);
+        assert!(
+            read_back.frames.is_empty(),
+            "only the 15 s window is read while the scan runs"
+        );
+        assert!(matches!(
+            backfill.earlier_active_at(target, &main, 1).unwrap(),
+            EarlierCues::Scanning
+        ));
+        backfill.index.as_ref().unwrap().lock().status = CueScanStatus::Complete;
+        let EarlierCues::Frames(frames) = backfill.earlier_active_at(target, &main, 1).unwrap()
+        else {
+            panic!("the finished scan must give the earlier cues");
+        };
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].start, Some(Duration::ZERO));
+        assert_eq!(frames[0].end, Some(Duration::from_secs(50)));
+    }
+
+    #[test]
+    fn backfill_window_still_finds_recent_cues_before_the_scan_finishes() {
+        let (path, main) = long_cue_fixture();
+        let mut backfill = SubtitleBackfill::open(&path, 1).unwrap();
+        backfill.index.as_ref().unwrap().wait_until_scanned();
+        {
+            let mut state = backfill.index.as_ref().unwrap().lock();
+            state.status = CueScanStatus::Scanning;
+            state.scanned_until = Duration::ZERO;
+        }
+        // NEXT is on 30-31 s, inside the window of a seek to 30.5 s.
+        let read_back = backfill
+            .active_at(Duration::from_millis(30_500), &main, 1)
+            .unwrap();
+        assert_eq!(read_back.frames.len(), 1);
+        assert_eq!(read_back.frames[0].start, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn seek_into_a_long_cue_shows_it() {
+        let request = MediaRequest::new(subtitle_seek_fixture("long.mkv"));
+        let config = PlaybackSessionConfig {
+            video_decode: VideoDecodePreference::Software,
+            ..Default::default()
+        };
+        let mut session = PlaybackSession::open(&request, config).unwrap();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        // Whether the scan finished before the seek or after it, the cue
+        // arrives, and without the playback thread waiting for the scan.
+        for _ in 0..2000 {
+            if let Some(frame) = session.next_subtitle_frame(target).unwrap() {
+                assert_eq!(frame.start, Some(Duration::ZERO));
+                assert_eq!(frame.end, Some(Duration::from_secs(50)));
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the 0-50 s cue never arrived after a seek to 40 s");
+    }
+
+    #[test]
+    fn switching_track_after_seek_keeps_new_track_cue() {
+        let request = MediaRequest::new(subtitle_seek_fixture("two-tracks.mkv"));
+        let config = PlaybackSessionConfig {
+            video_decode: VideoDecodePreference::Software,
+            ..Default::default()
+        };
+        let mut session = PlaybackSession::open(&request, config).unwrap();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        session.select_subtitle_track(Some(2), target).unwrap();
+        for _ in 0..500 {
+            session.video_frames.clear();
+            session.audio_frames.clear();
+            session.pump_once(PlaybackPumpDemand::Video).unwrap();
+            while let Some(frame) = session.next_subtitle_frame(target).unwrap() {
+                if frame.start.is_none_or(|start| start <= target)
+                    && frame.end.is_none_or(|end| end > target)
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("track 2 has a cue at 40-50 s, but none arrived after switching at 40 s");
+    }
+
+    fn open_switch_track_session() -> PlaybackSession {
+        let request = MediaRequest::new(subtitle_seek_fixture("switch-track.mkv"));
+        let config = PlaybackSessionConfig {
+            video_decode: VideoDecodePreference::Software,
+            ..Default::default()
+        };
+        PlaybackSession::open(&request, config).unwrap()
+    }
+
+    #[test]
+    fn switching_track_shows_the_cue_that_is_on_at_the_switch() {
+        let mut session = open_switch_track_session();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        session.select_subtitle_track(Some(2), target).unwrap();
+        for _ in 0..500 {
+            session.video_frames.clear();
+            session.audio_frames.clear();
+            session.pump_once(PlaybackPumpDemand::Video).unwrap();
+            if let Some(frame) = session.next_subtitle_frame(target).unwrap() {
+                assert_eq!(frame.start, Some(Duration::from_secs(35)));
+                assert_eq!(frame.end, Some(Duration::from_secs(45)));
+                assert_eq!(frame.track_id, 2);
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("track 2's 35-45 s cue is on at 40 s but never showed after switching");
+    }
+
+    #[test]
+    fn switching_track_while_paused_shows_the_cue_at_once() {
+        let mut session = open_switch_track_session();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        // Nothing is pumped: a paused player only asks for the subtitle.
+        session.select_subtitle_track(Some(2), target).unwrap();
+        let frame = session
+            .next_subtitle_frame(target)
+            .unwrap()
+            .expect("the cue on at the switch must be there without playing");
+        assert_eq!(frame.start, Some(Duration::from_secs(35)));
+        assert_eq!(frame.end, Some(Duration::from_secs(45)));
     }
 }
