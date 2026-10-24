@@ -1,0 +1,13 @@
+[package]
+name = "erika_plugin"
+description = "The playback half of liberika's JavaScript plugin interface"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -7,6 +7,7 @@ pub mod audio;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod core;
 pub mod danmaku;
+pub mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod debug_hud;
 #[cfg(not(target_arch = "wasm32"))]
