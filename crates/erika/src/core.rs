@@ -2213,7 +2213,17 @@ fn run_playback_worker(
                     &mut audio_output_backpressure,
                 );
             }
+        }
 
+        // Subtitles are delivered while paused too: a seek (or a subtitle
+        // chosen) on a paused player presents a frame, and the cue that is
+        // on at that time has to arrive with it, not after the next play.
+        if !frame_output_quiesced
+            && matches!(
+                engine.state(),
+                PlaybackRunState::Playing | PlaybackRunState::Paused
+            )
+        {
             match engine.tick_subtitle() {
                 Ok(Some(frame)) => emit_subtitle_frame_from_worker(
                     &inner,

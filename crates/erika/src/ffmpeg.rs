@@ -794,6 +794,12 @@ impl SubtitleDecoder {
         self.stream_index
     }
 
+    /// Draws through the same ASS resources as [`other`]: frames of this
+    /// decoder and of `other` belong to one track.
+    pub fn share_ass_track_with(&mut self, other: &SubtitleDecoder) {
+        self.ass_track = other.ass_track.clone();
+    }
+
     pub fn time_base(&self) -> TimeBase {
         self.time_base
     }

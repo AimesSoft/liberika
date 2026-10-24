@@ -830,6 +830,11 @@ pub struct PlaybackSession {
     video_frames: VecDeque<DecodedVideoFrame>,
     audio_frames: VecDeque<PcmAudioFrame>,
     subtitle_frames: VecDeque<DecodedSubtitleFrame>,
+    subtitle_backfill: Option<SubtitleBackfill>,
+    /// After a seek, the cues on at its target were read back (see
+    /// [`SubtitleBackfill`]): what the stream delivers that starts at or
+    /// before it is already among them.
+    subtitle_backfilled_until: Option<Duration>,
     pending_video_packets: VecDeque<ffmpeg::Packet>,
     video_fallback_waiting_for_keyframe: bool,
     audio_seek_waiting_for_valid_packet: bool,
@@ -1376,6 +1381,8 @@ impl PlaybackSession {
             video_frames: VecDeque::new(),
             audio_frames: VecDeque::new(),
             subtitle_frames: VecDeque::new(),
+            subtitle_backfill: None,
+            subtitle_backfilled_until: None,
             pending_video_packets: VecDeque::new(),
             video_fallback_waiting_for_keyframe: false,
             audio_seek_waiting_for_valid_packet: false,
@@ -1984,9 +1991,60 @@ impl PlaybackSession {
         for external in &mut self.external_subtitles {
             external.seek(position)?;
         }
+        self.backfill_embedded_subtitle(position);
         self.audio_resampler = None;
         self.reset_eof_drain_state();
         Ok(())
+    }
+
+    /// The cues on at [`position`] that began before the stream's seek
+    /// landed on its keyframe: the demuxer starts reading at that keyframe,
+    /// so a cue that began a moment before it would only show from the next
+    /// one. Read from the file again, the subtitle stream alone, from a
+    /// little earlier; what is on at [`position`] goes in front of what the
+    /// stream delivers. Local files only: a network source is not read twice
+    /// for this, and keeps what the stream delivers.
+    fn backfill_embedded_subtitle(&mut self, position: Duration) {
+        self.subtitle_backfilled_until = None;
+        let Some(track_id) = self.info.selected_subtitle_track else {
+            self.subtitle_backfill = None;
+            return;
+        };
+        let Some(decoder) = self.subtitle_decoder.as_ref() else {
+            self.subtitle_backfill = None;
+            return;
+        };
+        let stream_index = decoder.stream_index();
+        if !subtitle_backfill_source_is_local(&self.info.uri) {
+            return;
+        }
+        if self
+            .subtitle_backfill
+            .as_ref()
+            .is_none_or(|backfill| backfill.stream_index != stream_index)
+        {
+            self.subtitle_backfill = SubtitleBackfill::open(&self.info.uri, stream_index);
+        }
+        let Some(backfill) = self.subtitle_backfill.as_mut() else {
+            return;
+        };
+        let main = self.subtitle_decoder.as_ref().expect("checked above");
+        match backfill.active_at(position, main, track_id) {
+            Ok(frames) => {
+                self.subtitle_backfilled_until = Some(position);
+                for frame in frames {
+                    self.subtitle_frames.push_back(frame);
+                }
+                trim_subtitle_queue(&mut self.subtitle_frames, self.queue_limits.subtitle_frames);
+            }
+            Err(error) => {
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!("Erika subtitle backfill at {:.3}s failed: {error}", position.as_secs_f64()),
+                );
+                self.subtitle_backfill = None;
+            }
+        }
     }
 
     #[cfg(target_os = "android")]
@@ -2556,8 +2614,17 @@ impl PlaybackSession {
                 .as_mut()
                 .expect("subtitle decoder exists");
             if let Some(frame) = decoder.decode_packet(&packet)? {
-                self.subtitle_frames.push_back(frame);
-                trim_subtitle_queue(&mut self.subtitle_frames, self.queue_limits.subtitle_frames);
+                let read_back = self
+                    .subtitle_backfilled_until
+                    .zip(frame.start)
+                    .is_some_and(|(until, start)| start <= until);
+                if !read_back {
+                    self.subtitle_frames.push_back(frame);
+                    trim_subtitle_queue(
+                        &mut self.subtitle_frames,
+                        self.queue_limits.subtitle_frames,
+                    );
+                }
             }
         }
         Ok(())
@@ -3625,6 +3692,71 @@ fn select_ready_subtitle(
 
 fn decoded_subtitle_start(frame: &DecodedSubtitleFrame) -> Duration {
     frame.start.unwrap_or(Duration::ZERO)
+}
+
+/// How far before a seek's target the backfill starts reading.
+const SUBTITLE_BACKFILL_WINDOW: Duration = Duration::from_secs(15);
+
+fn subtitle_backfill_source_is_local(uri: &str) -> bool {
+    match uri.split_once("://") {
+        None => uri.starts_with('/') || uri.chars().nth(1) == Some(':'),
+        Some((scheme, _)) => scheme.eq_ignore_ascii_case("file"),
+    }
+}
+
+/// A second reader of the media file with only the selected subtitle
+/// stream on, to read the cues that are on at a seek's target.
+struct SubtitleBackfill {
+    demuxer: Demuxer,
+    decoder: SubtitleDecoder,
+    stream_index: i32,
+}
+
+impl SubtitleBackfill {
+    fn open(uri: &str, stream_index: i32) -> Option<Self> {
+        let source = source_from_uri_with_hint(uri, crate::core::MediaSourceHint::Auto).ok()?;
+        let mut demuxer = Demuxer::open_source(source).ok()?;
+        let decoder = demuxer.open_subtitle_decoder(stream_index).ok()?;
+        demuxer
+            .set_stream_selection(StreamSelection::only([stream_index]))
+            .ok()?;
+        Some(Self {
+            demuxer,
+            decoder,
+            stream_index,
+        })
+    }
+
+    /// The frames whose cues are on at `position`, read from a little earlier.
+    fn active_at(
+        &mut self,
+        position: Duration,
+        main: &SubtitleDecoder,
+        track_id: i64,
+    ) -> Result<Vec<DecodedSubtitleFrame>> {
+        self.decoder.share_ass_track_with(main);
+        self.demuxer
+            .seek(position.saturating_sub(SUBTITLE_BACKFILL_WINDOW))?;
+        self.decoder.flush();
+        let mut active = Vec::new();
+        while let Some(packet) = self.demuxer.read_packet()? {
+            if packet
+                .pts()
+                .and_then(|pts| pts.as_duration())
+                .is_some_and(|pts| pts > position)
+            {
+                break;
+            }
+            if let Some(frame) = self.decoder.decode_packet(&packet)? {
+                let started = frame.start.is_none_or(|start| start <= position);
+                let ongoing = frame.end.is_none_or(|end| end > position);
+                if started && ongoing {
+                    active.push(frame.with_track_id(track_id));
+                }
+            }
+        }
+        Ok(active)
+    }
 }
 
 struct ExternalSubtitleSession {
@@ -5375,7 +5507,11 @@ impl VideoPlaybackEngine {
     }
 
     pub fn tick_subtitle(&mut self) -> Result<Option<TimedSubtitleFrame>> {
-        if self.state != PlaybackRunState::Playing {
+        // Paused too: the cue on at a paused seek's frame is delivered with it.
+        if !matches!(
+            self.state,
+            PlaybackRunState::Playing | PlaybackRunState::Paused
+        ) {
             return Ok(None);
         }
         let media_time = self.media_time();
@@ -6411,6 +6547,16 @@ mod tests {
         for value in [None, Some(""), Some("auto"), Some("cuda")] {
             assert_eq!(software_forced_by(value), None);
         }
+    }
+
+    #[test]
+    fn subtitle_backfill_reads_local_files_only() {
+        assert!(subtitle_backfill_source_is_local("/Users/a/b.mkv"));
+        assert!(subtitle_backfill_source_is_local("file:///Users/a/b.mkv"));
+        assert!(subtitle_backfill_source_is_local("C:\\media\\b.mkv"));
+        assert!(!subtitle_backfill_source_is_local("https://host/b.mkv"));
+        assert!(!subtitle_backfill_source_is_local("smb://host/b.mkv"));
+        assert!(!subtitle_backfill_source_is_local("fd://12?offset=0&length=9"));
     }
 
     #[test]
