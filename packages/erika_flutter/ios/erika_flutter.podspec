@@ -1,15 +1,8 @@
 Pod::Spec.new do |s|
   erika_cabi_symbols = %w[
     erika_danmaku_track_info_free
-    erika_export_frame
     erika_export_gif
-    erika_frame_export_result_free
-    erika_frame_export_session_close
-    erika_frame_export_session_frame
-    erika_frame_export_session_open
     erika_last_error_message
-    erika_log_read_json
-    erika_presenter_get_diagnostics_json
     erika_presenter_invoke_json
     erika_string_free
     erika_presenter_add_danmaku_track_file
@@ -59,6 +52,20 @@ Pod::Spec.new do |s|
     erika_presenter_tracks
     erika_track_info_free
     erika_subtitle_memory_font_status_free
+  ]
+  # Entry points the plugin looks up only if the native library has them
+  # (ErikaFlutterPlugin.loadOptional). The pinned native artifacts
+  # (native_artifacts.properties) predate them, so they are not forced in
+  # with -u: forcing a symbol the static library lacks fails the link. They
+  # move to erika_cabi_symbols in the release whose artifacts ship them.
+  erika_cabi_optional_symbols = %w[
+    erika_export_frame
+    erika_frame_export_result_free
+    erika_frame_export_session_close
+    erika_frame_export_session_frame
+    erika_frame_export_session_open
+    erika_log_read_json
+    erika_presenter_get_diagnostics_json
   ]
   erika_cabi_undefined_flags = erika_cabi_symbols
     .map { |symbol| "-Wl,-u,_#{symbol}" }
