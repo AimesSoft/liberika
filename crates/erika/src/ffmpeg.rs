@@ -423,17 +423,18 @@ impl Demuxer {
                 // timeout, ...). Carry it into the terminal error: without it the
                 // error reads only "Input/output error (-5)" and the cause lives
                 // on stderr alone, which is why a report such as issue #1 needs a
-                // reproduction instead of a log line.
+                // reproduction instead of a log line. When the failure surfaced
+                // only after further successful reads cleared `last_error`, the
+                // sticky read record still names the offset and the source's
+                // reason (issue #163).
                 return Err(
                     match self
                         .context
                         .avio
                         .as_ref()
-                        .and_then(|avio| avio.last_error.as_deref())
+                        .and_then(|avio| avio.terminal_source_note(&error))
                     {
-                        Some(source_error) => {
-                            FfmpegError::Source(format!("{error}; custom AVIO: {source_error}"))
-                        }
+                        Some(source_note) => FfmpegError::Source(format!("{error}; {source_note}")),
                         None => error,
                     },
                 );
@@ -4132,6 +4133,12 @@ struct CustomAvio {
     source: Box<dyn MediaSource>,
     offset: u64,
     last_error: Option<String>,
+    /// The most recent read that returned an I/O error, with its offset.
+    /// `last_error` is cleared by the next successful read or seek, yet a
+    /// demuxer can surface an earlier read failure only after those, so the
+    /// terminal `av_read_frame` error falls back to this record to keep the
+    /// offset and the source's reason in the message (issue #163).
+    last_read_failure: Option<(u64, String)>,
 }
 
 fn normalize_avio_seek_whence(whence: c_int) -> c_int {
@@ -4152,6 +4159,7 @@ impl CustomAvio {
             source,
             offset: 0,
             last_error: None,
+            last_read_failure: None,
         });
         let context = unsafe {
             sys::avio_alloc_context(
@@ -4174,6 +4182,28 @@ impl CustomAvio {
 
     fn context(&self) -> *mut sys::AVIOContext {
         self.context
+    }
+
+    /// Source-side reason for a terminal FFmpeg failure: the freshest error
+    /// when the last source interaction failed, otherwise -- because
+    /// `last_error` is cleared by successful reads and seeks, while FFmpeg
+    /// can surface an earlier read failure only after those (issue #163) --
+    /// the most recent read that returned an I/O error, with its offset.
+    ///
+    /// The fallback is offered only when FFmpeg itself reports an I/O error:
+    /// only that failure can trace back to the source, and appending a stale
+    /// record to a demuxer-side failure would misattribute it.
+    fn terminal_source_note(&self, ffmpeg: &FfmpegError) -> Option<String> {
+        if let Some(last_error) = self.last_error.as_deref() {
+            return Some(format!("custom AVIO: {last_error}"));
+        }
+        let is_io_error = matches!(ffmpeg, FfmpegError::Api { code, .. } if *code == av_error(EIO));
+        if !is_io_error {
+            return None;
+        }
+        self.last_read_failure.as_ref().map(|(offset, reason)| {
+            format!("custom AVIO read at offset {offset} failed earlier: {reason}")
+        })
     }
 
     fn read_packet(&mut self, buffer: *mut u8, buffer_size: c_int) -> c_int {
@@ -4200,6 +4230,7 @@ impl CustomAvio {
             }
             Err(error) => {
                 self.last_error = Some(error.to_string());
+                self.last_read_failure = Some((self.offset, error.to_string()));
                 crate::trace::log(format!(
                     "Erika custom AVIO read failed at offset {} for {} bytes: {error}",
                     self.offset, length
@@ -4332,10 +4363,8 @@ fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatCont
             if !opened_context.is_null() {
                 unsafe { sys::avformat_close_input(&mut opened_context) };
             }
-            match avio.last_error.as_deref() {
-                Some(source_error) => Err(FfmpegError::Source(format!(
-                    "{error}; custom AVIO: {source_error}"
-                ))),
+            match avio.terminal_source_note(&error) {
+                Some(source_note) => Err(FfmpegError::Source(format!("{error}; {source_note}"))),
                 None => Err(error),
             }
         }

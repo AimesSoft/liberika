@@ -32,6 +32,13 @@ pub enum SourceError {
     Io(String),
     #[error("http error: {0}")]
     Http(String),
+    /// An answer whose position cannot be trusted: a 206 without
+    /// Content-Range on a resumed offset, or a served start that disagrees
+    /// with the request. Distinct from `Http` so the tail rule of issue #163
+    /// (an undelivered final range ends the read as EOF) never normalizes a
+    /// server that misanswers ranges -- that must stay an error.
+    #[error("http range verification error: {0}")]
+    HttpRangeVerification(String),
     #[error("http error: resource changed or cannot be safely validated during Range retry")]
     HttpEntityChanged,
     #[error("unsupported source URI: {0}")]
@@ -632,6 +639,31 @@ impl HttpRangeSource {
         })
     }
 
+    /// Whether a fetch window `[start, start + length)` runs to the end of the
+    /// resource, i.e. `fetch_length` truncated it at `content_length`. Windows
+    /// that reach the total are boundary traffic: players skip into the
+    /// closing moments of a file and read to its natural end, and origins
+    /// mishandle the final range (a 206 that promises the tail and delivers
+    /// nothing). An empty or failed answer there ends the read instead of
+    /// failing the session (issue #163); anywhere else an uncovered read
+    /// stays an error.
+    fn window_ends_at_total(&self, start: u64, length: u64) -> bool {
+        self.content_length
+            .is_some_and(|total| start.saturating_add(length) >= total)
+    }
+
+    /// Some(total) while an empty read at `offset` is a fetch failure rather
+    /// than the resource's end: the resource is known to hold more than the
+    /// tail slack beyond it. A fetch whose request window was truncated by
+    /// the resource total starts at most `HTTP_REQUEST_MAX_BYTES` short of
+    /// it, so the slack mirrors the largest window a tail flush can leave
+    /// uncovered and this guard agrees with the fetch-side
+    /// `window_ends_at_total` rule.
+    fn uncovered_read(&self, offset: u64) -> Option<u64> {
+        let total = self.content_length?;
+        (offset < total && total - offset > HTTP_TAIL_EOF_SLACK_BYTES).then_some(total)
+    }
+
     /// Append stripes the workers completed since the last read. Called
     /// before the hit checks so they see everything that has already arrived.
     /// A sync fetch that ran past the frontier (the fallback path) may have
@@ -901,13 +933,41 @@ impl HttpRangeSource {
             if request_length == 0 {
                 break;
             }
-            let fetched = self.fetch_range(ByteRange {
+            let fetched = match self.fetch_range(ByteRange {
                 start,
                 length: Some(request_length),
-            })?;
+            }) {
+                Ok(fetched) => fetched,
+                Err(error @ SourceError::Http(_))
+                    if self.window_ends_at_total(start, request_length) =>
+                {
+                    // The final range of the resource is boundary traffic: a
+                    // 206 that promises the tail and delivers nothing, a proxy
+                    // dropping the last body, a status the origin only serves
+                    // for the edge. Whatever the delivery failure, the fetch
+                    // already retried, and a window that runs to the resource
+                    // total ends the read instead of the session (issue #163).
+                    // Unverifiable answers (HttpRangeVerification) and entity
+                    // changes stay errors: those must fail loudly.
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_tail_eof\",\"start\":{},\"length\":{},\"error\":\"{}\"}}",
+                        start,
+                        request_length,
+                        json_escape(&error.to_string()),
+                    ));
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             if fetched.is_empty() {
-                // An empty answer when bytes are known to exist is not EOF.
-                if self.content_length.is_some_and(|total| start < total) {
+                // An empty answer when bytes are known to exist is not EOF,
+                // unless the piece window runs to the end of the resource and
+                // the empty answer marks the boundary (issue #163). Checked
+                // after the fetch: a successful response may be the first to
+                // name the total for an origin whose length probe failed.
+                if self.content_length.is_some_and(|total| start < total)
+                    && !self.window_ends_at_total(start, request_length)
+                {
                     return Err(SourceError::Http(format!(
                         "origin answered an empty body for bytes {start}.. although the resource is larger"
                     )));
@@ -933,15 +993,35 @@ impl HttpRangeSource {
             self.cache_bytes.clear();
             return Ok(());
         }
-        let fetched = self.fetch_range(ByteRange {
+        let fetched = match self.fetch_range(ByteRange {
             start: range.start,
             length: Some(request_length),
-        })?;
+        }) {
+            Ok(fetched) => fetched,
+            Err(error @ SourceError::Http(_))
+                if self.window_ends_at_total(range.start, request_length) =>
+            {
+                // Same boundary rule as `fetch_missing`: a window that runs to
+                // the resource total may meet an origin that cannot deliver
+                // the final bytes, and that ends the read (issue #163).
+                http_trace_log(format!(
+                    "{{\"event\":\"http_tail_eof\",\"start\":{},\"length\":{},\"error\":\"{}\"}}",
+                    range.start,
+                    request_length,
+                    json_escape(&error.to_string()),
+                ));
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         self.cache_start = range.start;
         self.cache_bytes = fetched;
         if self.cache_bytes.is_empty()
             && self.content_length.is_some_and(|total| range.start < total)
+            && !self.window_ends_at_total(range.start, request_length)
         {
+            // Checked after the fetch: a successful response may be the first
+            // to name the total for an origin whose length probe failed.
             return Err(SourceError::Http(format!(
                 "origin answered an empty body for bytes {}.. although the resource is larger",
                 range.start,
@@ -1085,14 +1165,14 @@ fn open_stream_response(
                 .map(str::to_string);
             if let Some(start) = content_range.as_deref().and_then(parse_content_range_start) {
                 if start != offset {
-                    return Err(SourceError::Http(format!(
+                    return Err(SourceError::HttpRangeVerification(format!(
                         "stream served from {start}, expected {offset}"
                     )));
                 }
             } else if offset > 0 {
                 // Without Content-Range a resumed stream cannot prove it is
                 // answering from the requested offset.
-                return Err(SourceError::Http(
+                return Err(SourceError::HttpRangeVerification(
                     "stream served 206 without Content-Range; cannot verify the resumed offset"
                         .to_string(),
                 ));
@@ -1362,6 +1442,19 @@ impl Default for HttpFetchTimeouts {
 /// cache window is still filled to its configured depth by successive capped
 /// requests or by the persistent stream worker.
 const HTTP_REQUEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How close to the end of the resource an empty read may fall and still
+/// count as reaching the end instead of a fetch failure (issue #163).
+///
+/// Players skip into the closing moments of a file and read to its natural
+/// end, so short reads at the resource boundary are normal traffic; origins
+/// answer the final range with a 206 that promises the tail and delivers
+/// nothing. A fetch whose request window was truncated by the resource total
+/// starts at most `HTTP_REQUEST_MAX_BYTES` short of it, so mirroring that
+/// ceiling here keeps this guard in agreement with the fetch-side
+/// `window_ends_at_total` rule. Beyond the slack, an uncovered read is still
+/// an error: bytes that exist must never look like EOF.
+const HTTP_TAIL_EOF_SLACK_BYTES: u64 = HTTP_REQUEST_MAX_BYTES;
 
 /// How much already-played data stays in the cache. A rewind inside this tail is
 /// served locally instead of re-downloaded: mpv keeps 50 MiB of back buffer by
@@ -1804,7 +1897,7 @@ async fn fetch_http_range_async(
                             "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":{}}}",
                             event, attempt, resume_range.start, start,
                         ));
-                        return Err(SourceError::Http(format!(
+                        return Err(SourceError::HttpRangeVerification(format!(
                             "server served range from {start}, expected {}",
                             resume_range.start
                         )));
@@ -1818,7 +1911,7 @@ async fn fetch_http_range_async(
                         "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":null}}",
                         event, attempt, resume_range.start,
                     ));
-                    return Err(SourceError::Http(
+                    return Err(SourceError::HttpRangeVerification(
                         "server served 206 without Content-Range; cannot verify the resumed offset"
                             .to_string(),
                     ));
@@ -2187,17 +2280,18 @@ impl MediaSource for HttpRangeSource {
         // resource really ends before the read.
         let offset = usize::try_from(range.start.saturating_sub(self.cache_start)).unwrap_or(0);
         let Some(tail) = self.cache_bytes.get(offset..) else {
-            if let Some(total) = self.content_length
-                && range.start < total
-            {
+            if let Some(total) = self.uncovered_read(range.start) {
                 return Err(SourceError::Http(format!(
                     "no data for bytes {}.. (origin total {total})",
                     range.start,
                 )));
             }
+            // Within the tail slack an empty result is the resource's end: a
+            // fetch window truncated by the total answered with nothing
+            // (issue #163) rather than a failure mid-read.
             return Ok(Vec::new());
         };
-        if tail.is_empty() && self.content_length.is_some_and(|total| range.start < total) {
+        if tail.is_empty() && self.uncovered_read(range.start).is_some() {
             // A whole-file 200 may have just discovered EOF before this read's
             // offset. Empty data below the total still means the fetch failed
             // (e.g. an empty 206), which must not look like EOF.
@@ -3415,6 +3509,110 @@ mod tests {
         );
     }
 
+    /// Serves `body` by Range (bounded and open-ended), clamping every answer
+    /// that would reach past `empty_from`, and answering any request that
+    /// starts at or beyond it the way the origin in issue #163 did: a 206
+    /// with a correct Content-Range and Content-Length but zero body bytes
+    /// before the connection closes.
+    fn spawn_fixture_range_server(
+        body: Arc<Vec<u8>>,
+        empty_from: u64,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let heads_seen = Arc::clone(&heads);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                heads_seen.lock().unwrap().push(head.clone());
+                let total = body.len() as u64;
+                if head.starts_with("HEAD") {
+                    // Metadata answers report the real resource size; only the
+                    // body serving is broken near the tail.
+                    let _ = stream.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n").as_bytes(),
+                    );
+                    continue;
+                }
+                let (start, requested_end) = parse_range_head(&head, total);
+                // An injected answer promises exactly the requested range and
+                // delivers nothing; every other answer is clamped so the tail
+                // stays reachable only through an injected request.
+                let injected = start >= empty_from;
+                let end = if injected {
+                    requested_end
+                } else {
+                    requested_end.min(empty_from - 1)
+                };
+                let length = end.saturating_sub(start) + 1;
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(response.as_bytes()).is_err() {
+                    continue;
+                }
+                if injected {
+                    // Declared but never delivered: the injected failure.
+                    continue;
+                }
+                let slice = &body[start as usize..=end as usize];
+                let _ = stream.write_all(slice);
+                let _ = stream.flush();
+            }
+        });
+        (uri, heads)
+    }
+
+    #[test]
+    fn http_tail_empty_range_injection_ends_playback_cleanly() {
+        // End-to-end shape of issue #163: an origin that cannot deliver the
+        // final bytes of the resource. Before the tail rule the demuxer
+        // turned those answers into a fatal av_read_frame EIO; the read must
+        // end the stream at EOF instead, after playing to its natural end.
+        let body = Arc::new(include_bytes!("../testdata/playback/playback-fixture.mkv").to_vec());
+        let total = body.len() as u64;
+        let empty_from = total - 4096;
+        let (uri, heads) = spawn_fixture_range_server(Arc::clone(&body), empty_from);
+        let source =
+            HttpRangeSource::with_http_headers_and_read_ahead(uri, Vec::new(), Some(64 * 1024));
+        let mut demuxer = crate::ffmpeg::Demuxer::open_source(Box::new(source)).unwrap();
+        assert_eq!(demuxer.probe().video.len(), 1);
+        let mut packets = 0;
+        while demuxer.read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(
+            packets >= 240,
+            "playback must reach its natural end, got {packets} packets"
+        );
+        let heads_snapshot = heads.lock().unwrap().clone();
+        let saw_injected_request = heads_snapshot.iter().any(|head| {
+            head.to_lowercase()
+                .lines()
+                .find(|line| line.starts_with("range:"))
+                .and_then(|line| line.split_once("bytes="))
+                .and_then(|(_, spec)| spec.split('-').next())
+                .and_then(|start| start.trim().parse::<u64>().ok())
+                .is_some_and(|start| start >= empty_from)
+        });
+        assert!(
+            saw_injected_request,
+            "the reproduction must actually exercise the injected empty tail; requests: {heads_snapshot:?}"
+        );
+    }
+
     #[test]
     fn http_range_accepts_status_200_for_whole_file_and_backfills_total() {
         let body = b"whole-file-payload".to_vec();
@@ -3482,7 +3680,10 @@ mod tests {
             })
             .expect_err("a 206 without Content-Range cannot prove the served offset");
         assert!(
-            matches!(&error, SourceError::Http(message) if message.contains("Content-Range")),
+            matches!(
+                &error,
+                SourceError::HttpRangeVerification(message) if message.contains("Content-Range")
+            ),
             "unexpected error: {error}"
         );
     }
@@ -3549,6 +3750,151 @@ mod tests {
         assert!(recv_request_head(&requests).contains("range: bytes=0-63"));
         // The resumed request must start where the truncated body stopped.
         assert!(recv_request_head(&requests).contains("range: bytes=32-63"));
+    }
+
+    /// A 206 whose Content-Length frames an empty body cleanly (unlike
+    /// `http_206_truncated_response`, which promises bytes and closes).
+    fn http_206_clean_empty_response(start: u64, end: u64, total: u64) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn http_tail_flush_empty_206_body_reads_as_eof() {
+        // Issue #163: a window that runs to the resource total is boundary
+        // traffic. An origin answering it with a clean empty 206 marks the
+        // resource's end, and the read must surface EOF, not a fatal fetch
+        // failure.
+        let total = 8 * 1024 * 1024u64;
+        let start = total - 4096;
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_clean_empty_response(start, total - 1, total),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(4096),
+            })
+            .unwrap();
+        assert!(bytes.is_empty(), "a tail-flush empty answer is EOF");
+        assert!(recv_request_head(&requests).contains(&format!("range: bytes={start}-")));
+    }
+
+    #[test]
+    fn http_tail_flush_empty_206_body_reads_as_eof_when_the_response_reveals_the_total() {
+        // An origin whose length probe finds nothing: the empty tail response
+        // is the first and only source of the total, and the boundary rule
+        // must still hold -- the window's reach is judged after the fetch,
+        // once the response has named the resource size.
+        let total = 8 * 1024 * 1024u64;
+        let start = total - 4096;
+        let (uri, _requests) = spawn_mock_http_server(vec![
+            // HEAD: no usable length (Content-Length: 0 triggers the probe).
+            MockResponse::immediate(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ),
+            // Probe: Range ignored, and no Content-Length either.
+            MockResponse::immediate(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec()),
+            MockResponse::immediate(http_206_clean_empty_response(start, total - 1, total)),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(4096),
+            })
+            .unwrap();
+        assert!(bytes.is_empty(), "a tail-flush empty answer is EOF");
+        assert_eq!(
+            source.len().unwrap(),
+            Some(total),
+            "the response supplies the total"
+        );
+    }
+
+    #[test]
+    fn http_midfile_empty_206_body_is_still_an_error() {
+        // 576c388's rule stands outside the tail: an empty answer for a
+        // window that ends short of the resource total is a fetch failure,
+        // and bytes that exist must never look like EOF.
+        let total = 8 * 1024 * 1024u64;
+        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_clean_empty_response(0, 2 * 1024 * 1024 - 1, total),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let error = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            })
+            .expect_err("an empty mid-file answer must not look like EOF");
+        assert!(
+            matches!(&error, SourceError::Http(message) if message.contains("empty body")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn http_tail_flush_zero_byte_truncated_body_reads_as_eof() {
+        // The injection from issue #163's reproduction: a 206 that declares
+        // the tail's Content-Length but delivers zero bytes and closes. The
+        // fetch exhausts its retries; the tail-flush window then ends the
+        // read as EOF instead of failing the session.
+        let total = 8 * 1024 * 1024u64;
+        let start = total - 2048;
+        let responses = (0..HTTP_FETCH_MAX_ATTEMPTS)
+            .map(|_| {
+                MockResponse::immediate(http_206_truncated_response(
+                    start,
+                    total,
+                    (total - start) as usize,
+                    &[],
+                ))
+            })
+            .collect();
+        let (uri, requests) = spawn_mock_http_server(responses);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(2048),
+            })
+            .unwrap();
+        assert!(bytes.is_empty(), "a tail-flush undelivered range is EOF");
+        for _ in 0..HTTP_FETCH_MAX_ATTEMPTS {
+            assert!(recv_request_head(&requests).contains(&format!("range: bytes={start}-")));
+        }
+    }
+
+    #[test]
+    fn http_midfile_truncated_body_exhausting_retries_is_still_an_error() {
+        // The transport-failure downgrade is tail-only: exhausted retries on
+        // a mid-file window still surface their error.
+        let total = 8 * 1024 * 1024u64;
+        let responses = (0..HTTP_FETCH_MAX_ATTEMPTS)
+            .map(|_| {
+                MockResponse::immediate(http_206_truncated_response(0, total, 2 * 1024 * 1024, &[]))
+            })
+            .collect();
+        let (uri, _requests) = spawn_mock_http_server(responses);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let error = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            })
+            .expect_err("mid-file transport failures must stay errors");
+        assert!(
+            matches!(&error, SourceError::Http(_)),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
