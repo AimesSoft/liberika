@@ -1,7 +1,40 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-25
 
+### Default behavior changes
+
+- Enabled native subtitle supersampling by default. Subtitle and danmaku
+  supersampling now default to on in both native and Web backends, with the
+  existing size limits, native subtitle CPU fallback and explicit opt-out
+  controls preserved.
+- Software video decoders now use frame and slice threading (FFmpeg picks the
+  count) for playback as well as exports; `ERIKA_VIDEO_DECODE_THREADS=1`
+  restores single-threaded decoding. Forced to software, 4K H.264 at 3x
+  presented 72 fps with no late drops where one thread presented 7 fps and
+  dropped 481 frames in 15 s, and the time from a seek to the first picture
+  fell from 2.8 s to 0.43 s (median). `ERIKA_HWDEC=software` makes software
+  decoding the default on every platform, for measuring it.
+
+### Features and fixes
+
+- Renamed the project and repositories to liberika and liberika-swift. The
+  `erika` Rust crate, `erika_*` C ABI and existing SDK package names remain
+  compatible.
+- Added `liberika-web-0.3.0.zip` to the Release, containing the complete Web
+  runtime, demo page and licenses, with its digest in `SHA256SUMS`.
+- Added container chapters to presenter JSON (`chapters`), available to
+  hosts without changing the existing C structs (#172).
+- Fixed embedded subtitle delivery while paused, long cues spanning a seek,
+  and the active cue after switching subtitle tracks during paused playback
+  (#171).
+- Fixed iOS/tvOS static linking of optional export and diagnostics symbols:
+  only symbols present in the selected native archive are force-linked, while
+  older pinned runtimes remain linkable (#170).
+- Added the failure reason to the `erika_play` trace so failed playback starts
+  can be diagnosed from logs.
+- Treat ordinary undelivered HTTP tail ranges within the final 4 MiB as EOF;
+  range verification and changed-entity errors remain errors (#169).
 - Fixed a danmaku memory spike when comments contain characters the embedded
   fallback font does not cover, such as emoji. The danmaku system font
   fallback now checks character coverage with zero-copy lookups before
@@ -9,10 +42,6 @@
   eviction while preserving the existing font fallback order, so a single
   uncovered character no longer copies every system font (about 1.65 GB in
   the reported macOS case) into memory.
-- Enabled native subtitle supersampling by default. Subtitle and danmaku
-  supersampling now default to on in both native and Web backends, with the
-  existing size limits, native subtitle CPU fallback and explicit opt-out
-  controls preserved.
 - Removed the duplicate Web fallback-font asset. libass now uses the complete
   font already embedded in the Rust WASM, eliminating a separate font request
   and about 6.07 MiB of package data (2.74 MiB with gzip). Incremental Web builds
@@ -29,7 +58,8 @@
 - Integrated the Web backend into Erika's browser application and verified it
   in Chrome with H.264/AAC/ASS MKV, VP9/Opus WebM, 2,000 comments, playback
   controls, screenshots, UI transitions and player cleanup. Web distribution
-  currently uses source builds; see the [browser guide](docs/web.md).
+  is available as a Release archive and from source; see the
+  [browser guide](docs/web.md).
 - Fixed HTTP(S) reads and persistent prefetch for origins that ignore Range
   and return `200` with the whole file, including HLS playlists and segments
   without Content-Length. Replayed prefixes are discarded before caching,
@@ -89,13 +119,7 @@
   `reserved_flags` of the result. Against a screenshot of the player on an SDR
   display, a 4K HDR10 frame differs by 0.1 to 0.3 of 255 on average (7 to 9
   before).
-- Software video decoders now use frame and slice threading (FFmpeg picks the
-  count) for playback as well as exports; `ERIKA_VIDEO_DECODE_THREADS=1`
-  restores single-threaded decoding. Forced to software, 4K H.264 at 3x
-  presented 72 fps with no late drops where one thread presented 7 fps and
-  dropped 481 frames in 15 s, and the time from a seek to the first picture
-  fell from 2.8 s to 0.43 s (median). `ERIKA_HWDEC=software` makes software
-  decoding the default on every platform, for measuring it.
+
 - Fixed `erika_presenter_select_subtitle_track` (and `Player::select_subtitle_track`)
   failing with `ErikaStatus 3` when asked for no subtitle while no media was
   open, which is how a host clears the subtitle before opening: it now succeeds

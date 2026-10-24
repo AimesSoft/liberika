@@ -11,16 +11,16 @@
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p erika -p erika_capi
-cargo clippy -p erika -p erika_capi --all-targets -- -D warnings
+cargo test --locked -p erika -p erika_capi
+cargo clippy --locked -p erika --all-targets --all-features --no-deps
 cd packages/erika_flutter
 dart pub publish --dry-run
 ```
 
-3. 给准备发布的提交打核心 tag。以下版本号是下一次发布的示例，按实际版本替换：
+3. 将 `Cargo.toml` 的 `[workspace.package].version` 改为发布版本，运行 `cargo update -w` 并一同提交 `Cargo.lock`。Release 会拒绝与 Cargo 版本不一致的 tag。先对准备发布的提交手动运行 `Release`，确认所有平台构建通过，再打核心 tag。以下版本号是下一次发布的示例，按实际版本替换：
 
 ```sh
-VERSION=0.2.2
+VERSION=0.3.0
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -29,12 +29,12 @@ git push origin "v${VERSION}"
 
 ## 自动发布流程
 
-[release.yml](../.github/workflows/release.yml) 并行构建各平台。iOS、tvOS、Android 按架构分片构建，再合并归档；macOS arm64/x64 合成 universal。完成后创建 GitHub Release，上传 13 个原生/Flutter 归档与 `SHA256SUMS`。
+[release.yml](../.github/workflows/release.yml) 并行构建各平台。iOS、tvOS、Android 按架构分片构建，再合并归档；macOS arm64/x64 合成 universal。完成后创建 GitHub Release，上传 13 个原生/Flutter 归档、Web 归档与 `SHA256SUMS`。
 
 [release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) 接着执行：
 
 - 用已上传的校验值更新 Flutter 和 OHPM 的版本与 `native_artifacts.properties`，提交到 `main`。
-- 创建内部 `erika_flutter-vX.Y.Z` tag，触发 [Flutter OIDC 发布](../.github/workflows/flutter-package.yml)。
+- 创建内部 `erika_flutter-vX.Y.Z` tag，触发 [Flutter OIDC 发布](../.github/workflows/pub-publish.yml)。
 - 构建 ArkTS HAR 并上传 OHPM。
 - 组装 Swift XCFramework，追加到核心 Release 和 `SHA256SUMS`，通知 liberika-swift 更新、测试并发布对应版本。
 
@@ -44,7 +44,7 @@ Flutter、OHPM 和 Swift 发布可以并行进行。维护者只创建核心 tag
 
 ## 发布产物
 
-完整发布共 14 个 ZIP，另附 `SHA256SUMS`：
+完整发布共 15 个 ZIP，另附 `SHA256SUMS`：
 
 | 平台 | 归档命名 | 数量 |
 |---|---|---|
@@ -54,6 +54,7 @@ Flutter、OHPM 和 Swift 发布可以并行进行。维护者只创建核心 tag
 | Android | `erika-capi-android.zip` | 1 |
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
+| Web / WASM | `liberika-web-X.Y.Z.zip` | 1 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI 包包含库、`include/erika.h`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、依赖许可证及记录 tag/commit 的 `MANIFEST.txt`。iOS/tvOS 为 device + simulator XCFramework；Android 合并包包含四个 ABI 的静态库、动态库和匹配的 `libc++_shared.so`。Flutter Android 包只携带单个 ABI 的动态运行时。

@@ -13,7 +13,7 @@
 
 The host application provides a rendering surface and sends playback commands — decoding, timing, video rendering, subtitles, danmaku, and audio output are handled entirely inside Erika. Native video surfaces present directly; Flutter textures can participate in host composition.
 
-Current release: **0.2.1**. Start with the [documentation index](../docs/README.md).
+Current release: **0.3.0**. Start with the [documentation index](../docs/README.md).
 
 **Play MKV in the browser with its ASS subtitles and attached fonts.** The current
 source includes a [Web / WASM backend](../docs/web.md), integrated into Erika Web.
@@ -36,16 +36,16 @@ the server.
 
 | Host | Install / entry point | Guide |
 |---|---|---|
-| Browser / JavaScript / TypeScript | `cargo run -p xtask -- web build` from current source | [Web integration and deployment](../docs/web.md) |
-| Flutter | `flutter pub add erika_flutter` (0.2.1) | [Plugin guide](../packages/erika_flutter/README.md) |
-| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode, from 0.2.1 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| Browser / JavaScript / TypeScript | Download `liberika-web-0.3.0.zip` or build from source | [Web integration and deployment](../docs/web.md) |
+| Flutter | `flutter pub add erika_flutter` (0.3.0) | [Plugin guide](../packages/erika_flutter/README.md) |
+| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode, from 0.3.0 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | Matching C ABI bundle and `erika.h` | [Native integration](../docs/integration.md) |
-| Rust | Git dependency pinned to `v0.2.1` | [Build guide](../docs/building.md) |
+| Rust | Git dependency pinned to `v0.3.0` | [Build guide](../docs/building.md) |
 | Linux | System FFmpeg 8 and patched libass; source build | [Linux guide](../docs/linux.md) |
 
-As of 2026-10-02, OHPM serves 0.1.9; 0.2.1 has been submitted for review.
-Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.2.1).
+As of 2026-10-25, OHPM serves the approved 0.2.1 package; 0.3.0 still requires review after upload.
+Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.0).
 
 ### Browser
 
@@ -57,7 +57,9 @@ python3 scripts/serve_web.py
 
 Open `http://127.0.0.1:18765` for the demo. Deploy the runtime from `target/web/`
 and use `Player.create({ canvas })` and `player.open(fileOrURL)` in your own UI.
-The Web build is available in current source and has not been published to npm.
+The Release includes `liberika-web-0.3.0.zip` with a demo `index.html`.
+Extract the whole archive and serve it over HTTPS or localhost; source builds
+are also available. The Web package has not been published to npm.
 Audio/video codecs depend on browser WebCodecs support. See the [browser guide](../docs/web.md)
 for prerequisites, a complete example and the Erika integration.
 
@@ -82,7 +84,7 @@ platform-specific choices and lifecycle.
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.2.1" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.0" }
 ```
 
 ```rust
@@ -108,7 +110,7 @@ subscriptions; `PresenterRuntime` owns rendering and audio. C hosts use
 | Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | Four ABI bundles, Flutter |
 | OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 bundle, Flutter, OHPM |
 | Linux (experimental) | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust, C ABI and Flutter source builds |
-| Browser | WebCodecs | WebGL2 / Canvas | Web Audio | JS / WASM package built from current source |
+| Browser | WebCodecs | WebGL2 / Canvas | Web Audio | Release Web archive or source-built JS / WASM package |
 
 The [platform matrix](../docs/platform_matrix.zh.md) summarizes surface and HDR
 paths. The browser backend currently outputs SDR and has been verified in Chrome.
