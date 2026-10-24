@@ -3749,7 +3749,7 @@ mod tests {
             .expect("pause command")
         {
             PlaybackCommand::Pause { sequence, .. } => sequence,
-            other => panic!("expected pause command"),
+            _ => panic!("expected pause command"),
         };
         let parked_clock = player.inner.lock().unwrap().playback_clock.clone();
         assert!(!parked_clock.is_running());
