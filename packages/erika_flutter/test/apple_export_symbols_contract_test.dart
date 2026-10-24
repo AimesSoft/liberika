@@ -7,9 +7,10 @@ import 'package:flutter_test/flutter_test.dart';
 /// from the Dart exports). The linker drops what nothing references, so every
 /// function those lookups need is named in the podspec's `-u` list, except
 /// the ones newer than the pinned native artifacts: forcing a symbol the
-/// static library lacks fails the link, so those are listed as optional (the
-/// plugin and the Dart side look them up optionally) until the release whose
-/// artifacts ship them moves them into the forced list.
+/// static library lacks fails the link, so those are listed as optional and
+/// force-linked only when the library the build produced defines them (a
+/// source build or a newer library does), until the release whose artifacts
+/// ship them moves them into the forced list.
 void main() {
   final header = File('native/include/erika.h').readAsStringSync();
   final declared = RegExp(r'\b(erika_\w+)\s*\(')
@@ -55,6 +56,12 @@ void main() {
         expect(forced.union(optional), contains(symbol));
       }
       expect(forced.intersection(optional), isEmpty);
+      // The optional ones are force-linked when the produced library defines
+      // them: the build phase writes the flags, the link reads them.
+      expect(podspec, contains("for symbol in #{erika_cabi_optional_symbols.join(' ')}"));
+      expect(podspec, contains('nm -gU "\$OUTPUT_LIB"'));
+      expect(podspec,
+          contains('\\"@\$(PODS_TARGET_SRCROOT)/native/erika_optional_ldflags.rsp\\"'));
       // A name that liberika does not define would fail the final link.
       expect(declared.containsAll(forced), isTrue,
           reason: 'not in erika.h: ${forced.difference(declared)}');
