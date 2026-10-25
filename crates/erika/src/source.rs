@@ -2433,12 +2433,34 @@ fn file_uri_path(path: &str) -> PathBuf {
         .strip_prefix("localhost")
         .filter(|rest| rest.starts_with('/'))
         .unwrap_or(path);
-    let raw = PathBuf::from(path);
+    let raw = PathBuf::from(system_path(path));
     let decoded = percent_decoded_path(path);
+    let decoded = match decoded.to_str() {
+        Some(text) if cfg!(windows) => PathBuf::from(system_path(text)),
+        _ => decoded,
+    };
     if decoded != raw && !decoded.exists() && raw.exists() {
         raw
     } else {
         decoded
+    }
+}
+
+/// The path a `file:` URI's path names on this system. On Windows a drive
+/// path comes after a slash (`file:///C:/Videos/a.mkv`, RFC 8089), which
+/// the drive path itself does not have.
+fn system_path(path: &str) -> &str {
+    if cfg!(windows) {
+        without_slash_before_drive(path)
+    } else {
+        path
+    }
+}
+
+fn without_slash_before_drive(path: &str) -> &str {
+    match path.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &path[1..],
+        _ => path,
     }
 }
 
@@ -2971,6 +2993,13 @@ mod tests {
             read_uri_to_end(&format!("file://{}", literal.display())).unwrap(),
             b"literal"
         );
+        assert_eq!(
+            without_slash_before_drive("/C:/Videos/a.mkv"),
+            "C:/Videos/a.mkv"
+        );
+        assert_eq!(without_slash_before_drive("/d:"), "d:");
+        assert_eq!(without_slash_before_drive("C:\\Videos"), "C:\\Videos");
+        assert_eq!(without_slash_before_drive("/Videos/a.mkv"), "/Videos/a.mkv");
         assert_eq!(percent_decoded_path("%zz%4"), PathBuf::from("%zz%4"));
         assert_eq!(percent_decoded_path("%+1"), PathBuf::from("%+1"));
         let _ = std::fs::remove_dir_all(dir);

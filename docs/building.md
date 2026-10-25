@@ -196,6 +196,17 @@ The `xtask --target`, `ERIKA_NATIVE_TARGET`, and Cargo `--target` values must
 match, otherwise Cargo can attempt to link native dependencies for a different
 architecture.
 
+Windows native libraries link the DLL C runtime (`/MD`) by default, as Rust
+does. A host that links the C runtime statically
+(`-C target-feature=+crt-static`) needs native libraries that do too, or the
+link misses symbols such as `__imp_strtol`: add `--crt static`. The build goes
+to its own `<profile>-crt-static` directory, which `erika_ffmpeg_sys` and
+`erika` use when Rust links the C runtime statically.
+
+```powershell
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
+```
+
 ### Android x86_64 build (Windows PowerShell)
 
 ```powershell

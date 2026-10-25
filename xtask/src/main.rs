@@ -201,19 +201,23 @@ fn deps(mut args: Vec<String>) -> Result<()> {
     let options = DepsOptions::parse(&args)?;
     match subcommand.as_str() {
         "plan" => {
-            print_dependency_plan(options.profile, options.target);
+            print_dependency_plan(options.profile, options.target, options.crt);
             Ok(())
         }
         "fetch" => {
-            print_dependency_plan(options.profile, options.target);
-            let layout = workspace_layout(options.profile, options.target)?;
+            print_dependency_plan(options.profile, options.target, options.crt);
+            let layout = workspace_layout(options.profile, options.target, options.crt)?;
             fetch_dependency_sources(&layout, options.all)?;
             write_profile_metadata(&layout, options.profile, options.target)
         }
-        "status" => print_dependency_status(&workspace_layout(options.profile, options.target)?),
+        "status" => print_dependency_status(&workspace_layout(
+            options.profile,
+            options.target,
+            options.crt,
+        )?),
         "smoke-ffmpeg-make" => smoke_ffmpeg_make(options),
         "build" => {
-            print_dependency_plan(options.profile, options.target);
+            print_dependency_plan(options.profile, options.target, options.crt);
             build_dependencies(options)
         }
         other => bail!("unknown deps subcommand: {other}"),
@@ -224,6 +228,33 @@ fn deps(mut args: Vec<String>) -> Result<()> {
 enum NativeDependencyProfile {
     Lgpl,
     GplFull,
+}
+
+/// The MSVC C runtime the Windows libraries link against: the DLL (`/MD`,
+/// as Rust links by default) or the static one (`/MT`, for hosts built with
+/// `-C target-feature=+crt-static`). A static build goes to its own
+/// `<profile>-crt-static` directory, where `erika_ffmpeg_sys` looks when
+/// Rust links the CRT statically. Other targets ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsCrt {
+    Dynamic,
+    Static,
+}
+
+impl WindowsCrt {
+    fn ffmpeg_cflag(self) -> &'static str {
+        match self {
+            Self::Dynamic => "--extra-cflags=-MD",
+            Self::Static => "--extra-cflags=-MT",
+        }
+    }
+
+    fn dir_suffix(self) -> &'static str {
+        match self {
+            Self::Dynamic => "",
+            Self::Static => "-crt-static",
+        }
+    }
 }
 
 impl NativeDependencyProfile {
@@ -270,13 +301,22 @@ impl NativeDependencyProfile {
         }
     }
 
+    #[cfg(test)]
     fn ffmpeg_configure_flags_for_target(self, target: NativeTarget) -> Vec<&'static str> {
+        self.ffmpeg_configure_flags_for(target, WindowsCrt::Dynamic)
+    }
+
+    fn ffmpeg_configure_flags_for(
+        self,
+        target: NativeTarget,
+        crt: WindowsCrt,
+    ) -> Vec<&'static str> {
         let mut flags = self.ffmpeg_configure_flags().to_vec();
         if target.is_windows() {
-            // Match Meson/CMake dependencies and Rust's default dynamic MSVC
-            // CRT, including configure's link probes against static dav1d.
-            // Keep this in the recorded flags so old builds are invalidated.
-            flags.extend(["--enable-d3d11va", "--enable-dxva2", "--extra-cflags=-MD"]);
+            // Match the Meson/CMake dependencies and the CRT Rust links,
+            // including configure's link probes against static dav1d. Keep
+            // this in the recorded flags so old builds are invalidated.
+            flags.extend(["--enable-d3d11va", "--enable-dxva2", crt.ffmpeg_cflag()]);
         } else if target.is_android() {
             flags.extend([
                 "--enable-jni",
@@ -587,6 +627,7 @@ impl NativeTarget {
 struct DepsOptions {
     profile: NativeDependencyProfile,
     target: NativeTarget,
+    crt: WindowsCrt,
     force: bool,
     all: bool,
     jobs: Option<usize>,
@@ -597,6 +638,7 @@ impl DepsOptions {
         let mut options = Self {
             profile: NativeDependencyProfile::Lgpl,
             target: NativeTarget::Host,
+            crt: WindowsCrt::Dynamic,
             force: false,
             all: false,
             jobs: None,
@@ -618,6 +660,15 @@ impl DepsOptions {
                     options.target = NativeTarget::parse(value)?;
                     index += 2;
                 }
+                "--crt" => {
+                    let value = args.get(index + 1).context("--crt requires a value")?;
+                    options.crt = match value.as_str() {
+                        "dynamic" => WindowsCrt::Dynamic,
+                        "static" => WindowsCrt::Static,
+                        other => bail!("unknown C runtime: {other} (dynamic or static)"),
+                    };
+                    index += 2;
+                }
                 "--force" => {
                     options.force = true;
                     index += 1;
@@ -634,6 +685,9 @@ impl DepsOptions {
                 }
                 other => bail!("unknown deps option: {other}"),
             }
+        }
+        if options.crt == WindowsCrt::Static && !options.target.is_windows() {
+            bail!("--crt static applies to Windows targets only");
         }
         Ok(options)
     }
@@ -681,23 +735,25 @@ struct WorkspaceLayout {
 fn workspace_layout(
     profile: NativeDependencyProfile,
     target: NativeTarget,
+    crt: WindowsCrt,
 ) -> Result<WorkspaceLayout> {
     let root = workspace_root()?;
     let cache_dir = root.join("third_party/cache");
     let source_dir = root.join("third_party/src");
+    let profile_dir = format!("{}{}", profile_name(profile), crt.dir_suffix());
     let (build_dir, dist_dir) = if let Some(triple) = target.triple() {
         (
             root.join("third_party/build")
                 .join(triple)
-                .join(profile_name(profile)),
+                .join(&profile_dir),
             root.join("third_party/dist")
                 .join(triple)
-                .join(profile_name(profile)),
+                .join(&profile_dir),
         )
     } else {
         (
-            root.join("third_party/build").join(profile_name(profile)),
-            root.join("third_party/dist").join(profile_name(profile)),
+            root.join("third_party/build").join(&profile_dir),
+            root.join("third_party/dist").join(&profile_dir),
         )
     };
     let ffmpeg_source_dir = source_dir.join(FFMPEG_DIR);
@@ -768,7 +824,7 @@ fn workspace_layout(
     })
 }
 
-fn print_dependency_plan(profile: NativeDependencyProfile, target: NativeTarget) {
+fn print_dependency_plan(profile: NativeDependencyProfile, target: NativeTarget, crt: WindowsCrt) {
     println!("Erika native dependency plan");
     println!("profile: {}", profile_name(profile));
     println!("target: {}", target.triple().unwrap_or("host"));
@@ -790,7 +846,7 @@ fn print_dependency_plan(profile: NativeDependencyProfile, target: NativeTarget)
     println!("fribidi: {FRIBIDI_VERSION} ({})", FRIBIDI_URLS[0]);
     println!("zlib: {ZLIB_VERSION} ({})", ZLIB_URLS[0]);
     println!("ffmpeg configure flags:");
-    for flag in profile.ffmpeg_configure_flags_for_target(target) {
+    for flag in profile.ffmpeg_configure_flags_for(target, crt) {
         println!("  {flag}");
     }
     println!(
@@ -829,7 +885,7 @@ fn fetch_dependency_sources(layout: &WorkspaceLayout, all: bool) -> Result<()> {
 }
 
 fn build_dependencies(options: DepsOptions) -> Result<()> {
-    let layout = workspace_layout(options.profile, options.target)?;
+    let layout = workspace_layout(options.profile, options.target, options.crt)?;
     ensure_required_tools(options, &layout)?;
     prepare_dependency_dirs(&layout)?;
     fetch_dependency_sources(&layout, options.all)?;
@@ -1119,6 +1175,7 @@ fn build_zlib(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             layout.zlib_prefix.display()
         ));
     apply_cmake_target(&mut configure, options.target)?;
+    apply_cmake_crt(&mut configure, options);
     run(&mut configure)?;
     cmake_build_install(&layout.zlib_build_dir, options.jobs, options.target)?;
     ensure_windows_link_aliases(
@@ -1179,6 +1236,7 @@ fn build_dav1d(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("-Denable_docs=false")
         .arg("-Dlogging=true");
     apply_meson_target(&mut setup, layout, options.target, "dav1d")?;
+    apply_meson_crt(&mut setup, options);
     apply_windows_target_env(&mut setup, options.target)?;
     if matches!(options.target, NativeTarget::Aarch64WindowsMsvc) {
         let gaspp = ensure_gas_preprocessor(layout)?;
@@ -1295,6 +1353,7 @@ fn build_freetype(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .arg("-DFT_DISABLE_HARFBUZZ=TRUE")
         .arg("-DFT_DISABLE_BROTLI=TRUE");
     apply_cmake_target(&mut configure, options.target)?;
+    apply_cmake_crt(&mut configure, options);
     run(&mut configure)?;
     cmake_build_install(&layout.freetype_build_dir, options.jobs, options.target)?;
     write_marker(
@@ -1360,6 +1419,7 @@ fn build_harfbuzz(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
             .arg("-DHB_HAVE_DIRECTWRITE=OFF");
     }
     apply_cmake_target(&mut configure, options.target)?;
+    apply_cmake_crt(&mut configure, options);
     run(&mut configure)?;
     cmake_build_install(&layout.harfbuzz_build_dir, options.jobs, options.target)?;
     write_marker(
@@ -1407,6 +1467,7 @@ fn build_fribidi(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("-Ddocs=false")
         .arg("-Dtests=false");
     apply_meson_target(&mut setup, layout, options.target, "fribidi")?;
+    apply_meson_crt(&mut setup, options);
     apply_windows_target_env(&mut setup, options.target)?;
     run(&mut setup)?;
     meson_compile_install(
@@ -1511,6 +1572,7 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             .arg("-Drequire-system-font-provider=false");
     }
     apply_meson_target(&mut setup, layout, options.target, "libass")?;
+    apply_meson_crt(&mut setup, options);
     apply_windows_target_env(&mut setup, options.target)?;
     run(&mut setup)?;
 
@@ -1621,6 +1683,11 @@ fn ensure_meson_tools(layout: &WorkspaceLayout) -> Result<MesonTools> {
 fn meson_command(meson: &MesonTools) -> Command {
     let mut command = Command::new(&meson.meson);
     prepend_path(&mut command, &meson.bin_dir);
+    // MSVC prints in the system code page. Python's UTF-8 mode would make
+    // Meson fail to read `cl`'s output on, for example, Chinese Windows.
+    if cfg!(windows) {
+        command.env_remove("PYTHONUTF8");
+    }
     command
 }
 
@@ -1703,6 +1770,24 @@ fn apply_cmake_apple_target(command: &mut Command, target: NativeTarget) -> Resu
         command.arg("-DCMAKE_SYSTEM_NAME=tvOS");
     }
     apply_apple_target_env(command, target)
+}
+
+/// The static C runtime for a Windows CMake build, which otherwise uses the
+/// DLL. The policy lets projects that require an older CMake honour it.
+fn apply_cmake_crt(command: &mut Command, options: DepsOptions) {
+    if options.target.is_windows() && options.crt == WindowsCrt::Static {
+        command
+            .arg("-DCMAKE_POLICY_DEFAULT_CMP0091=NEW")
+            .arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded");
+    }
+}
+
+/// The static C runtime for a Windows Meson build, which otherwise uses the
+/// DLL.
+fn apply_meson_crt(command: &mut Command, options: DepsOptions) {
+    if options.target.is_windows() && options.crt == WindowsCrt::Static {
+        command.arg("-Db_vscrt=mt");
+    }
 }
 
 fn apply_meson_target(
@@ -2846,7 +2931,7 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     }
     for flag in options
         .profile
-        .ffmpeg_configure_flags_for_target(options.target)
+        .ffmpeg_configure_flags_for(options.target, options.crt)
     {
         configure.arg(flag);
     }
@@ -2931,7 +3016,7 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             layout.ffmpeg_prefix.display(),
             options
                 .profile
-                .ffmpeg_configure_flags_for_target(options.target)
+                .ffmpeg_configure_flags_for(options.target, options.crt)
                 .join(" ")
         ),
     )
@@ -3415,7 +3500,12 @@ fn ffmpeg_build_marker_is_current(layout: &WorkspaceLayout, options: DepsOptions
         ))
         && marker.contains(&format!("zlib={ZLIB_VERSION}\n"))
         && marker.contains(&format!("dav1d={}\n", DAV1D_VERSION))
-        && ffmpeg_build_marker_has_current_flags(&marker, options.profile, options.target)
+        && ffmpeg_build_marker_has_current_flags(
+            &marker,
+            options.profile,
+            options.target,
+            options.crt,
+        )
         && patchset_is_current
         && android_api_is_current
         && marker.contains(&format!(
@@ -3485,8 +3575,9 @@ fn ffmpeg_build_marker_has_current_flags(
     marker: &str,
     profile: NativeDependencyProfile,
     target: NativeTarget,
+    crt: WindowsCrt,
 ) -> bool {
-    let expected = profile.ffmpeg_configure_flags_for_target(target).join(" ");
+    let expected = profile.ffmpeg_configure_flags_for(target, crt).join(" ");
     marker
         .lines()
         .find_map(|line| line.strip_prefix("flags="))
@@ -5280,14 +5371,60 @@ mod tests {
                 assert!(flags.contains(&"--extra-cflags=-MD"));
                 let current = format!("flags={}\n", flags.join(" "));
                 assert!(ffmpeg_build_marker_has_current_flags(
-                    &current, profile, target
+                    &current,
+                    profile,
+                    target,
+                    WindowsCrt::Dynamic
                 ));
                 let stale = current.replace(" --extra-cflags=-MD", "");
                 assert!(!ffmpeg_build_marker_has_current_flags(
-                    &stale, profile, target
+                    &stale,
+                    profile,
+                    target,
+                    WindowsCrt::Dynamic
+                ));
+                // A static runtime build is a different build.
+                assert!(!ffmpeg_build_marker_has_current_flags(
+                    &current,
+                    profile,
+                    target,
+                    WindowsCrt::Static
                 ));
             }
         }
+    }
+
+    #[test]
+    fn windows_static_crt_builds_ffmpeg_with_mt_in_its_own_directory() {
+        let target = NativeTarget::X86_64WindowsMsvc;
+        let flags =
+            NativeDependencyProfile::Lgpl.ffmpeg_configure_flags_for(target, WindowsCrt::Static);
+        assert!(flags.contains(&"--extra-cflags=-MT"));
+        assert!(!flags.contains(&"--extra-cflags=-MD"));
+        let layout =
+            workspace_layout(NativeDependencyProfile::Lgpl, target, WindowsCrt::Static).unwrap();
+        assert!(
+            layout
+                .dist_dir
+                .ends_with("x86_64-pc-windows-msvc/lgpl-crt-static")
+        );
+        let options = DepsOptions::parse(&[
+            "--target".into(),
+            "x86_64-pc-windows-msvc".into(),
+            "--crt".into(),
+            "static".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.crt, WindowsCrt::Static);
+        assert!(
+            DepsOptions::parse(&[
+                "--crt".into(),
+                "static".into(),
+                "--target".into(),
+                "aarch64-apple-darwin".into()
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -5299,12 +5436,18 @@ mod tests {
             profile.ffmpeg_configure_flags_for_target(target).join(" ")
         );
         assert!(ffmpeg_build_marker_has_current_flags(
-            &current, profile, target
+            &current,
+            profile,
+            target,
+            WindowsCrt::Dynamic
         ));
 
         let stale = current.replace(",vp8,vp9", ",vp9");
         assert!(!ffmpeg_build_marker_has_current_flags(
-            &stale, profile, target
+            &stale,
+            profile,
+            target,
+            WindowsCrt::Dynamic
         ));
     }
 

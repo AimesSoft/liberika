@@ -172,6 +172,12 @@ cargo build -p erika_capi --release --target aarch64-pc-windows-msvc
 
 `xtask --target`、`ERIKA_NATIVE_TARGET` 和 Cargo `--target` 必须相同，否则 Cargo 可能链接到其他架构的原生依赖。
 
+Windows 原生库默认链接 C 运行库的 DLL（`/MD`），与 Rust 的默认相同。宿主用 `-C target-feature=+crt-static` 静态链接 C 运行库时，原生库也要静态链接，否则链接时缺 `__imp_strtol` 等符号：加 `--crt static`，产物放在单独的 `<profile>-crt-static` 目录，`erika_ffmpeg_sys` 与 `erika` 发现 Rust 静态链接 C 运行库时自动使用它。
+
+```powershell
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
+```
+
 ### Windows PowerShell 构建 Android x86_64
 
 ```powershell

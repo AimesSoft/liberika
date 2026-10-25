@@ -1220,6 +1220,11 @@ pub struct D3d11Renderer {
     state: Option<D3d11DeviceState>,
     surface: Option<AttachedSurface>,
     current_video: Option<ImportedVideoFrame>,
+    /// Signalled once the GPU finished the last draw that read
+    /// `current_video` into a compositor-owned surface; `None` until a draw.
+    current_video_fence: Option<ID3D11Query>,
+    /// `MetalRendererConfig::compositor_handoff_timeout`.
+    handoff_timeout: Duration,
     flutter_scene: Option<FlutterTextureScene>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
     requested_output_mode: crate::renderer::output::OutputMode,
@@ -1247,6 +1252,8 @@ impl D3d11Renderer {
             state: None,
             surface: None,
             current_video: None,
+            current_video_fence: None,
+            handoff_timeout: config.compositor_handoff_timeout,
             flutter_scene: None,
             danmaku_atlas_cache: None,
             requested_output_mode: config.output_mode,
@@ -1269,17 +1276,21 @@ impl D3d11Renderer {
         // Preserve main's HWND playback policy. Only compositor-owned surfaces
         // need this additional handoff barrier. Do not grow the decoder pool or
         // accumulate an unbounded queue of AVFrames on delayed/failed fences.
+        // The barrier is the last draw that read the frame, not everything
+        // queued since: a hardware decoder's seek preroll can keep the GPU
+        // busy for hundreds of milliseconds after it.
         if self.current_video.is_some()
             && self
                 .surface
                 .as_ref()
                 .is_some_and(|s| s.composition || s.flutter_texture)
+            && let (Some(state), Some(fence)) =
+                (self.state.as_ref(), self.current_video_fence.as_ref())
         {
-            if let Some(state) = self.state.as_ref() {
-                wait_for_gpu(&state.device, &state.context)?;
-            }
+            wait_for_fence(&state.context, fence, self.handoff_timeout)?;
         }
         self.current_video = None;
+        self.current_video_fence = None;
         Ok(())
     }
 
@@ -1298,7 +1309,7 @@ impl D3d11Renderer {
         }
         // Flush only submits work. Complete the copy before another D3D device
         // opens this immutable snapshot. The extra GPU copy is texture-only.
-        wait_for_gpu(&state.device, &state.context)?;
+        wait_for_gpu(&state.device, &state.context, self.handoff_timeout)?;
         surface.published_texture = Some(snapshot);
         Ok(())
     }
@@ -1350,6 +1361,7 @@ impl D3d11Renderer {
 
     fn invalidate_device(&mut self) {
         self.current_video = None;
+        self.current_video_fence = None;
         self.danmaku_atlas_cache = None;
         self.flutter_scene = None;
         self.state = None;
@@ -2327,6 +2339,17 @@ impl D3d11Renderer {
         if let Some(swapchain) = surface.swapchain.as_ref() {
             present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
         }
+        // What retiring this frame waits for.
+        let fence = if surface.composition || flutter_texture {
+            let fence = create_d3d11_event_query(&state.device)?;
+            unsafe { state.context.End(&fence) };
+            Some(fence)
+        } else {
+            None
+        };
+        if fence.is_some() {
+            self.current_video_fence = fence;
+        }
         if flutter_texture {
             self.publish_flutter_texture()?;
             if let Some(scene) = self.flutter_scene.as_mut() {
@@ -3217,15 +3240,29 @@ fn d3d11_event_query_complete(context: &ID3D11DeviceContext, query: &ID3D11Query
     Ok(complete.as_bool())
 }
 
-fn wait_for_gpu(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<()> {
+fn wait_for_gpu(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    timeout: Duration,
+) -> Result<()> {
     let query = create_d3d11_event_query(device)?;
     unsafe {
         context.End(&query);
+    }
+    wait_for_fence(context, &query, timeout)
+}
+
+fn wait_for_fence(
+    context: &ID3D11DeviceContext,
+    fence: &ID3D11Query,
+    timeout: Duration,
+) -> Result<()> {
+    unsafe {
         context.Flush();
     }
     let started = Instant::now();
-    while !d3d11_event_query_complete(context, &query)? {
-        if started.elapsed() >= Duration::from_millis(100) {
+    while !d3d11_event_query_complete(context, fence)? {
+        if started.elapsed() >= timeout {
             return Err(PlayerError::Renderer(
                 "d3d11: compositor GPU handoff timed out; retaining the current decoder frame"
                     .into(),
@@ -4538,6 +4575,7 @@ mod tests {
             output_mode: crate::renderer::metal::MetalOutputMode::Sdr,
             luma_upscaler: LumaUpscalerMode::ArtCnnC4F16,
             video_alpha_mode: VideoAlphaMode::Opaque,
+            ..MetalRendererConfig::default()
         })
         .unwrap();
 

@@ -165,6 +165,12 @@ cargo build -p erika_capi --release --target aarch64-pc-windows-msvc
 
 `xtask --target`、`ERIKA_NATIVE_TARGET`、Cargo `--target` は同じ値にしてください。一致しない場合、Cargo が別 architecture の native dependency を link する可能性があります。
 
+Windows の native library は既定で C runtime の DLL（`/MD`）を link します（Rust の既定と同じ）。host が `-C target-feature=+crt-static` で C runtime を静的に link する場合は native library も静的にする必要があり、そうしないと link 時に `__imp_strtol` などが見つかりません：`--crt static` を付けてください。成果物は別の `<profile>-crt-static` directory に置かれ、Rust が C runtime を静的に link するとき `erika_ffmpeg_sys` と `erika` が自動的に使います。
+
+```powershell
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
+```
+
 ## ライセンス profile
 
 ネイティブビルドはライセンス境界を明示するため profile で分かれています：

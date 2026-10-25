@@ -80,6 +80,13 @@ pub struct MetalRendererConfig {
     pub output_mode: MetalOutputMode,
     pub luma_upscaler: LumaUpscalerMode,
     pub video_alpha_mode: VideoAlphaMode,
+    /// How long the Direct3D 11 renderer waits for the GPU to finish with a
+    /// decoded frame before handing it back to the decoder, when it draws
+    /// into a compositor-owned surface. A hardware decoder's work shares
+    /// the wait, which after a seek can take hundreds of milliseconds: a
+    /// host rendering on its UI thread keeps it short, one rendering on a
+    /// thread of its own can wait that out.
+    pub compositor_handoff_timeout: Duration,
 }
 
 /// Describes how a decoded video frame carries transparency.
@@ -122,6 +129,7 @@ impl Default for MetalRendererConfig {
             output_mode: MetalOutputMode::default(),
             luma_upscaler: LumaUpscalerMode::default(),
             video_alpha_mode: VideoAlphaMode::default(),
+            compositor_handoff_timeout: Duration::from_millis(100),
         }
     }
 }

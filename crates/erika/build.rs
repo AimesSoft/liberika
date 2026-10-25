@@ -393,10 +393,10 @@ fn ffmpeg_dist_dir() -> PathBuf {
         return workspace_root()
             .join("third_party/dist")
             .join(target)
-            .join(native_profile())
+            .join(native_profile_dir())
             .join("ffmpeg");
     }
-    native_dist_root().join(native_profile()).join("ffmpeg")
+    native_dist_root().join(native_profile_dir()).join("ffmpeg")
 }
 
 fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
@@ -407,10 +407,10 @@ fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
         return workspace_root()
             .join("third_party/dist")
             .join(target)
-            .join(native_profile())
+            .join(native_profile_dir())
             .join(name);
     }
-    native_dist_root().join(native_profile()).join(name)
+    native_dist_root().join(native_profile_dir()).join(name)
 }
 
 /// The dist directory `xtask deps build` filled for this target: the one
@@ -423,7 +423,7 @@ fn native_dist_root() -> PathBuf {
     }
     if let Ok(target) = env::var("TARGET") {
         let built = dist.join(target);
-        if built.join(native_profile()).is_dir() {
+        if built.join(native_profile_dir()).is_dir() {
             return built;
         }
     }
@@ -432,6 +432,24 @@ fn native_dist_root() -> PathBuf {
 
 fn native_profile() -> String {
     env::var("ERIKA_NATIVE_PROFILE").unwrap_or_else(|_| "lgpl".to_string())
+}
+
+/// Rust links the MSVC C runtime statically (`-C target-feature=+crt-static`),
+/// so the native libraries must too: `xtask deps build --crt static`.
+fn static_crt() -> bool {
+    env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+        && env::var("CARGO_CFG_TARGET_FEATURE")
+            .is_ok_and(|features| features.split(',').any(|feature| feature == "crt-static"))
+}
+
+/// The dist directory of the profile, which a static C runtime build keeps
+/// apart.
+fn native_profile_dir() -> String {
+    if static_crt() {
+        format!("{}-crt-static", native_profile())
+    } else {
+        native_profile()
+    }
 }
 
 fn inferred_native_target() -> Option<String> {
