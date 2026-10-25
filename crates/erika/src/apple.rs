@@ -774,28 +774,50 @@ pub mod coreaudio {
         // the gain the previous callback ended on needs no synchronization.
         let mut last_applied_volume = f32::from_bits(volume.load(Ordering::Relaxed));
         audio_unit.set_render_callback(move |mut args: Args| {
-            let read_result = buffer
-                .lock()
-                .map_err(|_| ())
-                .and_then(|mut buffer| buffer.read_interleaved(args.data.buffer).map_err(|_| ()))?;
-            // Ramp from the previous callback's gain so an atomic volume step
-            // never lands as an audible discontinuity (zipper noise). Only the
-            // frames the ring actually supplied advance the ramp.
-            let target = f32::from_bits(volume.load(Ordering::Relaxed));
-            last_applied_volume = apply_volume_ramp(
+            let flags = render_output_buffer(
+                &buffer,
                 args.data.buffer,
                 channels,
-                last_applied_volume,
-                target,
-                read_result.frames,
-            );
-            if read_result.underflow_frames > 0 {
-                args.flags
-                    .insert(render_callback::ActionFlags::OUTPUT_IS_SILENCE);
-            }
+                f32::from_bits(volume.load(Ordering::Relaxed)),
+                &mut last_applied_volume,
+            )?;
+            args.flags
+                .remove(render_callback::ActionFlags::OUTPUT_IS_SILENCE);
+            args.flags.insert(flags);
             Ok(())
         })?;
         Ok(())
+    }
+
+    fn render_output_buffer(
+        buffer: &Mutex<AudioRingBuffer>,
+        output: &mut [f32],
+        channels: usize,
+        target_volume: f32,
+        last_applied_volume: &mut f32,
+    ) -> std::result::Result<render_callback::ActionFlags, ()> {
+        let read_result = buffer
+            .lock()
+            .map_err(|_| ())?
+            .read_interleaved(output)
+            .map_err(|_| ())?;
+        // Only frames supplied by the ring advance the volume ramp.
+        *last_applied_volume = apply_volume_ramp(
+            output,
+            channels,
+            *last_applied_volume,
+            target_volume,
+            read_result.frames,
+        );
+        // CoreAudio's silence hint describes the entire buffer. A partial
+        // underflow still contains valid PCM followed by zero padding; marking
+        // it silent lets the mixer discard samples already consumed by the
+        // media clock, turning a short underrun into a larger audible gap.
+        Ok(if read_result.frames == 0 {
+            render_callback::ActionFlags::OUTPUT_IS_SILENCE
+        } else {
+            render_callback::ActionFlags::empty()
+        })
     }
 
     fn configure_buffer(buffer: &Arc<Mutex<AudioRingBuffer>>, format: PcmFormat) -> Result<()> {
@@ -817,6 +839,42 @@ pub mod coreaudio {
     mod tests {
         use super::*;
         use crate::audio::apply_volume;
+
+        #[test]
+        fn callback_preserves_partial_audio_and_recovers_after_underflow() {
+            let format = PcmFormat::f32_interleaved(48_000, 2);
+            let mut ring = AudioRingBuffer::new(AudioRingBufferConfig::default());
+            ring.configure(format).unwrap();
+            let frame = PcmAudioFrame {
+                format,
+                pts: Some(std::time::Duration::ZERO),
+                frames: 2,
+                samples: vec![0.8, -0.8, 0.4, -0.4],
+            };
+            ring.push_frame(frame.clone()).unwrap();
+            let ring = Mutex::new(ring);
+            let mut output = [9.0; 8];
+            let mut gain = 1.0;
+            let flags = render_output_buffer(&ring, &mut output, 2, 1.0, &mut gain).unwrap();
+            assert_eq!(output, [0.8, -0.8, 0.4, -0.4, 0.0, 0.0, 0.0, 0.0]);
+            assert!(
+                !flags.contains(render_callback::ActionFlags::OUTPUT_IS_SILENCE),
+                "CoreAudio must process the valid prefix of a partially filled buffer"
+            );
+            assert_eq!(ring.lock().unwrap().stats().read_frames, 2);
+            assert_eq!(ring.lock().unwrap().stats().underflow_frames, 2);
+
+            let flags = render_output_buffer(&ring, &mut output, 2, 0.5, &mut gain).unwrap();
+            assert_eq!(output, [0.0; 8]);
+            assert!(flags.contains(render_callback::ActionFlags::OUTPUT_IS_SILENCE));
+            assert_eq!(gain, 1.0, "silence must not consume the gain ramp");
+
+            ring.lock().unwrap().push_frame(frame).unwrap();
+            let flags = render_output_buffer(&ring, &mut output[..4], 2, 0.5, &mut gain).unwrap();
+            assert!(!flags.contains(render_callback::ActionFlags::OUTPUT_IS_SILENCE));
+            assert_eq!(output[..4], [0.6, -0.6, 0.2, -0.2]);
+            assert_eq!(gain, 0.5);
+        }
 
         #[test]
         fn volume_is_clamped_and_applied_to_pcm_samples() {
