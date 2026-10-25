@@ -39,7 +39,8 @@ use objc2_metal::{
 };
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLDevice, MTLDrawable, MTLRenderPassDescriptor, MTLResource, MTLTexture,
+    MTLCommandQueue, MTLDevice, MTLDrawable, MTLGPUFamily, MTLRenderPassDescriptor, MTLResource,
+    MTLTexture,
 };
 use objc2_metal::{
     MTLLibrary, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPipelineDescriptor,
@@ -52,6 +53,7 @@ use objc2_quartz_core::{kCAContentsFormatRGBA8Uint, kCAContentsFormatRGBA16Float
 
 use crate::core::{ColorPrimaries, RendererResourceStats, SurfaceMetrics, TransferFunction};
 use crate::danmaku::{DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuRenderPlan};
+use crate::overlay::OverlayViewport;
 use crate::renderer::gamut::{
     GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
 };
@@ -166,6 +168,9 @@ struct GamutLutCache {
 
 pub struct MetalRendererImpl {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
+    /// Widest and tallest 2D texture `device` accepts; see
+    /// [`max_texture_dimension_2d`].
+    max_texture_dimension: usize,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     requested_output_mode: MetalOutputMode,
     output_mode: MetalOutputMode,
@@ -231,6 +236,18 @@ fn pq_code_for_lut(nits: f32) -> f32 {
     ((c1 + c2 * p) / (1.0 + c3 * p).max(0.000_001)).powf(m2)
 }
 
+/// Metal has no query for the 2D texture size limit; the feature set tables
+/// give 16384 for every Mac family and for Apple3 onwards, and 8192 for the
+/// Apple1 and Apple2 GPUs before them. A descriptor above it aborts the process
+/// in `-[MTLTextureDescriptorInternal validateWithDevice:]`.
+fn max_texture_dimension_2d(device: &ProtocolObject<dyn MTLDevice>) -> usize {
+    if device.supportsFamily(MTLGPUFamily::Mac2) || device.supportsFamily(MTLGPUFamily::Apple3) {
+        16_384
+    } else {
+        8_192
+    }
+}
+
 fn code_to_primaries(code: u32) -> ColorPrimaries {
     match code {
         1 => ColorPrimaries::Bt2020,
@@ -249,6 +266,7 @@ impl MetalRendererImpl {
             .ok_or_else(|| PlayerError::Renderer("newCommandQueue returned nil".to_string()))?;
         let initial_output_mode = config.output_mode.resolve_for_source(false);
         Ok(Self {
+            max_texture_dimension: max_texture_dimension_2d(&device),
             device,
             queue,
             requested_output_mode: config.output_mode,
@@ -403,10 +421,11 @@ impl MetalRendererImpl {
             .saturating_mul(u64::from(self.stats.drawable_height))
             .saturating_mul(drawable_bytes_per_pixel)
             .saturating_mul(u64::from(drawable_count));
-        let overlay_atlas_bytes = self
-            .overlay_alpha_atlas_cache
-            .as_ref()
-            .map_or(0, |cache| cache.texture.allocatedSize() as u64);
+        let overlay_atlas_bytes = self.overlay_alpha_atlas_cache.as_ref().map_or(0, |cache| {
+            cache.pages.iter().fold(0u64, |total, page| {
+                total.saturating_add(page.texture.allocatedSize() as u64)
+            })
+        });
         let danmaku_atlas_bytes = self.danmaku_alpha_atlas_cache.as_ref().map_or(0, |cache| {
             (cache.fill_texture.allocatedSize() as u64)
                 .saturating_add(cache.outline_texture.allocatedSize() as u64)
@@ -1580,28 +1599,31 @@ impl MetalRendererImpl {
             }
         }
         if !overlay.frame.subtitle_alpha_planes.is_empty() {
-            let atlas = self.prepare_overlay_alpha_atlas(
+            let Some(atlas) = self.prepare_overlay_alpha_atlas(
                 &overlay.frame.subtitle_alpha_planes,
+                overlay.frame.viewport,
                 overlay.frame.subtitle_changed,
-            )?;
-            let texture = atlas.texture.clone();
+            )?
+            else {
+                return Ok(());
+            };
+            let pages = atlas.pages.clone();
             let placements = atlas.placements.clone();
-            let atlas_width = atlas.width;
-            let atlas_height = atlas.height;
             for placement in &placements {
                 let bitmap = &overlay.frame.subtitle_alpha_planes[placement.bitmap_index];
+                let page = &pages[placement.page];
                 let uniforms = OverlayUniforms::from_alpha_atlas_bitmap(
                     bitmap,
                     placement,
-                    atlas_width,
-                    atlas_height,
+                    page.width,
+                    page.height,
                     layout,
                     target,
                     self.output_mode.is_edr(),
                 );
                 unsafe {
                     encoder.setRenderPipelineState(&pipeline);
-                    encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
+                    encoder.setFragmentTexture_atIndex(Some(&*page.texture), 0);
                     encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
                     encoder.setVertexBytes_length_atIndex(
                         overlay_uniform_pointer(&uniforms),
@@ -1903,36 +1925,52 @@ impl MetalRendererImpl {
         Ok(buffer)
     }
 
+    /// Returns `None` when no bitmap has a visible pixel.
     fn prepare_overlay_alpha_atlas(
         &mut self,
         bitmaps: &[SubtitleAlphaBitmap],
+        viewport: OverlayViewport,
         changed: bool,
-    ) -> Result<&OverlayAlphaAtlasCache> {
+    ) -> Result<Option<&OverlayAlphaAtlasCache>> {
         if !changed {
             if let Some(cache) = &self.overlay_alpha_atlas_cache {
-                if cache.can_reuse_for(bitmaps) {
+                if cache.can_reuse_for(bitmaps, viewport) {
                     self.stats.overlay_alpha_atlas_reuses += 1;
-                    return Ok(self
-                        .overlay_alpha_atlas_cache
-                        .as_ref()
-                        .expect("overlay atlas cache exists"));
+                    return Ok(self.overlay_alpha_atlas_cache.as_ref());
                 }
             }
         }
 
-        let Some(plan) = OverlayAlphaAtlasPlan::pack(bitmaps)? else {
-            self.overlay_alpha_atlas_cache = None;
-            return Err(PlayerError::Renderer(
-                "cannot prepare empty overlay alpha atlas".to_string(),
-            ));
+        self.overlay_alpha_atlas_cache = None;
+        let Some(plan) =
+            OverlayAlphaAtlasPlan::pack(bitmaps, viewport, self.max_texture_dimension)?
+        else {
+            return Ok(None);
         };
-        let texture = self.create_overlay_alpha_atlas_texture(&plan)?;
-        self.overlay_alpha_atlas_cache = Some(OverlayAlphaAtlasCache::new(texture, plan, bitmaps));
+        let pages = plan
+            .pages
+            .iter()
+            .map(|page| {
+                Ok(OverlayAlphaAtlasTexture {
+                    texture: self.create_overlay_alpha_texture(
+                        page.width,
+                        page.height,
+                        page.width,
+                        &page.pixels,
+                    )?,
+                    width: page.width,
+                    height: page.height,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.overlay_alpha_atlas_cache = Some(OverlayAlphaAtlasCache::new(
+            pages,
+            plan.placements,
+            bitmaps,
+            viewport,
+        ));
         self.stats.overlay_alpha_atlas_uploads += 1;
-        Ok(self
-            .overlay_alpha_atlas_cache
-            .as_ref()
-            .expect("overlay atlas cache exists"))
+        Ok(self.overlay_alpha_atlas_cache.as_ref())
     }
 
     fn create_overlay_texture(
@@ -1975,13 +2013,6 @@ impl MetalRendererImpl {
             );
         }
         Ok(texture)
-    }
-
-    fn create_overlay_alpha_atlas_texture(
-        &self,
-        atlas: &OverlayAlphaAtlasPlan,
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        self.create_overlay_alpha_texture(atlas.width, atlas.height, atlas.stride, &atlas.pixels)
     }
 
     fn create_overlay_alpha_texture(
@@ -2702,16 +2733,16 @@ impl OverlayUniforms {
         let atlas_height = atlas_height.max(1) as f32;
         Self {
             rect: layout.map_source_rect(
-                bitmap.placement.x as f32,
-                bitmap.placement.y as f32,
-                bitmap.placement.width as f32,
-                bitmap.placement.height as f32,
+                bitmap.placement.x as f32 + placement.source_x as f32,
+                bitmap.placement.y as f32 + placement.source_y as f32,
+                placement.width as f32,
+                placement.height as f32,
             ),
             tex_rect: [
                 placement.x as f32 / atlas_width,
                 placement.y as f32 / atlas_height,
-                bitmap.placement.width as f32 / atlas_width,
-                bitmap.placement.height as f32 / atlas_height,
+                placement.width as f32 / atlas_width,
+                placement.height as f32 / atlas_height,
             ],
             viewport: layout.overlay_viewport(),
             overlay_mode: 1,
@@ -2760,27 +2791,49 @@ fn draw_danmaku_instance_batch(
     Ok(())
 }
 
+/// One piece of a subtitle bitmap in the atlas: usually its whole visible
+/// part, or a tile of it when that part is larger than a texture may be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OverlayAlphaAtlasPlacement {
     bitmap_index: usize,
+    page: usize,
+    /// Top-left of the piece in its page.
     x: usize,
     y: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OverlayAlphaAtlasPlan {
+    /// Top-left of the piece in its bitmap.
+    source_x: usize,
+    source_y: usize,
     width: usize,
     height: usize,
-    stride: usize,
+}
+
+/// An R8 atlas image with a stride of `width`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayAlphaAtlasPage {
+    width: usize,
+    height: usize,
     pixels: Vec<u8>,
+}
+
+/// Subtitle bitmaps packed into as many pages as the texture size limit
+/// needs. Placements keep the bitmaps' draw order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayAlphaAtlasPlan {
+    pages: Vec<OverlayAlphaAtlasPage>,
     placements: Vec<OverlayAlphaAtlasPlacement>,
 }
 
-struct OverlayAlphaAtlasCache {
+#[derive(Clone)]
+struct OverlayAlphaAtlasTexture {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
     width: usize,
     height: usize,
+}
+
+struct OverlayAlphaAtlasCache {
+    pages: Vec<OverlayAlphaAtlasTexture>,
     placements: Vec<OverlayAlphaAtlasPlacement>,
+    viewport: OverlayViewport,
     signature: OverlayAlphaAtlasSignature,
 }
 
@@ -2857,21 +2910,22 @@ fn update_danmaku_alpha_texture(
 
 impl OverlayAlphaAtlasCache {
     fn new(
-        texture: Retained<ProtocolObject<dyn MTLTexture>>,
-        plan: OverlayAlphaAtlasPlan,
+        pages: Vec<OverlayAlphaAtlasTexture>,
+        placements: Vec<OverlayAlphaAtlasPlacement>,
         bitmaps: &[SubtitleAlphaBitmap],
+        viewport: OverlayViewport,
     ) -> Self {
         Self {
-            texture,
-            width: plan.width,
-            height: plan.height,
-            placements: plan.placements,
+            pages,
+            placements,
+            viewport,
             signature: OverlayAlphaAtlasSignature::from_bitmaps(bitmaps),
         }
     }
 
-    fn can_reuse_for(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
-        self.signature == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)
+    fn can_reuse_for(&self, bitmaps: &[SubtitleAlphaBitmap], viewport: OverlayViewport) -> bool {
+        self.viewport == viewport
+            && self.signature == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)
     }
 }
 
@@ -2939,36 +2993,28 @@ fn hash_alpha_bitmap(bitmap: &SubtitleAlphaBitmap) -> u64 {
     hash
 }
 
+/// Transparent texels between packed pieces, so linear filtering at the edge
+/// of one piece never reads its neighbour when the overlay is scaled.
+const OVERLAY_ALPHA_ATLAS_GUTTER: usize = 1;
+
 impl OverlayAlphaAtlasPlan {
-    fn pack(bitmaps: &[SubtitleAlphaBitmap]) -> Result<Option<Self>> {
-        let total_width = bitmaps.iter().try_fold(0usize, |sum, bitmap| {
-            let width = bitmap.placement.width as usize;
-            sum.checked_add(width).ok_or_else(|| {
-                PlayerError::Renderer("overlay alpha atlas width overflow".to_string())
-            })
-        })?;
-        let max_height = bitmaps
-            .iter()
-            .map(|bitmap| bitmap.placement.height as usize)
-            .max()
-            .unwrap_or(0);
-        if total_width == 0 || max_height == 0 {
-            return Ok(None);
-        }
-
-        let width = total_width;
-        let height = max_height;
-        let len = width.checked_mul(height).ok_or_else(|| {
-            PlayerError::Renderer("overlay alpha atlas size overflow".to_string())
-        })?;
-        let mut pixels = vec![0u8; len];
+    /// Packs `bitmaps` in rows ("shelves") into pages no wider or taller than
+    /// `max_dimension`. Only the part of a bitmap inside `viewport` is packed,
+    /// since nothing outside it is shown, and a visible part still larger
+    /// than `max_dimension` is cut into tiles.
+    ///
+    /// Laying every bitmap side by side in one row made the atlas as wide as
+    /// all of them together: two long ASS tracks with fill and outline at a
+    /// Retina viewport reached 21640 texels and Metal aborted the process.
+    fn pack(
+        bitmaps: &[SubtitleAlphaBitmap],
+        viewport: OverlayViewport,
+        max_dimension: usize,
+    ) -> Result<Option<Self>> {
+        let max_dimension = max_dimension.max(1);
         let mut placements = Vec::with_capacity(bitmaps.len());
-        let mut cursor_x = 0usize;
-
         for (bitmap_index, bitmap) in bitmaps.iter().enumerate() {
-            let bitmap_width = bitmap.placement.width as usize;
-            let bitmap_height = bitmap.placement.height as usize;
-            if bitmap_width == 0 || bitmap_height == 0 {
+            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
                 continue;
             }
             if !bitmap.is_valid() {
@@ -2981,31 +3027,97 @@ impl OverlayAlphaAtlasPlan {
                     bitmap.stride
                 )));
             }
-
-            for row in 0..bitmap_height {
-                let src_start = row * bitmap.stride;
-                let src_end = src_start + bitmap_width;
-                let dst_start = row * width + cursor_x;
-                let dst_end = dst_start + bitmap_width;
-                pixels[dst_start..dst_end].copy_from_slice(&bitmap.alpha[src_start..src_end]);
+            let Some((left, top, right, bottom)) = visible_bitmap_rect(bitmap, viewport) else {
+                continue;
+            };
+            for source_y in (top..bottom).step_by(max_dimension) {
+                for source_x in (left..right).step_by(max_dimension) {
+                    placements.push(OverlayAlphaAtlasPlacement {
+                        bitmap_index,
+                        page: 0,
+                        x: 0,
+                        y: 0,
+                        source_x,
+                        source_y,
+                        width: (right - source_x).min(max_dimension),
+                        height: (bottom - source_y).min(max_dimension),
+                    });
+                }
             }
-
-            placements.push(OverlayAlphaAtlasPlacement {
-                bitmap_index,
-                x: cursor_x,
-                y: 0,
-            });
-            cursor_x += bitmap_width;
+        }
+        if placements.is_empty() {
+            return Ok(None);
         }
 
-        Ok(Some(Self {
-            width,
-            height,
-            stride: width,
-            pixels,
-            placements,
-        }))
+        // Every piece fits an empty shelf and an empty page, so each wrap
+        // below leaves something behind and the loop always places the piece.
+        let mut page_sizes = vec![(0usize, 0usize)];
+        let mut shelf_x = 0usize;
+        let mut shelf_y = 0usize;
+        let mut shelf_height = 0usize;
+        for placement in &mut placements {
+            if shelf_x + placement.width > max_dimension {
+                shelf_y += shelf_height + OVERLAY_ALPHA_ATLAS_GUTTER;
+                shelf_x = 0;
+                shelf_height = 0;
+            }
+            if shelf_y + placement.height > max_dimension {
+                page_sizes.push((0, 0));
+                shelf_x = 0;
+                shelf_y = 0;
+                shelf_height = 0;
+            }
+            placement.page = page_sizes.len() - 1;
+            placement.x = shelf_x;
+            placement.y = shelf_y;
+            shelf_x += placement.width + OVERLAY_ALPHA_ATLAS_GUTTER;
+            shelf_height = shelf_height.max(placement.height);
+            let page = page_sizes.last_mut().expect("atlas has a page");
+            page.0 = page.0.max(placement.x + placement.width);
+            page.1 = page.1.max(placement.y + placement.height);
+        }
+
+        let mut pages = page_sizes
+            .into_iter()
+            .map(|(width, height)| OverlayAlphaAtlasPage {
+                width,
+                height,
+                pixels: vec![0u8; width * height],
+            })
+            .collect::<Vec<_>>();
+        for placement in &placements {
+            let bitmap = &bitmaps[placement.bitmap_index];
+            let page = &mut pages[placement.page];
+            for row in 0..placement.height {
+                let src_start = (placement.source_y + row) * bitmap.stride + placement.source_x;
+                let dst_start = (placement.y + row) * page.width + placement.x;
+                page.pixels[dst_start..dst_start + placement.width]
+                    .copy_from_slice(&bitmap.alpha[src_start..src_start + placement.width]);
+            }
+        }
+
+        Ok(Some(Self { pages, placements }))
     }
+}
+
+/// The part of `bitmap` inside `viewport` as `(left, top, right, bottom)` in
+/// the bitmap's own coordinates, or `None` when none of it is.
+fn visible_bitmap_rect(
+    bitmap: &SubtitleAlphaBitmap,
+    viewport: OverlayViewport,
+) -> Option<(usize, usize, usize, usize)> {
+    let x = i64::from(bitmap.placement.x);
+    let y = i64::from(bitmap.placement.y);
+    let left = (-x).max(0);
+    let top = (-y).max(0);
+    let right = (i64::from(viewport.width) - x).min(i64::from(bitmap.placement.width));
+    let bottom = (i64::from(viewport.height) - y).min(i64::from(bitmap.placement.height));
+    (left < right && top < bottom).then_some((
+        left as usize,
+        top as usize,
+        right as usize,
+        bottom as usize,
+    ))
 }
 
 const VIDEO_SHADER_SOURCE: &str = r#"
@@ -4354,8 +4466,13 @@ mod tests {
         );
         let placement = super::OverlayAlphaAtlasPlacement {
             bitmap_index: 0,
+            page: 0,
             x: 10,
             y: 5,
+            source_x: 0,
+            source_y: 0,
+            width: 56,
+            height: 78,
         };
         let layout = super::VideoPresentationLayout::aspect_fit(640, 360, 640, 360);
 
@@ -4378,6 +4495,61 @@ mod tests {
         assert!((uniforms.color[3] - (128.0 / 255.0)).abs() < 0.0001);
     }
 
+    fn alpha_bitmap(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        seed: u8,
+    ) -> crate::subtitle::SubtitleAlphaBitmap {
+        let alpha = (0..width as usize * height as usize)
+            .map(|index| seed.wrapping_add((index % 251) as u8))
+            .collect();
+        crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(x, y, width, height),
+            width as usize,
+            0xffffff00,
+            alpha,
+        )
+    }
+
+    /// Every page within `max_dimension`, every piece inside its page and
+    /// apart from the others, and every piece holding its bitmap's texels.
+    fn assert_atlas_is_sound(
+        atlas: &super::OverlayAlphaAtlasPlan,
+        bitmaps: &[crate::subtitle::SubtitleAlphaBitmap],
+        max_dimension: usize,
+    ) {
+        for page in &atlas.pages {
+            assert!(page.width <= max_dimension && page.height <= max_dimension);
+            assert_eq!(page.pixels.len(), page.width * page.height);
+        }
+        for (index, piece) in atlas.placements.iter().enumerate() {
+            let page = &atlas.pages[piece.page];
+            assert!(piece.x + piece.width <= page.width);
+            assert!(piece.y + piece.height <= page.height);
+            for other in &atlas.placements[index + 1..] {
+                assert!(
+                    other.page != piece.page
+                        || other.x >= piece.x + piece.width
+                        || piece.x >= other.x + other.width
+                        || other.y >= piece.y + piece.height
+                        || piece.y >= other.y + other.height,
+                    "{piece:?} overlaps {other:?}"
+                );
+            }
+            let bitmap = &bitmaps[piece.bitmap_index];
+            for row in 0..piece.height {
+                let src = (piece.source_y + row) * bitmap.stride + piece.source_x;
+                let dst = (piece.y + row) * page.width + piece.x;
+                assert_eq!(
+                    page.pixels[dst..dst + piece.width],
+                    bitmap.alpha[src..src + piece.width]
+                );
+            }
+        }
+    }
+
     #[test]
     fn overlay_alpha_atlas_packs_masks_in_one_r8_image() {
         let first = crate::subtitle::SubtitleAlphaBitmap::new(
@@ -4393,19 +4565,182 @@ mod tests {
             vec![5, 6, 7],
         );
 
-        let atlas = super::OverlayAlphaAtlasPlan::pack(&[first, second])
-            .unwrap()
-            .unwrap();
+        let atlas = super::OverlayAlphaAtlasPlan::pack(
+            &[first, second],
+            crate::overlay::OverlayViewport::new(64, 64),
+            16_384,
+        )
+        .unwrap()
+        .unwrap();
 
-        assert_eq!(atlas.width, 3);
-        assert_eq!(atlas.height, 3);
-        assert_eq!(atlas.stride, 3);
-        assert_eq!(atlas.pixels, vec![1, 2, 5, 3, 4, 6, 0, 0, 7]);
+        // One page, the bitmaps side by side with a transparent gutter.
+        assert_eq!(atlas.pages.len(), 1);
+        assert_eq!(atlas.pages[0].width, 4);
+        assert_eq!(atlas.pages[0].height, 3);
+        assert_eq!(
+            atlas.pages[0].pixels,
+            vec![1, 2, 0, 5, 3, 4, 0, 6, 0, 0, 0, 7]
+        );
         assert_eq!(atlas.placements.len(), 2);
         assert_eq!(atlas.placements[0].bitmap_index, 0);
         assert_eq!(atlas.placements[0].x, 0);
         assert_eq!(atlas.placements[1].bitmap_index, 1);
-        assert_eq!(atlas.placements[1].x, 2);
+        assert_eq!(atlas.placements[1].x, 3);
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_wraps_rows_at_the_texture_limit() {
+        // The crash at 15:35 of a two-track ASS video on a Retina window:
+        // two subtitle tracks, a Chinese and a Japanese line each, a fill and
+        // an outline bitmap per line. Side by side they needed a 21640-texel
+        // wide texture and Metal aborted on its 16384 limit.
+        let viewport = crate::overlay::OverlayViewport::new(3456, 2234);
+        let bitmaps = (0..8u8)
+            .map(|index| alpha_bitmap(375, 1800 - i32::from(index / 2) * 140, 2705, 130, index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bitmaps
+                .iter()
+                .map(|bitmap| bitmap.placement.width)
+                .sum::<u32>(),
+            21_640
+        );
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 16_384)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 16_384);
+        assert_eq!(atlas.pages.len(), 1);
+        assert_eq!(atlas.placements.len(), 8);
+        // Six fit the first shelf; the last two start a second one below it.
+        assert_eq!(atlas.pages[0].width, 6 * 2705 + 5);
+        assert_eq!(atlas.pages[0].height, 130 + 1 + 130);
+        assert_eq!((atlas.placements[6].x, atlas.placements[6].y), (0, 131));
+        // Draw order is kept.
+        assert!(
+            atlas
+                .placements
+                .iter()
+                .enumerate()
+                .all(|(index, piece)| piece.bitmap_index == index)
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_starts_a_page_when_shelves_fill_one() {
+        let viewport = crate::overlay::OverlayViewport::new(64, 64);
+        let bitmaps = (0..3u8)
+            .map(|index| alpha_bitmap(i32::from(index) * 6, 0, 5, 5, index * 50))
+            .collect::<Vec<_>>();
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 8)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 8);
+        assert_eq!(atlas.pages.len(), 3);
+        assert_eq!(
+            atlas
+                .placements
+                .iter()
+                .map(|piece| piece.page)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_packs_only_the_visible_part() {
+        let viewport = crate::overlay::OverlayViewport::new(4, 3);
+        let bitmaps = [
+            alpha_bitmap(-2, -1, 5, 5, 0),
+            alpha_bitmap(4, 0, 5, 5, 100),
+            alpha_bitmap(0, -9, 2, 2, 200),
+        ];
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 16_384)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 16_384);
+        assert_eq!(atlas.placements.len(), 1);
+        let piece = atlas.placements[0];
+        assert_eq!(piece.bitmap_index, 0);
+        assert_eq!((piece.source_x, piece.source_y), (2, 1));
+        assert_eq!((piece.width, piece.height), (3, 3));
+
+        let uniforms = super::OverlayUniforms::from_alpha_atlas_bitmap(
+            &bitmaps[0],
+            &piece,
+            atlas.pages[0].width,
+            atlas.pages[0].height,
+            super::VideoPresentationLayout::aspect_fit(4, 3, 4, 3),
+            crate::renderer::pipeline::TargetColorState::default(),
+            false,
+        );
+        assert_eq!(uniforms.rect, [0.0, 0.0, 3.0, 3.0]);
+        assert_eq!(uniforms.tex_rect, [0.0, 0.0, 1.0, 1.0]);
+
+        let hidden = [alpha_bitmap(10, 10, 2, 2, 0)];
+        assert!(
+            super::OverlayAlphaAtlasPlan::pack(&hidden, viewport, 16_384)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_tiles_a_bitmap_wider_than_the_texture_limit() {
+        let viewport = crate::overlay::OverlayViewport::new(10, 3);
+        let bitmaps = [alpha_bitmap(0, 0, 10, 3, 7)];
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 4)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 4);
+        assert_eq!(
+            atlas
+                .placements
+                .iter()
+                .map(|piece| (piece.source_x, piece.source_y, piece.width, piece.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 4, 3), (4, 0, 4, 3), (8, 0, 2, 3)]
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_textures_stay_within_the_device_limit() {
+        use objc2_metal::MTLTexture;
+
+        // Needs a real Metal device; skip rather than fail where there is none.
+        let Ok(mut renderer) =
+            super::MetalRendererImpl::new(crate::renderer::metal::MetalRendererConfig::default())
+        else {
+            eprintln!("skipping: no Metal device available");
+            return;
+        };
+        let limit = renderer.max_texture_dimension;
+        let viewport = crate::overlay::OverlayViewport::new(3456, 2234);
+        // Wider together than the limit, and wider than a page row alone.
+        let bitmaps = (0..12u8)
+            .map(|index| alpha_bitmap(0, i32::from(index) * 150, 2705, 130, index))
+            .collect::<Vec<_>>();
+
+        let cache = renderer
+            .prepare_overlay_alpha_atlas(&bitmaps, viewport, true)
+            .expect("overlay atlas")
+            .expect("visible bitmaps");
+
+        assert_eq!(cache.placements.len(), bitmaps.len());
+        for page in &cache.pages {
+            assert!(page.texture.width() <= limit && page.texture.height() <= limit);
+            assert_eq!(
+                (page.texture.width(), page.texture.height()),
+                (page.width, page.height)
+            );
+        }
     }
 
     #[test]
