@@ -36,7 +36,11 @@ pub struct OpeningFrame {
 
 /// The frames of the first `seconds` of the video at `uri`, `per_second`
 /// of them each second.
-pub fn opening_profile(uri: &str, seconds: f64, per_second: f64) -> Result<Vec<OpeningFrame>, String> {
+pub fn opening_profile(
+    uri: &str,
+    seconds: f64,
+    per_second: f64,
+) -> Result<Vec<OpeningFrame>, String> {
     let seconds = seconds.clamp(0.5, 60.0);
     let interval = 1.0 / per_second.clamp(0.5, 30.0);
     let source = source_from_uri(uri).map_err(|error| error.to_string())?;
@@ -59,8 +63,12 @@ pub fn opening_profile(uri: &str, seconds: f64, per_second: f64) -> Result<Vec<O
     demuxer
         .set_stream_selection(StreamSelection::only([stream]))
         .map_err(|error| error.to_string())?;
-    let mut decoder = demuxer.open_decoder(stream).map_err(|error| error.to_string())?;
-    demuxer.seek(Duration::ZERO).map_err(|error| error.to_string())?;
+    let mut decoder = demuxer
+        .open_decoder(stream)
+        .map_err(|error| error.to_string())?;
+    demuxer
+        .seek(Duration::ZERO)
+        .map_err(|error| error.to_string())?;
     decoder.flush();
 
     let mut measure = Measure::new();
@@ -98,7 +106,9 @@ pub fn opening_profile(uri: &str, seconds: f64, per_second: f64) -> Result<Vec<O
             return Ok(frames);
         }
         match demuxer.read_packet().map_err(|error| error.to_string())? {
-            Some(packet) => decoder.send_packet(&packet).map_err(|error| error.to_string())?,
+            Some(packet) => decoder
+                .send_packet(&packet)
+                .map_err(|error| error.to_string())?,
             None => decoder.send_eof().map_err(|error| error.to_string())?,
         }
     }
@@ -137,7 +147,12 @@ impl Measure {
                 return Err("sws_getCachedContext returned null".into());
             }
             let source = frame.as_ptr();
-            let destination = [self.pixels.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()];
+            let destination = [
+                self.pixels.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ];
             let strides = [WIDTH * 3, 0, 0, 0];
             let rows = sys::sws_scale(
                 self.scaler,
@@ -149,7 +164,9 @@ impl Measure {
                 strides.as_ptr(),
             );
             if rows != HEIGHT {
-                return Err(format!("sws_scale converted {rows} rows, expected {HEIGHT}"));
+                return Err(format!(
+                    "sws_scale converted {rows} rows, expected {HEIGHT}"
+                ));
             }
         }
         Ok(measure(&self.pixels, time))
@@ -226,7 +243,14 @@ mod real {
         for frame in super::opening_profile(&uri, 8.0, 2.0).unwrap() {
             println!(
                 "{:5.2}s luma {:.2} rgb {:.2} {:.2} {:.2} dark {:.2} white {:.2} red {:.2}",
-                frame.time, frame.luma, frame.red, frame.green, frame.blue, frame.dark, frame.white, frame.red_share
+                frame.time,
+                frame.luma,
+                frame.red,
+                frame.green,
+                frame.blue,
+                frame.dark,
+                frame.white,
+                frame.red_share
             );
         }
     }

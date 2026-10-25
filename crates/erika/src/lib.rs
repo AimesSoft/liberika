@@ -7,7 +7,6 @@ pub mod audio;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod core;
 pub mod danmaku;
-pub mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod debug_hud;
 #[cfg(not(target_arch = "wasm32"))]
@@ -16,8 +15,6 @@ pub mod diagnostics;
 pub mod export;
 #[cfg(not(target_arch = "wasm32"))]
 mod export_color;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod opening;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffmpeg;
 pub mod font;
@@ -28,9 +25,12 @@ pub(crate) mod luma_stats;
 #[cfg(target_env = "ohos")]
 pub mod ohos;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod opening;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod overlay;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod playback;
+pub mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod presenter;
 #[cfg(not(target_arch = "wasm32"))]

@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "erika_plugin"
-version = "0.1.8"
+version = "0.3.0"
 dependencies = [
  "regex",
  "serde",

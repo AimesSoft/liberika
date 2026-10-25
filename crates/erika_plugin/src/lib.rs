@@ -175,11 +175,18 @@ impl Comment {
             _ => CommentKind::Scroll,
         };
         Some(Comment {
-            time: field(&["time", "t"]).and_then(number_value).unwrap_or(0.0).max(0.0),
+            time: field(&["time", "t"])
+                .and_then(number_value)
+                .unwrap_or(0.0)
+                .max(0.0),
             content,
             kind,
-            color: field(&["color", "r"]).and_then(color_value).unwrap_or([255; 3]),
-            is_me: field(&["isMe", "is_me"]).and_then(Value::as_bool).unwrap_or(false),
+            color: field(&["color", "r"])
+                .and_then(color_value)
+                .unwrap_or([255; 3]),
+            is_me: field(&["isMe", "is_me"])
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
@@ -287,7 +294,10 @@ mod tests {
 
     #[test]
     fn calls_parse_as_the_prelude_queues_them() {
-        assert_eq!(Call::parse("playerSeek", &[json!("12.5")]), Some(Call::Seek(12.5)));
+        assert_eq!(
+            Call::parse("playerSeek", &[json!("12.5")]),
+            Some(Call::Seek(12.5))
+        );
         assert_eq!(Call::parse("playerSetRate", &[json!(0)]), None);
         assert_eq!(
             Call::parse("danmakuAddFilter", &[json!("id"), json!("剧透")]),
@@ -295,7 +305,9 @@ mod tests {
         );
         let replaced = Call::parse(
             "danmakuReplace",
-            &[json!({ "count": 1, "comments": [{ "time": 3, "content": "好", "type": "top", "color": "rgb(255,0,0)" }] })],
+            &[
+                json!({ "count": 1, "comments": [{ "time": 3, "content": "好", "type": "top", "color": "rgb(255,0,0)" }] }),
+            ],
         );
         let Some(Call::ReplaceDanmaku(comments)) = replaced else {
             panic!("a replacement");

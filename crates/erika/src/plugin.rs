@@ -77,5 +77,4 @@ mod tests {
         let hidden = filter(&BlockList::new(["我的"]), &timeline);
         assert_eq!(super::comments(&hidden), comments[..1].to_vec());
     }
-
 }

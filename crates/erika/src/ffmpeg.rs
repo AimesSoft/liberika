@@ -2527,7 +2527,10 @@ impl Frame {
     }
 
     pub fn try_clone_ref(&self) -> Result<Self> {
-        #[cfg_attr(not(any(target_os = "android", target_env = "ohos")), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(target_os = "android", target_env = "ohos")),
+            allow(unused_mut)
+        )]
         let mut frame = Frame::alloc(self.time_base)?;
         check(
             unsafe { sys::av_frame_ref(frame.ptr, self.ptr) },
