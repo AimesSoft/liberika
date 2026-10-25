@@ -455,8 +455,12 @@ const methods = {
     if (supersampling !== undefined) subtitleSampling = supersampling ? 2 : 1;
     subtitleDirty = true;
   },
-  async sendDanmaku({ text, seconds }) {
-    danmaku.send(text, Math.max(0, seconds + 0.2 - danmakuDelay));
+  async sendDanmaku({ text, color, seconds }) {
+    danmaku.send(
+      text,
+      Math.max(0, seconds + 0.2 - danmakuDelay),
+      Number.isInteger(color) ? color & 0xffffff : undefined,
+    );
   },
   async capture({ width, seconds }) {
     if (!loaded) throw new Error("No media to capture");

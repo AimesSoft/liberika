@@ -86,10 +86,15 @@ impl WebDanmaku {
         self.prepared = None;
         Ok(count)
     }
-    pub fn send(&mut self, text: &str, seconds: f64) -> Result<(), JsValue> {
+    /// Show the viewer's own comment, bordered, in `color` (`0xRRGGBB`;
+    /// white when omitted).
+    pub fn send(&mut self, text: &str, seconds: f64, color: Option<u32>) -> Result<(), JsValue> {
         if !seconds.is_finite() || text.trim().is_empty() {
             return Ok(());
         }
+        let color = color.map_or(DanmakuColor::WHITE, |rgb| {
+            DanmakuColor::rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+        });
         let mut items = self.timeline.items().to_vec();
         items.push(DanmakuItem {
             id: items.iter().map(|i| i.id).max().unwrap_or(0) + 1,
@@ -97,7 +102,7 @@ impl WebDanmaku {
             text: text.into(),
             mode: DanmakuMode::Scroll,
             font_size: 25.0,
-            color: DanmakuColor::WHITE,
+            color,
             opacity: 1.0,
             is_self: true,
         });
@@ -153,6 +158,7 @@ impl WebDanmaku {
             ("blockBottom", &mut self.config.block_bottom),
             ("blockScroll", &mut self.config.block_scroll),
             ("mergeDuplicates", &mut self.config.merge_duplicates),
+            ("randomColors", &mut self.config.random_colors),
         ] {
             if let Some(b) = v.get(key).and_then(|b| b.as_bool()) {
                 *slot = b;
@@ -170,6 +176,7 @@ impl WebDanmaku {
         paint.font_size = self.config.font_size;
         paint.opacity = self.config.opacity;
         paint.enabled = self.config.enabled;
+        paint.random_colors = self.config.random_colors;
         if paint != self.config {
             self.prepared = None;
             self.pending_size_at = None;
@@ -235,13 +242,22 @@ impl WebDanmaku {
         let mut groups = Vec::<f32>::new();
         let mut last = None;
         for item in &plan.items {
-            if last != Some(item.item_id) {
+            // A group shares one paint; the border of the viewer's own
+            // comment is white beside its colored text.
+            let style = (
+                item.item_id,
+                item.color_rgba,
+                item.outline_rgba,
+                item.shadow_rgba,
+                item.shadow_offset,
+            );
+            if last != Some(style) {
                 groups.extend_from_slice(&[(glyphs.len() / 8) as f32, 0.0]);
                 groups.extend_from_slice(&item.color_rgba);
                 groups.extend_from_slice(&item.outline_rgba);
                 groups.extend_from_slice(&item.shadow_rgba);
                 groups.extend_from_slice(&item.shadow_offset);
-                last = Some(item.item_id);
+                last = Some(style);
             }
             let count = groups.len() - 15;
             groups[count] += 1.0;

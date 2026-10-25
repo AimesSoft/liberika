@@ -808,6 +808,9 @@ ErikaStatus erika_presenter_set_danmaku_font(
 ErikaStatus erika_presenter_set_danmaku_block_words_json(
     ErikaPresenterHandle *handle,
     const char *json);
+ErikaStatus erika_presenter_set_danmaku_random_colors(
+    ErikaPresenterHandle *handle,
+    bool enabled);
 ErikaStatus erika_presenter_track_selection(
     ErikaPresenterHandle *handle,
     ErikaTrackSelection *out_selection);

@@ -2107,6 +2107,7 @@ fn danmaku_config_from_c(
         custom_font_family: base.custom_font_family.clone(),
         custom_font_file_path: base.custom_font_file_path.clone(),
         custom_font_face_index: base.custom_font_face_index,
+        random_colors: base.random_colors,
     }
 }
 
@@ -3438,6 +3439,31 @@ pub unsafe extern "C" fn erika_presenter_set_danmaku_block_words_json(
     target_env = "ohos"
 ))]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_danmaku_random_colors(
+    handle: *mut ErikaPresenterHandle,
+    enabled: bool,
+) -> ErikaStatus {
+    with_presenter_mut(handle, |handle| {
+        let mut config = handle
+            .presenter
+            .danmaku_config()
+            .cloned()
+            .unwrap_or_default();
+        config.random_colors = enabled;
+        handle.presenter.set_danmaku_config(config);
+        ErikaStatus::Ok
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn erika_presenter_track_selection(
     handle: *mut ErikaPresenterHandle,
     out_selection: *mut ErikaTrackSelection,
@@ -3972,6 +3998,22 @@ pub unsafe extern "C" fn erika_presenter_set_danmaku_block_words_json(
     if json.is_null() {
         return ErikaStatus::NullPointer;
     }
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_danmaku_random_colors(
+    _handle: *mut std::ffi::c_void,
+    _enabled: bool,
+) -> ErikaStatus {
     ErikaStatus::PlayerError
 }
 

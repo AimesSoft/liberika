@@ -3,6 +3,7 @@ members = [
   "crates/erika",
   "crates/erika_capi",
   "crates/erika_ffmpeg_sys",
+  "crates/erika_plugin",
   "examples/capi_smoke",
   "examples/ffmpeg_audio_decode",
   "examples/ffmpeg_decode",

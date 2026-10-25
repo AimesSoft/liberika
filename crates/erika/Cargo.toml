@@ -20,6 +20,7 @@ ab_glyph.workspace = true
 aho-corasick.workspace = true
 chardetng.workspace = true
 encoding_rs.workspace = true
+erika_plugin = { path = "../erika_plugin" }
 fontdb.workspace = true
 libc.workspace = true
 regex.workspace = true

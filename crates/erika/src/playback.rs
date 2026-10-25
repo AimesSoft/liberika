@@ -784,12 +784,14 @@ enum MediaCodecFallbackTarget {
     Software,
 }
 
+#[cfg(target_os = "android")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaCodecSeekRoute {
     Surface,
     ByteBuffer,
 }
 
+#[cfg(target_os = "android")]
 impl MediaCodecSeekRoute {
     fn decoder_config(self) -> DecoderConfig {
         match self {
@@ -1506,6 +1508,7 @@ impl PlaybackSession {
         }
     }
 
+    #[cfg(target_os = "android")]
     fn selected_video_codec(&self) -> Option<String> {
         let selected = self.info.selected_video_track?;
         self.info
@@ -6839,6 +6842,7 @@ fn mediacodec_fallback_target(
     }
 }
 
+#[cfg(target_os = "android")]
 fn mediacodec_seek_route(
     active_backend: Option<DecoderBackend>,
     uses_surface: bool,
@@ -7352,6 +7356,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "android")]
     #[test]
     fn mediacodec_seek_reopens_the_active_surface_or_bytebuffer_route() {
         assert_eq!(

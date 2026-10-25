@@ -55,6 +55,30 @@ const DEFAULT_DANMAKU_TRACK_ID: u64 = 1;
 const MAX_CUSTOM_DANMAKU_FONT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESIDENT_FALLBACK_FACES: usize = 8;
 pub const DANMAKU_DEBUG_BUCKETS: usize = 16;
+// An opaque square at the glyph atlas origin. Quads sampling its middle draw
+// flat lines through the glyph pipeline every renderer already implements,
+// so drawing the border of the viewer's own comments needs no new shaders.
+const SOLID_ATLAS_BLOCK: u32 = 4;
+// The border around the viewer's own comments, in logical pixels: a line
+// 1.5 wide, 2 outside the text box.
+const SELF_BORDER_WIDTH: f32 = 1.5;
+const SELF_BORDER_PADDING: f32 = 2.0;
+
+/// The colors [`DanmakuLayoutConfig::random_colors`] picks from: the colorful
+/// entries of the common sending palette, without black, white and grey.
+pub const DANMAKU_RANDOM_COLORS: [DanmakuColor; 11] = [
+    DanmakuColor::rgb_u8(0xfe, 0x05, 0x02),
+    DanmakuColor::rgb_u8(0xff, 0x71, 0x06),
+    DanmakuColor::rgb_u8(0xff, 0xaa, 0x01),
+    DanmakuColor::rgb_u8(0xff, 0xd3, 0x01),
+    DanmakuColor::rgb_u8(0xff, 0xff, 0x00),
+    DanmakuColor::rgb_u8(0xa0, 0xee, 0x02),
+    DanmakuColor::rgb_u8(0x04, 0xcd, 0x00),
+    DanmakuColor::rgb_u8(0x01, 0x98, 0x99),
+    DanmakuColor::rgb_u8(0x42, 0x66, 0xbe),
+    DanmakuColor::rgb_u8(0x89, 0xd5, 0xff),
+    DanmakuColor::rgb_u8(0xcc, 0x01, 0x73),
+];
 
 #[derive(Debug, Error)]
 pub enum DanmakuError {
@@ -149,6 +173,8 @@ pub struct DanmakuItem {
     pub font_size: f32,
     pub color: DanmakuColor,
     pub opacity: f32,
+    /// The viewer sent this comment; it is drawn inside a thin white border.
+    /// JSON timelines set it with `is_me` / `isMe`.
     pub is_self: bool,
 }
 
@@ -220,6 +246,10 @@ pub struct DanmakuLayoutConfig {
     pub block_scroll: bool,
     pub block_words: Vec<String>,
     pub enabled: bool,
+    /// Paint every comment in a color picked from [`DANMAKU_RANDOM_COLORS`]
+    /// by its time, mode and text instead of its own color. The same comment
+    /// keeps its color; changing this only repaints.
+    pub random_colors: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -278,6 +308,7 @@ impl Default for DanmakuLayoutConfig {
             block_scroll: false,
             block_words: Vec::new(),
             enabled: true,
+            random_colors: false,
         }
     }
 }
@@ -316,6 +347,7 @@ impl DanmakuLayoutConfig {
         config.shadow_offset = [0.0, 0.0];
         config.shadow_style = DanmakuShadowStyle::default();
         config.enabled = false;
+        config.random_colors = false;
         config
     }
 
@@ -791,7 +823,31 @@ pub struct PreparedDanmakuItem {
     pub scroll_speed: f32,
     pub duration: Duration,
     pub duplicate_count: u32,
+    pub is_self: bool,
     text_layout: Arc<PreparedTextLayout>,
+}
+
+impl PreparedDanmakuItem {
+    /// The comment's color from [`DANMAKU_RANDOM_COLORS`]: an FNV-1a hash of
+    /// its time, mode and text, so the same comment always gets the same one.
+    fn random_color(&self) -> DanmakuColor {
+        let millis = self.time.as_millis().min(u128::from(u64::MAX)) as u64;
+        let mode = mode_to_dfm_type_code(self.mode) as u8;
+        let mut hash = 0x811c_9dc5_u32;
+        for byte in millis
+            .to_le_bytes()
+            .into_iter()
+            .chain([mode])
+            .chain(self.text.bytes())
+        {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        DanmakuColor {
+            alpha: self.color.alpha,
+            ..DANMAKU_RANDOM_COLORS[hash as usize % DANMAKU_RANDOM_COLORS.len()]
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -836,6 +892,7 @@ impl DfmPreparedLayout {
         self.config.shadow_offset = config.shadow_offset;
         self.config.shadow_style = config.shadow_style;
         self.config.enabled = config.enabled;
+        self.config.random_colors = config.random_colors;
     }
 
     pub fn frame_layout(&self, media_time: Duration, generation: u64) -> DanmakuFrameLayout {
@@ -861,12 +918,17 @@ impl DfmPreparedLayout {
                 width: item.width,
                 height: item.height,
                 font_size: item.font_size,
-                color: item.color,
+                color: if self.config.random_colors {
+                    item.random_color()
+                } else {
+                    item.color
+                },
                 opacity: item.opacity * self.config.opacity,
                 outline_width: resolve_width_px(item.font_size, self.config.outline_width),
                 shadow_offset: scale_offset(self.config.shadow_offset, self.viewport.scale_factor),
                 shadow_alpha: shadow_style_alpha(self.config.shadow_style),
                 duplicate_count: item.duplicate_count,
+                is_self: item.is_self,
                 text_layout: Arc::clone(&item.text_layout),
             });
         });
@@ -918,6 +980,8 @@ pub struct DanmakuPlacedItem {
     pub shadow_offset: [f32; 2],
     pub shadow_alpha: f32,
     pub duplicate_count: u32,
+    /// Sent by the viewer: the render plan borders it.
+    pub is_self: bool,
     text_layout: Arc<PreparedTextLayout>,
 }
 
@@ -1739,13 +1803,23 @@ impl DanmakuTextRasterizer {
         let capacity = layout
             .items
             .iter()
-            .map(|item| item.text_layout.glyphs.len())
+            .map(|item| item.text_layout.glyphs.len() + if item.is_self { 4 } else { 0 })
             .sum();
         let mut items = Vec::with_capacity(capacity);
         for item in &layout.items {
             let color = item.color.rgba(item.opacity);
             if color[3] <= 0.0 {
                 continue;
+            }
+            if item.is_self {
+                append_self_border(
+                    item,
+                    scale,
+                    layout.viewport.scale_factor,
+                    atlas_w,
+                    atlas_h,
+                    &mut items,
+                );
             }
             self.append_item_glyphs(item, color, atlas_w, atlas_h, scale, &mut items);
         }
@@ -1768,15 +1842,7 @@ impl DanmakuTextRasterizer {
         scale: f32,
         items: &mut Vec<DanmakuGlyphInstance>,
     ) {
-        let x = match item.mode {
-            DanmakuMode::Top | DanmakuMode::Bottom => item.x + item.width * (1.0 - scale) * 0.5,
-            _ => item.x,
-        };
-        let y = if item.mode == DanmakuMode::Bottom {
-            item.y + item.height * (1.0 - scale)
-        } else {
-            item.y
-        };
+        let [x, y] = scaled_origin(item, scale);
         let baseline = y + item.text_layout.metrics.ascent * scale;
         let outline = item.color.outline_rgba(item.opacity);
         for placement in &item.text_layout.glyphs {
@@ -1858,6 +1924,68 @@ impl DanmakuTextRasterizer {
             }
         }
         rasterize_fallback_glyph(&self.shaper, key)
+    }
+}
+
+/// Where a comment's text box starts while a font-size preview scales it:
+/// static comments keep their center (top) or bottom edge.
+fn scaled_origin(item: &DanmakuPlacedItem, scale: f32) -> [f32; 2] {
+    let x = match item.mode {
+        DanmakuMode::Top | DanmakuMode::Bottom => item.x + item.width * (1.0 - scale) * 0.5,
+        _ => item.x,
+    };
+    let y = if item.mode == DanmakuMode::Bottom {
+        item.y + item.height * (1.0 - scale)
+    } else {
+        item.y
+    };
+    [x, y]
+}
+
+/// Frame the viewer's own comment with four non-overlapping bars that sample
+/// the atlas's solid block, so every renderer draws them as it draws glyphs:
+/// white at the comment's opacity, with the text's shadow and no outline.
+/// The line is a whole number of device pixels, and its rows sit on the
+/// pixel grid, so it stays crisp while the comment scrolls.
+fn append_self_border(
+    item: &DanmakuPlacedItem,
+    scale: f32,
+    scale_factor: f32,
+    atlas_w: f32,
+    atlas_h: f32,
+    items: &mut Vec<DanmakuGlyphInstance>,
+) {
+    let scale_factor = sanitize_f32(scale_factor, 1.0).max(0.1);
+    let line = (SELF_BORDER_WIDTH * scale_factor).round().max(1.0);
+    let outset = SELF_BORDER_PADDING * scale_factor + line * 0.5;
+    let [x, y] = scaled_origin(item, scale);
+    let left = x - outset;
+    let top = (y - outset).round();
+    let width = item.width * scale + outset * 2.0;
+    let height = ((y + item.height * scale + outset).round() - top).max(line * 2.0);
+    let color = DanmakuColor::WHITE.rgba(item.opacity);
+    let shadow = [0.0, 0.0, 0.0, (color[3] * item.shadow_alpha).min(1.0)];
+    let tex_rect = [
+        1.0 / atlas_w,
+        1.0 / atlas_h,
+        (SOLID_ATLAS_BLOCK - 2) as f32 / atlas_w,
+        (SOLID_ATLAS_BLOCK - 2) as f32 / atlas_h,
+    ];
+    for rect in [
+        [left, top, width, line],
+        [left, top + height - line, width, line],
+        [left, top + line, line, height - line * 2.0],
+        [left + width - line, top + line, line, height - line * 2.0],
+    ] {
+        items.push(DanmakuGlyphInstance {
+            item_id: item.item_id,
+            rect,
+            tex_rect,
+            color_rgba: color,
+            outline_rgba: [0.0; 4],
+            shadow_rgba: shadow,
+            shadow_offset: item.shadow_offset,
+        });
     }
 }
 
@@ -1980,15 +2108,19 @@ impl PersistentGlyphAtlas {
         let width = GLYPH_ATLAS_WIDTH;
         let height = GLYPH_ATLAS_INITIAL_HEIGHT;
         let stride = width as usize;
+        let mut fill_alpha = vec![0; stride * height as usize];
+        for row in 0..SOLID_ATLAS_BLOCK as usize {
+            fill_alpha[row * stride..row * stride + SOLID_ATLAS_BLOCK as usize].fill(u8::MAX);
+        }
         Self {
             width,
             height,
             stride,
-            cursor_x: 0,
+            cursor_x: SOLID_ATLAS_BLOCK,
             cursor_y: 0,
-            row_height: 0,
-            fill_alpha: vec![0; stride * height as usize],
-            outline_alpha: vec![0; stride * height as usize],
+            row_height: SOLID_ATLAS_BLOCK,
+            outline_alpha: fill_alpha.clone(),
+            fill_alpha,
             packed: HashMap::new(),
             version: NEXT_GLYPH_ATLAS_VERSION.fetch_add(1, Ordering::Relaxed),
             dirty: true,
@@ -2424,6 +2556,7 @@ fn prepare_layout(
                 scroll_speed: item.scroll_speed as f32,
                 duration: Duration::from_secs_f64(item.duration_seconds.max(0.0)),
                 duplicate_count: item.duplicate_count,
+                is_self: item.is_me,
                 text_layout,
             }
         })
@@ -3841,6 +3974,127 @@ mod tests {
     }
 
     #[test]
+    fn own_comments_are_framed_by_solid_bars_around_their_text() {
+        let mut own = item(0.0, "我的弹幕", DanmakuMode::Top);
+        own.is_self = true;
+        own.color = DanmakuColor::rgb_u8(0xfe, 0x05, 0x02);
+        let timeline =
+            DanmakuTimeline::new(vec![own, item(0.0, "别人的", DanmakuMode::Bottom)]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        let at = Duration::from_millis(500);
+        let plan = engine.render_plan(at, viewport, 1);
+        let atlas = plan.atlas.as_ref().expect("glyph atlas exists");
+        let layout = engine.frame_layout(at, viewport, 1);
+        let own = layout.items.iter().find(|item| item.is_self).unwrap();
+        let other = layout.items.iter().find(|item| !item.is_self).unwrap();
+        let on_block = |glyph: &DanmakuGlyphInstance| {
+            glyph.tex_rect[0] * (atlas.width as f32) < SOLID_ATLAS_BLOCK as f32
+                && glyph.tex_rect[1] * (atlas.height as f32) < SOLID_ATLAS_BLOCK as f32
+        };
+        let bars: Vec<_> = plan.items.iter().filter(|glyph| on_block(glyph)).collect();
+
+        // Four bars for the viewer's comment, none for anyone else's, and no
+        // glyph of the text shares the solid block.
+        assert_eq!(bars.len(), 4, "{:?}", plan.items);
+        assert!(bars.iter().all(|bar| bar.item_id == own.item_id));
+        assert!(
+            plan.items
+                .iter()
+                .any(|glyph| glyph.item_id == other.item_id)
+        );
+        for y in 0..SOLID_ATLAS_BLOCK as usize {
+            for x in 0..SOLID_ATLAS_BLOCK as usize {
+                assert_eq!(atlas.fill_alpha[y * atlas.stride + x], u8::MAX);
+                assert_eq!(atlas.outline_alpha[y * atlas.stride + x], u8::MAX);
+            }
+        }
+        for bar in &bars {
+            // The middle of the opaque block, whatever the filtering.
+            let [u, v, w, h] = bar.tex_rect;
+            assert_close(u * atlas.width as f32, 1.0);
+            assert_close(v * atlas.height as f32, 1.0);
+            assert_close((u + w) * atlas.width as f32, 3.0);
+            assert_close((v + h) * atlas.height as f32, 3.0);
+            assert_eq!(bar.color_rgba, [1.0, 1.0, 1.0, own.opacity]);
+            assert_eq!(bar.outline_rgba[3], 0.0);
+            assert!(bar.shadow_rgba[3] > 0.0);
+        }
+        // A 1.5-point line is 3 device pixels at 2x, framing the text box
+        // 2 points (4 pixels) out.
+        let [top, bottom, left, right] = [bars[0].rect, bars[1].rect, bars[2].rect, bars[3].rect];
+        assert_close(top[3], 3.0);
+        assert_close(left[2], 3.0);
+        assert_close(top[0], own.x - 4.0 - 1.5);
+        assert_close(top[2], own.width + 2.0 * (4.0 + 1.5));
+        assert!(top[1] <= own.y - 4.0 && top[1].fract() == 0.0);
+        assert!(bottom[1] + bottom[3] >= own.y + own.height + 4.0);
+        assert_close(right[0] + right[2], top[0] + top[2]);
+        // The bars do not overlap, so blending never doubles a corner.
+        assert_close(left[1], top[1] + top[3]);
+        assert_close(left[1] + left[3], bottom[1]);
+    }
+
+    #[test]
+    fn random_colors_repaint_stably_without_a_new_layout() {
+        let comments = ["第一条", "第二条", "第三条", "第四条", "第五条", "第六条"];
+        let timeline = DanmakuTimeline::new(
+            comments
+                .iter()
+                .enumerate()
+                .map(|(n, text)| item(n as f64 * 0.01, text, DanmakuMode::Scroll))
+                .collect(),
+        )
+        .unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let viewport = DanmakuViewport::new(1280, 720);
+        let at = Duration::from_millis(500);
+        let plain = engine.frame_layout(at, viewport, 1);
+        assert_eq!(plain.items.len(), comments.len());
+        assert!(
+            plain
+                .items
+                .iter()
+                .all(|item| item.color == DanmakuColor::WHITE)
+        );
+
+        let config = DanmakuLayoutConfig {
+            random_colors: true,
+            ..DanmakuLayoutConfig::default()
+        };
+        assert_eq!(engine.apply_config(config), DanmakuConfigChange::PaintOnly);
+        let colored = engine.frame_layout(at, viewport, 2);
+        let again = engine.frame_layout(at, viewport, 3);
+        assert_eq!(colored.items.len(), comments.len());
+        for (item, same) in colored.items.iter().zip(&again.items) {
+            assert!(
+                DANMAKU_RANDOM_COLORS.contains(&item.color),
+                "{:?}",
+                item.color
+            );
+            assert_eq!(item.color, same.color);
+        }
+        let distinct = colored
+            .items
+            .iter()
+            .map(|item| color_to_argb(item.color))
+            .collect::<BTreeSet<_>>();
+        assert!(distinct.len() > 1, "{distinct:?}");
+
+        assert_eq!(
+            engine.apply_config(DanmakuLayoutConfig::default()),
+            DanmakuConfigChange::PaintOnly
+        );
+        let restored = engine.frame_layout(at, viewport, 4);
+        assert!(
+            restored
+                .items
+                .iter()
+                .all(|item| item.color == DanmakuColor::WHITE)
+        );
+    }
+
+    #[test]
     fn layout_equivalence_only_ignores_the_declared_paint_only_fields() {
         let base = DanmakuLayoutConfig::default();
 
@@ -3849,6 +4103,7 @@ mod tests {
         paint_only.shadow_offset = [4.0, 4.0];
         paint_only.shadow_style = DanmakuShadowStyle::None;
         paint_only.enabled = !base.enabled;
+        paint_only.random_colors = !base.random_colors;
         assert!(base.layout_equivalent(&paint_only));
 
         // Anything outside that set must force a relayout; the normalization

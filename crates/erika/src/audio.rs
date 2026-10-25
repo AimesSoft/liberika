@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
 use crate::trace;
 
+#[cfg(any(target_os = "android", target_env = "ohos", test))]
 pub(crate) mod spsc;
 
 // Keep enough old-rate PCM to cover SoundTouch startup and one normal output

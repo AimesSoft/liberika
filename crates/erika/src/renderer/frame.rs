@@ -30,6 +30,7 @@ pub struct VideoFrameDescriptor {
 }
 
 impl VideoFrameDescriptor {
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     fn from_frame(frame: &Frame) -> Self {
         Self {
             width: frame.width(),
