@@ -1341,7 +1341,10 @@ impl D3d11Renderer {
             .is_some_and(|state| unsafe { state.device.GetDeviceRemovedReason() }.is_err());
         if removed {
             self.invalidate_device();
-            eprintln!("erika d3d11: GPU device removed; renderer will rebuild on the next frame");
+            crate::trace::diagnostic_at(
+                crate::trace::LogLevel::Warn,
+                "erika d3d11: GPU device removed; renderer will rebuild on the next frame",
+            );
         }
     }
 
@@ -3872,7 +3875,10 @@ fn trace(message: &str) {
 }
 
 fn report_upscaler_failure(stage: &str, mode: LumaUpscalerMode, error: &PlayerError) {
-    eprintln!("Erika D3D11 ArtCNN disabled after {stage} failure: {error}");
+    crate::trace::diagnostic_at(
+        crate::trace::LogLevel::Warn,
+        format!("Erika D3D11 ArtCNN disabled after {stage} failure: {error}"),
+    );
     crate::trace::diagnostic(
         serde_json::json!({
             "event": "luma_upscaler",

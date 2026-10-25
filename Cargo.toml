@@ -10,6 +10,7 @@ members = [
   "examples/ffmpeg_demux",
   "examples/ffmpeg_probe",
   "examples/ffmpeg_probe_source",
+  "examples/playback_rate_check",
   "examples/playback_tick",
   "examples/player_tick",
   "examples/coreaudio_smoke",
@@ -17,6 +18,7 @@ members = [
   "examples/danmaku_perf_lab",
   "examples/metal_presenter_check",
   "examples/ffmpeg_videotoolbox",
+  "examples/frame_export_bench",
   "examples/metal_import_videotoolbox",
   "examples/metal_overlay_check",
   "examples/playback_audio_tick",
@@ -37,7 +39,7 @@ edition = "2024"
 license = "MPL-2.0"
 repository = "https://github.com/AimesSoft/liberika"
 rust-version = "1.92"
-version = "0.1.8"
+version = "0.3.0"
 
 [workspace.dependencies]
 ab_glyph = "0.2.32"
@@ -48,6 +50,7 @@ bitflags = "2.10.0"
 bindgen = "0.72.1"
 cc = "1.2.47"
 pkg-config = "0.3.32"
+png = "0.17.16"
 chardetng = "0.1"
 crossbeam-channel = "0.5.15"
 encoding_rs = "0.8"

@@ -3110,6 +3110,10 @@ class ErikaFlutterPlugin :
             "selectAudioTrack",
             "selectSubtitleTrack",
             "tracks",
+            // Served by the shared Rust pass-through table.
+            "getDiagnosticsSnapshot",
+            "getLogs",
+            "invokeJson",
         )
     }
 }

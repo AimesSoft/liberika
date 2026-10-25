@@ -1035,6 +1035,11 @@ unsafe fn invoke_presenter(
             )
         }),
         "setDanmakuConfig" => unsafe { set_danmaku_config(handle, args) },
+        // Remaining names go to the shared pass-through table (diagnostics,
+        // logs, listMethods, invokeJson, …); unknown names still fail here.
+        method if crate::presenter_json::json_method_spec(method).is_some() => unsafe {
+            crate::presenter_json::invoke(handle, method, arguments)
+        },
         method => Err(format!("unsupported Erika Android method: {method}")),
     }
 }

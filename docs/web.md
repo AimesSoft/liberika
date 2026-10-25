@@ -10,8 +10,10 @@ required.
 
 The backend is integrated into the **Erika Web application**, including its
 playback controls, track selection, chapters, screenshots and danmaku settings.
-It is available from current source; the Web package is not an npm release or
-part of the published 0.2.1 native archives.
+Release 0.3.0 includes `liberika-web-0.3.0.zip`, a complete browser runtime and
+`index.html` demo with SHA-256 recorded in `SHA256SUMS`. Extract the whole archive
+and serve it over HTTPS or localhost. It is separate from the native bundles
+and is not published to npm; source builds remain available.
 
 ## MKV subtitles and attached fonts
 

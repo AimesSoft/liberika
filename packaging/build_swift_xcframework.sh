@@ -56,12 +56,38 @@ MODULEMAP
 
 XCFRAMEWORK="$WORK_DIR/CErika.xcframework"
 xcodebuild -create-xcframework \
-  -library "$MACOS_LIBRARY" -headers "$HEADERS" \
   -library "$IOS_DEVICE" -headers "$HEADERS" \
   -library "$IOS_SIMULATOR" -headers "$HEADERS" \
   -library "$TVOS_DEVICE" -headers "$HEADERS" \
   -library "$TVOS_SIMULATOR" -headers "$HEADERS" \
   -output "$XCFRAMEWORK"
+
+# Rust's compiler_builtins objects can carry both macOS and Mac Catalyst
+# LC_BUILD_VERSION commands. Xcode rejects those when inferring the platform
+# of a static library, even though this archive was built for macOS. Add its
+# explicit macOS entry after Xcode packages the mobile libraries, preserving
+# the released library byte-for-byte.
+MACOS_SLICE="$XCFRAMEWORK/macos-arm64_x86_64"
+mkdir -p "$MACOS_SLICE/Headers"
+cp "$MACOS_LIBRARY" "$MACOS_SLICE/liberika_capi.a"
+cp "$HEADERS/"* "$MACOS_SLICE/Headers/"
+python3 - "$XCFRAMEWORK/Info.plist" <<'PYTHON'
+import plistlib
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as file:
+    info = plistlib.load(file)
+info["AvailableLibraries"].append({
+    "LibraryIdentifier": "macos-arm64_x86_64",
+    "LibraryPath": "liberika_capi.a",
+    "HeadersPath": "Headers",
+    "SupportedArchitectures": ["arm64", "x86_64"],
+    "SupportedPlatform": "macos",
+})
+with open(path, "wb") as file:
+    plistlib.dump(info, file)
+PYTHON
 
 test ! -e "$OUTPUT_ZIP"
 (

@@ -912,6 +912,7 @@ export default class ErikaFlutterPlugin implements FlutterPlugin, MethodCallHand
       'setDanmakuTrackOffset', 'setDanmakuGlobalOffset',
       'danmakuTracks', 'clearDanmaku', 'setDanmakuEnabled',
       'setDanmakuConfig', 'selectAudioTrack', 'selectSubtitleTrack', 'tracks',
+      'getDiagnosticsSnapshot', 'getLogs', 'invokeJson',
     ].includes(method);
   }
 }

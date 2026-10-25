@@ -8,6 +8,7 @@ use std::slice;
 use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::core::{
@@ -422,17 +423,18 @@ impl Demuxer {
                 // timeout, ...). Carry it into the terminal error: without it the
                 // error reads only "Input/output error (-5)" and the cause lives
                 // on stderr alone, which is why a report such as issue #1 needs a
-                // reproduction instead of a log line.
+                // reproduction instead of a log line. When the failure surfaced
+                // only after further successful reads cleared `last_error`, the
+                // sticky read record still names the offset and the source's
+                // reason (issue #163).
                 return Err(
                     match self
                         .context
                         .avio
                         .as_ref()
-                        .and_then(|avio| avio.last_error.as_deref())
+                        .and_then(|avio| avio.terminal_source_note(&error))
                     {
-                        Some(source_error) => {
-                            FfmpegError::Source(format!("{error}; custom AVIO: {source_error}"))
-                        }
+                        Some(source_note) => FfmpegError::Source(format!("{error}; {source_note}")),
                         None => error,
                     },
                 );
@@ -532,6 +534,48 @@ impl Demuxer {
             "avformat_flush",
         )?;
         Ok(())
+    }
+
+    /// Media time of the last keyframe at or before `position` on the
+    /// selected video stream, from the demuxer's seek index. `None` when the
+    /// index has no entry there (no index, or not read yet: Matroska reads
+    /// its cues at the first seek). Times are relative to the timeline origin,
+    /// like packet and frame timestamps.
+    pub fn keyframe_at_or_before(&self, position: Duration) -> Option<Duration> {
+        let stream_index = self.selected_video_seek_stream()?;
+        let time_base = self.stream_time_base(stream_index)?;
+        let raw = self.context.as_ptr();
+        let stream = unsafe { *(*raw).streams.add(usize::try_from(stream_index).ok()?) };
+        if stream.is_null() || unsafe { sys::avformat_index_get_entries_count(stream) } <= 0 {
+            return None;
+        }
+        let relative = position.as_micros().min(i64::MAX as u128) as i64;
+        let target = rescale_microseconds_to_time_base(
+            absolute_seek_target_micros(relative, self.timeline_origin_micros),
+            time_base,
+        );
+        let index = unsafe {
+            sys::av_index_search_timestamp(stream, target, sys::AVSEEK_FLAG_BACKWARD as i32)
+        };
+        if index < 0 {
+            return None;
+        }
+        let entry = unsafe { sys::avformat_index_get_entry(stream, index) };
+        if entry.is_null() {
+            return None;
+        }
+        let micros = unsafe {
+            sys::av_rescale_q(
+                (*entry).timestamp,
+                time_base.to_av_rational(),
+                sys::AVRational {
+                    num: 1,
+                    den: sys::AV_TIME_BASE as i32,
+                },
+            )
+        }
+        .saturating_sub(self.timeline_origin_micros);
+        Some(Duration::from_micros(micros.max(0) as u64))
     }
 
     fn selected_video_seek_stream(&self) -> Option<i32> {
@@ -751,6 +795,12 @@ impl SubtitleDecoder {
         self.stream_index
     }
 
+    /// Draws through the same ASS resources as [`other`]: frames of this
+    /// decoder and of `other` belong to one track.
+    pub fn share_ass_track_with(&mut self, other: &SubtitleDecoder) {
+        self.ass_track = other.ass_track.clone();
+    }
+
     pub fn time_base(&self) -> TimeBase {
         self.time_base
     }
@@ -937,6 +987,79 @@ struct HardwareDecoderState {
     device_ref: *mut sys::AVBufferRef,
     frames_ref: *mut sys::AVBufferRef,
     pixel_format: sys::AVPixelFormat,
+    /// What FFmpeg's pixel-format negotiation last chose; see [`HardwareRoute`].
+    route: HardwareRoute,
+}
+
+impl HardwareDecoderState {
+    fn new(
+        device_ref: *mut sys::AVBufferRef,
+        frames_ref: *mut sys::AVBufferRef,
+        pixel_format: sys::AVPixelFormat,
+    ) -> Self {
+        Self {
+            device_ref,
+            frames_ref,
+            pixel_format,
+            route: HardwareRoute::default(),
+        }
+    }
+}
+
+/// FFmpeg negotiates a hardware decoder's output format in `get_format`,
+/// again after every stream parameter change. When the hwaccel fails to
+/// initialise (or is not offered for the stream), FFmpeg asks once more
+/// without the hardware format and, for VideoToolbox and D3D11VA, decodes in
+/// software from then on while `avcodec_open2` had succeeded. The callback
+/// records each choice here so the decoder reports the backend that is
+/// actually decoding.
+#[derive(Default)]
+struct HardwareRoute {
+    /// `ROUTE_*`: nothing negotiated yet, hardware, or software.
+    state: AtomicU8,
+    /// The hardware format was handed to FFmpeg by the previous call.
+    hardware_offered: AtomicBool,
+    /// The previous call returned the hardware format and FFmpeg then asked
+    /// without it: its hwaccel failed to initialise.
+    init_failed: AtomicBool,
+    software_format: AtomicI32,
+}
+
+const ROUTE_UNKNOWN: u8 = 0;
+const ROUTE_HARDWARE: u8 = 1;
+const ROUTE_SOFTWARE: u8 = 2;
+
+impl HardwareRoute {
+    fn chose_hardware(&self) {
+        self.hardware_offered.store(true, Ordering::Relaxed);
+        self.init_failed.store(false, Ordering::Relaxed);
+        self.state.store(ROUTE_HARDWARE, Ordering::Release);
+    }
+
+    fn chose_software(&self, format: sys::AVPixelFormat) {
+        let after_hardware = self.hardware_offered.swap(false, Ordering::Relaxed);
+        self.init_failed.store(after_hardware, Ordering::Relaxed);
+        self.software_format.store(format, Ordering::Relaxed);
+        self.state.store(ROUTE_SOFTWARE, Ordering::Release);
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+}
+
+/// A change in how a hardware decoder is actually decoding, seen after FFmpeg
+/// renegotiated its output format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderRouteChange {
+    /// The backend the decoder was opened with.
+    pub configured: DecoderBackend,
+    /// The backend decoding now: `configured`, or `Software`.
+    pub active: DecoderBackend,
+    /// The software pixel format FFmpeg chose instead, when it fell back.
+    pub pixel_format: Option<String>,
+    /// Why, when it fell back.
+    pub reason: Option<String>,
 }
 
 #[cfg(target_os = "android")]
@@ -969,6 +1092,9 @@ pub struct Decoder {
     eof_sent: bool,
     end_of_stream: bool,
     hw_state: Option<Box<HardwareDecoderState>>,
+    /// The negotiated route last returned by [`Decoder::take_route_change`];
+    /// opening reports the configured backend.
+    reported_route: u8,
     #[cfg(target_os = "android")]
     mediacodec_source: Option<Arc<AndroidMediaCodecFrameSource>>,
     #[cfg(target_env = "ohos")]
@@ -1037,11 +1163,37 @@ impl Decoder {
         )
     }
 
+    /// Opens a software decoder that decodes on several threads (FFmpeg
+    /// picks the count), for one-off work such as a frame export. Software
+    /// video decoders opened for playback follow
+    /// [`software_video_decode_threads`].
+    pub fn open_software_threaded(parameters: CodecParameters<'_>) -> Result<Self> {
+        Self::open_raw_with_threads(
+            parameters.ptr,
+            parameters.stream_index,
+            parameters.time_base,
+            DecoderConfig::software(),
+            Some(0),
+        )
+    }
+
     fn open_raw(
         parameters_ptr: *const sys::AVCodecParameters,
         stream_index: i32,
         time_base: TimeBase,
         config: DecoderConfig,
+    ) -> Result<Self> {
+        Self::open_raw_with_threads(parameters_ptr, stream_index, time_base, config, None)
+    }
+
+    /// `threads`: the codec context's thread count; `None` keeps FFmpeg's
+    /// default of one.
+    fn open_raw_with_threads(
+        parameters_ptr: *const sys::AVCodecParameters,
+        stream_index: i32,
+        time_base: TimeBase,
+        config: DecoderConfig,
+        threads: Option<i32>,
     ) -> Result<Self> {
         configure_ffmpeg_debug_logging();
         let codec_id = unsafe { (*parameters_ptr).codec_id };
@@ -1086,6 +1238,7 @@ impl Decoder {
             eof_sent: false,
             end_of_stream: false,
             hw_state: None,
+            reported_route: ROUTE_HARDWARE,
             #[cfg(target_os = "android")]
             mediacodec_source: None,
             #[cfg(target_env = "ohos")]
@@ -1111,6 +1264,16 @@ impl Decoder {
         // of an undefined base.
         unsafe {
             (*decoder.context).pkt_timebase = time_base.to_av_rational();
+        }
+        let threads = threads.or_else(|| {
+            let video =
+                unsafe { (*parameters_ptr).codec_type } == sys::AVMediaType_AVMEDIA_TYPE_VIDEO;
+            (video && config.backend == DecoderBackend::Software)
+                .then(software_video_decode_threads)
+        });
+        if let Some(threads) = threads {
+            // 0: as many threads as FFmpeg finds useful for this codec.
+            unsafe { (*decoder.context).thread_count = threads };
         }
         let mut decoder = decoder;
         match config.backend {
@@ -1282,6 +1445,25 @@ impl Decoder {
             }
         }
         open_result?;
+        if threads.is_some() {
+            let (count, kind) = unsafe {
+                (
+                    (*decoder.context).thread_count,
+                    (*decoder.context).active_thread_type,
+                )
+            };
+            crate::trace::diagnostic(
+                serde_json::json!({
+                    "event": "video_decoder",
+                    "stage": "software_threads",
+                    "codec": codec_name_for_id(codec_id),
+                    "requestedThreads": threads,
+                    "threads": count,
+                    "threadType": thread_type_label(kind),
+                })
+                .to_string(),
+            );
+        }
         if config.backend == DecoderBackend::Software && codec_id == sys::AVCodecID_AV_CODEC_ID_AV1
         {
             crate::trace::diagnostic(
@@ -1305,8 +1487,63 @@ impl Decoder {
         self.time_base
     }
 
+    /// The backend the decoder was opened with. See [`Decoder::active_backend`]
+    /// for the one decoding now.
     pub fn backend(&self) -> DecoderBackend {
         self.backend
+    }
+
+    /// The backend actually decoding: the configured one, or `Software` when
+    /// FFmpeg's last format negotiation dropped the hardware format (its
+    /// hwaccel failed to initialise or does not take this stream).
+    pub fn active_backend(&self) -> DecoderBackend {
+        match &self.hw_state {
+            Some(state) if state.route.state() == ROUTE_SOFTWARE => DecoderBackend::Software,
+            _ => self.backend,
+        }
+    }
+
+    /// Returns the route FFmpeg settled on when it differs from the one last
+    /// returned here (opening counts as the configured hardware backend):
+    /// a fallback to software, or hardware again after one.
+    pub fn take_route_change(&mut self) -> Option<DecoderRouteChange> {
+        let state = self.hw_state.as_ref()?;
+        let route = state.route.state();
+        if route == ROUTE_UNKNOWN || route == self.reported_route {
+            return None;
+        }
+        self.reported_route = route;
+        if route == ROUTE_HARDWARE {
+            return Some(DecoderRouteChange {
+                configured: self.backend,
+                active: self.backend,
+                pixel_format: unsafe { pixel_format_name(state.pixel_format) },
+                reason: None,
+            });
+        }
+        let software =
+            unsafe { pixel_format_name(state.route.software_format.load(Ordering::Relaxed)) };
+        let hardware = unsafe { pixel_format_name(state.pixel_format) }
+            .unwrap_or_else(|| self.backend.as_str().to_string());
+        let reason = if state.route.init_failed.load(Ordering::Relaxed) {
+            format!(
+                "FFmpeg could not initialise the {} hwaccel ({hardware}) for this stream and decodes it in software ({}); its log has the cause",
+                self.backend.as_str(),
+                software.as_deref().unwrap_or("unknown format"),
+            )
+        } else {
+            format!(
+                "FFmpeg did not offer the {} hwaccel ({hardware}) for this stream and decodes it in software ({})",
+                self.backend.as_str(),
+                software.as_deref().unwrap_or("unknown format"),
+            )
+        };
+        Some(DecoderRouteChange {
+            configured: self.backend,
+            active: DecoderBackend::Software,
+            pixel_format: software,
+            reason: Some(reason),
+        })
     }
 
     pub fn uses_mediacodec_surface(&self) -> bool {
@@ -1529,6 +1766,7 @@ impl Decoder {
             eof_sent: false,
             end_of_stream: false,
             hw_state: None,
+            reported_route: ROUTE_HARDWARE,
             #[cfg(target_os = "android")]
             mediacodec_source: None,
             ohos_decoder: Some(ohos_decoder),
@@ -1640,11 +1878,11 @@ impl Decoder {
                     "av_buffer_ref(MediaCodec hw_device_ctx)",
                 ));
             }
-            let mut hw_state = Box::new(HardwareDecoderState {
+            let mut hw_state = Box::new(HardwareDecoderState::new(
                 device_ref,
-                frames_ref: ptr::null_mut(),
+                ptr::null_mut(),
                 pixel_format,
-            });
+            ));
             unsafe {
                 (*self.context).hw_device_ctx = context_device_ref;
                 (*self.context).opaque = (&mut *hw_state) as *mut HardwareDecoderState as *mut _;
@@ -1715,11 +1953,11 @@ impl Decoder {
             return Err(FfmpegError::NullPointer("av_buffer_ref(hw_device_ctx)"));
         }
 
-        let mut hw_state = Box::new(HardwareDecoderState {
+        let mut hw_state = Box::new(HardwareDecoderState::new(
             device_ref,
-            frames_ref: ptr::null_mut(),
+            ptr::null_mut(),
             pixel_format,
-        });
+        ));
 
         unsafe {
             (*self.context).hw_device_ctx = context_device_ref;
@@ -1729,6 +1967,50 @@ impl Decoder {
         self.hw_state = Some(hw_state);
         Ok(())
     }
+}
+
+/// Environment override for [`software_video_decode_threads`]: a positive
+/// thread count, or `0`/`auto` for FFmpeg's choice.
+pub const VIDEO_DECODE_THREADS_ENV: &str = "ERIKA_VIDEO_DECODE_THREADS";
+
+/// Thread count for software video decoders, playback included.
+///
+/// FFmpeg's own default is one thread, which leaves a 4K stream that falls
+/// back to software short of real time. `0` lets libavcodec pick: frame plus
+/// slice threading with one thread per core plus one, capped at 16 (its
+/// `MAX_AUTO_THREADS`); libdav1d takes 1.5 threads per core. mpv's
+/// `vd-lavc-threads` defaults to the same. Frame threading delays the first
+/// picture after open or seek by up to that many packets, which a local file
+/// or a buffered stream supplies at once. `ERIKA_VIDEO_DECODE_THREADS`
+/// overrides it (`1` restores single-threaded decoding).
+pub fn software_video_decode_threads() -> i32 {
+    software_video_decode_threads_from(std::env::var(VIDEO_DECODE_THREADS_ENV).ok().as_deref())
+}
+
+/// [`software_video_decode_threads`] for a given override value.
+pub(crate) fn software_video_decode_threads_from(value: Option<&str>) -> i32 {
+    match value.map(str::trim) {
+        Some(value) if !value.is_empty() && !value.eq_ignore_ascii_case("auto") => value
+            .parse::<i32>()
+            .ok()
+            .filter(|threads| (0..=64).contains(threads))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn thread_type_label(active_thread_type: i32) -> &'static str {
+    if active_thread_type & sys::FF_THREAD_FRAME as i32 != 0 {
+        "frame"
+    } else if active_thread_type & sys::FF_THREAD_SLICE as i32 != 0 {
+        "slice"
+    } else {
+        "none"
+    }
+}
+
+fn codec_name_for_id(codec_id: sys::AVCodecID) -> Option<String> {
+    unsafe { codec_name(codec_id) }
 }
 
 fn software_decoder(codec_id: sys::AVCodecID) -> (*const sys::AVCodec, &'static str) {
@@ -1877,9 +2159,80 @@ fn align_i32(value: i32, alignment: i32) -> i32 {
 }
 
 fn configure_ffmpeg_debug_logging() {
+    install_ffmpeg_log_capture();
     if std::env::var_os("ERIKA_FFMPEG_DEBUG").is_some() {
         unsafe { sys::av_log_set_level(sys::AV_LOG_DEBUG as c_int) };
     }
+}
+
+type FfmpegLogSink = unsafe extern "C" fn(level: c_int, line: *const c_char);
+
+unsafe extern "C" {
+    fn erika_ffmpeg_install_log_bridge(sink: FfmpegLogSink);
+}
+
+/// Copies FFmpeg warnings and errors into the diagnostics log ring.
+///
+/// `av_log_set_callback` is process-wide, so this runs once for every player.
+/// The C bridge still forwards each message to FFmpeg's default callback,
+/// leaving stderr output unchanged. `ERIKA_FFMPEG_LOG_CAPTURE=0` disables
+/// capture; with a shared system FFmpeg (Linux distro build) capture is opt-in
+/// via `ERIKA_FFMPEG_LOG_CAPTURE=1` because other libraries in the process may
+/// own the callback.
+pub(crate) fn install_ffmpeg_log_capture() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        use crate::trace::{FfmpegLogCapture, set_ffmpeg_log_capture};
+        let requested = std::env::var("ERIKA_FFMPEG_LOG_CAPTURE").ok();
+        let disabled = matches!(
+            requested.as_deref(),
+            Some("0" | "false" | "FALSE" | "off" | "OFF")
+        );
+        let forced = requested.as_deref().is_some_and(|value| {
+            !value.is_empty() && !matches!(value, "0" | "false" | "FALSE" | "off" | "OFF")
+        });
+        if disabled {
+            set_ffmpeg_log_capture(FfmpegLogCapture::Disabled);
+            return;
+        }
+        if cfg!(erika_shared_ffmpeg) && !forced {
+            set_ffmpeg_log_capture(FfmpegLogCapture::SharedLibrary);
+            return;
+        }
+        unsafe { erika_ffmpeg_install_log_bridge(ffmpeg_log_sink) };
+        set_ffmpeg_log_capture(FfmpegLogCapture::Active);
+    });
+}
+
+fn ffmpeg_log_level(level: c_int) -> crate::trace::LogLevel {
+    use crate::trace::LogLevel;
+    if level <= sys::AV_LOG_ERROR as c_int {
+        LogLevel::Error
+    } else if level <= sys::AV_LOG_WARNING as c_int {
+        LogLevel::Warn
+    } else if level <= sys::AV_LOG_INFO as c_int {
+        LogLevel::Info
+    } else if level <= sys::AV_LOG_DEBUG as c_int {
+        LogLevel::Debug
+    } else {
+        LogLevel::Trace
+    }
+}
+
+/// Receives a formatted FFmpeg line from the C bridge. It runs on FFmpeg's
+/// logging thread, so it only borrows the line (no copy unless it is stored or
+/// is not UTF-8) and never blocks on the ring.
+unsafe extern "C" fn ffmpeg_log_sink(level: c_int, line: *const c_char) {
+    if line.is_null() {
+        return;
+    }
+    let bytes = unsafe { CStr::from_ptr(line) }.to_bytes();
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    crate::trace::record_ffmpeg(ffmpeg_log_level(level), text);
 }
 
 /// Registers the process Java VM used by FFmpeg's MediaCodec bridge.
@@ -3783,6 +4136,12 @@ struct CustomAvio {
     source: Box<dyn MediaSource>,
     offset: u64,
     last_error: Option<String>,
+    /// The most recent read that returned an I/O error, with its offset.
+    /// `last_error` is cleared by the next successful read or seek, yet a
+    /// demuxer can surface an earlier read failure only after those, so the
+    /// terminal `av_read_frame` error falls back to this record to keep the
+    /// offset and the source's reason in the message (issue #163).
+    last_read_failure: Option<(u64, String)>,
 }
 
 fn normalize_avio_seek_whence(whence: c_int) -> c_int {
@@ -3803,6 +4162,7 @@ impl CustomAvio {
             source,
             offset: 0,
             last_error: None,
+            last_read_failure: None,
         });
         let context = unsafe {
             sys::avio_alloc_context(
@@ -3825,6 +4185,28 @@ impl CustomAvio {
 
     fn context(&self) -> *mut sys::AVIOContext {
         self.context
+    }
+
+    /// Source-side reason for a terminal FFmpeg failure: the freshest error
+    /// when the last source interaction failed, otherwise -- because
+    /// `last_error` is cleared by successful reads and seeks, while FFmpeg
+    /// can surface an earlier read failure only after those (issue #163) --
+    /// the most recent read that returned an I/O error, with its offset.
+    ///
+    /// The fallback is offered only when FFmpeg itself reports an I/O error:
+    /// only that failure can trace back to the source, and appending a stale
+    /// record to a demuxer-side failure would misattribute it.
+    fn terminal_source_note(&self, ffmpeg: &FfmpegError) -> Option<String> {
+        if let Some(last_error) = self.last_error.as_deref() {
+            return Some(format!("custom AVIO: {last_error}"));
+        }
+        let is_io_error = matches!(ffmpeg, FfmpegError::Api { code, .. } if *code == av_error(EIO));
+        if !is_io_error {
+            return None;
+        }
+        self.last_read_failure.as_ref().map(|(offset, reason)| {
+            format!("custom AVIO read at offset {offset} failed earlier: {reason}")
+        })
     }
 
     fn read_packet(&mut self, buffer: *mut u8, buffer_size: c_int) -> c_int {
@@ -3851,6 +4233,7 @@ impl CustomAvio {
             }
             Err(error) => {
                 self.last_error = Some(error.to_string());
+                self.last_read_failure = Some((self.offset, error.to_string()));
                 crate::trace::log(format!(
                     "Erika custom AVIO read failed at offset {} for {} bytes: {error}",
                     self.offset, length
@@ -3936,6 +4319,7 @@ unsafe extern "C" fn custom_avio_seek(opaque: *mut c_void, offset: i64, whence: 
 }
 
 fn open_format_context(uri: &str) -> Result<FormatContext> {
+    install_ffmpeg_log_capture();
     let input = CString::new(uri).map_err(|_| FfmpegError::InteriorNul)?;
     let mut format_context = ptr::null_mut();
     check(
@@ -3953,6 +4337,7 @@ fn open_format_context(uri: &str) -> Result<FormatContext> {
 }
 
 fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatContext> {
+    install_ffmpeg_log_capture();
     let uri = CString::new(source.uri()).map_err(|_| FfmpegError::InteriorNul)?;
     let avio = CustomAvio::new(source)?;
     let format_context = unsafe { sys::avformat_alloc_context() };
@@ -3981,10 +4366,8 @@ fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatCont
             if !opened_context.is_null() {
                 unsafe { sys::avformat_close_input(&mut opened_context) };
             }
-            match avio.last_error.as_deref() {
-                Some(source_error) => Err(FfmpegError::Source(format!(
-                    "{error}; custom AVIO: {source_error}"
-                ))),
+            match avio.terminal_source_note(&error) {
+                Some(source_note) => Err(FfmpegError::Source(format!("{error}; {source_note}"))),
                 None => Err(error),
             }
         }
@@ -5383,6 +5766,7 @@ unsafe extern "C" fn select_hw_format(
                 break;
             }
             if format == target {
+                unsafe { (*state).route.chose_hardware() };
                 #[cfg(target_os = "windows")]
                 if target == sys::AVPixelFormat_AV_PIX_FMT_D3D11 {
                     unsafe { ensure_d3d11va_frames_for_context(context, state.cast_mut()) };
@@ -5409,6 +5793,17 @@ unsafe extern "C" fn select_hw_format(
             sys::AVPixelFormat_AV_PIX_FMT_CUDA | sys::AVPixelFormat_AV_PIX_FMT_VAAPI
         ) {
             return sys::AVPixelFormat_AV_PIX_FMT_NONE;
+        }
+        // VideoToolbox and D3D11VA continue in software. Record it: the
+        // decoder was opened as hardware and must not keep reporting so.
+        // (MediaCodec's own decoders stay MediaCodec whatever they output.)
+        if matches!(
+            target,
+            sys::AVPixelFormat_AV_PIX_FMT_VIDEOTOOLBOX | sys::AVPixelFormat_AV_PIX_FMT_D3D11
+        ) {
+            let chosen = unsafe { sys::avcodec_default_get_format(context, formats) };
+            unsafe { (*state).route.chose_software(chosen) };
+            return chosen;
         }
     }
     unsafe { sys::avcodec_default_get_format(context, formats) }
@@ -5516,6 +5911,53 @@ mod tests {
             1,
             "the audio track stays discoverable"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decoder_reports_the_route_ffmpeg_negotiated() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback/playback-fixture.mkv");
+        let mut demuxer = Demuxer::open_path(&fixture).unwrap();
+        demuxer
+            .set_stream_selection(StreamSelection::only([0]))
+            .unwrap();
+        let mut decoder = Decoder::open_with_config(
+            demuxer.codec_parameters(0).unwrap(),
+            DecoderConfig::videotoolbox(),
+        )
+        .unwrap();
+        assert_eq!(decoder.backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.active_backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.take_route_change(), None);
+
+        let mut frame = None;
+        while frame.is_none() {
+            let packet = demuxer.read_packet().unwrap().expect("a video packet");
+            if packet.stream_index() != 0 {
+                continue;
+            }
+            decoder.send_packet(&packet).unwrap();
+            if let DecoderOutputFrame::Frame(decoded) = decoder.receive_frame().unwrap() {
+                frame = Some(decoded);
+            }
+        }
+        // MPEG-4 Part 2 at 160x90: FFmpeg offers videotoolbox_vld, its
+        // hwaccel fails to initialise, and FFmpeg decodes in software.
+        assert!(!frame.unwrap().is_videotoolbox());
+        assert_eq!(decoder.backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.active_backend(), DecoderBackend::Software);
+        let change = decoder.take_route_change().expect("a route change");
+        assert_eq!(change.configured, DecoderBackend::VideoToolbox);
+        assert_eq!(change.active, DecoderBackend::Software);
+        assert_eq!(change.pixel_format.as_deref(), Some("yuv420p"));
+        assert!(
+            change
+                .reason
+                .unwrap()
+                .contains("could not initialise the videotoolbox hwaccel")
+        );
+        assert_eq!(decoder.take_route_change(), None);
     }
 
     #[test]
@@ -6848,6 +7290,68 @@ mod tests {
         assert!(
             (actual - expected).abs() < 0.0001,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn av_log_bridge_copies_warnings_and_errors_into_the_log_ring() {
+        use crate::trace::{FfmpegLogCapture, LogLevel, LogQuery, export_logs, ffmpeg_log_capture};
+
+        install_ffmpeg_log_capture();
+        if ffmpeg_log_capture() != FfmpegLogCapture::Active {
+            // Disabled via ERIKA_FFMPEG_LOG_CAPTURE=0 or a shared system FFmpeg.
+            return;
+        }
+        let marker = "erika-av-log-bridge-5d1e";
+        let warning = CString::new(format!("{marker} warning %d\n")).unwrap();
+        let error = CString::new(format!("{marker} error %s\n")).unwrap();
+        let info = CString::new(format!("{marker} info\n")).unwrap();
+        let detail = CString::new("detail").unwrap();
+        unsafe {
+            sys::av_log(
+                ptr::null_mut(),
+                sys::AV_LOG_WARNING as c_int,
+                warning.as_ptr(),
+                42 as c_int,
+            );
+            sys::av_log(
+                ptr::null_mut(),
+                sys::AV_LOG_ERROR as c_int,
+                error.as_ptr(),
+                detail.as_ptr(),
+            );
+            sys::av_log(ptr::null_mut(), sys::AV_LOG_INFO as c_int, info.as_ptr());
+        }
+        let exported = export_logs(&LogQuery {
+            limit: 0,
+            min_level: None,
+            since_seq: 0,
+        });
+        let entries: Vec<&serde_json::Value> = exported["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(marker))
+            })
+            .collect();
+        assert_eq!(exported["ffmpegCapture"], "active");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["source"], "ffmpeg");
+        assert_eq!(entries[0]["level"], LogLevel::Warn.as_str());
+        assert_eq!(entries[0]["message"], format!("{marker} warning 42"));
+        assert_eq!(entries[1]["level"], LogLevel::Error.as_str());
+        assert_eq!(entries[1]["message"], format!("{marker} error detail"));
+        assert_eq!(
+            ffmpeg_log_level(sys::AV_LOG_FATAL as c_int),
+            LogLevel::Error
+        );
+        assert_eq!(ffmpeg_log_level(sys::AV_LOG_INFO as c_int), LogLevel::Info);
+        assert_eq!(
+            ffmpeg_log_level(sys::AV_LOG_TRACE as c_int),
+            LogLevel::Trace
         );
     }
 }

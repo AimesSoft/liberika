@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(erika_shared_ffmpeg)");
     // Browser C dependencies are built and packaged by `cargo run -p xtask -- web build`.
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
         return;
@@ -32,6 +33,18 @@ fn main() {
 
     let ffmpeg_version_major = emit_ffmpeg_version_cfg();
     enforce_bundled_ffmpeg_version(ffmpeg_version_major);
+
+    // FFmpeg av_log bridge feeding the diagnostics log ring. A distro FFmpeg is
+    // a shared library other components of the host process may configure, so
+    // capture there is opt-in (see trace::FfmpegLogCapture::SharedLibrary).
+    if use_system_libraries("ERIKA_FFMPEG_DIR") {
+        println!("cargo:rustc-cfg=erika_shared_ffmpeg");
+    }
+    println!("cargo:rerun-if-changed=src/ffmpeg_log_bridge.c");
+    cc::Build::new()
+        .file("src/ffmpeg_log_bridge.c")
+        .warnings(true)
+        .compile("erika_ffmpeg_log_bridge");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").ok();
     if target_os.as_deref() == Some("linux")

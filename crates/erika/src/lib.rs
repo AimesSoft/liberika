@@ -11,7 +11,11 @@ pub mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod debug_hud;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod diagnostics;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod export;
+#[cfg(not(target_arch = "wasm32"))]
+mod export_color;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod opening;
 #[cfg(not(target_arch = "wasm32"))]

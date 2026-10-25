@@ -37,8 +37,31 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
+  version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Match the tag to the Cargo workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "erika") | .version')"
+          [[ "$crate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_REF_TYPE" == tag && "v${crate_version}" != "$GITHUB_REF_NAME" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo version ${crate_version}." >&2
+            exit 1
+          fi
+          echo "version=$crate_version" >> "$GITHUB_OUTPUT"
+
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     env:
@@ -121,6 +144,7 @@ jobs:
 
   ios-slices:
     name: iOS ${{ matrix.target }}
+    needs: version
     runs-on: macos-26
     timeout-minutes: 180
     strategy:
@@ -209,6 +233,7 @@ jobs:
 
   tvos-slices:
     name: tvOS ${{ matrix.target }}
+    needs: version
     runs-on: macos-26
     timeout-minutes: 240
     strategy:
@@ -296,6 +321,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.arch }}
+    needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -393,6 +419,7 @@ jobs:
 
   android-slices:
     name: Android ${{ matrix.abi }}
+    needs: version
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -509,6 +536,7 @@ jobs:
           path: dist/*.zip
 
   openharmony:
+    needs: version
     name: OpenHarmony arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -612,7 +640,12 @@ jobs:
           for symbol in \
             erika_presenter_invoke_json \
             erika_presenter_render_tick_json \
-            erika_presenter_poll_event_json
+            erika_presenter_poll_event_json \
+            erika_export_frame \
+            erika_frame_export_result_free \
+            erika_frame_export_session_open \
+            erika_frame_export_session_frame \
+            erika_frame_export_session_close
           do
             grep -Fxq "$symbol" <<< "$symbols"
           done
@@ -624,9 +657,55 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  web:
+    name: Web / WASM package
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: "4.0.23"
+          actions-cache-folder: emsdk-cache
+      - name: Install Web build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config zip
+          python3 -m venv /tmp/erika-web-tools
+          /tmp/erika-web-tools/bin/pip install meson
+          echo /tmp/erika-web-tools/bin >> "$GITHUB_PATH"
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Build complete browser package
+        run: cargo run --locked -p xtask -- web build
+      - name: Core regression
+        run: node --test packages/erika_web/tests/*.test.mjs
+      - name: Package Web runtime and demo
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f target/web/index.html
+          test -f target/web/erika_core_bg.wasm
+          test -f target/web/media.wasm
+          mkdir -p dist
+          cd target/web
+          zip -r "$GITHUB_WORKSPACE/dist/liberika-web-${VERSION}.zip" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liberika-web
+          path: dist/liberika-web-*.zip
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: [macos, macos-universal, ios, tvos, windows, android, openharmony]
+    needs: [macos, macos-universal, ios, tvos, windows, android, openharmony, web]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -636,6 +715,10 @@ jobs:
         with:
           pattern: erika-capi-*
           path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: liberika-web
+          path: artifacts/liberika-web
       - name: Create release checksums
         shell: bash
         run: |
@@ -660,9 +743,13 @@ jobs:
             Windows ARM64, iOS, tvOS, and Android arm64-v8a, armeabi-v7a,
             x86_64, and x86, plus OpenHarmony arm64.
 
-            Each archive contains the library, `include/erika.h`, `LICENSE`
+            Native archives contain the library, `include/erika.h`, `LICENSE`
             (MPL-2.0), and `THIRD_PARTY_NOTICES.md`. `SHA256SUMS` in this
-            release records the digest of every archive. See
+            release records the digest of every archive, including the separate
+            `liberika-web-X.Y.Z.zip` browser runtime and demo. Serve the complete
+            Web archive over HTTPS or localhost, preserving its relative paths.
+            See [docs/web.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/web.md)
+            for browser requirements and integration. See
             [docs/capi_reference.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/capi_reference.md)
             and [docs/integration.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/integration.md)
             to integrate. Review [CHANGELOG.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/CHANGELOG.md)

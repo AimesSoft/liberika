@@ -48,13 +48,21 @@ void main() {
         '$platform/Classes/ErikaFlutterPlugin.swift',
       ).readAsStringSync();
 
+      // iOS does not wait for the player's lock on the main thread while a
+      // long call on another queue holds it: it returns the last stats.
       expect(
         plugin,
         contains(
-          'func presenterStats() -> [String: Any] {\n'
-          '    nativeCallLock.lock()\n'
-          '    defer { nativeCallLock.unlock() }\n'
-          '    return latestPresenterStats.toFlutterMap()',
+          platform == 'ios'
+              ? 'func presenterStats() -> [String: Any] {\n'
+                  '    // The last stats the render tick stored; while another queue is inside a\n'
+                  '    // long call the previous copy is returned instead of waiting for it.\n'
+                  '    tryWithNativeCall { latestPresenterStats.toFlutterMap() }\n'
+                  '      ?? latestPresenterStats.toFlutterMap()'
+              : 'func presenterStats() -> [String: Any] {\n'
+                  '    nativeCallLock.lock()\n'
+                  '    defer { nativeCallLock.unlock() }\n'
+                  '    return latestPresenterStats.toFlutterMap()',
         ),
       );
     });

@@ -88,6 +88,34 @@ ErikaStatus erika_export_gif( const ErikaGifExportOptions *options, ErikaGifExpo
 handle を必要としない同期処理です。UI では worker から呼びます。時刻はミリ秒、サイズは出力ピクセルです。
 品質 Normal は bilinear、High は Lanczos。loop_count は -1 がループなし、0 が無限です。
 
+```c
+ErikaStatus erika_export_frame(const ErikaFrameExportOptions *options, ErikaFrameExportResult *out_result);
+void erika_frame_export_result_free(ErikaFrameExportResult *result);
+```
+
+`position_millis` の時刻に表示される 1 枚（その時刻以前の最後のフレーム）を、独立した demuxer と
+マルチスレッドのソフトウェアデコーダで取り出し、RGBA（1 行 `width * 4` バイト、alpha 255）または
+PNG（8 bit RGB）で返します。handle 不要の同期処理なので UI では worker から呼びます。
+`max_width`/`max_height` は上限（0 は無制限）で、表示アスペクト比を保ち、動画より大きくはしません。
+`data` は `erika_frame_export_result_free` まで liberika が所有します。HDR ソース（PQ、HLG、Dolby Vision）は
+Erika のレンダラが SDR ディスプレイ向けに使う演算（ITU-R BT.2390 EETF、目標 203 nit、BT.2020 から BT.709 への
+gamut mapping、gamma 2.2）で SDR にトーンマッピングし、`result.reserved_flags` に
+`ERIKA_FRAME_EXPORT_TONE_MAPPED` を立てます。SDR ソースは通常の色変換のままです。
+
+複数枚を取るときは `ErikaFrameExportSession` を一度だけ開き、1 枚ずつ要求します。demuxer とデコーダは開いたままです。
+
+```c
+ErikaStatus erika_frame_export_session_open(const ErikaFrameExportSessionOptions *options, ErikaFrameExportSession **out_session);
+ErikaStatus erika_frame_export_session_frame(ErikaFrameExportSession *session, const ErikaFrameExportRequest *request, ErikaFrameExportResult *out_result);
+void erika_frame_export_session_close(ErikaFrameExportSession *session);
+```
+
+前回のデコード位置と今回の要求の間にキーフレームがなければ続きをデコードし（demuxer の seek index で判定。index がなければ
+2 秒以内、または見たキーフレーム間隔の最大値の半分以内）、あれば直前のキーフレームへ seek します。順序は任意ですが、
+時刻の昇順が最も安価です。結果・サイズ・形式・トーンマッピングは `erika_export_frame` と同じです。失敗した要求の後も
+セッションは使えます。同一セッションの呼び出しは直列化され、すべて同期です。`erika_frame_export_session_close` は
+`NULL` を受け付け、実行中の呼び出しがあってはならず、閉じた後に呼んでもいけません。
+
 ## 規約
 
 ### ステータスコード
@@ -663,23 +691,40 @@ char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 { "ok": false, "status": 3, "error": "<message>" }
 ```
 
-`arguments_json` は JSON オブジェクトである必要があります。`method` は操作を選び、
-C エントリポイントに対応します: `open`、`play`、`pause`、`stop`、`close`、`seek`、
-`setPlaybackRate`、`setVolume`、`setUpscaler`、`setSubtitleScale`、
-`getUpscalerStatus`、`getOutputStatus`、`getPresenterStats`、`tracks`、
-`addExternalSubtitle`、`removeSubtitleTrack`、`selectAudioTrack`、
-`selectSubtitleTrack`、および danmaku 系（`loadDanmakuFile`、`loadDanmakuJson`、
-`addDanmakuTrackFile`、`addDanmakuTrackJson`、`removeDanmakuTrack`、
-`setDanmakuTrackEnabled`、`setDanmakuTrackOffset`、`setDanmakuGlobalOffset`、
-`danmakuTracks`、`clearDanmaku`、`setDanmakuEnabled`、`setDanmakuConfig`）、および
-字幕フォント・リソース状態系（`selectSubtitleMemoryFonts`、
-`clearSubtitleMemoryFonts`、`getSubtitleMemoryFontStatus`、`getResourceStatus`）。
-未知の method は abort せず `ok: false` を返します。正となる dispatch table は
-`crates/erika_capi/src/presenter_json.rs` です。
+`arguments_json` は JSON オブジェクトである必要があります。`method` は
+`crates/erika_capi/src/presenter_json.rs` の dispatch table（`JSON_METHODS`）の
+1 項目を選びます。table は C エントリポイントに対応します: 再生（`open`、`play`、
+`pause`、`stop`、`close`、`seek`、`setPlaybackRate`、`setVolume`）、トラックと字幕
+（`tracks`、`trackSelection`、`selectAudioTrack`、`selectSubtitleTrack`、
+`addExternalSubtitle`、`removeSubtitleTrack`、`setSubtitleScale`、`setSubtitleFont`、
+`setSubtitleStyle`、字幕メモリフォント系）、danmaku 系（`getDanmakuConfig` を含む）、
+出力とアップスケーラ（`setUpscaler`、`getUpscalerStatus`、`setOutputHeadroom`、
+`getOutputStatus`、`setDebugHudEnabled`）、カウンタ（`getPresenterStats`、
+`getResourceStatus`）、および後述の診断（`getDiagnosticsSnapshot`、`getLogs`）。
 
-このブリッジは利便性のためのレイヤーであり、2 つ目の API ではありません。上で
-説明した関数をそのまま呼ぶだけで、追加の機能はありません。プラットフォーム
-チャネルで構造体を渡せるホストは型付きエントリポイントを優先してください。
+`erika_presenter_invoke_json` はエンジンへの汎用パススルーも兼ねます。
+
+- `listMethods` は table 自体（`{schema: 1, fields, methods: [{name, scope, summary,
+  arguments: [{name, type, required}], returns, blocking, writesFiles}]}`）を返すので、ホスト（とその先の
+  エージェント）はコード変更なしに機能を発見・転送できます。機能の登録は `invoke` の
+  `match` 分岐と `JSON_METHODS` の項目を追加するだけで、両者が食い違うと単体テストが
+  失敗します。
+- 各項目は `blocking`（呼び出しスレッド上で処理が終わってから返り、時間が入力（メディア長、ファイルサイズ）に応じて増える）と
+  `writesFiles`（ディスク上にファイルを作り、結果にパスを列挙する）も持ち、最上位の `fields` が両方を説明します。
+  `exportFrame`、`exportFrames` は上のフレーム書き出しでメディアから画像を取ります。`outputPath` / `outputDir` を
+  指定すると PNG または RGBA ファイルを書いてパスを返し、`outputPath` なしの `exportFrame` は base64 のバイト列を返します。
+- `scope` が `global` のメソッド（`listMethods`、`getLogs`、`exportFrame`、`exportFrames`）は `NULL` ハンドルを
+  受け付けます。
+- `invokeJson`（`{method, arguments}`）は table の別メソッドを呼び、その envelope 全体を
+  `value` として返します。envelope をネイティブ側で外すプラグイン（Linux、HarmonyOS、
+  Android）は Dart の `ErikaPlayer.invokeJson` をこれでそのまま転送します。
+- 未知の method は `{"ok": false, "status": 3, "code": "unknown_method", "method":
+  "<名前>", "error": "unsupported Erika presenter method: <名前>"}` を返し、
+  `arguments_json` が不正なら `"code": "invalid_arguments"` が付きます。どちらも abort
+  しません。
+
+このブリッジは上の関数をそのまま呼ぶだけで、追加の機能はありません。構造体を渡せる
+ホストは型付きエントリポイントを使っても構いません。
 
 ### 診断とスクリーンショット
 
@@ -743,6 +788,81 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+### エージェント向け診断（JSON）
+
+```c
+ErikaStatus erika_presenter_get_diagnostics_json(ErikaPresenterHandle *, char **out_json);
+ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t since_seq,
+                                char **out_json);
+```
+
+新しい診断データは JSON ドキュメントで返し、上の構造体にフィールドは追加しません
+（Apple プラグインは構造体を手書きでミラーしているため、追加するとライブラリと
+プラグインの同時更新が必要になります）。両シンボルはオプションとして解決し、欠けて
+いれば「非対応」として扱ってください。`Ok` のとき `*out_json` は呼び出し側所有の UTF-8
+ドキュメントで、`erika_string_free` で解放します。それ以外の status では `NULL` です。
+各ドキュメントは `schema`（現在 `1`）を持ち、同じ schema 内ではフィールドの追加のみ
+行います。不明な値は `null` で、0 を捏造しません。時間はミリ秒（マイクロ秒精度）です。
+
+#### 診断スナップショット
+
+`erika_presenter_get_diagnostics_json` は 1 回の呼び出しで全体を返します。presenter の
+フィールド、レンダラ/オーディオのカウンタ、ロックフリーの再生カウンタを読むだけで、
+デコードもレンダリングもせず、再生スレッドを待ちません（macOS の release ビルドで再生中、
+JSON エンコード込みで中央値 約 0.3 ms）。スレッド規則は他のハンドル呼び出しと同じです。
+
+セクション: `playback`（状態、位置、長さ、倍速、`audioOnly`、`buffering`）、`media`
+（選択中の映像/音声/字幕トラック）、`decoder`（直近のデコーダ遷移: 要求/実際/直前の
+バックエンド、`hardware`、`fellBack`、`fallbackCount`、`stage`、`reason` など。初回遷移前は
+`null`）、`video`（ハードウェア/ソフトウェア/ゼロコピー各フレーム数、CPU フォールバック、
+失敗、バックプレッシャー破棄）、`presenter`（surface、各段の直近所要時間）、`output`、
+`hdr`、`resources`、`upscaler`、`audio`（キュー、アンダーフロー、リングの破棄、デバイス
+復旧）、`buffers`（再生スレッドが公開するキュー深さ `{queued, capacity}`、presenter の
+フレームチャネル）、`timing`:
+
+- `timing.scheduler`: 設定（`leadTimeMs`、`dropToleranceMs`、`maxConsecutiveDrops`）、
+  `presentedFrames`、`lateDroppedFrames`（ドロップ許容を超えて破棄。従来は未計数）、
+  `forcedLatePresents`（許容超過だが連続ドロップ枠を使い切ったため表示）、
+  `maxDropBurst`、`maxDroppedLateMs`、`lastDropAgoMs`、`seekPrerollDroppedFrames`、直近
+  128 表示フレームの `lateByMs` 窓（`samples`、`meanMs`、`p50Ms`、`p95Ms`、`maxMs`）、
+  `lateHistogram`。
+- `timing.presentation`: liberika がレンダリングした時点で計測（実際の vsync ではない）。
+  `tickIntervalMs`、`newFramesPresented`、`supersededBeforePresent`、`frameIntervalMs`、
+  `jitterMs`（ソースフレーム間隔÷倍速との絶対差）、`longFrames`（1.5 間隔超）。
+- `timing.clock`: オーディオマスターの補正（従来は trace のみ）。`observations`、
+  `corrections`、`snaps`、前進/後退回数、`lastDriftMs`（正: オーディオが再生クロックより
+  先行）、`maxAbsDriftMs`、`appliedTotalMs`、最終補正/スナップからの経過、`absDriftMs` 窓。
+
+`timing` と `buffers.playback` は新しいメディアを開くとリセットされます。各フィールドの
+完全な一覧は英語版 `capi_reference.md` を参照してください。
+
+#### ログリング
+
+`erika_log_read_json` はプロセス全体のメモリ内リング（最大 2000 件 / 512 KiB、1 件の本文は
+4 KiB まで）を出力します。ハンドル不要で、どのスレッドからも呼べます。内容は、従来
+stderr / logcat / hilog に出ていた運用診断（出力自体は不変）、以前は素の `eprintln!` だった
+運用上の失敗、警告以上の FFmpeg `av_log` です。FFmpeg コールバックはプロセス全体で共有され、
+スタックバッファで整形し、ブロックせず（競合時は `droppedContended`）、数字/アドレスだけが
+異なる連続メッセージは `count` 付きの 1 件にまとめ、新規 FFmpeg 件数は毎秒 50 件まで
+（超過分は `rateLimited`）。FFmpeg 自身の stderr 出力は従来どおりです。
+`ERIKA_FFMPEG_LOG_CAPTURE=0` で無効化、Linux のシステム共有 FFmpeg では
+`ERIKA_FFMPEG_LOG_CAPTURE=1` のときのみ有効です。
+
+引数: `limit` はフィルタ後の最新件数（`0` で全件）、`min_level` は `ErikaLogLevel`
+（`Trace` 0 … `Error` 4）または全レベルの `-1`、`since_seq` は `seq >= since_seq` の
+件のみ（前回の `nextSeq` を渡すと差分読み出し）。件は古い順で、構造化診断は `data`、
+それ以外は `message` として返ります。
+
+レベル: 呼び出し側が分かる場合は明示。FFmpeg は PANIC/FATAL/ERROR → `error`、
+WARNING → `warn`、libass は 0–1 → `error`、2 → `warn`。その他の構造化診断は
+`event`/`stage` 名から既定値を決めます（fatal/panic は `error`、失敗・タイムアウト・
+利用不可/喪失/拒否/欠落・ストール・フォールバックは `warn`、それ以外は `info`）。
+
+マスキングは出力時に行います: URL のユーザー情報と `?`/`#` 以降、認証情報らしき
+`key=value`/`key: value` と JSON キー、`Bearer`/`Basic` 認証、現在のユーザーのホーム
+ディレクトリ（`~`）、その他の `/Users/<user>`、`/home/<user>`、`C:\Users\<user>`。
+リングはプロセスメモリ内にのみあり、要求時に読み出されます。
 
 ## 列挙
 

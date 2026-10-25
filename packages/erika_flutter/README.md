@@ -81,7 +81,10 @@ timeline through Now Playing, and handles system play, pause, stop, and seek
 commands through Remote Command Center.
 
 Overrides: `ERIKA_CAPI_DYLIB` forces the runtime dylib path; `ERIKA_MACOS_CAPI_DYLIB`
-points the build phase at an explicit dylib to bundle instead of building.
+points the build phase at an explicit dylib to bundle instead of building or
+downloading, such as a local `cargo build -p erika_capi --release` used before
+a release. It is not checksum-verified; the build fails when it lacks an
+architecture being built.
 
 ## Native binaries
 

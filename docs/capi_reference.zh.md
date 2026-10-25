@@ -72,6 +72,68 @@ ErikaStatus status = erika_export_gif(&options, &result);
 `-1` 不循环、`0` 无限循环、正数表示循环次数。HTTP 输入可使用与
 `ErikaOpenOptions` 相同的请求头和 read-ahead 覆盖参数。
 
+## Headless 单帧导出
+
+`erika_export_frame` 同样独立于两个 handle 族。它创建私有的 demuxer 和多线程软件解码器，
+跳到 `position_millis` 之前的关键帧后向前解码，返回该媒体时间显示的画面：时间不晚于它的最后一帧
+（位置早于第一帧时为第一帧）。
+
+```c
+ErikaFrameExportOptions options = {
+    .input_uri = "/path/input.mkv",
+    .position_millis = 60000,
+    .max_width = 640,
+    .max_height = 640,
+    .format = ErikaFrameExportFormat_Png,
+};
+ErikaFrameExportResult result = {0};
+if (erika_export_frame(&options, &result) == ErikaStatus_Ok) {
+    /* result.data 中是 result.data_len 字节的 PNG 文件。 */
+    erika_frame_export_result_free(&result);
+}
+```
+
+该调用是同步的；UI 宿主必须把它放到 worker thread 或 isolate 中执行。`max_width` 与
+`max_height` 限定画面尺寸（0 表示该边不限）：保持显示宽高比，且不会大于视频本身，两者都为 0
+时返回视频原尺寸。`ErikaFrameExportFormat_Rgba` 返回每行恰好 `width * 4` 字节、alpha 为 255
+的像素；`ErikaFrameExportFormat_Png` 返回 8 位 RGB 的 PNG 文件。色彩转换按帧的色彩空间与范围；
+未标注的 YUV 源在高清及以上按 BT.709、其余按 BT.601。HDR 源（PQ、HLG、杜比视界）会按 Erika 渲染器在 SDR 显示器上使用的
+运算做色调映射到 SDR（ITU-R BT.2390 EETF，目标 203 nit，BT.2020 到 BT.709 的色域映射，gamma 2.2），
+并在 `result.reserved_flags` 置位 `ERIKA_FRAME_EXPORT_TONE_MAPPED`；SDR 源仍用普通色彩转换。结果给出画面所在时间
+（`timestamp_micros`）、解码后的视频尺寸与媒体时长（未知为 0）。位置不早于已知时长时返回
+`ErikaStatus_PlayerError`。HTTP 输入可使用与 `ErikaOpenOptions` 相同的请求头和 read-ahead
+覆盖参数。`data` 归 liberika 所有，直到调用 `erika_frame_export_result_free`；该函数会清空结果，
+可重复调用。
+
+### 连续取多帧
+
+`erika_export_frame` 每取一张都要重新打开媒体并 seek。要从同一媒体取多张时，只打开一次
+`ErikaFrameExportSession`，再逐张向它索取；demuxer 与解码器保持打开。
+
+```c
+ErikaFrameExportSessionOptions open = { .input_uri = "/path/input.mkv" };
+ErikaFrameExportSession *session = NULL;
+if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
+    for (uint64_t ms = 60000; ms < 66000; ms += 100) {
+        ErikaFrameExportRequest request = {
+            .position_millis = ms, .max_width = 640, .max_height = 640,
+            .format = ErikaFrameExportFormat_Png,
+        };
+        ErikaFrameExportResult result = {0};
+        if (erika_frame_export_session_frame(session, &request, &result) == ErikaStatus_Ok) {
+            erika_frame_export_result_free(&result);
+        }
+    }
+    erika_frame_export_session_close(session);
+}
+```
+
+若上一次解码位置到本次请求之间没有关键帧（demuxer 的 seek 索引可以判断；没有索引时，请求在
+两秒内或最长关键帧间隔的一半以内），就接着解码；否则 seek 到请求之前的关键帧。请求可以任意顺序，
+时间递增最省。结果、尺寸、格式与色调映射同 `erika_export_frame`。某次请求失败后会话仍可使用。
+同一会话上的调用相互串行，所有调用都是同步的。`erika_frame_export_session_close` 接受 `NULL`；
+关闭时不得有调用在执行，之后也不得再调用。
+
 ## 约定
 
 ### 状态码
@@ -616,21 +678,37 @@ char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 { "ok": false, "status": 3, "error": "<message>" }
 ```
 
-`arguments_json` 必须是 JSON 对象。`method` 选择操作，与 C 入口一一对应：
-`open`、`play`、`pause`、`stop`、`close`、`seek`、`setPlaybackRate`、`setVolume`、
-`setUpscaler`、`setSubtitleScale`、`getUpscalerStatus`、`getOutputStatus`、
-`getPresenterStats`、`tracks`、`addExternalSubtitle`、`removeSubtitleTrack`、
-`selectAudioTrack`、`selectSubtitleTrack`，以及弹幕系列（`loadDanmakuFile`、
-`loadDanmakuJson`、`addDanmakuTrackFile`、`addDanmakuTrackJson`、
-`removeDanmakuTrack`、`setDanmakuTrackEnabled`、`setDanmakuTrackOffset`、
-`setDanmakuGlobalOffset`、`danmakuTracks`、`clearDanmaku`、`setDanmakuEnabled`、
-`setDanmakuConfig`），以及字幕字体与资源状态系列（`selectSubtitleMemoryFonts`、
-`clearSubtitleMemoryFonts`、`getSubtitleMemoryFontStatus`、`getResourceStatus`）。
-未知 method 返回 `ok: false`，不会中止。权威分发表见
-`crates/erika_capi/src/presenter_json.rs`。
+`arguments_json` 必须是 JSON 对象。`method` 选择
+`crates/erika_capi/src/presenter_json.rs` 中分派表（`JSON_METHODS`）的一项。分派表
+与 C 入口对应：播放（`open`、`play`、`pause`、`stop`、`close`、`seek`、
+`setPlaybackRate`、`setVolume`）、轨道与字幕（`tracks`、`trackSelection`、
+`selectAudioTrack`、`selectSubtitleTrack`、`addExternalSubtitle`、
+`removeSubtitleTrack`、`setSubtitleScale`、`setSubtitleFont`、`setSubtitleStyle`、
+字幕内存字体系列）、弹幕系列（含 `getDanmakuConfig`）、输出与超分（`setUpscaler`、
+`getUpscalerStatus`、`setOutputHeadroom`、`getOutputStatus`、`setDebugHudEnabled`）、
+计数（`getPresenterStats`、`getResourceStatus`），以及下文的诊断
+（`getDiagnosticsSnapshot`、`getLogs`）。
 
-这层桥只是便利封装，不是第二套 API：它调用的就是上面这些函数，没有额外能力。
-能在平台通道上传结构体的宿主应优先用类型化入口。
+`erika_presenter_invoke_json` 同时是进入内核的通用透传通道：
+
+- `listMethods` 返回分派表本身——`{schema: 1, fields, methods: [{name, scope, summary,
+  arguments: [{name, type, required}], returns, blocking, writesFiles}]}`——宿主（或其后的智能体）无需改代码
+  就能发现并转发能力。登记一项能力 = 在 `invoke` 加一个 `match` 分支，并在
+  `JSON_METHODS` 加一项；两者不一致时单元测试会失败。
+- 每一项还带 `blocking`（调用在调用线程上做完才返回，耗时随输入增长：媒体长度、文件大小）和
+  `writesFiles`（调用会在磁盘上创建文件，结果列出路径）；顶层 `fields` 写明这两个字段。
+  `exportFrame`、`exportFrames` 用上面的单帧导出从媒体取画面：给出 `outputPath` / `outputDir` 时写
+  PNG 或 RGBA 文件并返回路径，`exportFrame` 不给 `outputPath` 时返回 base64 编码的字节。
+- `scope` 为 `global` 的方法（`listMethods`、`getLogs`、`exportFrame`、`exportFrames`）接受 `NULL` 句柄。
+- `invokeJson`（`{method, arguments}`）调用表中另一方法，并把它的完整信封作为
+  `value` 返回。会在原生侧拆信封的平台插件（Linux、鸿蒙、Android）用它原样转发 Dart
+  的 `ErikaPlayer.invokeJson`。
+- 未知方法返回 `{"ok": false, "status": 3, "code": "unknown_method", "method":
+  "<名称>", "error": "unsupported Erika presenter method: <名称>"}`；`arguments_json`
+  格式错误时带 `"code": "invalid_arguments"`。两者都不会中止。
+
+这层桥调用的就是上面这些函数，没有额外能力。能在平台通道上传结构体的宿主也可以用
+类型化入口。
 
 ### 诊断与截图
 
@@ -692,6 +770,97 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+### 智能体诊断（JSON）
+
+```c
+ErikaStatus erika_presenter_get_diagnostics_json(ErikaPresenterHandle *, char **out_json);
+ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t since_seq,
+                                char **out_json);
+```
+
+新的诊断数据一律以 JSON 文档返回，不给上面的结构体加字段（Apple 插件手写镜像这些
+结构体，加字段会迫使动态库与插件锁步升级）。两个符号都应按可选方式加载，缺失即视为
+“不支持”。返回 `Ok` 时 `*out_json` 是调用方所有的 UTF-8 文档，用 `erika_string_free`
+释放；其它状态下为 `NULL`。每个文档带 `schema`（当前为 `1`），同一 schema 内只增字段。
+取不到的值为 `null`，不会填假的 0。时长单位为毫秒（微秒精度）。
+
+#### 诊断快照
+
+`erika_presenter_get_diagnostics_json` 一次取全。它只读 presenter 字段、渲染/音频计数
+和无锁的播放计数：不解码、不渲染，也从不等待播放线程（macOS release 构建播放中实测
+单次中位数约 0.3 ms，含 JSON 编码）。线程规则与其它句柄调用相同。
+
+| 段 | 内容 |
+|----|------|
+| `schema`、`capturedAtUnixMs` | 文档版本与采集时刻（墙钟）。 |
+| `playback` | `state`、`playing`、`mediaTimeSeconds`、`durationSeconds`、`playbackRate`、`generation`、`audioOnly`（后台暂停视频解码）、`buffering` `{active, events, currentMs, totalMs}`。 |
+| `media` | 选中的 `video`（`codec`、`profile`、`level`、`width`、`height`、`pixelFormat`、`frameRate`、`bitRate`）、`audio`（`codec`、`sampleRate`、`channels`、`sampleFormat`、`bitRate`）、`subtitle`，没有则为 `null`。 |
+| `decoder` | 最近一次解码器切换，可直接查询而不再只靠事件：`requestedBackend`、`activeBackend`、`previousBackend`、`hardware`、`fellBack`、`fallbackCount`、`stage`、`reason`、`codec`、`pixelFormat`、`lineSizes`。首次切换前为 `null`。 |
+| `video` | 解码/渲染帧、硬件/软件/零拷贝/直接零拷贝/共享句柄帧、`cpuFallbackFrames`、`importFailures`、`renderFailures`、`backpressureDrops`、`rejectedImportRoute`。 |
+| `presenter` | surface 挂载与尺寸，最近一次 tick/pump/音频/字幕/视频/时钟/弹幕规划/渲染/GPU 耗时，测试帧/叠加/字幕/弹幕计数。 |
+| `output` | 请求模式、实际编码、surface 格式、dataspace、请求/实际余量（未知为 `null`）、回退原因标签与计数。 |
+| `hdr` | HDR 源帧、HDR10 输出帧、色调映射到 SDR 的帧、元数据更新/失败、输出失败、`outputActive`。 |
+| `resources` | 与 `ErikaPresenterResourceStatus` 相同。 |
+| `upscaler` | 请求模式与实际后端（标签）、回退次数、超分帧数、最近编码耗时。 |
+| `audio` | 输出状态、configured/started、音量、推入帧、失败数、队列帧与 `queuedMs`、读/写/欠载帧、环形缓冲 `ringDroppedFrames`、设备恢复 `recovery`。 |
+| `buffers` | 播放线程发布的队列深度 `playback`（`demuxPackets`、`pendingVideoPackets`、`decodedVideoFrames`、`decodedAudioFrames`、`decodedSubtitleFrames`，形如 `{queued, capacity}`；`demuxEof`、`updatedAgoMs`；open 前为 `null`）、presenter 帧通道、`audioOutputQueuedMs`。 |
+| `timing.scheduler` | `leadTimeMs`、`dropToleranceMs`、`maxConsecutiveDrops`；`presentedFrames`；`lateDroppedFrames`（因超过丢帧容忍度被丢弃，过去没有计数）；`forcedLatePresents`（超过容忍度但连续丢帧额度用尽而照常显示）；`maxDropBurst`、`maxDroppedLateMs`、`lastDropAgoMs`、`seekPrerollDroppedFrames`；最近 128 个已呈现帧的 `lateByMs` 窗口 `{samples, meanMs, p50Ms, p95Ms, maxMs}`；`lateHistogram`（`le10ms` … `gt120ms`）。 |
+| `timing.presentation` | 在 liberika 渲染处测得，并非显示器真实 vsync：`ticks` 与 `tickIntervalMs`；`uploadedFrames`、`newFramesPresented`、`supersededBeforePresent`；`frameIntervalMs` 与 `jitterMs`（相对源帧间隔÷倍速的绝对偏差）；`longFrames`（在屏时长超过 `longFrameFactor` = 1.5 个源帧间隔）；`lastPresentAgoMs`。 |
+| `timing.clock` | 音频主时钟纠偏（过去只写 trace）：模式、同步参数（`deadbandMs`、`maxCorrectionPerFrameMs`、`snapThresholdMs`、`audioLeadTimeMs`）、`observations`、`corrections`、`snaps`、`forwardCorrections`、`backwardCorrections`、`lastDriftMs`（正值：音频领先播放时钟）、`maxAbsDriftMs`、`appliedTotalMs`、`lastCorrectionAgoMs`、`lastSnapAgoMs`、`absDriftMs` 窗口。 |
+
+`timing` 与 `buffers.playback` 中的计数在 presenter 打开新媒体时清零。
+
+#### 日志环形缓冲
+
+`erika_log_read_json` 导出进程级内存环形缓冲（最多 2000 条 / 512 KiB，单条正文上限
+4 KiB）。无需句柄，任意线程可调用。收集内容：
+
+- liberika 原本写到 stderr / logcat / hilog 的全部运维诊断（这些输出保持不变）；
+- 过去是裸 `eprintln!` 的运维失败（音频 configure/push/start/pause/reset、渲染器
+  clear、字幕渲染与解码器打开、WASAPI、D3D11 设备移除、超分被禁用）；
+- 警告及以上的 FFmpeg `av_log` 消息。回调是进程级的，所有播放器共享：在栈缓冲里格式化，
+  从不阻塞（争用时计入 `droppedContended`），只差数字/地址的连续重复合并为一条并计
+  `count`，FFmpeg 新条目每秒最多 50 条（其余计入 `rateLimited`）。FFmpeg 自身的 stderr
+  输出照旧。`ERIKA_FFMPEG_LOG_CAPTURE=0` 关闭捕获；使用发行版共享 FFmpeg（Linux 系统库）
+  时默认不捕获，需 `ERIKA_FFMPEG_LOG_CAPTURE=1`，因为进程里其它库可能占用该回调。
+
+参数：`limit` 过滤后最新的条数（`0` = 全部保留条目）；`min_level` 为 `ErikaLogLevel`
+（`Trace` 0 … `Error` 4）或 `-1` 表示全部；`since_seq` 只取 `seq >= since_seq` 的条目
+（传上次的 `nextSeq` 即增量读取）。
+
+```json
+{
+  "schema": 1,
+  "capacity": { "entries": 2000, "bytes": 524288, "entryTextBytes": 4096 },
+  "retained": 15, "retainedBytes": 6011, "oldestSeq": 1, "nextSeq": 16,
+  "evicted": 0, "rateLimited": 0, "droppedContended": 0,
+  "ffmpegCapture": "active", "redacted": true,
+  "entries": [
+    { "seq": 3, "unixMs": 1761134400123, "level": "error", "source": "ffmpeg",
+      "event": null, "count": 1,
+      "message": "[mpeg4 @ 0x…] Failed setup for format videotoolbox_vld: hwaccel initialisation returned error." },
+    { "seq": 4, "unixMs": 1761134400140, "level": "warn", "source": "erika",
+      "event": "video_decoder", "count": 2, "lastUnixMs": 1761134400410,
+      "data": { "event": "video_decoder", "stage": "open_avcodec_to_software" } }
+  ]
+}
+```
+
+条目按时间从旧到新。结构化诊断解析为 `data`，其它行为 `message`。`ffmpegCapture` 取值
+`not_installed`（尚未用到 FFmpeg）、`active`、`disabled`、
+`shared_library_opt_in_required`。
+
+级别：已知严重程度的调用点显式传入；FFmpeg 的 PANIC/FATAL/ERROR → `error`、
+WARNING → `warn`；libass 0–1 → `error`、2 → `warn`。其它结构化诊断按 `event`/`stage`
+名称给默认级别：fatal/panic 为 `error`；失败、超时、资源不可用/丢失/被拒/缺失、卡住与
+回退（包括 `*_to_software`、`*_to_bytebuffer` 路径）为 `warn`；其余为 `info`。
+
+脱敏在导出时进行：URL 的用户信息以及 `?`/`#` 之后的全部内容、凭据类 `key=value` /
+`key: value` 与 JSON 键（`token`、`api_key`、`access_token`、`authorization`、
+`cookie`、`X-Emby-Token` 等）、`Bearer`/`Basic` 凭据、当前用户主目录（替换为 `~`），以及
+其它 `/Users/<user>`、`/home/<user>`、`C:\Users\<user>` 路径段。缓冲只存在于进程内存，
+按需读取。
 
 ## 枚举
 

@@ -1,11 +1,47 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-25
+
+### Default behavior changes
 
 - Enabled native subtitle supersampling by default. Subtitle and danmaku
   supersampling now default to on in both native and Web backends, with the
   existing size limits, native subtitle CPU fallback and explicit opt-out
   controls preserved.
+- Software video decoders now use frame and slice threading (FFmpeg picks the
+  count) for playback as well as exports; `ERIKA_VIDEO_DECODE_THREADS=1`
+  restores single-threaded decoding. Forced to software, 4K H.264 at 3x
+  presented 72 fps with no late drops where one thread presented 7 fps and
+  dropped 481 frames in 15 s, and the time from a seek to the first picture
+  fell from 2.8 s to 0.43 s (median). `ERIKA_HWDEC=software` makes software
+  decoding the default on every platform, for measuring it.
+
+### Features and fixes
+
+- Renamed the project and repositories to liberika and liberika-swift. The
+  `erika` Rust crate, `erika_*` C ABI and existing SDK package names remain
+  compatible.
+- Added `liberika-web-0.3.0.zip` to the Release, containing the complete Web
+  runtime, demo page and licenses, with its digest in `SHA256SUMS`.
+- Added container chapters to presenter JSON (`chapters`), available to
+  hosts without changing the existing C structs (#172).
+- Fixed embedded subtitle delivery while paused, long cues spanning a seek,
+  and the active cue after switching subtitle tracks during paused playback
+  (#171).
+- Fixed iOS/tvOS static linking of optional export and diagnostics symbols:
+  only symbols present in the selected native archive are force-linked, while
+  older pinned runtimes remain linkable (#170).
+- Added the failure reason to the `erika_play` trace so failed playback starts
+  can be diagnosed from logs.
+- Treat ordinary undelivered HTTP tail ranges within the final 4 MiB as EOF;
+  range verification and changed-entity errors remain errors (#169).
+- Fixed a danmaku memory spike when comments contain characters the embedded
+  fallback font does not cover, such as emoji. The danmaku system font
+  fallback now checks character coverage with zero-copy lookups before
+  loading a face and keeps a bounded set of fallback faces resident with LRU
+  eviction while preserving the existing font fallback order, so a single
+  uncovered character no longer copies every system font (about 1.65 GB in
+  the reported macOS case) into memory.
 - Removed the duplicate Web fallback-font asset. libass now uses the complete
   font already embedded in the Rust WASM, eliminating a separate font request
   and about 6.07 MiB of package data (2.74 MiB with gzip). Incremental Web builds
@@ -22,7 +58,8 @@
 - Integrated the Web backend into Erika's browser application and verified it
   in Chrome with H.264/AAC/ASS MKV, VP9/Opus WebM, 2,000 comments, playback
   controls, screenshots, UI transitions and player cleanup. Web distribution
-  currently uses source builds; see the [browser guide](docs/web.md).
+  is available as a Release archive and from source; see the
+  [browser guide](docs/web.md).
 - Fixed HTTP(S) reads and persistent prefetch for origins that ignore Range
   and return `200` with the whole file, including HLS playlists and segments
   without Content-Length. Replayed prefixes are discarded before caching,
@@ -30,6 +67,63 @@
   Retries reject changed entity validators instead of mixing file versions.
   Entity validation failures also block synchronous fallback and later reads;
   weak ETags cannot authorize resuming a partial response.
+- Added a process-wide diagnostics log ring, read with the new
+  `erika_log_read_json`. It keeps operational diagnostics (with a level and
+  timestamp), operational failures that previously went to bare stderr, and
+  FFmpeg warnings and errors through an `av_log` bridge that never blocks,
+  folds repeats and rate-limits floods. Exports are redacted (URL query strings
+  and user info, credentials, home directories). Existing stderr, logcat and
+  hilog output is unchanged; `ERIKA_FFMPEG_LOG_CAPTURE=0` turns FFmpeg capture
+  off, and Linux builds against a shared system FFmpeg capture only with
+  `ERIKA_FFMPEG_LOG_CAPTURE=1`.
+- Added `erika_presenter_get_diagnostics_json`, a one-call JSON snapshot of the
+  decoder and hardware path, presenter counters, output/HDR, resources,
+  upscaler, audio, buffer depths and timing. Timing adds counters that did not
+  exist before: frames the scheduler dropped for being late, late frames shown
+  after the drop budget ran out, presentation cadence and jitter, and audio
+  clock drift, corrections and snaps. Existing structs are unchanged.
+- `erika_presenter_invoke_json` is now a discoverable pass-through: one
+  dispatch table backs it, `listMethods` returns that table with arguments and
+  results, `invokeJson` nests a call, `listMethods`/`getLogs` accept a NULL
+  handle, and unknown methods return `"code": "unknown_method"`. The table adds
+  `getDiagnosticsSnapshot`, `getLogs`, `setDebugHudEnabled`,
+  `setOutputHeadroom`, `trackSelection`, `getDanmakuConfig`,
+  `setSubtitleFont` and `setSubtitleStyle`; Android's JSON bridge falls back to
+  it for methods it does not implement itself.
+- Fixed decoder reporting when FFmpeg drops VideoToolbox or D3D11VA after the
+  decoder opened: when the hwaccel fails to initialise (or is not offered for
+  the stream), FFmpeg renegotiates and decodes in software, while liberika kept
+  reporting the hardware backend with no fallback. The format negotiation is
+  now recorded; the playback session emits a decoder change
+  (`hwaccel_<backend>_to_software`, or `…_restored` when the hardware returns)
+  with the software pixel format and the reason, counts the fallback, and tags
+  frames with the backend that actually decoded them.
+- Added `erika_export_frame` and `erika_frame_export_result_free`: a headless
+  single-frame export that returns the picture shown at a media time as RGBA or
+  PNG, scaled within optional bounds, from its own demuxer and multi-threaded
+  software decoder.
+- Added frame export sessions: `erika_frame_export_session_open`,
+  `erika_frame_export_session_frame` and `erika_frame_export_session_close`
+  open a media once and take pictures from it one after another. A request
+  after the previous one continues decoding from where the decoder stopped
+  when no keyframe lies between (the demuxer's seek index tells), and seeks
+  otherwise. 60 pictures 100 ms apart from a 4096x1744 H.264 file took 23.9 s
+  through one `erika_export_frame` call each (60 opens and seeks) and 1.0 s
+  through a session (one seek, 335 frames decoded). The JSON
+  method table gains `exportFrame` and `exportFrames` (scope `global`); each
+  table entry now says whether it is `blocking` and whether it `writesFiles`.
+- Frame exports tone map HDR sources (PQ, HLG, Dolby Vision) to SDR with the
+  arithmetic the video renderer applies for an SDR display (ITU-R BT.2390 EETF
+  against a 203-nit target, BT.2020 to BT.709 gamut mapping, gamma 2.2) instead
+  of FFmpeg's plain conversion, and set `ERIKA_FRAME_EXPORT_TONE_MAPPED` in
+  `reserved_flags` of the result. Against a screenshot of the player on an SDR
+  display, a 4K HDR10 frame differs by 0.1 to 0.3 of 255 on average (7 to 9
+  before).
+
+- Fixed `erika_presenter_select_subtitle_track` (and `Player::select_subtitle_track`)
+  failing with `ErikaStatus 3` when asked for no subtitle while no media was
+  open, which is how a host clears the subtitle before opening: it now succeeds
+  and changes nothing.
 
 ## 0.2.1 - 2026-10-02
 

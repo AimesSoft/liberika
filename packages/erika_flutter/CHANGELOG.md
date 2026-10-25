@@ -1,6 +1,53 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-25
+
+### Default behavior changes
+
+- Enabled subtitle and danmaku supersampling by default; explicit opt-out
+  settings remain available.
+- Software video decoding now uses FFmpeg frame/slice threading by default;
+  `ERIKA_VIDEO_DECODE_THREADS=1` restores single-threaded decoding.
+
+### Playback and SDK updates
+
+- Fixed subtitles during paused seeks and track switches, including long cues
+  spanning the seek position (#171).
+- Added container chapters through `invokeJson('chapters')` (#172).
+- iOS/tvOS force-link only optional entry points actually present in the
+  selected native archive, retaining compatibility with older runtimes (#170).
+- Added playback-start failure reasons to native traces, fixed ordinary HTTP
+  tail read failures becoming playback errors (#169), and bounded system-font
+  fallback memory without hiding previously visible symbols (#173).
+- Renamed the project to liberika; the `erika_flutter` package name is unchanged.
+
+
+- Added `ErikaPlayer.getDiagnosticsSnapshot()`, `getLogs()` and
+  `invokeJson()`. They return JSON maps from the native engine for automated
+  troubleshooting; `invokeJson('listMethods')` lists every native method.
+  macOS, iOS and tvOS resolve the new native symbols optionally, Linux,
+  HarmonyOS and Android use the shared JSON bridge, and Windows (or an older
+  native library) throws `UnsupportedError`. Requires native artifacts from
+  the matching release.
+- Added `ErikaPlayer.exportFrame()`, which returns the picture shown at a
+  position of a media URI as RGBA or PNG through the native headless frame
+  export, off the UI thread (a native worker on macOS, a background isolate on
+  the FFI platforms).
+- Large JSON documents from `getLogs()`, `getDiagnosticsSnapshot()` and
+  `invokeJson()` are decoded on a background isolate.
+- On macOS and iOS `getLogs()`, `getDiagnosticsSnapshot()` and `invokeJson()`
+  run on a background queue and answer on the main thread; while one of them
+  runs inside the player the plugin's main-thread timers skip a tick instead of
+  waiting for the player's lock, and methods with scope `global` run without it.
+- Added `ErikaFrameExportSession` and `ErikaPlayer.exportFrames()`: the media is
+  opened once and many pictures are taken from it (a native worker queue on
+  macOS, a background isolate per session on the FFI platforms).
+  `ErikaExportedFrame.toneMapped` says whether an HDR source was tone mapped to
+  SDR. `ERIKA_FLUTTER_LIBRARY` points the FFI exports at a library under test.
+- The iOS and tvOS podspecs retain available export, diagnostics and JSON
+  functions for the plugin's and Dart's lookups in the running executable.
+- The macOS build phase checks that an `ERIKA_MACOS_CAPI_DYLIB` override has
+  every architecture being built and says which library it bundles.
 
 ## 0.2.1
 

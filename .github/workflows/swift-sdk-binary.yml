@@ -11,7 +11,7 @@ on:
       version:
         description: Existing liberika native release version
         required: true
-        default: "0.1.7"
+        default: "0.3.0"
         type: string
       upload:
         description: Attach the Swift XCFramework to the existing release
@@ -50,7 +50,7 @@ jobs:
       checksum: ${{ steps.binary.outputs.checksum }}
     env:
       GH_TOKEN: ${{ github.token }}
-      VERSION: ${{ inputs.version || '0.1.7' }}
+      VERSION: ${{ inputs.version || '0.3.0' }}
     steps:
       - uses: actions/checkout@v4
         with:

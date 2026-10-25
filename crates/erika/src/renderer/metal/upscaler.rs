@@ -207,8 +207,11 @@ impl LumaUpscaler {
     fn record_auto_matmul_failure(&mut self, error: &PlayerError) {
         if !self.auto_matmul_failed {
             self.auto_matmul_fallbacks = self.auto_matmul_fallbacks.saturating_add(1);
-            eprintln!(
-                "Erika luma upscaler falling back to scalar backend after matmul build failed: {error}"
+            crate::trace::diagnostic_at(
+                crate::trace::LogLevel::Warn,
+                format!(
+                    "Erika luma upscaler falling back to scalar backend after matmul build failed: {error}"
+                ),
             );
         }
         self.auto_matmul_failed = true;

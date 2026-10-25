@@ -2458,15 +2458,24 @@ unsafe extern "C" fn libass_log_sink(
         return;
     }
     drop(seen);
-    crate::trace::diagnostic(
-        serde_json::json!({
-            "event": "subtitle_libass",
-            "stage": stage,
-            "trackId": context.track_id,
-            "level": level,
-            "message": message,
-        })
-        .to_string(),
+    let line = serde_json::json!({
+        "event": "subtitle_libass",
+        "stage": stage,
+        "trackId": context.track_id,
+        "level": level,
+        "message": message,
+    })
+    .to_string();
+    // libass: 0 fatal, 1 error, 2 warning, 3..5 informational. Missing styles
+    // and fonts stay at least a warning whatever level libass used.
+    let libass_level = match level {
+        0 | 1 => crate::trace::LogLevel::Error,
+        2 => crate::trace::LogLevel::Warn,
+        _ => crate::trace::LogLevel::Info,
+    };
+    crate::trace::diagnostic_at(
+        libass_level.max(crate::trace::classify_diagnostic(&line)),
+        line,
     );
 }
 

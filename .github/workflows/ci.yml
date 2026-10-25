@@ -101,6 +101,9 @@ jobs:
       - name: Verify software playback fixture checksums
         working-directory: crates/erika/testdata/software
         run: sha256sum --check SHA256SUMS
+      - name: Verify subtitle seek fixture checksums
+        working-directory: crates/erika/testdata/subtitle-seek
+        run: sha256sum --check SHA256SUMS
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Check C API and package binding alignment

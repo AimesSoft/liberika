@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'erika_flutter'
-  s.version          = '0.2.1'
+  s.version          = '0.3.0'
   s.summary          = 'Flutter embedder glue for the liberika Rust media engine.'
   s.description      = <<-DESC
 Flutter macOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI.
@@ -98,7 +98,25 @@ fi
 
 SOURCE_DYLIB=""
 if [ -n "${ERIKA_MACOS_CAPI_DYLIB:-}" ]; then
+  # A local build (for example `cargo build -p erika_capi --release`) used
+  # instead of a release prebuilt, unverified by checksum: it must at least
+  # carry every architecture Xcode is building.
   SOURCE_DYLIB="$ERIKA_MACOS_CAPI_DYLIB"
+  if [ ! -f "$SOURCE_DYLIB" ]; then
+    echo "error: ERIKA_MACOS_CAPI_DYLIB does not exist: $SOURCE_DYLIB" >&2
+    exit 1
+  fi
+  LOCAL_ARCHS="$(lipo -archs "$SOURCE_DYLIB" 2>/dev/null || true)"
+  for BUILD_ARCH in ${ARCHS:-}; do
+    case " $LOCAL_ARCHS " in
+      *" $BUILD_ARCH "*) ;;
+      *)
+        echo "error: ERIKA_MACOS_CAPI_DYLIB ($SOURCE_DYLIB) has [$LOCAL_ARCHS], not $BUILD_ARCH" >&2
+        exit 1
+        ;;
+    esac
+  done
+  echo "Erika: bundling local $SOURCE_DYLIB [$LOCAL_ARCHS] instead of the release prebuilt"
 elif [ "$USE_SOURCE_BUILD" != "1" ]; then
   sh "$PACKAGE_ROOT/native/prepare_apple_prebuilt.sh"     macos macos "$PREBUILT_ARCH" "$DEST_DYLIB"
 else

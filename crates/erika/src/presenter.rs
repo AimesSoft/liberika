@@ -352,6 +352,7 @@ pub struct PresenterRuntime {
     last_render_duration: Duration,
     last_render_current_duration: Duration,
     last_render_test_duration: Duration,
+    presentation: crate::diagnostics::PresentationStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -819,6 +820,7 @@ impl PresenterRuntime {
             last_render_duration: Duration::ZERO,
             last_render_current_duration: Duration::ZERO,
             last_render_test_duration: Duration::ZERO,
+            presentation: Default::default(),
         })
     }
 
@@ -939,6 +941,7 @@ impl PresenterRuntime {
         self.drain_pending_player_frames();
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;
+        self.presentation.reset();
         let result = self.player.open(media);
         let rate_result = if result.is_ok() && !playback_rate_matches(self.playback_rate, 1.0) {
             self.player.set_playback_rate(self.playback_rate)
@@ -977,7 +980,10 @@ impl PresenterRuntime {
         }
         if let Err(error) = self.audio_output.pause() {
             self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio pause failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio pause failed: {error}"),
+            );
         }
         self.audio_started = false;
         self.last_audio_clock_report = None;
@@ -1473,6 +1479,10 @@ impl PresenterRuntime {
         if !self.player.tracks().is_empty() && self.player.track_selection().subtitle == track_id {
             return Ok(());
         }
+        if track_id.is_none() && !self.player.has_open_media() {
+            // Nothing is open, so no subtitle is shown: nothing to quiesce.
+            return self.player.select_subtitle_track(None);
+        }
         let quiesced = self.quiesce_frame_output("select_subtitle_track")?;
         let result = self.player.select_subtitle_track(track_id);
         let rate_result = self.commit_pending_playback_rate_now();
@@ -1544,6 +1554,8 @@ impl PresenterRuntime {
             self.video_decode_resume_attempts = 0;
         }
         let tick_started = Instant::now();
+        self.presentation
+            .on_tick(presentation_time.unwrap_or(tick_started));
         self.commit_pending_playback_rate()?;
         let pump_started = Instant::now();
         self.refresh_video_decoder_status();
@@ -1655,7 +1667,15 @@ impl PresenterRuntime {
         self.last_render_duration = self.last_render_current_duration;
         self.last_render_test_duration = Duration::ZERO;
         match render_result {
-            Ok(true) => self.stats.rendered_video_frames += 1,
+            Ok(true) => {
+                self.stats.rendered_video_frames += 1;
+                self.presentation.on_render(
+                    presentation_time.unwrap_or_else(Instant::now),
+                    true,
+                    self.is_playing(),
+                    self.playback_rate,
+                );
+            }
             Ok(false) => {
                 if self.render_test_pattern_when_idle {
                     let render_started = Instant::now();
@@ -2084,6 +2104,154 @@ impl PresenterRuntime {
         }
     }
 
+    /// One-call diagnostics document for hosts and agents, schema
+    /// [`crate::diagnostics::DIAGNOSTICS_SCHEMA`].
+    ///
+    /// It reads presenter fields, renderer/audio counters and the player's
+    /// lock-free timing counters; it never decodes, renders or waits on the
+    /// playback worker. Unknown values are `null`.
+    pub fn diagnostics_snapshot(&mut self) -> serde_json::Value {
+        use crate::diagnostics as diag;
+        use serde_json::json;
+
+        self.refresh_video_decoder_status();
+        let now = Instant::now();
+        let snapshot = self.runtime_snapshot();
+        let renderer = &snapshot.renderer;
+        let tracks = self.player.tracks();
+        let selection = self.player.track_selection();
+        let find_track =
+            |id: Option<i64>| id.and_then(|id| tracks.iter().find(|track| track.id == id));
+        let video_track = find_track(selection.video).map(|track| {
+            json!({
+                "trackId": track.id,
+                "codec": track.codec,
+                "profile": track.profile,
+                "level": track.level,
+                "width": track.width,
+                "height": track.height,
+                "pixelFormat": track.pixel_format,
+                "frameRate": track.frame_rate.as_ref().map(|rate| rate.frames_per_second()),
+                "bitRate": track.bit_rate,
+            })
+        });
+        let audio_track = find_track(selection.audio).map(|track| {
+            json!({
+                "trackId": track.id,
+                "codec": track.codec,
+                "profile": track.profile,
+                "sampleRate": track.sample_rate,
+                "channels": track.channels,
+                "sampleFormat": track.sample_format,
+                "bitRate": track.bit_rate,
+            })
+        });
+        let subtitle_track = find_track(selection.subtitle).map(|track| {
+            json!({ "trackId": track.id, "codec": track.codec, "language": track.language })
+        });
+        let timing = self.player.timing_counters();
+        let audio_ring = self.audio_output.stats();
+        let audio_runtime = snapshot.audio_output_runtime_stats;
+        let queues = timing.queues_json();
+        let channel = |queued: usize, capacity: Option<usize>| json!({ "queued": queued, "capacity": capacity });
+        let surface = self.current_surface_metrics;
+        json!({
+            "schema": diag::DIAGNOSTICS_SCHEMA,
+            "capturedAtUnixMs": diag::unix_ms_now(),
+            "playback": {
+                "state": format!("{:?}", self.player.state()).to_lowercase(),
+                "playing": snapshot.playing,
+                "mediaTimeSeconds": snapshot.media_time.as_secs_f64(),
+                "durationSeconds": self.player.duration().map(|duration| duration.as_secs_f64()),
+                "playbackRate": self.playback_rate,
+                "generation": snapshot.generation,
+                "audioOnly": self.audio_only_tick_active,
+                "buffering": timing.buffering_json(),
+            },
+            "media": {
+                "video": video_track,
+                "audio": audio_track,
+                "subtitle": subtitle_track,
+            },
+            "decoder": diag::decoder_json(self.latest_video_decoder.as_ref()),
+            "video": {
+                "decodedFrames": snapshot.stats.decoded_video_frames,
+                "renderedFrames": snapshot.stats.rendered_video_frames,
+                "hardwareFrames": renderer.hardware_video_frames,
+                "softwareFrames": renderer.software_video_frames,
+                "zeroCopyFrames": renderer.zero_copy_video_frames,
+                "directZeroCopyFrames": renderer.direct_zero_copy_video_frames,
+                "sharedHandleFrames": renderer.shared_handle_video_frames,
+                "cpuFallbackFrames": renderer.cpu_video_frame_fallbacks,
+                "importFailures": snapshot.stats.import_failures,
+                "renderFailures": snapshot.stats.render_failures,
+                "backpressureDrops": snapshot.stats.video_frame_backpressure_drops,
+                "rejectedImportRoute": self.rejected_video_import_route.map(|route| json!({
+                    "backend": route.backend.as_str(),
+                    "mediaCodecSurface": route.mediacodec_surface,
+                    "generation": route.generation,
+                })),
+            },
+            "presenter": {
+                "surfaceAttached": renderer.attached,
+                "surfaceWidth": surface.map(|metrics| metrics.physical_extent.width),
+                "surfaceHeight": surface.map(|metrics| metrics.physical_extent.height),
+                "lastTickMs": diag::duration_ms_value(snapshot.last_tick_duration),
+                "lastPumpMs": diag::duration_ms_value(snapshot.last_pump_duration),
+                "lastAudioPumpMs": diag::duration_ms_value(snapshot.last_audio_pump_duration),
+                "lastSubtitlePumpMs": diag::duration_ms_value(snapshot.last_subtitle_pump_duration),
+                "lastVideoPumpMs": diag::duration_ms_value(snapshot.last_video_pump_duration),
+                "lastClockSyncMs": diag::duration_ms_value(snapshot.last_clock_sync_duration),
+                "lastDanmakuPlanMs": diag::duration_ms_value(snapshot.last_danmaku_plan_duration),
+                "lastRenderMs": diag::duration_ms_value(snapshot.last_render_duration),
+                "lastGpuMs": diag::duration_ms_value(renderer.last_gpu_duration),
+                "renderedTestFrames": snapshot.stats.rendered_test_frames,
+                "overlayFrames": snapshot.stats.overlay_frames,
+                "decodedSubtitleFrames": snapshot.stats.decoded_subtitle_frames,
+                "danmakuFrames": snapshot.stats.danmaku_frames,
+                "danmakuItems": snapshot.stats.danmaku_items,
+                "currentDanmakuItems": snapshot.current_danmaku_items,
+            },
+            "output": diag::output_json(&snapshot.output),
+            "hdr": diag::hdr_json(renderer),
+            "resources": diag::resources_json(&snapshot.resources, snapshot.current_danmaku_atlas_bytes),
+            "upscaler": diag::upscaler_json(renderer),
+            "audio": {
+                "outputState": format!("{:?}", self.audio_output.state()).to_lowercase(),
+                "configured": self.audio_configured,
+                "started": self.audio_started,
+                "volume": self.audio_output.volume(),
+                "pushedFrames": snapshot.stats.pushed_audio_frames,
+                "failures": snapshot.stats.audio_failures,
+                "queuedFrames": snapshot.audio_output_queued_frames,
+                "queuedMs": diag::optional_duration_ms(snapshot.audio_output_queued_duration),
+                "readFrames": snapshot.audio_output_read_frames,
+                "writtenFrames": snapshot.audio_output_written_frames,
+                "underflowFrames": snapshot.audio_output_underflow_frames,
+                "ringDroppedFrames": audio_ring.dropped_frames,
+                "recovery": {
+                    "state": audio_runtime.recovery_state.as_str(),
+                    "lastErrorCode": audio_runtime.last_error_code,
+                    "attempts": audio_runtime.recovery_attempts,
+                    "count": audio_runtime.recovery_count,
+                    "failures": audio_runtime.recovery_failures,
+                },
+            },
+            "buffers": {
+                "playback": queues,
+                "presenterVideoFrames": channel(self.video_frames.len(), self.video_frames.capacity()),
+                "presenterAudioFrames": channel(self.audio_frames.len(), self.audio_frames.capacity()),
+                "presenterSubtitleFrames": channel(self.subtitle_frames.len(), self.subtitle_frames.capacity()),
+                "audioOutputQueuedMs": diag::optional_duration_ms(snapshot.audio_output_queued_duration),
+            },
+            "timing": {
+                "scheduler": timing.scheduler_json(),
+                "presentation": self.presentation.to_json(now),
+                "clock": timing.clock_json(),
+            },
+        })
+    }
+
     fn pump_video(&mut self) {
         let started = Instant::now();
         let mut pumped = 0usize;
@@ -2126,6 +2294,7 @@ impl PresenterRuntime {
                                 self.rejected_video_import_route = None;
                             }
                             let pts = frame.pts.unwrap_or(frame.media_time);
+                            self.presentation.on_upload(pts, frame.generation);
                             self.current_media_time = pts;
                             self.current_generation =
                                 frame.generation.max(self.danmaku_generation).max(1);
@@ -2955,7 +3124,10 @@ impl PresenterRuntime {
     fn release_current_video_frame(&mut self) {
         if let Err(error) = self.renderer.clear_current_frame() {
             self.stats.render_failures += 1;
-            eprintln!("Erika presenter renderer clear failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter renderer clear failed: {error}"),
+            );
         }
     }
 
@@ -3276,7 +3448,10 @@ impl PresenterRuntime {
             self.player.invalidate_audio_clock();
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
-                eprintln!("Erika presenter audio configure failed: {error}");
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!("Erika presenter audio configure failed: {error}"),
+                );
                 return;
             }
             self.audio_configured = true;
@@ -3286,7 +3461,10 @@ impl PresenterRuntime {
             Ok(_) => self.stats.pushed_audio_frames += 1,
             Err(error) => {
                 self.stats.audio_failures += 1;
-                eprintln!("Erika presenter audio push failed: {error}");
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!("Erika presenter audio push failed: {error}"),
+                );
                 return;
             }
         }
@@ -3304,7 +3482,10 @@ impl PresenterRuntime {
         }
         if let Err(error) = self.audio_output.start() {
             self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio start failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio start failed: {error}"),
+            );
             return;
         }
         self.audio_started = true;
@@ -3326,7 +3507,10 @@ impl PresenterRuntime {
         self.player.invalidate_audio_clock();
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio reset failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio reset failed: {error}"),
+            );
         }
         self.audio_configured = false;
         self.audio_started = false;
@@ -6209,5 +6393,70 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         assert_eq!(presenter.danmaku_tracks().len(), 1);
         assert!(presenter.remove_danmaku_track(first_id));
         assert!(presenter.danmaku_tracks().is_empty());
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn diagnostics_snapshot_reports_every_section_with_nulls_for_unknowns() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let snapshot = presenter.diagnostics_snapshot();
+        assert_eq!(snapshot["schema"], crate::diagnostics::DIAGNOSTICS_SCHEMA);
+        assert!(snapshot["capturedAtUnixMs"].as_u64().unwrap() > 0);
+        for section in [
+            "playback",
+            "media",
+            "decoder",
+            "video",
+            "presenter",
+            "output",
+            "hdr",
+            "resources",
+            "upscaler",
+            "audio",
+            "buffers",
+            "timing",
+        ] {
+            assert!(
+                snapshot.get(section).is_some(),
+                "missing {section}: {snapshot}"
+            );
+        }
+        // Nothing is open: unknown values are null rather than zero.
+        assert_eq!(snapshot["playback"]["state"], "idle");
+        assert!(snapshot["playback"]["durationSeconds"].is_null());
+        assert_eq!(snapshot["playback"]["buffering"]["active"], false);
+        assert!(snapshot["media"]["video"].is_null());
+        assert!(snapshot["decoder"].is_null());
+        assert!(snapshot["buffers"]["playback"].is_null());
+        assert!(snapshot["timing"]["scheduler"]["dropToleranceMs"].is_null());
+        assert!(snapshot["timing"]["clock"]["lastDriftMs"].is_null());
+        assert_eq!(snapshot["timing"]["scheduler"]["presentedFrames"], 0);
+        assert_eq!(snapshot["timing"]["presentation"]["newFramesPresented"], 0);
+        assert!(snapshot["timing"]["presentation"]["lastPresentAgoMs"].is_null());
+        assert_eq!(snapshot["output"]["requestedMode"], "sdr");
+        assert!(snapshot["output"]["fallbackReason"].is_string());
+        assert_eq!(snapshot["upscaler"]["requestedMode"], "off");
+        assert_eq!(snapshot["audio"]["recovery"]["state"], "stable");
+        assert!(snapshot["buffers"]["presenterVideoFrames"]["queued"].is_u64());
+
+        // The latest decoder transition becomes queryable instead of being
+        // available only to event listeners that were attached in time.
+        presenter.latest_video_decoder = Some(VideoDecoderEvent {
+            stage: "open_avcodec_to_software".to_string(),
+            requested_backend: DecoderBackend::VideoToolbox,
+            previous_backend: Some(DecoderBackend::VideoToolbox),
+            active_backend: DecoderBackend::Software,
+            fallback_count: 1,
+            codec: Some("hevc".to_string()),
+            pixel_format: Some("yuv420p10le".to_string()),
+            line_sizes: None,
+            reason: Some("unsupported profile".to_string()),
+        });
+        let snapshot = presenter.diagnostics_snapshot();
+        assert_eq!(snapshot["decoder"]["activeBackend"], "software");
+        assert_eq!(snapshot["decoder"]["requestedBackend"], "videotoolbox");
+        assert_eq!(snapshot["decoder"]["hardware"], false);
+        assert_eq!(snapshot["decoder"]["fellBack"], true);
+        assert_eq!(snapshot["decoder"]["reason"], "unsupported profile");
     }
 }

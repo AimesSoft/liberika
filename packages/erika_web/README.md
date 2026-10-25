@@ -3,7 +3,8 @@
 An embeddable browser player for MKV with ASS subtitles, attached fonts and
 danmaku. The backend is part of liberika and is integrated into Erika Web.
 
-Build from current source with `cargo run -p xtask -- web build`; deploy the
+Download `liberika-web-0.3.0.zip` from the 0.3.0 Release, or
+build from current source with `cargo run -p xtask -- web build`; deploy the
 complete runtime in `target/web/`, preserving its relative paths. This source
 directory alone is not a deployable package, and no npm release is available.
 

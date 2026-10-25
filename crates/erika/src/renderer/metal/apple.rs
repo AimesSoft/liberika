@@ -1088,7 +1088,10 @@ impl MetalRendererImpl {
                         upscaled_luma = texture;
                     }
                     Err(error) => {
-                        eprintln!("Erika luma upscaler disabled after encode failure: {error}");
+                        crate::trace::diagnostic_at(
+                            crate::trace::LogLevel::Warn,
+                            format!("Erika luma upscaler disabled after encode failure: {error}"),
+                        );
                         self.upscaler.set_mode(LumaUpscalerMode::Off);
                     }
                 }

@@ -36,7 +36,7 @@ NVIDIA 使用 CUDA/NVDEC，Intel/AMD 使用 VA-API，可回退 FFmpeg 软件解�
 
 ## macOS Setup
 
-macOS CocoaPods 构建阶段默认下载并打包经校验、签名的 `liberika_capi.dylib`，默认 arm64+x86_64 universal。通过 `ERIKA_MACOS_ARCHS=arm64`、`x86_64` 或 `arm64,x86_64` 选择架构。运行时通过 `dlopen` 加载；`ERIKA_CAPI_DYLIB` 可覆盖加载路径，`ERIKA_MACOS_CAPI_DYLIB` 可指定要打包的本地动态库。
+macOS CocoaPods 构建阶段默认下载并打包经校验、签名的 `liberika_capi.dylib`，默认 arm64+x86_64 universal。通过 `ERIKA_MACOS_ARCHS=arm64`、`x86_64` 或 `arm64,x86_64` 选择架构。运行时通过 `dlopen` 加载；`ERIKA_CAPI_DYLIB` 可覆盖加载路径，`ERIKA_MACOS_CAPI_DYLIB` 可指定要打包的本地动态库（例如发版前本地 `cargo build -p erika_capi --release` 的产物），不做校验和检查，缺少正在构建的架构时构建失败。
 
 macOS 通过 Now Playing 和 Remote Command Center 提供媒体信息、播放、暂停、停止及进度控制。
 

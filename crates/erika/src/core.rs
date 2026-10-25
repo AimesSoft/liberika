@@ -1164,6 +1164,7 @@ pub struct Player {
     decoder_resources: PlaybackDecoderResources,
     inner: Arc<Mutex<PlayerInner>>,
     lifecycle: Arc<Mutex<PlayerLifecycle>>,
+    timing_counters: Arc<crate::diagnostics::PlaybackTimingCounters>,
 }
 
 impl Player {
@@ -1196,7 +1197,14 @@ impl Player {
                 epoch: 1,
                 playback: None,
             })),
+            timing_counters: Arc::new(crate::diagnostics::PlaybackTimingCounters::new()),
         }
+    }
+
+    /// Scheduler, clock-discipline, buffering and queue counters of the
+    /// current media. Lock-free to read from any thread.
+    pub fn timing_counters(&self) -> &crate::diagnostics::PlaybackTimingCounters {
+        &self.timing_counters
     }
 
     #[cfg(target_env = "ohos")]
@@ -1396,6 +1404,7 @@ impl Player {
             inner.track_selection = info.track_selection();
             generation
         };
+        engine.attach_timing_counters(Arc::clone(&self.timing_counters));
         lifecycle.playback = Some(PlaybackRuntime::spawn(
             engine,
             Arc::clone(&self.inner),
@@ -1589,8 +1598,13 @@ impl Player {
         self.send_playback_command(PlaybackCommand::SelectAudioTrack(track_id))
     }
 
+    /// Selects a subtitle track, or none. Asking for none while no media is
+    /// open succeeds and changes nothing: no subtitle is shown then.
     pub fn select_subtitle_track(&self, track_id: Option<i64>) -> Result<()> {
         self.ensure_not_closed()?;
+        if track_id.is_none() && self.optional_playback_commands().is_none() {
+            return Ok(());
+        }
         self.send_playback_command(PlaybackCommand::SelectSubtitleTrack(track_id))
     }
 
@@ -1968,6 +1982,11 @@ impl Player {
             .clone())
     }
 
+    /// Whether a media is open (opening counts): a playback worker exists.
+    pub fn has_open_media(&self) -> bool {
+        self.optional_playback_commands().is_some()
+    }
+
     fn optional_playback_commands(&self) -> Option<Sender<PlaybackCommand>> {
         self.lifecycle
             .lock()
@@ -2194,7 +2213,17 @@ fn run_playback_worker(
                     &mut audio_output_backpressure,
                 );
             }
+        }
 
+        // Subtitles are delivered while paused too: a seek (or a subtitle
+        // chosen) on a paused player presents a frame, and the cue that is
+        // on at that time has to arrive with it, not after the next play.
+        if !frame_output_quiesced
+            && matches!(
+                engine.state(),
+                PlaybackRunState::Playing | PlaybackRunState::Paused
+            )
+        {
             match engine.tick_subtitle() {
                 Ok(Some(frame)) => emit_subtitle_frame_from_worker(
                     &inner,
@@ -2232,10 +2261,12 @@ fn run_playback_worker(
         let after_av = std::time::Instant::now();
 
         if let Some(buffering) = buffering_event {
+            engine.timing_counters().record_buffering(buffering);
             emit_from_worker(&inner, PlayerEvent::BufferingChanged(buffering));
         }
 
         emit_video_decoder_events_from_worker(engine, &inner);
+        engine.publish_queue_depths();
 
         if last_position_event.is_some_and(|(generation, _)| generation != playback_generation) {
             last_position_event = None;
@@ -3890,6 +3921,22 @@ mod tests {
     fn frame_output_barrier_is_a_noop_without_open_media() {
         let player = Player::new(PlayerConfig::default());
         assert!(!player.set_frame_output_quiesced(true).unwrap());
+    }
+
+    #[test]
+    fn selecting_no_subtitle_without_open_media_succeeds_and_a_track_does_not() {
+        let player = Player::new(PlayerConfig::default());
+        assert!(!player.has_open_media());
+        player.select_subtitle_track(None).unwrap();
+        let error = player.select_subtitle_track(Some(3)).unwrap_err();
+        assert!(error.to_string().contains("no media is open"), "{error}");
+        let receiver = install_test_runtime(&player, 2);
+        assert!(player.has_open_media());
+        player.select_subtitle_track(None).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            PlaybackCommand::SelectSubtitleTrack(None)
+        ));
     }
 
     #[test]

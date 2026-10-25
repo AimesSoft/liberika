@@ -46,6 +46,8 @@ extern "C" {
 /* Opaque handles. ErikaHandle = pull model, ErikaPresenterHandle = push model. */
 typedef struct ErikaHandle ErikaHandle;
 typedef struct ErikaPresenterHandle ErikaPresenterHandle;
+/* A media kept open for taking many pictures; see erika_frame_export_session_open. */
+typedef struct ErikaFrameExportSession ErikaFrameExportSession;
 
 typedef struct ErikaHttpHeader {
   const char *name;
@@ -100,6 +102,75 @@ typedef struct ErikaGifExportResult {
   uint64_t frame_count;
   uint64_t file_size;
 } ErikaGifExportResult;
+
+/* Headless single-frame export: the picture shown at position_millis (a
+ * media time) as RGBA or PNG. max_width/max_height bound the output (0 =
+ * unbounded); the display aspect ratio is kept and the picture is never
+ * larger than the video. HDR sources (PQ, HLG, Dolby Vision) are tone mapped
+ * to SDR the way Erika renders them on an SDR display. Synchronous; UI
+ * integrations must call it from a worker thread. Owns an independent
+ * demux/decode pipeline (multi-threaded software decoding) and requires no
+ * player or presenter handle. */
+typedef enum ErikaFrameExportFormat {
+  ErikaFrameExportFormat_Rgba = 0, /* rows of width * 4 bytes, alpha 255 */
+  ErikaFrameExportFormat_Png = 1,  /* PNG file bytes, 8-bit RGB */
+} ErikaFrameExportFormat;
+
+typedef struct ErikaFrameExportOptions {
+  const char *input_uri;
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t position_millis;
+  uint64_t http_read_ahead_bytes;
+  uint32_t max_width;
+  uint32_t max_height;
+  int32_t format;
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportOptions;
+
+/* data stays owned by liberika until erika_frame_export_result_free. Times
+ * are microseconds: timestamp_micros is where the picture is, duration_micros
+ * the media duration (0 when the container reports none). reserved_flags
+ * carries ERIKA_FRAME_EXPORT_TONE_MAPPED when the picture was tone mapped. */
+#define ERIKA_FRAME_EXPORT_TONE_MAPPED 1u
+
+typedef struct ErikaFrameExportResult {
+  uint8_t *data;
+  uintptr_t data_len;
+  uint64_t timestamp_micros;
+  uint64_t duration_micros;
+  uint32_t width;
+  uint32_t height;
+  uint32_t source_width;
+  uint32_t source_height;
+  int32_t format;
+  uint32_t reserved_flags;
+  uint64_t reserved[2];
+} ErikaFrameExportResult;
+
+/* Frame export session: the media is opened once and pictures are taken from
+ * it one after another. A request after the previous one continues decoding
+ * from where the decoder stopped when no keyframe lies between, and seeks
+ * otherwise (backwards included), so requests in ascending time order are the
+ * cheapest. Results are the same as erika_export_frame's. */
+typedef struct ErikaFrameExportSessionOptions {
+  const char *input_uri;
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t http_read_ahead_bytes;
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportSessionOptions;
+
+typedef struct ErikaFrameExportRequest {
+  uint64_t position_millis;
+  uint32_t max_width;
+  uint32_t max_height;
+  int32_t format; /* ErikaFrameExportFormat */
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportRequest;
 
 typedef enum ErikaStatus {
   ErikaStatus_Ok = 0,
@@ -476,6 +547,22 @@ void erika_string_free(char *value);
 ErikaStatus erika_export_gif(
     const ErikaGifExportOptions *options,
     ErikaGifExportResult *out_result);
+ErikaStatus erika_export_frame(
+    const ErikaFrameExportOptions *options,
+    ErikaFrameExportResult *out_result);
+void erika_frame_export_result_free(ErikaFrameExportResult *result);
+/* Synchronous: opening reads the container header and each frame call decodes
+ * on the calling thread. Calls on one session are serialised; the session is
+ * released with erika_frame_export_session_close (NULL is accepted), and no
+ * call on it may be running or follow. *out_session is NULL after a failure. */
+ErikaStatus erika_frame_export_session_open(
+    const ErikaFrameExportSessionOptions *options,
+    ErikaFrameExportSession **out_session);
+ErikaStatus erika_frame_export_session_frame(
+    ErikaFrameExportSession *session,
+    const ErikaFrameExportRequest *request,
+    ErikaFrameExportResult *out_result);
+void erika_frame_export_session_close(ErikaFrameExportSession *session);
 
 /* Playback control. uri is a local path or HTTP(S) URL; times are microseconds.
  * open() synchronously probes streams and transitions to Ready. */
@@ -850,7 +937,16 @@ ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *handle, ErikaEvent 
 
 /* JSON bridge used by embedders whose platform channel already serializes
  * structured arguments. Returned strings are owned by liberika and must be
- * released with erika_string_free. poll_event_json returns NULL when idle. */
+ * released with erika_string_free. poll_event_json returns NULL when idle.
+ *
+ * invoke_json is also the generic pass-through into liberika: method names
+ * come from one dispatch table, and "listMethods" returns that table (name,
+ * scope, arguments, result) so hosts can forward new capabilities without
+ * code changes. Methods with scope "global" ("listMethods", "getLogs")
+ * accept a NULL handle. The response is {"ok":true,"status":0,"value":...}
+ * or {"ok":false,"status":n,"error":"..."}; an unknown method adds
+ * "code":"unknown_method" and "method", malformed arguments JSON adds
+ * "code":"invalid_arguments". */
 char *erika_presenter_invoke_json(
     ErikaPresenterHandle *handle,
     const char *method,
@@ -859,6 +955,46 @@ char *erika_presenter_render_tick_json(
     ErikaPresenterHandle *handle,
     double time_seconds);
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *handle);
+
+/* ===== Diagnostics (JSON) =====
+ * New diagnostic data is returned as JSON documents, never as new fields on
+ * the structs above. Both functions may be missing from older native
+ * libraries: resolve them optionally (dlsym / GetProcAddress) and treat a
+ * missing symbol as "not supported". On Ok, *out_json receives a caller-owned
+ * NUL-terminated UTF-8 document; free it with erika_string_free. It is NULL on
+ * any other status. Each document has a "schema" number; fields are only
+ * added within a schema. Layout: docs/capi_reference.md, "Diagnostics". */
+typedef enum ErikaLogLevel {
+  ErikaLogLevel_Trace = 0,
+  ErikaLogLevel_Debug = 1,
+  ErikaLogLevel_Info = 2,
+  ErikaLogLevel_Warn = 3,
+  ErikaLogLevel_Error = 4,
+} ErikaLogLevel;
+
+/* Process-wide log ring: liberika's operational diagnostics plus FFmpeg
+ * warnings and errors. Returns the newest `limit` entries (0 = every retained
+ * entry) at or above min_level (an ErikaLogLevel, or -1 for every level) with
+ * seq >= since_seq (0 = from the oldest; pass the previous "nextSeq" to read
+ * incrementally). Entries are oldest first and redacted: URL query strings
+ * and user info, credential-like values and headers, the user's home
+ * directory. The ring holds at most 2000 entries / 512 KiB. Needs no handle
+ * and may be called from any thread. */
+ErikaStatus erika_log_read_json(
+    uint32_t limit,
+    int32_t min_level,
+    uint64_t since_seq,
+    char **out_json);
+
+/* One-call presenter snapshot: decoder and hardware-decode path, presenter
+ * counters and stage durations, output/HDR, resources, upscaler, audio,
+ * buffer depths, and timing (scheduler late drops, presentation cadence and
+ * jitter, clock drift and corrections). Unknown values are null. It only
+ * reads counters: no decoding or rendering, and it never waits on the
+ * playback worker. Same threading rule as every other handle call. */
+ErikaStatus erika_presenter_get_diagnostics_json(
+    ErikaPresenterHandle *handle,
+    char **out_json);
 
 /* Screenshot: render the current composited frame (video + subtitle, no
  * danmaku) off-screen into a caller-allocated RGBA8 buffer at the requested

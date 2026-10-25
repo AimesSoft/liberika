@@ -1,6 +1,6 @@
 {
   "name": "erika-ohos-smoke-entry",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Build-only application that consumes the packaged liberika HAR",
   "main": "",
   "author": "AimesSoft",

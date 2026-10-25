@@ -138,7 +138,12 @@ jobs:
           for symbol in \
             erika_presenter_invoke_json \
             erika_presenter_render_tick_json \
-            erika_presenter_poll_event_json
+            erika_presenter_poll_event_json \
+            erika_export_frame \
+            erika_frame_export_result_free \
+            erika_frame_export_session_open \
+            erika_frame_export_session_frame \
+            erika_frame_export_session_close
           do
             grep -Fxq "$symbol" <<< "$symbols"
           done

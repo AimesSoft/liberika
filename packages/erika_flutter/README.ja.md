@@ -36,7 +36,7 @@ NVIDIA は CUDA/NVDEC、Intel/AMD は VA-API を使い、FFmpeg software decode 
 
 ## macOS Setup
 
-macOS CocoaPods の build phase は検証・署名済み `liberika_capi.dylib` を download して bundle します。既定は arm64+x86_64 universal。`ERIKA_MACOS_ARCHS=arm64`、`x86_64`、`arm64,x86_64` で architecture を選択できます。実行時は `dlopen` で load します。`ERIKA_CAPI_DYLIB` は load path、`ERIKA_MACOS_CAPI_DYLIB` は bundle するローカル library を指定します。
+macOS CocoaPods の build phase は検証・署名済み `liberika_capi.dylib` を download して bundle します。既定は arm64+x86_64 universal。`ERIKA_MACOS_ARCHS=arm64`、`x86_64`、`arm64,x86_64` で architecture を選択できます。実行時は `dlopen` で load します。`ERIKA_CAPI_DYLIB` は load path、`ERIKA_MACOS_CAPI_DYLIB` は bundle するローカル library（例: リリース前のローカル `cargo build -p erika_capi --release` の成果物）を指定します。checksum 検証は行わず、build 中の architecture を含まない場合は build が失敗します。
 
 macOS は Now Playing と Remote Command Center で media 情報、再生、一時停止、停止、seek を提供します。
 

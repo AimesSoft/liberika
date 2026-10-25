@@ -364,7 +364,10 @@ pub mod wasapi {
                         init_tx,
                     );
                     if let Err(error) = result {
-                        eprintln!("erika WASAPI render thread stopped: {error}");
+                        crate::trace::diagnostic_at(
+                            crate::trace::LogLevel::Error,
+                            format!("erika WASAPI render thread stopped: {error}"),
+                        );
                     }
                 })
                 .map_err(|error| WasapiAudioOutputError::Wasapi {
@@ -432,7 +435,10 @@ pub mod wasapi {
                 *next_recovery_at = None;
             }
         }
-        eprintln!("erika WASAPI render error (HRESULT 0x{code:08X}): {error}");
+        crate::trace::diagnostic_at(
+            crate::trace::LogLevel::Warn,
+            format!("erika WASAPI render error (HRESULT 0x{code:08X}): {error}"),
+        );
     }
 
     fn run_render_thread(
@@ -592,7 +598,10 @@ pub mod wasapi {
                                 next_recovery_at = None;
                             }
                         }
-                        eprintln!("erika WASAPI device recovery failed: {error}");
+                        crate::trace::diagnostic_at(
+                            crate::trace::LogLevel::Warn,
+                            format!("erika WASAPI device recovery failed: {error}"),
+                        );
                     }
                 }
             }

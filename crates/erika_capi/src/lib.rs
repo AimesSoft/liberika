@@ -7,10 +7,13 @@ use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, Location, catch_unwind};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "android")]
 mod android_jni;
+mod diagnostics;
+pub use diagnostics::ErikaLogLevel;
 #[cfg(any(
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
@@ -43,7 +46,7 @@ use erika::audio::AudioRecoveryState;
 use erika::danmaku::{
     DanmakuLayoutConfig, DanmakuShadowStyle, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
 };
-use erika::export::{GifExportOptions, GifExportQuality};
+use erika::export::{FrameExportFormat, FrameExportOptions, GifExportOptions, GifExportQuality};
 #[cfg(any(
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
@@ -155,6 +158,102 @@ pub struct ErikaGifExportResult {
     pub height: u32,
     pub frame_count: u64,
     pub file_size: u64,
+}
+
+/// Headless single-frame export request. `position_millis` is a media time;
+/// the picture shown then is exported. `max_width`/`max_height` bound the
+/// output (0 = unbounded); the display aspect ratio is kept and the picture is
+/// never larger than the video. The call is synchronous and must be
+/// dispatched to a worker thread by UI integrations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ErikaFrameExportOptions {
+    pub input_uri: *const c_char,
+    pub headers: *const ErikaHttpHeader,
+    pub header_count: usize,
+    pub position_millis: u64,
+    pub http_read_ahead_bytes: u64,
+    pub max_width: u32,
+    pub max_height: u32,
+    /// 0 = RGBA rows (`width * 4` bytes each), 1 = PNG file bytes.
+    pub format: i32,
+    pub reserved_flags: u32,
+    pub reserved: [u64; 4],
+}
+
+/// Result of `erika_export_frame`. `data` is owned by liberika and released
+/// with `erika_frame_export_result_free`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ErikaFrameExportResult {
+    pub data: *mut u8,
+    pub data_len: usize,
+    /// Presentation time of the exported picture.
+    pub timestamp_micros: u64,
+    /// Media duration; 0 when the container reports none.
+    pub duration_micros: u64,
+    pub width: u32,
+    pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub format: i32,
+    pub reserved_flags: u32,
+    pub reserved: [u64; 2],
+}
+
+impl Default for ErikaFrameExportResult {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null_mut(),
+            data_len: 0,
+            timestamp_micros: 0,
+            duration_micros: 0,
+            width: 0,
+            height: 0,
+            source_width: 0,
+            source_height: 0,
+            format: 0,
+            reserved_flags: 0,
+            reserved: [0; 2],
+        }
+    }
+}
+
+/// Bit 0 of `ErikaFrameExportResult::reserved_flags`: the source is HDR (PQ,
+/// HLG or Dolby Vision) and the picture was tone mapped to SDR the way Erika
+/// renders it on an SDR display.
+pub const ERIKA_FRAME_EXPORT_TONE_MAPPED: u32 = 1;
+
+/// Opens a [`ErikaFrameExportSession`]: the media pictures are taken from.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ErikaFrameExportSessionOptions {
+    pub input_uri: *const c_char,
+    pub headers: *const ErikaHttpHeader,
+    pub header_count: usize,
+    pub http_read_ahead_bytes: u64,
+    pub reserved_flags: u32,
+    pub reserved: [u64; 4],
+}
+
+/// One picture asked of a frame export session.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ErikaFrameExportRequest {
+    pub position_millis: u64,
+    pub max_width: u32,
+    pub max_height: u32,
+    /// 0 = RGBA rows (`width * 4` bytes each), 1 = PNG file bytes.
+    pub format: i32,
+    pub reserved_flags: u32,
+    pub reserved: [u64; 4],
+}
+
+/// A media kept open for taking many pictures: one demuxer and one decoder,
+/// and requests in ascending time order are decoded on from where the last
+/// one stopped instead of seeking again. Calls on one session are serialised.
+pub struct ErikaFrameExportSession {
+    session: Mutex<erika::export::FrameExportSession>,
 }
 
 thread_local! {
@@ -927,6 +1026,241 @@ pub unsafe extern "C" fn erika_export_gif(
     }
 }
 
+/// Decodes the picture shown at a media time and returns it as RGBA or PNG,
+/// on the calling thread.
+///
+/// Like `erika_export_gif` this owns an independent demux/decode pipeline and
+/// needs no player or presenter handle. On success `out_result->data` holds
+/// `data_len` bytes until `erika_frame_export_result_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_export_frame(
+    options: *const ErikaFrameExportOptions,
+    out_result: *mut ErikaFrameExportResult,
+) -> ErikaStatus {
+    if options.is_null() || out_result.is_null() {
+        set_last_error("frame export options and result pointers must not be null");
+        return ErikaStatus::NullPointer;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        let options = unsafe { &*options };
+        if options.reserved_flags != 0 || options.reserved.iter().any(|field| *field != 0) {
+            return player_error("ErikaFrameExportOptions reserved fields must be zero");
+        }
+        let input_uri = match c_string(options.input_uri) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let headers = match c_http_headers(options.headers, options.header_count) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let format = match frame_export_format(options.format) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let mut request = MediaRequest::new(input_uri).with_http_headers(headers);
+        request = request.map_http_read_ahead_bytes(Some(options.http_read_ahead_bytes));
+        let export_options = FrameExportOptions {
+            input: request,
+            position: Duration::from_millis(options.position_millis),
+            max_width: options.max_width,
+            max_height: options.max_height,
+            format,
+        };
+        match erika::export::export_frame(&export_options) {
+            Ok(frame) => {
+                unsafe { *out_result = frame_export_result(frame, options.format) };
+                ErikaStatus::Ok
+            }
+            Err(error) => player_error(error.to_string()),
+        }
+    })) {
+        Ok(status) => finalize_status(status),
+        Err(payload) => {
+            set_last_error(report_capi_panic(
+                "Erika frame export C ABI call",
+                Location::caller(),
+                payload,
+            ));
+            ErikaStatus::Panic
+        }
+    }
+}
+
+/// Moves an exported picture into the C result; its bytes belong to liberika
+/// until `erika_frame_export_result_free`.
+fn frame_export_result(frame: erika::export::ExportedFrame, format: i32) -> ErikaFrameExportResult {
+    let data_len = frame.data.len();
+    let data = Box::into_raw(frame.data.into_boxed_slice());
+    ErikaFrameExportResult {
+        data: data.cast::<u8>(),
+        data_len,
+        timestamp_micros: frame.timestamp.as_micros().min(u64::MAX as u128) as u64,
+        duration_micros: frame.duration.map_or(0, |duration| {
+            duration.as_micros().min(u64::MAX as u128) as u64
+        }),
+        width: frame.width,
+        height: frame.height,
+        source_width: frame.source_width,
+        source_height: frame.source_height,
+        format,
+        reserved_flags: if frame.tone_mapped {
+            ERIKA_FRAME_EXPORT_TONE_MAPPED
+        } else {
+            0
+        },
+        ..ErikaFrameExportResult::default()
+    }
+}
+
+fn frame_export_format(value: i32) -> Result<FrameExportFormat, ErikaStatus> {
+    match value {
+        0 => Ok(FrameExportFormat::Rgba),
+        1 => Ok(FrameExportFormat::Png),
+        value => Err(player_error(format!(
+            "unsupported frame export format: {value}"
+        ))),
+    }
+}
+
+/// Opens a media for taking many pictures (see `ErikaFrameExportSession`).
+/// Like `erika_export_frame` it owns an independent demux/decode pipeline and
+/// needs no player or presenter handle; opening reads the container header on
+/// the calling thread. On success `*out_session` is released with
+/// `erika_frame_export_session_close`; on failure it is set to NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_frame_export_session_open(
+    options: *const ErikaFrameExportSessionOptions,
+    out_session: *mut *mut ErikaFrameExportSession,
+) -> ErikaStatus {
+    if options.is_null() || out_session.is_null() {
+        set_last_error("frame export session options and result pointers must not be null");
+        return ErikaStatus::NullPointer;
+    }
+    unsafe { *out_session = std::ptr::null_mut() };
+    match catch_unwind(AssertUnwindSafe(|| {
+        let options = unsafe { &*options };
+        if options.reserved_flags != 0 || options.reserved.iter().any(|field| *field != 0) {
+            return player_error("ErikaFrameExportSessionOptions reserved fields must be zero");
+        }
+        let input_uri = match c_string(options.input_uri) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let headers = match c_http_headers(options.headers, options.header_count) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let request = MediaRequest::new(input_uri)
+            .with_http_headers(headers)
+            .map_http_read_ahead_bytes(Some(options.http_read_ahead_bytes));
+        match erika::export::FrameExportSession::open(&request) {
+            Ok(session) => {
+                unsafe {
+                    *out_session = Box::into_raw(Box::new(ErikaFrameExportSession {
+                        session: Mutex::new(session),
+                    }));
+                }
+                ErikaStatus::Ok
+            }
+            Err(error) => player_error(error.to_string()),
+        }
+    })) {
+        Ok(status) => finalize_status(status),
+        Err(payload) => {
+            set_last_error(report_capi_panic(
+                "Erika frame export session open C ABI call",
+                Location::caller(),
+                payload,
+            ));
+            ErikaStatus::Panic
+        }
+    }
+}
+
+/// Decodes the picture shown at `request->position_millis` and returns it as
+/// RGBA or PNG, on the calling thread. `out_result->data` is released with
+/// `erika_frame_export_result_free`. A failed request leaves the session usable:
+/// the next one seeks again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_frame_export_session_frame(
+    session: *mut ErikaFrameExportSession,
+    request: *const ErikaFrameExportRequest,
+    out_result: *mut ErikaFrameExportResult,
+) -> ErikaStatus {
+    if session.is_null() || request.is_null() || out_result.is_null() {
+        set_last_error("frame export session, request and result pointers must not be null");
+        return ErikaStatus::NullPointer;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        let request = unsafe { &*request };
+        if request.reserved_flags != 0 || request.reserved.iter().any(|field| *field != 0) {
+            return player_error("ErikaFrameExportRequest reserved fields must be zero");
+        }
+        let format = match frame_export_format(request.format) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let session = unsafe { &*session };
+        let mut guard = session
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let picture = erika::export::FrameRequest {
+            position: Duration::from_millis(request.position_millis),
+            max_width: request.max_width,
+            max_height: request.max_height,
+            format,
+        };
+        match guard.frame_at(&picture) {
+            Ok(frame) => {
+                unsafe { *out_result = frame_export_result(frame, request.format) };
+                ErikaStatus::Ok
+            }
+            Err(error) => player_error(error.to_string()),
+        }
+    })) {
+        Ok(status) => finalize_status(status),
+        Err(payload) => {
+            set_last_error(report_capi_panic(
+                "Erika frame export session C ABI call",
+                Location::caller(),
+                payload,
+            ));
+            ErikaStatus::Panic
+        }
+    }
+}
+
+/// Closes a frame export session and releases its demuxer and decoder. Safe
+/// on NULL. No call on the session may be running or follow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_frame_export_session_close(session: *mut ErikaFrameExportSession) {
+    if !session.is_null() {
+        drop(unsafe { Box::from_raw(session) });
+    }
+}
+
+/// Releases the bytes of an `erika_export_frame` result and clears it. Safe
+/// to call on a cleared or zeroed result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_frame_export_result_free(result: *mut ErikaFrameExportResult) {
+    if result.is_null() {
+        return;
+    }
+    let result = unsafe { &mut *result };
+    if !result.data.is_null() {
+        drop(unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                result.data,
+                result.data_len,
+            ))
+        });
+    }
+    result.data = std::ptr::null_mut();
+    result.data_len = 0;
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn erika_open(handle: *mut ErikaHandle, uri: *const c_char) -> ErikaStatus {
     unsafe { erika_open_with_headers(handle, uri, std::ptr::null(), 0) }
@@ -980,8 +1314,13 @@ pub unsafe extern "C" fn erika_play(handle: *mut ErikaHandle) -> ErikaStatus {
     with_handle_mut(handle, |handle| {
         capi_trace(format!("fn=erika_play handle={handle:p}"));
         let status = status_from_player_result(handle.player.play());
+        let reason = if status == ErikaStatus::Ok {
+            String::new()
+        } else {
+            LAST_ERROR.with(|slot| slot.borrow().clone().unwrap_or_default())
+        };
         capi_trace(format!(
-            "fn=erika_play.done handle={handle:p} status={status:?}"
+            "fn=erika_play.done handle={handle:p} status={status:?} {reason}"
         ));
         status
     })
@@ -5313,6 +5652,245 @@ mod tests {
                 .unwrap_or_default()
                 .contains("reserved")
         );
+    }
+
+    #[test]
+    fn frame_export_c_api_returns_owned_pixels_and_validates_its_boundary() {
+        let mut result = ErikaFrameExportResult::default();
+        assert_eq!(
+            unsafe { erika_export_frame(std::ptr::null(), &mut result) },
+            ErikaStatus::NullPointer
+        );
+        let fixture = CString::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../erika/testdata/playback/playback-fixture.mkv")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let options = ErikaFrameExportOptions {
+            input_uri: fixture.as_ptr(),
+            headers: std::ptr::null(),
+            header_count: 0,
+            position_millis: 1_000,
+            http_read_ahead_bytes: 0,
+            max_width: 0,
+            max_height: 45,
+            format: 0,
+            reserved_flags: 0,
+            reserved: [0; 4],
+        };
+        assert_eq!(
+            unsafe { erika_export_frame(&options, &mut result) },
+            ErikaStatus::Ok
+        );
+        assert_eq!((result.width, result.height), (80, 45));
+        assert_eq!((result.source_width, result.source_height), (160, 90));
+        assert_eq!(result.data_len, 80 * 45 * 4);
+        assert!(!result.data.is_null());
+        assert!(result.timestamp_micros <= 1_000_000);
+        assert_eq!(result.duration_micros, 8_000_000);
+        unsafe { erika_frame_export_result_free(&mut result) };
+        assert!(result.data.is_null());
+        assert_eq!(result.data_len, 0);
+        // A cleared result may be released again.
+        unsafe { erika_frame_export_result_free(&mut result) };
+
+        let png = ErikaFrameExportOptions {
+            format: 1,
+            ..options
+        };
+        assert_eq!(
+            unsafe { erika_export_frame(&png, &mut result) },
+            ErikaStatus::Ok
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        unsafe { erika_frame_export_result_free(&mut result) };
+
+        for (options, message) in [
+            (
+                ErikaFrameExportOptions {
+                    format: 2,
+                    ..options
+                },
+                "unsupported frame export format",
+            ),
+            (
+                ErikaFrameExportOptions {
+                    reserved: [0, 1, 0, 0],
+                    ..options
+                },
+                "reserved",
+            ),
+            (
+                ErikaFrameExportOptions {
+                    position_millis: 9_000,
+                    ..options
+                },
+                "not before the end",
+            ),
+        ] {
+            assert_eq!(
+                unsafe { erika_export_frame(&options, &mut result) },
+                ErikaStatus::PlayerError
+            );
+            assert!(result.data.is_null());
+            let error = LAST_ERROR
+                .with(|slot| slot.borrow().clone())
+                .unwrap_or_default();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn frame_export_session_c_api_takes_many_pictures_from_one_open_media() {
+        let fixture = CString::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../erika/testdata/playback/playback-fixture.mkv")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
+        let mut session: *mut ErikaFrameExportSession = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { erika_frame_export_session_open(std::ptr::null(), &mut session) },
+            ErikaStatus::NullPointer
+        );
+        let options = ErikaFrameExportSessionOptions {
+            input_uri: fixture.as_ptr(),
+            headers: std::ptr::null(),
+            header_count: 0,
+            http_read_ahead_bytes: 0,
+            reserved_flags: 0,
+            reserved: [0; 4],
+        };
+        let missing = CString::new("/nonexistent/erika-missing.mkv").unwrap();
+        assert_eq!(
+            unsafe {
+                erika_frame_export_session_open(
+                    &ErikaFrameExportSessionOptions {
+                        input_uri: missing.as_ptr(),
+                        ..options
+                    },
+                    &mut session,
+                )
+            },
+            ErikaStatus::PlayerError
+        );
+        assert!(session.is_null());
+        assert_eq!(
+            unsafe {
+                erika_frame_export_session_open(
+                    &ErikaFrameExportSessionOptions {
+                        reserved: [1, 0, 0, 0],
+                        ..options
+                    },
+                    &mut session,
+                )
+            },
+            ErikaStatus::PlayerError
+        );
+        assert_eq!(
+            unsafe { erika_frame_export_session_open(&options, &mut session) },
+            ErikaStatus::Ok
+        );
+        assert!(!session.is_null());
+
+        let request = ErikaFrameExportRequest {
+            position_millis: 100,
+            max_width: 0,
+            max_height: 45,
+            format: 0,
+            reserved_flags: 0,
+            reserved: [0; 4],
+        };
+        let mut result = ErikaFrameExportResult::default();
+        let mut previous = Vec::new();
+        for millis in [100, 200, 300, 2_500] {
+            assert_eq!(
+                unsafe {
+                    erika_frame_export_session_frame(
+                        session,
+                        &ErikaFrameExportRequest {
+                            position_millis: millis,
+                            ..request
+                        },
+                        &mut result,
+                    )
+                },
+                ErikaStatus::Ok,
+                "{millis} ms"
+            );
+            assert_eq!((result.width, result.height), (80, 45));
+            assert_eq!(result.duration_micros, 8_000_000);
+            assert_eq!(result.reserved_flags, 0);
+            let pixels =
+                unsafe { std::slice::from_raw_parts(result.data, result.data_len) }.to_vec();
+            assert_eq!(pixels.len(), 80 * 45 * 4);
+            unsafe { erika_frame_export_result_free(&mut result) };
+            previous.push(pixels);
+        }
+        assert_ne!(previous[0], previous[3], "pictures differ between times");
+
+        // A failed request leaves the session usable.
+        assert_eq!(
+            unsafe {
+                erika_frame_export_session_frame(
+                    session,
+                    &ErikaFrameExportRequest {
+                        position_millis: 9_000,
+                        ..request
+                    },
+                    &mut result,
+                )
+            },
+            ErikaStatus::PlayerError
+        );
+        assert!(result.data.is_null());
+        for (bad, message) in [
+            (
+                ErikaFrameExportRequest {
+                    format: 2,
+                    ..request
+                },
+                "unsupported frame export format",
+            ),
+            (
+                ErikaFrameExportRequest {
+                    reserved: [0, 0, 1, 0],
+                    ..request
+                },
+                "reserved",
+            ),
+        ] {
+            assert_eq!(
+                unsafe { erika_frame_export_session_frame(session, &bad, &mut result) },
+                ErikaStatus::PlayerError
+            );
+            let error = LAST_ERROR
+                .with(|slot| slot.borrow().clone())
+                .unwrap_or_default();
+            assert!(error.contains(message), "{error}");
+        }
+        let png = ErikaFrameExportRequest {
+            position_millis: 100,
+            format: 1,
+            ..request
+        };
+        assert_eq!(
+            unsafe { erika_frame_export_session_frame(session, &png, &mut result) },
+            ErikaStatus::Ok
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        unsafe { erika_frame_export_result_free(&mut result) };
+        assert_eq!(
+            unsafe { erika_frame_export_session_frame(std::ptr::null_mut(), &png, &mut result) },
+            ErikaStatus::NullPointer
+        );
+        unsafe { erika_frame_export_session_close(session) };
+        unsafe { erika_frame_export_session_close(std::ptr::null_mut()) };
     }
 
     #[test]

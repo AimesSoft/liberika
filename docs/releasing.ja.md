@@ -11,16 +11,16 @@
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p erika -p erika_capi
-cargo clippy -p erika -p erika_capi --all-targets -- -D warnings
+cargo test --locked -p erika -p erika_capi
+cargo clippy --locked -p erika --all-targets --all-features --no-deps
 cd packages/erika_flutter
 dart pub publish --dry-run
 ```
 
-3. リリースする commit に tag を付けます。以下は次回バージョンの例です。実際の番号に置き換えてください。
+3. `Cargo.toml` の `[workspace.package].version` を更新し、`cargo update -w` 後の `Cargo.lock` も commit します。Release は Cargo version と異なる tag を拒否します。対象 commit で手動 `Release` を実行し、全 platform の build 成功を確認してから tag を付けます。以下は次回バージョンの例です。実際の番号に置き換えてください。
 
 ```sh
-VERSION=0.2.2
+VERSION=0.3.0
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -29,12 +29,12 @@ git push origin "v${VERSION}"
 
 ## 自動公開の流れ
 
-[release.yml](../.github/workflows/release.yml) は platform を並列 build します。iOS、tvOS、Android は architecture slice を個別に build して archive を組み立て、macOS arm64/x64 は universal に結合します。GitHub Release に 13 個の native/Flutter archive と `SHA256SUMS` を公開します。
+[release.yml](../.github/workflows/release.yml) は platform を並列 build します。iOS、tvOS、Android は architecture slice を個別に build して archive を組み立て、macOS arm64/x64 は universal に結合します。GitHub Release に 13 個の native/Flutter archive、Web archive と `SHA256SUMS` を公開します。
 
 [release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) が続けて実行します：
 
 - 公開済みの checksum で Flutter/OHPM version と `native_artifacts.properties` を更新し、metadata を `main` に commit。
-- 内部 tag `erika_flutter-vX.Y.Z` を作成し、[Flutter OIDC 公開](../.github/workflows/flutter-package.yml)を開始。
+- 内部 tag `erika_flutter-vX.Y.Z` を作成し、[Flutter OIDC 公開](../.github/workflows/pub-publish.yml)を開始。
 - ArkTS HAR を build し OHPM に upload。
 - Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。liberika-swift に更新・テスト・同じ version の公開を通知。
 
@@ -44,7 +44,7 @@ Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが
 
 ## 公開する成果物
 
-完了したリリースは ZIP 14 個と `SHA256SUMS` を含みます。
+完了したリリースは ZIP 15 個と `SHA256SUMS` を含みます。
 
 | Platform | Archive 命名 | 数 |
 |---|---|---|
@@ -54,6 +54,7 @@ Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが
 | Android | `erika-capi-android.zip` | 1 |
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
+| Web / WASM | `liberika-web-X.Y.Z.zip` | 1 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI bundle は library、`include/erika.h`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、依存 license、tag/commit を記録した `MANIFEST.txt` を含みます。iOS/tvOS は device + simulator XCFramework、Android 統合 bundle は 4 ABI の static/shared library と対応する `libc++_shared.so` を含みます。Flutter Android bundle は各 ABI の shared runtime のみを含みます。

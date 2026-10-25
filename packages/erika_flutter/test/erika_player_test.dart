@@ -754,6 +754,210 @@ void main() {
     expect((call.arguments as Map<Object?, Object?>)['framesPerSecond'], 10);
   });
 
+  test('macOS frame export runs in the plugin and returns its bytes', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      if (call.method == 'exportFrame') {
+        return <String, Object?>{
+          'width': 640,
+          'height': 273,
+          'format': 1,
+          'bytes': Uint8List.fromList(<int>[0x89, 0x50, 0x4e, 0x47]),
+          'timestampMicros': 59958000,
+          'durationMicros': 888032000,
+          'sourceWidth': 4096,
+          'sourceHeight': 1744,
+        };
+      }
+      return null;
+    });
+
+    final frame = await ErikaPlayer.exportFrame(
+      '/tmp/input.mkv',
+      position: const Duration(seconds: 60),
+      width: 640,
+      height: 640,
+    );
+
+    expect(frame.format, ErikaFrameFormat.png);
+    expect((frame.width, frame.height), (640, 273));
+    expect((frame.sourceWidth, frame.sourceHeight), (4096, 1744));
+    expect(frame.timestamp, const Duration(microseconds: 59958000));
+    expect(frame.duration, const Duration(microseconds: 888032000));
+    expect(frame.bytes, <int>[0x89, 0x50, 0x4e, 0x47]);
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'exportFrame',
+    );
+    expect(call.arguments, <String, Object?>{
+      'uri': '/tmp/input.mkv',
+      'positionMillis': 60000,
+      'width': 640,
+      'height': 640,
+      'format': 1,
+    });
+  });
+
+  test('macOS frame export reports liberika failures as errors', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      throw PlatformException(
+        code: call.arguments is Map &&
+                (call.arguments as Map)['positionMillis'] == 1
+            ? 'ERIKA_UNSUPPORTED'
+            : 'ERIKA_ERROR',
+        message: 'Frame export failed: position 900s is not before the end',
+      );
+    });
+
+    await expectLater(
+      ErikaPlayer.exportFrame('/tmp/input.mkv',
+          position: const Duration(seconds: 900)),
+      throwsA(isA<StateError>().having(
+          (error) => error.message, 'message', contains('not before the end'))),
+    );
+    await expectLater(
+      ErikaPlayer.exportFrame('/tmp/input.mkv',
+          position: const Duration(milliseconds: 1)),
+      throwsA(isA<UnsupportedError>()),
+    );
+    await expectLater(
+      ErikaPlayer.exportFrame('/tmp/input.mkv',
+          position: Duration.zero, width: -1),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('macOS frame export session keeps the media open across pictures',
+      () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    var closed = false;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      switch (call.method) {
+        case 'openFrameExportSession':
+          return 41;
+        case 'exportSessionFrame':
+          final arguments = call.arguments as Map<Object?, Object?>;
+          if (arguments['positionMillis'] == 900000) {
+            throw PlatformException(
+              code: 'ERIKA_ERROR',
+              message: 'Frame export failed: position 900s is not before the end',
+            );
+          }
+          return <String, Object?>{
+            'width': 640,
+            'height': 273,
+            'format': arguments['format'],
+            'bytes': Uint8List.fromList(<int>[1, 2, 3]),
+            'timestampMicros': (arguments['positionMillis']! as int) * 1000,
+            'durationMicros': 888032000,
+            'sourceWidth': 3840,
+            'sourceHeight': 1632,
+            'toneMapped': true,
+          };
+        case 'closeFrameExportSession':
+          closed = true;
+          return null;
+      }
+      return null;
+    });
+
+    final session = await ErikaFrameExportSession.open(
+      '/tmp/input.mkv',
+      httpHeaders: const <String, String>{'X-Test': '1'},
+    );
+    final first = await session.frameAt(
+      const Duration(seconds: 60),
+      width: 640,
+      format: ErikaFrameFormat.rgba,
+    );
+    final second = await session.frameAt(const Duration(milliseconds: 60100));
+    expect(first.toneMapped, isTrue);
+    expect(first.format, ErikaFrameFormat.rgba);
+    expect(second.timestamp, const Duration(milliseconds: 60100));
+    expect((second.sourceWidth, second.sourceHeight), (3840, 1632));
+    await expectLater(
+      session.frameAt(const Duration(seconds: 900)),
+      throwsA(isA<StateError>().having(
+          (error) => error.message, 'message', contains('not before the end'))),
+    );
+    await expectLater(
+      session.frameAt(Duration.zero, width: -1),
+      throwsA(isA<ArgumentError>()),
+    );
+    await session.close();
+    await session.close();
+    expect(closed, isTrue);
+    await expectLater(
+        session.frameAt(Duration.zero), throwsA(isA<StateError>()));
+
+    final calls = playerCalls.map((MethodCall call) => call.method).toList();
+    expect(calls.where((name) => name == 'openFrameExportSession'), hasLength(1));
+    expect(calls.where((name) => name == 'closeFrameExportSession'), hasLength(1));
+    final open = playerCalls.firstWhere(
+      (MethodCall call) => call.method == 'openFrameExportSession',
+    );
+    expect(open.arguments, <String, Object?>{
+      'uri': '/tmp/input.mkv',
+      'httpHeaders': <String, String>{'X-Test': '1'},
+    });
+    final frame = playerCalls.firstWhere(
+      (MethodCall call) => call.method == 'exportSessionFrame',
+    );
+    expect(frame.arguments, <String, Object?>{
+      'sessionId': 41,
+      'positionMillis': 60000,
+      'width': 640,
+      'height': 0,
+      'format': 0,
+    });
+  });
+
+  test('exportFrames opens the media once for all positions and closes it',
+      () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      if (call.method == 'openFrameExportSession') {
+        return 5;
+      }
+      if (call.method == 'exportSessionFrame') {
+        final arguments = call.arguments as Map<Object?, Object?>;
+        if (arguments['positionMillis'] == 3000) {
+          throw PlatformException(code: 'ERIKA_ERROR', message: 'cannot decode');
+        }
+        return <String, Object?>{
+          'width': 16,
+          'height': 9,
+          'format': 1,
+          'bytes': Uint8List(4),
+          'timestampMicros': 0,
+        };
+      }
+      return null;
+    });
+
+    final frames = await ErikaPlayer.exportFrames(
+      '/tmp/input.mkv',
+      positions: const <Duration>[Duration(seconds: 1), Duration(seconds: 2)],
+    );
+    expect(frames, hasLength(2));
+    await expectLater(
+      ErikaPlayer.exportFrames('/tmp/input.mkv',
+          positions: const <Duration>[Duration(seconds: 1), Duration(seconds: 3)]),
+      throwsA(isA<StateError>()),
+    );
+    final methods = playerCalls.map((MethodCall call) => call.method).toList();
+    expect(methods.where((name) => name == 'openFrameExportSession'), hasLength(2));
+    expect(methods.where((name) => name == 'closeFrameExportSession'), hasLength(2),
+        reason: 'the media is released even when a picture fails');
+  });
+
   test('GIF export rejects values outside the native ABI limits', () async {
     Future<void> expectRejected(ErikaGifExportOptions options) async {
       await expectLater(

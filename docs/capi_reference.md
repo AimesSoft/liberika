@@ -80,6 +80,82 @@ uses FFmpeg GIF semantics: `-1` disables looping, `0` loops forever, and a
 positive value is the loop count. HTTP inputs accept the same headers and
 read-ahead override as `ErikaOpenOptions`.
 
+## Headless frame export
+
+`erika_export_frame` is independent of both handle families too. It opens a
+private demuxer and a multi-threaded software decoder, seeks to the keyframe
+before `position_millis`, decodes forward and returns the picture shown at that
+media time: the last frame at or before it (the first frame when the position
+precedes it).
+
+```c
+ErikaFrameExportOptions options = {
+    .input_uri = "/path/input.mkv",
+    .position_millis = 60000,
+    .max_width = 640,
+    .max_height = 640,
+    .format = ErikaFrameExportFormat_Png,
+};
+ErikaFrameExportResult result = {0};
+if (erika_export_frame(&options, &result) == ErikaStatus_Ok) {
+    /* result.data holds result.data_len bytes of a PNG file. */
+    erika_frame_export_result_free(&result);
+}
+```
+
+The call is synchronous; UI hosts must run it on a worker thread or isolate.
+`max_width` and `max_height` bound the picture (0 leaves a side unbounded): the
+display aspect ratio is kept and the picture is never larger than the video, so
+two zeros return the video's own size. `ErikaFrameExportFormat_Rgba` returns
+rows of exactly `width * 4` bytes with alpha 255; `ErikaFrameExportFormat_Png`
+returns an 8-bit RGB PNG file. Colour conversion follows the frame's colour
+space and range; an unlabelled YUV source is taken as BT.709 when it is HD or
+larger and BT.601 otherwise. HDR sources (PQ, HLG, Dolby Vision) are tone
+mapped to SDR with the arithmetic Erika's renderer uses for an SDR display
+(ITU-R BT.2390 EETF against a 203-nit target, BT.2020 to BT.709 gamut mapping,
+gamma 2.2), and `ERIKA_FRAME_EXPORT_TONE_MAPPED` is set in
+`result.reserved_flags`; SDR sources keep the plain colour conversion.
+The result reports where the picture is (`timestamp_micros`), the decoded video
+size and the media duration (0 when unknown). A position at or past a known
+duration fails with `ErikaStatus_PlayerError`. HTTP inputs accept the same
+headers and read-ahead override as `ErikaOpenOptions`. `data` stays owned by
+liberika until `erika_frame_export_result_free`, which clears the result and
+may be called again.
+
+### Taking many pictures
+
+`erika_export_frame` opens the media and seeks for every picture. For several
+pictures of one media, open an `ErikaFrameExportSession` once and ask it for
+each picture; the demuxer and decoder stay open.
+
+```c
+ErikaFrameExportSessionOptions open = { .input_uri = "/path/input.mkv" };
+ErikaFrameExportSession *session = NULL;
+if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
+    for (uint64_t ms = 60000; ms < 66000; ms += 100) {
+        ErikaFrameExportRequest request = {
+            .position_millis = ms, .max_width = 640, .max_height = 640,
+            .format = ErikaFrameExportFormat_Png,
+        };
+        ErikaFrameExportResult result = {0};
+        if (erika_frame_export_session_frame(session, &request, &result) == ErikaStatus_Ok) {
+            erika_frame_export_result_free(&result);
+        }
+    }
+    erika_frame_export_session_close(session);
+}
+```
+
+A request after the previous one continues decoding from where the decoder
+stopped when no keyframe lies between that point and the request (the demuxer's
+seek index tells; without an index, when the request is within two seconds or
+half the longest keyframe interval seen), and seeks to the keyframe before it
+otherwise. Requests may come in any order; ascending order is the cheapest.
+Results, sizing, formats and tone mapping are those of `erika_export_frame`.
+A failed request leaves the session usable. Calls on one session are
+serialised; all calls are synchronous. `erika_frame_export_session_close`
+accepts `NULL`; no call on the session may be running or follow it.
+
 ## Conventions
 
 ### Status codes
@@ -690,24 +766,48 @@ All three wrap their result in an envelope:
 { "ok": false, "status": 3, "error": "<message>" }
 ```
 
-`arguments_json` must be a JSON object. `method` selects the operation and
-mirrors the C entry points: `open`, `play`, `pause`, `stop`, `close`, `seek`,
-`setPlaybackRate`, `setVolume`, `setUpscaler`, `setSubtitleScale`,
-`getUpscalerStatus`, `getOutputStatus`, `getPresenterStats`, `tracks`,
-`addExternalSubtitle`, `removeSubtitleTrack`, `selectAudioTrack`,
-`selectSubtitleTrack`, and the danmaku family (`loadDanmakuFile`,
-`loadDanmakuJson`, `addDanmakuTrackFile`, `addDanmakuTrackJson`,
-`removeDanmakuTrack`, `setDanmakuTrackEnabled`, `setDanmakuTrackOffset`,
-`setDanmakuGlobalOffset`, `danmakuTracks`, `clearDanmaku`, `setDanmakuEnabled`,
-`setDanmakuConfig`), plus `selectSubtitleMemoryFonts`,
-`clearSubtitleMemoryFonts`, `getSubtitleMemoryFontStatus`, and
-`getResourceStatus`. An unknown method fails with `ok: false` rather than
-aborting. The authoritative dispatch table is
-`crates/erika_capi/src/presenter_json.rs`.
+`arguments_json` must be a JSON object. `method` selects an entry of the
+dispatch table in `crates/erika_capi/src/presenter_json.rs` (`JSON_METHODS`).
+The table mirrors the C entry points — playback (`open`, `play`, `pause`,
+`stop`, `close`, `seek`, `setPlaybackRate`, `setVolume`), tracks and subtitles
+(`tracks`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
+`addExternalSubtitle`, `removeSubtitleTrack`, `setSubtitleScale`,
+`setSubtitleFont`, `setSubtitleStyle`, the subtitle memory-font calls), the
+danmaku family (including `getDanmakuConfig`), output and upscaler
+(`setUpscaler`, `getUpscalerStatus`, `setOutputHeadroom`, `getOutputStatus`,
+`setDebugHudEnabled`), counters (`getPresenterStats`, `getResourceStatus`), and
+the diagnostics below (`getDiagnosticsSnapshot`, `getLogs`).
 
-The bridge is a convenience layer, not a second API: it calls the same
-functions documented above and carries no extra capability. Hosts that can pass
-structs across their platform channel should prefer the typed entry points.
+`erika_presenter_invoke_json` doubles as the generic pass-through into the
+engine:
+
+- `listMethods` returns the table itself — `{schema: 1, fields, methods: [{name, scope,
+  summary, arguments: [{name, type, required}], returns, blocking, writesFiles}]}` — so a host (or an
+  agent behind it) can discover and forward capabilities without code changes.
+  Registering a capability means adding a `match` arm in `invoke` and an entry
+  in `JSON_METHODS`; a unit test fails if the two disagree.
+- Each entry also carries `blocking` (the call returns when the work is done,
+  on the calling thread, and the work grows with its input: media length, file
+  size) and `writesFiles` (the call creates files on disk and its result lists
+  their paths); `fields` at the top level states both. `exportFrame` and
+  `exportFrames` take pictures from a media with the frame export above: with
+  `outputPath` / `outputDir` they write PNG or RGBA files and return the paths,
+  and `exportFrame` without `outputPath` returns the bytes base64 encoded.
+- Methods whose `scope` is `global` (`listMethods`, `getLogs`, `exportFrame`,
+  `exportFrames`) accept a `NULL`
+  handle.
+- `invokeJson` (`{method, arguments}`) calls another table method and returns
+  its full envelope as `value`. Platform plugins that unwrap envelopes
+  natively (Linux, HarmonyOS, Android) use it to forward Dart's
+  `ErikaPlayer.invokeJson` unchanged.
+- An unknown method returns `{"ok": false, "status": 3, "code":
+  "unknown_method", "method": "<name>", "error": "unsupported Erika presenter
+  method: <name>"}`; malformed `arguments_json` adds `"code":
+  "invalid_arguments"`. Neither aborts.
+
+The bridge calls the same functions documented above and carries no extra
+capability. Hosts that can pass structs across their platform channel may
+prefer the typed entry points.
 
 ### Diagnostics and capture
 
@@ -783,6 +883,115 @@ frames, overlay and danmaku atlases, danmaku vertex buffers, upscaler), the
 renderer-tracked total, presenter CPU-side danmaku atlas bytes, the drawable
 count, and how many times the output mode was switched. All values are
 snapshots from the same runtime state as `get_output_status`.
+
+### Agent diagnostics (JSON)
+
+```c
+ErikaStatus erika_presenter_get_diagnostics_json(ErikaPresenterHandle *, char **out_json);
+ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t since_seq,
+                                char **out_json);
+```
+
+New diagnostic data is returned as JSON documents, never as new fields on the
+structs above (Apple plugins mirror those structs by hand, so growing them would
+force a lock-step library/plugin upgrade). Resolve both symbols optionally and
+treat a missing symbol as "not supported". On `Ok`, `*out_json` holds a
+caller-owned UTF-8 document to free with `erika_string_free`; it is `NULL` on
+any other status. Each document has a `schema` number (currently `1`); fields
+are only added within a schema. Values that are not known are `null`, never a
+made-up zero. Durations are milliseconds with microsecond precision.
+
+#### Diagnostics snapshot
+
+`erika_presenter_get_diagnostics_json` gathers everything in one call. It only
+reads presenter fields, renderer/audio counters and lock-free playback
+counters: it neither decodes nor renders and never waits on the playback
+worker (on macOS, a release build measured a median of 0.3 ms per call
+including JSON encoding during playback). Same threading rule as every other
+handle call.
+
+| Section | Contents |
+|---------|----------|
+| `schema`, `capturedAtUnixMs` | Document version and wall-clock capture time. |
+| `playback` | `state`, `playing`, `mediaTimeSeconds`, `durationSeconds`, `playbackRate`, `generation`, `audioOnly` (background video suspension), `buffering` `{active, events, currentMs, totalMs}`. |
+| `media` | Selected `video` (`codec`, `profile`, `level`, `width`, `height`, `pixelFormat`, `frameRate`, `bitRate`), `audio` (`codec`, `sampleRate`, `channels`, `sampleFormat`, `bitRate`) and `subtitle` tracks, or `null`. |
+| `decoder` | Latest decoder transition, queryable instead of event-only: `requestedBackend`, `activeBackend`, `previousBackend`, `hardware`, `fellBack`, `fallbackCount`, `stage`, `reason`, `codec`, `pixelFormat`, `lineSizes`. `null` before the first transition. |
+| `video` | Decoded/rendered frames, hardware/software/zero-copy/direct-zero-copy/shared-handle frames, `cpuFallbackFrames`, `importFailures`, `renderFailures`, `backpressureDrops`, `rejectedImportRoute`. |
+| `presenter` | Surface attachment and size, last tick/pump/audio/subtitle/video/clock/danmaku-plan/render/GPU durations, test/overlay/subtitle/danmaku counters. |
+| `output` | Requested mode, active encoding, surface format, dataspace, requested/active headroom (`null` when unknown), fallback reason label and counters. |
+| `hdr` | HDR source frames, HDR10 output frames, SDR tone-mapped frames, metadata updates/failures, output failures, `outputActive`. |
+| `resources` | Same fields as `ErikaPresenterResourceStatus`. |
+| `upscaler` | Requested mode and active backend as labels, fallbacks, upscaled frames, last encode time. |
+| `audio` | Output state, configured/started, volume, pushed frames, failures, queued frames and `queuedMs`, read/written/underflow frames, ring `ringDroppedFrames`, device `recovery` state and counts. |
+| `buffers` | `playback` queue depths published by the worker (`demuxPackets`, `pendingVideoPackets`, `decodedVideoFrames`, `decodedAudioFrames`, `decodedSubtitleFrames` as `{queued, capacity}`, `demuxEof`, `updatedAgoMs`; `null` before open), presenter frame channels, `audioOutputQueuedMs`. |
+| `timing.scheduler` | `leadTimeMs`, `dropToleranceMs`, `maxConsecutiveDrops`; `presentedFrames`; `lateDroppedFrames` (discarded for being later than the drop tolerance — previously uncounted); `forcedLatePresents` (late beyond tolerance but shown because the consecutive-drop budget was spent); `maxDropBurst`, `maxDroppedLateMs`, `lastDropAgoMs`, `seekPrerollDroppedFrames`; `lateByMs` window `{samples, meanMs, p50Ms, p95Ms, maxMs}` over the last 128 presented frames; `lateHistogram` (`le10ms` … `gt120ms`). |
+| `timing.presentation` | Measured where liberika renders, not at the display's vsync: `ticks` and `tickIntervalMs`; `uploadedFrames`, `newFramesPresented`, `supersededBeforePresent`; `frameIntervalMs` and `jitterMs` (absolute deviation from the source frame interval divided by the playback rate); `longFrames` (on screen longer than `longFrameFactor` = 1.5 source intervals); `lastPresentAgoMs`. |
+| `timing.clock` | Audio-master discipline, previously trace-only: mode, sync config (`deadbandMs`, `maxCorrectionPerFrameMs`, `snapThresholdMs`, `audioLeadTimeMs`), `observations`, `corrections`, `snaps`, `forwardCorrections`, `backwardCorrections`, `lastDriftMs` (positive: audio ahead of the playback clock), `maxAbsDriftMs`, `appliedTotalMs`, `lastCorrectionAgoMs`, `lastSnapAgoMs`, `absDriftMs` window. |
+
+Counters in `timing` and `buffers.playback` restart when the presenter opens
+new media.
+
+#### Log ring
+
+`erika_log_read_json` exports a process-wide in-memory ring (at most 2000
+entries / 512 KiB, entry text capped at 4 KiB). It needs no handle and may be
+called from any thread. It collects:
+
+- every operational diagnostic liberika already wrote to stderr / logcat /
+  hilog (those outputs are unchanged);
+- operational failures that used to be bare `eprintln!` (audio
+  configure/push/start/pause/reset, renderer clear, subtitle render and
+  decoder open, WASAPI, D3D11 device removal, upscaler disablement);
+- FFmpeg `av_log` messages at warning level and above. The callback is
+  process-wide and shared by every player: it formats into a stack buffer,
+  never blocks (contended messages are counted as `droppedContended`), folds
+  consecutive repeats that differ only in numbers or addresses into one entry
+  with `count`, and admits at most 50 new FFmpeg entries per second (the rest
+  are `rateLimited`). FFmpeg's own stderr output is still produced.
+  `ERIKA_FFMPEG_LOG_CAPTURE=0` disables capture; with a shared distro FFmpeg
+  (Linux system libraries) capture is off unless `ERIKA_FFMPEG_LOG_CAPTURE=1`,
+  because other libraries in the process may own the callback.
+
+Arguments: `limit` newest entries after filtering (`0` = every retained
+entry); `min_level` an `ErikaLogLevel` (`Trace` 0 … `Error` 4) or `-1` for all;
+`since_seq` only entries with `seq >= since_seq` (pass the previous `nextSeq`
+to read incrementally).
+
+```json
+{
+  "schema": 1,
+  "capacity": { "entries": 2000, "bytes": 524288, "entryTextBytes": 4096 },
+  "retained": 15, "retainedBytes": 6011, "oldestSeq": 1, "nextSeq": 16,
+  "evicted": 0, "rateLimited": 0, "droppedContended": 0,
+  "ffmpegCapture": "active", "redacted": true,
+  "entries": [
+    { "seq": 3, "unixMs": 1761134400123, "level": "error", "source": "ffmpeg",
+      "event": null, "count": 1,
+      "message": "[mpeg4 @ 0x…] Failed setup for format videotoolbox_vld: hwaccel initialisation returned error." },
+    { "seq": 4, "unixMs": 1761134400140, "level": "warn", "source": "erika",
+      "event": "video_decoder", "count": 2, "lastUnixMs": 1761134400410,
+      "data": { "event": "video_decoder", "stage": "open_avcodec_to_software" } }
+  ]
+}
+```
+
+Entries are oldest first. Structured diagnostics come back parsed as `data`,
+other lines as `message`. `ffmpegCapture` is `not_installed` (FFmpeg not used
+yet), `active`, `disabled`, or `shared_library_opt_in_required`.
+
+Levels: call sites that know the severity pass it; FFmpeg levels map
+PANIC/FATAL/ERROR → `error`, WARNING → `warn`; libass maps 0–1 → `error`,
+2 → `warn`. Other structured diagnostics get a default from their `event` and
+`stage` names: `error` for fatal/panic, `warn` for failures, timeouts,
+unavailable/lost/rejected/missing resources, stalls and fallbacks (including
+`*_to_software` and `*_to_bytebuffer` routes), `info` otherwise.
+
+Redaction happens on export: URL user info and everything after `?`/`#`,
+credential-like `key=value`/`key: value` pairs and JSON keys (`token`,
+`api_key`, `access_token`, `authorization`, `cookie`, `X-Emby-Token`, …),
+`Bearer`/`Basic` credentials, the current user's home directory (`~`), and
+other `/Users/<user>`, `/home/<user>`, `C:\Users\<user>` path segments. The
+ring lives only in process memory and is read on demand.
 
 ## Enums
 
