@@ -3276,10 +3276,29 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&overlay_pipeline.pipeline);
+            // Subtitle coordinates are produced in the video-frame viewport.
+            // Composite them through the same aspect-fit viewport as the video
+            // so they stay inside the picture; only danmaku use the letterbox.
+            pass.set_viewport(
+                viewport.x,
+                viewport.y,
+                viewport.width,
+                viewport.height,
+                0.0,
+                1.0,
+            );
             for draw in &overlay_draws {
                 pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
                 pass.draw(0..4, 0..1);
             }
+            pass.set_viewport(
+                0.0,
+                0.0,
+                target_width as f32,
+                target_height as f32,
+                0.0,
+                1.0,
+            );
             for draw in &danmaku_draws {
                 pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
                 pass.draw(0..4, 0..1);
@@ -6514,6 +6533,79 @@ mod tests {
         assert_eq!(capture.pixel(1, 1), [255, 0, 0, 255]);
         assert_eq!(capture.pixel(2, 2), [255, 0, 0, 255]);
         assert_eq!(capture.pixel(3, 3), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn wgpu_renderer_keeps_subtitles_inside_the_picture_and_lets_danmaku_use_the_letterbox() {
+        use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement};
+
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        // A 2:1 picture in a square target: rows 2..6 are the picture, rows
+        // 0..2 and 6..8 are the letterbox.
+        renderer
+            .upload_nv12(8, 4, &[16; 32], &[128; 16], uniforms)
+            .unwrap();
+        // libass draws on a canvas twice the video size; one line along its
+        // top edge and one along its bottom edge, in red.
+        let line = |y| {
+            SubtitleAlphaBitmap::new(
+                SubtitleBitmapPlacement::new(0, y, 16, 2),
+                16,
+                0xff00_0000,
+                vec![255; 32],
+            )
+        };
+        let overlay = OverlayFrame {
+            pts: Duration::ZERO,
+            viewport: crate::overlay::OverlayViewport::new(16, 8),
+            subtitle_planes: Vec::new(),
+            subtitle_alpha_planes: vec![line(0), line(6)],
+            subtitle_changed: true,
+        };
+        // Danmaku are laid out on the whole surface: green rows at its very
+        // top and bottom.
+        let mut plan = DanmakuRenderPlan::empty(Duration::ZERO, 1, DanmakuViewport::new(8, 8));
+        plan.atlas = Some(std::sync::Arc::new(DanmakuGlyphAtlas {
+            width: 1,
+            height: 1,
+            stride: 1,
+            fill_alpha: vec![255],
+            outline_alpha: vec![0],
+            version: 1,
+            update: None,
+        }));
+        for (item_id, y) in [(1, 0.0), (2, 7.0)] {
+            plan.items.push(DanmakuGlyphInstance {
+                item_id,
+                rect: [0.0, y, 8.0, 1.0],
+                tex_rect: [0.0, 0.0, 1.0, 1.0],
+                color_rgba: [0.0, 1.0, 0.0, 1.0],
+                outline_rgba: [0.0; 4],
+                shadow_rgba: [0.0; 4],
+                shadow_offset: [0.0; 2],
+            });
+        }
+
+        let capture = renderer
+            .render_current_offscreen_sized(8, 8, Some(&overlay), Some(&plan))
+            .unwrap()
+            .expect("current wgpu frame captured with overlays");
+
+        let row_color = |y: u32| match capture.pixel(4, y) {
+            [r, g, ..] if r > 200 && g < 40 => "subtitle",
+            [r, g, ..] if r < 40 && g > 200 => "danmaku",
+            [r, g, ..] if r < 40 && g < 40 => "black",
+            pixel => panic!("row {y} has an unexpected color {pixel:?}"),
+        };
+        let rows = (0..8).map(row_color).collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "danmaku", "black", "subtitle", "black", "black", "subtitle", "black", "danmaku",
+            ]
+        );
     }
 
     #[test]
