@@ -18,6 +18,7 @@ MKV 内嵌 ASS 和字体附件，由 libass 绘制字幕、Rust 引擎绘制弹�
 | OpenHarmony ArkTS SDK | — | [Package guide](../packages/erika_ohos/README.md) | — |
 | C/C++ 等原生宿主 / Native hosts | [接入指南](integration.zh.md) | [Integration](integration.md) | [組み込み](integration.ja.md) |
 | C ABI：签名、类型、所有权 / Reference | [参考手册](capi_reference.zh.md) | [C ABI reference](capi_reference.md) | [C ABI](capi_reference.ja.md) |
+| 外部 GPU 纹理：原生句柄与同步 / Native textures | [纹理输出](external_textures.zh.md) | [Texture output](external_textures.md) | [テクスチャ出力](external_textures.ja.md) |
 | Linux / WSLg（实验性） | [Linux 接入](linux.zh.md) | [Linux integration](linux.md) | — |
 | Flutter 原生表面与平台桥接 / Native surfaces | [嵌入设计](flutter_embedding.zh.md) | [Flutter embedding](flutter_embedding.md) | [Flutter 組み込み](flutter_embedding.ja.md) |
 

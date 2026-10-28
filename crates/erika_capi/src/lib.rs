@@ -47,6 +47,15 @@ use erika::danmaku::{
     DanmakuLayoutConfig, DanmakuShadowStyle, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
 };
 use erika::export::{FrameExportFormat, FrameExportOptions, GifExportOptions, GifExportQuality};
+pub use erika::{
+    ExternalTextureFormat as ErikaExternalTextureFormat,
+    ExternalTextureInfo as ErikaExternalTextureInfo,
+    ExternalTextureKind as ErikaExternalTextureKind,
+};
+
+pub struct ErikaTextureFrame {
+    frame: erika::ExternalTextureFrame,
+}
 #[cfg(any(
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
@@ -1661,6 +1670,25 @@ pub extern "C" fn erika_presenter_create_with_config(
     config: ErikaPresenterConfig,
 ) -> *mut ErikaPresenterHandle {
     create_presenter_handle(presenter_config_from_c(config))
+}
+
+/// Creates a presenter using the wgpu backend for native texture export.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_presenter_create_for_texture_export(
+    config: ErikaPresenterConfig,
+) -> *mut ErikaPresenterHandle {
+    let mut config = presenter_config_from_c(config);
+    config.player.renderer = erika::RendererBackendPreference::WgpuFallback;
+    create_presenter_handle(config)
 }
 
 #[cfg(any(
@@ -4421,6 +4449,132 @@ pub unsafe extern "C" fn erika_presenter_capture_frame_rgba(
     out_rgba: *mut u8,
     out_capacity: usize,
 ) -> ErikaStatus {
+    unsafe {
+        capture_presenter_frame_rgba_into(handle, width, height, out_rgba, out_capacity, false)
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+/// Captures the current video, subtitles and enabled danmaku as SDR RGBA8.
+///
+/// # Safety
+/// `handle` must be null or a live presenter accessed exclusively for this
+/// call. `out_rgba` must be null or point to a writable allocation of at least
+/// `out_capacity` bytes, which must not overlap the presenter's storage.
+pub unsafe extern "C" fn erika_presenter_capture_frame_rgba_with_danmaku(
+    handle: *mut ErikaPresenterHandle,
+    width: u32,
+    height: u32,
+    out_rgba: *mut u8,
+    out_capacity: usize,
+) -> ErikaStatus {
+    unsafe {
+        capture_presenter_frame_rgba_into(handle, width, height, out_rgba, out_capacity, true)
+    }
+}
+
+/// Renders an immutable native GPU frame, including enabled danmaku.
+///
+/// # Safety
+/// `handle` must be null or an exclusively accessed live presenter. `out_frame`
+/// must be null or point to writable storage. Release successful frames only
+/// after all consumer GPU work and imported aliases are retired.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_export_frame_texture(
+    handle: *mut ErikaPresenterHandle,
+    width: u32,
+    height: u32,
+    out_frame: *mut *mut ErikaTextureFrame,
+) -> ErikaStatus {
+    if out_frame.is_null() {
+        set_last_error("native texture frame output pointer is null");
+        return ErikaStatus::NullPointer;
+    }
+    unsafe { *out_frame = std::ptr::null_mut() };
+    with_presenter_mut(handle, |handle| {
+        match handle.presenter.export_frame_texture(width, height) {
+            Ok(Some(frame)) => {
+                unsafe { *out_frame = Box::into_raw(Box::new(ErikaTextureFrame { frame })) };
+                ErikaStatus::Ok
+            }
+            Ok(None) => ErikaStatus::NoEvent,
+            Err(error) => player_error(error.to_string()),
+        }
+    })
+}
+
+/// Reads borrowed native handles and their import metadata.
+///
+/// # Safety
+/// `frame` must be null or a live frame and `out_info` must be null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_texture_frame_get_info(
+    frame: *const ErikaTextureFrame,
+    out_info: *mut ErikaExternalTextureInfo,
+) -> ErikaStatus {
+    if frame.is_null() || out_info.is_null() {
+        set_last_error("native texture frame or info pointer is null");
+        return ErikaStatus::NullPointer;
+    }
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        *out_info = *(*frame).frame.info()
+    })) {
+        Ok(()) => {
+            clear_last_error();
+            ErikaStatus::Ok
+        }
+        Err(_) => {
+            set_last_error("panic while reading native texture frame info");
+            ErikaStatus::Panic
+        }
+    }
+}
+
+/// Releases a frame and its native texture. Null is accepted.
+///
+/// # Safety
+/// Release each successful frame exactly once, after all consuming GPU work
+/// and imported aliases have been retired. No concurrent frame access.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_texture_frame_release(frame: *mut ErikaTextureFrame) {
+    if !frame.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(frame)) }));
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+unsafe fn capture_presenter_frame_rgba_into(
+    handle: *mut ErikaPresenterHandle,
+    width: u32,
+    height: u32,
+    out_rgba: *mut u8,
+    out_capacity: usize,
+    include_danmaku: bool,
+) -> ErikaStatus {
     let Some(expected_len) = (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
@@ -4431,7 +4585,12 @@ pub unsafe extern "C" fn erika_presenter_capture_frame_rgba(
         return ErikaStatus::NullPointer;
     }
     with_presenter_mut(handle, |handle| {
-        match capture_presenter_frame_rgba(handle, width, height) {
+        let capture = if include_danmaku {
+            capture_presenter_frame_rgba_impl(handle, width, height, true)
+        } else {
+            capture_presenter_frame_rgba(handle, width, height)
+        };
+        match capture {
             Ok(Some(rgba)) => {
                 unsafe {
                     std::ptr::copy_nonoverlapping(rgba.as_ptr(), out_rgba, expected_len);
@@ -4459,13 +4618,37 @@ fn capture_presenter_frame_rgba(
     width: u32,
     height: u32,
 ) -> Result<Option<Vec<u8>>, String> {
+    capture_presenter_frame_rgba_impl(handle, width, height, false)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+fn capture_presenter_frame_rgba_impl(
+    handle: &mut ErikaPresenterHandle,
+    width: u32,
+    height: u32,
+    include_danmaku: bool,
+) -> Result<Option<Vec<u8>>, String> {
     let expected_len = (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| {
             format!("capture_frame_rgba dimensions overflow for {width}x{height} RGBA")
         })?;
-    match handle.presenter.capture_frame_rgba(width, height) {
+    let capture = if include_danmaku {
+        handle
+            .presenter
+            .capture_frame_rgba_with_danmaku(width, height)
+    } else {
+        handle.presenter.capture_frame_rgba(width, height)
+    };
+    match capture {
         Ok(Some(rgba)) if rgba.len() == expected_len => Ok(Some(rgba)),
         Ok(Some(rgba)) => Err(format!(
             "capture_frame_rgba returned {} bytes, expected {expected_len} for {width}x{height} RGBA",
@@ -6179,8 +6362,134 @@ mod tests {
         let failure = capture_presenter_frame_rgba(handle_ref, 0, 2)
             .expect_err("zero-width capture must remain a real error");
         assert!(failure.contains("capture size must be non-zero"));
+        assert_eq!(
+            capture_presenter_frame_rgba_impl(handle_ref, 2, 2, true),
+            Ok(None)
+        );
+        let failure = capture_presenter_frame_rgba_impl(handle_ref, 0, 2, true)
+            .expect_err("zero-width capture with danmaku must remain a real error");
+        assert!(failure.contains("capture size must be non-zero"));
+
+        for capture in [
+            erika_presenter_capture_frame_rgba,
+            erika_presenter_capture_frame_rgba_with_danmaku,
+        ] {
+            let mut rgba = [0xabu8; 16];
+            assert_eq!(
+                unsafe { capture(handle, 2, 2, rgba.as_mut_ptr(), 15) },
+                ErikaStatus::NullPointer
+            );
+            assert_eq!(
+                unsafe { capture(handle, 0, 2, rgba.as_mut_ptr(), 16) },
+                ErikaStatus::NullPointer
+            );
+            assert_eq!(
+                unsafe { capture(handle, 2, 2, std::ptr::null_mut(), 16) },
+                ErikaStatus::NullPointer
+            );
+            assert_eq!(
+                unsafe { capture(std::ptr::null_mut(), 2, 2, rgba.as_mut_ptr(), 16) },
+                ErikaStatus::NullPointer
+            );
+            assert_eq!(
+                unsafe { capture(handle, u32::MAX, u32::MAX, rgba.as_mut_ptr(), 16) },
+                ErikaStatus::PlayerError
+            );
+            assert_eq!(
+                unsafe { capture(handle, 2, 2, rgba.as_mut_ptr(), 16) },
+                ErikaStatus::PlayerError
+            );
+            assert_eq!(
+                rgba, [0xab; 16],
+                "failed capture must leave the output untouched"
+            );
+        }
 
         unsafe { erika_presenter_destroy(handle) };
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "wgpu",
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
+    fn native_texture_c_api_handles_absence_errors_and_frame_ownership() {
+        let handle = erika_presenter_create_for_texture_export(ErikaPresenterConfig::default());
+        assert!(!handle.is_null());
+        let mut frame = std::ptr::dangling_mut::<ErikaTextureFrame>();
+        assert_eq!(
+            unsafe {
+                erika_presenter_export_frame_texture(std::ptr::null_mut(), 320, 180, &mut frame)
+            },
+            ErikaStatus::NullPointer
+        );
+        assert!(frame.is_null());
+        assert_eq!(
+            unsafe { erika_presenter_export_frame_texture(handle, 320, 180, std::ptr::null_mut()) },
+            ErikaStatus::NullPointer
+        );
+        assert_eq!(
+            unsafe { erika_presenter_export_frame_texture(handle, 0, 180, &mut frame) },
+            ErikaStatus::PlayerError
+        );
+        assert!(frame.is_null());
+        assert_eq!(
+            unsafe { erika_presenter_export_frame_texture(handle, 320, 180, &mut frame) },
+            ErikaStatus::NoEvent
+        );
+        assert!(frame.is_null());
+        assert_eq!(
+            unsafe { erika_texture_frame_get_info(frame, std::ptr::null_mut()) },
+            ErikaStatus::NullPointer
+        );
+        unsafe { erika_texture_frame_release(std::ptr::null_mut()) };
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../erika/testdata/playback/playback-fixture.mkv");
+        let uri = CString::new(fixture.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { erika_presenter_open(handle, uri.as_ptr()) },
+            ErikaStatus::Ok
+        );
+        assert_eq!(
+            unsafe { erika_presenter_set_volume(handle, 0.0) },
+            ErikaStatus::Ok
+        );
+        assert_eq!(unsafe { erika_presenter_play(handle) }, ErikaStatus::Ok);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status =
+                unsafe { erika_presenter_export_frame_texture(handle, 320, 180, &mut frame) };
+            if status == ErikaStatus::Ok {
+                break;
+            }
+            assert_eq!(status, ErikaStatus::NoEvent);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first native texture was not delivered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!frame.is_null());
+        unsafe { erika_presenter_destroy(handle) };
+        let mut info = std::mem::MaybeUninit::<ErikaExternalTextureInfo>::uninit();
+        assert_eq!(
+            unsafe { erika_texture_frame_get_info(frame, info.as_mut_ptr()) },
+            ErikaStatus::Ok
+        );
+        let info = unsafe { info.assume_init() };
+        assert_eq!((info.width, info.height), (320, 180));
+        assert_eq!(info.format, ErikaExternalTextureFormat::Rgba8Unorm);
+        assert_eq!(
+            unsafe { erika_texture_frame_get_info(frame, std::ptr::null_mut()) },
+            ErikaStatus::NullPointer
+        );
+        unsafe { erika_texture_frame_release(frame) };
     }
 
     #[cfg(any(

@@ -274,6 +274,13 @@ iOS Flutter プラグインは `CADisplayLink.targetTimestamp` を tick mailbox 
   Android native host は `erika_presenter_set_output_headroom` で dynamic display ratio を
   publish します。`capture_frame_rgba` は display output が extended-linear の場合も、映像 +
   字幕（弾幕は含みません）を SDR RGBA8 screenshot として返します。
+- **ホストのオフスクリーン合成:** Rust の
+  `PresenterRuntime::capture_frame_rgba_with_danmaku(w, h)` または C の
+  `erika_presenter_capture_frame_rgba_with_danmaku` は surface を接続せずに
+  有効な弾幕も含む RGBA8 を返し、ホストの UI テクスチャにアップロードできます。
+  [capture の契約と使用例](capi_reference.ja.md)を参照。
+  CPU readback のない GPU handle には `export_frame_texture` を使い、音声もその
+  ループで進めます。[ネイティブテクスチャ出力](external_textures.ja.md)を参照。
 
 ## 9. 解放
 

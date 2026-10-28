@@ -1,0 +1,23 @@
+{
+  "completed_frame_mean_ms": 9.35516911666667,
+  "compose_wait_mean_ms": 1.7814293833333323,
+  "consumer_adapter": "AdapterInfo { name: \"llvmpipe (LLVM 21.1.8, 256 bits)\", vendor: 65541, device: 0, device_type: Cpu, driver: \"llvmpipe\", driver_info: \"Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8)\", backend: Vulkan }",
+  "consumer_wgpu": "26.0.1",
+  "export_mean_ms": 6.902262224999999,
+  "final_verification_readback_excluded_from_timing": true,
+  "height": 540,
+  "import_mean_ms": 0.4563456666666668,
+  "measured_frames": 120,
+  "mode": "native texture import",
+  "producer_adapter": "AdapterInfo { name: \"llvmpipe (LLVM 21.1.8, 256 bits)\", vendor: 65541, device: 0, device_type: Cpu, device_pci_bus_id: \"\", driver: \"llvmpipe\", driver_info: \"Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8)\", backend: Vulkan, subgroup_min_size: 8, subgroup_max_size: 8, transient_saves_memory: false }",
+  "producer_wgpu": "29.0.3",
+  "renderer_throughput_fps": 106.89277633885351,
+  "require_hardware": false,
+  "source_height": 36,
+  "source_width": 64,
+  "total_wall_seconds": 1.280445069,
+  "verification_pixel_match": true,
+  "warmup_frames": 3,
+  "width": 960,
+  "workload": "renderer-only static GPU fixture; decoding and window presentation excluded"
+}

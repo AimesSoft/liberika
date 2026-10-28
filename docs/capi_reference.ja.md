@@ -733,6 +733,8 @@ ErikaStatus erika_presenter_get_upscaler_status(ErikaPresenterHandle *, ErikaUps
 ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutputStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle *, uint32_t width, uint32_t height,
+                                                         uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
 `get_upscaler_status` は要求アップスケーラモード、現在の backend（off / inactive /
@@ -788,6 +790,33 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+UI を独自に合成するホスト（Wayland 上の Dioxus など）は、同じ引数で
+`erika_presenter_capture_frame_rgba_with_danmaku` を使うと有効な弾幕も含められます。
+弾幕は現在の再生クロック、トラック選択、オフセット、フォント、描画設定に従い、
+要求したピクセルサイズと scale factor 1 で独立に配置されます。capture に surface や
+事前の `render_tick` は不要です。debug HUD は含まず、SDR RGBA8、バッファとエラーの
+契約は screenshot API と同じです。短い時間窓を同期的に準備してキャッシュするため、
+リサイズ、seek、弾幕設定の変更後は次の呼び出しで再準備する場合があります。
+音声出力には通常の `render_tick` が必要です。`audio_only_tick` は映像デコードを停止します。
+
+Rust の入口は `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)` です。
+
+```rust,ignore
+if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
+    // 密に詰まった RGBA8 ピクセルをホストのテクスチャへアップロード。
+}
+```
+
+この経路は CPU にピクセルを読み戻します。共有 GPU テクスチャの export は行わず、
+liberika とホストの wgpu バージョンが一致する必要もありません。
+
+ネイティブ GPU 出力には `erika_presenter_create_for_texture_export(config)` を使い、
+各フレームで `erika_presenter_export_frame_texture(p, w, h, &frame)` を呼びます。
+`erika_texture_frame_get_info` で借用 handle を取得し、consumer GPU の完了と import
+別名の破棄後に `erika_texture_frame_release` で解放します。音声もこのループで進みます。
+Linux Vulkan OPAQUE_FD と Apple Metal を実装し、公開 API に wgpu 型はありません。
+形式、同期、所有権、host importer は[ネイティブテクスチャ出力](external_textures.ja.md)を参照。
 
 ### エージェント向け診断（JSON）
 

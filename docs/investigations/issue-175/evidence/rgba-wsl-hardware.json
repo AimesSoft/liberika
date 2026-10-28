@@ -1,0 +1,23 @@
+{
+  "completed_frame_mean_ms": 3.998284174999999,
+  "compose_wait_mean_ms": 0.0,
+  "consumer_adapter": null,
+  "consumer_wgpu": null,
+  "export_mean_ms": 3.998284174999999,
+  "final_verification_readback_excluded_from_timing": true,
+  "height": 540,
+  "import_mean_ms": 0.0,
+  "measured_frames": 120,
+  "mode": "RGBA capture only; no consumer",
+  "producer_adapter": "AdapterInfo { name: \"D3D12 (NVIDIA GeForce RTX 5060 Ti)\", vendor: 0, device: 0, device_type: Other, device_pci_bus_id: \"\", driver: \"\", driver_info: \"4.6 (Core Profile) Mesa 26.0.8-1ubuntu0.3\", backend: Gl, subgroup_min_size: 4, subgroup_max_size: 128, transient_saves_memory: false }",
+  "producer_wgpu": "29.0.3",
+  "renderer_throughput_fps": 250.107285083107,
+  "require_hardware": true,
+  "source_height": 36,
+  "source_width": 64,
+  "total_wall_seconds": 0.770333023,
+  "verification_pixel_match": true,
+  "warmup_frames": 3,
+  "width": 960,
+  "workload": "renderer-only static GPU fixture; decoding and window presentation excluded"
+}

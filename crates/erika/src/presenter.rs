@@ -316,6 +316,7 @@ pub struct PresenterRuntime {
     debug_hud: DebugHud,
     current_danmaku: Option<DanmakuRenderPlan>,
     current_danmaku_prepared: Option<CurrentDanmakuPrepared>,
+    capture_danmaku: Option<CaptureDanmakuState>,
     danmaku_plan_replacement_pending: bool,
     danmaku_resize_settle_at: Option<Instant>,
     danmaku_font_size_update: Option<DanmakuFontSizeUpdate>,
@@ -471,6 +472,13 @@ struct CurrentDanmakuPrepared {
     request: AsyncDanmakuPlanRequest,
     prepared: DfmPreparedLayout,
     rasterizer: DanmakuTextRasterizer,
+    window_start: Duration,
+    window_end: Duration,
+}
+
+struct CaptureDanmakuState {
+    engine: DfmLayoutEngine,
+    key: DanmakuPlanKey,
     window_start: Duration,
     window_end: Duration,
 }
@@ -787,6 +795,7 @@ impl PresenterRuntime {
             debug_hud: DebugHud::new(),
             current_danmaku: None,
             current_danmaku_prepared: None,
+            capture_danmaku: None,
             danmaku_plan_replacement_pending: false,
             danmaku_resize_settle_at: None,
             danmaku_font_size_update: None,
@@ -1964,7 +1973,35 @@ impl PresenterRuntime {
         }
     }
 
+    /// Captures video and subtitles as tightly packed SDR RGBA8 pixels.
+    ///
+    /// Danmaku and the debug HUD are excluded. Returns `None` until a video
+    /// frame is available; no display surface is required.
     pub fn capture_frame_rgba(&mut self, width: u32, height: u32) -> Result<Option<Vec<u8>>> {
+        self.capture_frame_rgba_impl(width, height, false)
+    }
+
+    /// Captures video, subtitles and enabled danmaku as SDR RGBA8 pixels.
+    ///
+    /// Danmaku uses the current playback time and the requested pixel viewport
+    /// (scale factor 1), independently of any display surface or render ticks.
+    /// Layout is prepared synchronously in cached timeline windows. The debug
+    /// HUD is excluded. Audio output still needs the regular render ticks.
+    /// See [`Self::capture_frame_rgba`] for pixel layout and return semantics.
+    pub fn capture_frame_rgba_with_danmaku(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.capture_frame_rgba_impl(width, height, true)
+    }
+
+    fn capture_frame_rgba_impl(
+        &mut self,
+        width: u32,
+        height: u32,
+        include_danmaku: bool,
+    ) -> Result<Option<Vec<u8>>> {
         if width == 0 || height == 0 {
             return Err(PlayerError::Renderer(
                 "capture size must be non-zero".to_string(),
@@ -1978,19 +2015,128 @@ impl PresenterRuntime {
         // Capture is a real render target with its own pixel viewport. Reusing
         // the surface-sized overlay here would scale a stale subtitle atlas, so
         // rebuild the regular subtitle overlay for the requested target.
-        //
-        // Danmaku is deliberately not attached to this offscreen context:
-        // screenshots are used as watch-history thumbnails and must represent
-        // the video rather than transient on-screen comments. The presentation
-        // context in `render_current` still attaches `current_danmaku`.
         let capture_overlay = self.capture_overlay(width, height);
+        // Use the capture engine's cached layout, not the surface's async plan:
+        // a headless host may never render a tick, and capture dimensions can
+        // differ from the surface. This leaves on-screen preparation untouched.
+        let capture_danmaku = if include_danmaku {
+            self.capture_danmaku_plan(DanmakuViewport::new(width, height))
+        } else {
+            None
+        };
 
         let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
             .overlay(Some(&capture_overlay))
+            .danmaku(capture_danmaku.as_ref())
             .output_size(width, height);
         self.renderer
             .capture_current_frame(context, width, height)
             .map(|capture| capture.map(|capture| capture.rgba))
+    }
+
+    fn capture_danmaku_plan(&mut self, viewport: DanmakuViewport) -> Option<DanmakuRenderPlan> {
+        if !self.danmaku.config().enabled {
+            return None;
+        }
+        let key = DanmakuPlanKey {
+            media_time: self.current_media_time,
+            viewport,
+            generation: self.current_generation,
+        };
+        let needs_prepare = self.capture_danmaku.as_ref().is_none_or(|capture| {
+            capture.key.generation != key.generation
+                || capture.key.viewport != viewport
+                || capture.engine.config() != self.danmaku.config()
+                || key.media_time < capture.window_start
+                || capture.window_end.saturating_sub(key.media_time)
+                    <= DANMAKU_PREPARE_REFRESH_MARGIN
+        });
+        if needs_prepare {
+            let (window, window_start, window_end) = danmaku_plan_window(
+                &self.danmaku_session.active_timeline_clone(),
+                key.media_time,
+                self.danmaku.config(),
+                viewport,
+            );
+            let capture = self
+                .capture_danmaku
+                .get_or_insert_with(|| CaptureDanmakuState {
+                    engine: self.danmaku.clone(),
+                    key,
+                    window_start,
+                    window_end,
+                });
+            if capture.key.generation != key.generation {
+                // Includes seek, track changes and font-selection changes.
+                capture.engine = self.danmaku.clone();
+            }
+            capture.engine.set_config_with_rasterizer(
+                self.danmaku.config().clone(),
+                self.danmaku.rasterizer_clone(),
+            );
+            capture.engine.sync_timeline(&window);
+            capture.engine.recycle_raster_caches_if_needed();
+            capture.engine.prepare(viewport, key.generation);
+            capture.key = key;
+            capture.window_start = window_start;
+            capture.window_end = window_end;
+        }
+        let capture = self.capture_danmaku.as_mut()?;
+        Some(
+            capture
+                .engine
+                .render_plan(key.media_time, viewport, key.generation),
+        )
+    }
+
+    /// Composites video, subtitles and enabled danmaku into a native GPU texture.
+    ///
+    /// No surface or pixel readback is involved. Returns `None` before the
+    /// first video frame. Select `WgpuFallback`; currently implemented for
+    /// Linux Vulkan OPAQUE_FD and Apple Metal. Native handles and synchronization
+    /// rules are documented on [`crate::ExternalTextureFrame`]. Each call also
+    /// pumps audio; use this as the host's frame loop without `render_tick`.
+    pub fn export_frame_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<crate::core::ExternalTextureFrame>> {
+        if width == 0 || height == 0 {
+            return Err(PlayerError::Renderer("export size must be non-zero".into()));
+        }
+        if self.audio_only_tick_active {
+            // An external target is a foreground video sink even without a
+            // window surface, so it can resume decode after background audio.
+            self.discard_pending_video_frames();
+            self.player.set_video_decode_suspended(false)?;
+            self.audio_only_tick_active = false;
+            self.resume_pending = false;
+            self.video_decode_resume_attempts = 0;
+        }
+        self.commit_pending_playback_rate()?;
+        self.refresh_video_decoder_status();
+        self.pump_subtitles();
+        self.pump_video();
+        self.report_audio_output_runtime_stats();
+        self.pump_audio();
+        self.report_audio_output_runtime_stats();
+        self.sync_media_time_from_player();
+        let overlay = self.capture_overlay(width, height);
+        let danmaku = self.capture_danmaku_plan(DanmakuViewport::new(width, height));
+        let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
+            .overlay(Some(&overlay))
+            .danmaku(danmaku.as_ref())
+            .output_size(width, height);
+        let render_started = Instant::now();
+        let frame = self
+            .renderer
+            .export_current_frame_texture(context, width, height)?;
+        self.last_render_current_duration = render_started.elapsed();
+        self.last_render_duration = self.last_render_current_duration;
+        if frame.is_some() {
+            self.stats.rendered_video_frames += 1;
+        }
+        Ok(frame)
     }
 
     pub fn take_flutter_frame(&mut self) -> Option<crate::core::RendererFrameCapture> {
@@ -3095,6 +3241,7 @@ impl PresenterRuntime {
 
     fn clear_current_danmaku_state(&mut self) {
         self.invalidate_current_danmaku_plan();
+        self.capture_danmaku = None;
         self.current_danmaku_viewport = None;
     }
 
@@ -4509,10 +4656,14 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     struct CapturedComposition {
         has_overlay: bool,
         has_danmaku: bool,
+        danmaku_viewport: Option<DanmakuViewport>,
+        danmaku_time: Option<Duration>,
+        danmaku_generation: Option<u64>,
+        danmaku_items: usize,
         width: u32,
         height: u32,
     }
@@ -4556,6 +4707,10 @@ mod tests {
                 Some(CapturedComposition {
                     has_overlay: context.overlay.is_some(),
                     has_danmaku: context.danmaku.is_some(),
+                    danmaku_viewport: context.danmaku.map(|plan| plan.viewport),
+                    danmaku_time: context.danmaku.map(|plan| plan.media_time),
+                    danmaku_generation: context.danmaku.map(|plan| plan.generation),
+                    danmaku_items: context.danmaku.map_or(0, |plan| plan.items.len()),
                     width,
                     height,
                 });
@@ -6307,9 +6462,258 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             Some(CapturedComposition {
                 has_overlay: true,
                 has_danmaku: false,
+                danmaku_viewport: None,
+                danmaku_time: None,
+                danmaku_generation: None,
+                danmaku_items: 0,
                 width: 320,
                 height: 180,
             })
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn headless_capture_includes_danmaku_at_capture_size_without_changing_surface_plan() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::clone(&captured),
+        });
+        let mut item = danmaku_item(1, 0.0, "headless capture");
+        item.mode = DanmakuMode::Top;
+        presenter.set_danmaku_timeline(DanmakuTimeline::new(vec![item]).unwrap());
+        let surface_viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        presenter.current_danmaku_viewport = Some(surface_viewport);
+        presenter.current_danmaku = Some(DanmakuRenderPlan::empty(
+            Duration::from_secs(5),
+            presenter.current_generation,
+            surface_viewport,
+        ));
+        assert!(presenter.current_surface_metrics.is_none());
+
+        for (width, height) in [(320, 180), (640, 480), (320, 180)] {
+            let rgba = presenter
+                .capture_frame_rgba_with_danmaku(width, height)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rgba.len(), width as usize * height as usize * 4);
+            let composition = captured.lock().unwrap().unwrap();
+            assert!(composition.has_overlay);
+            assert!(composition.danmaku_items > 0);
+            assert_eq!(
+                composition.danmaku_viewport,
+                Some(DanmakuViewport::new(width, height))
+            );
+            assert_eq!(
+                composition.danmaku_time,
+                Some(presenter.player.current_media_time())
+            );
+            assert_eq!(
+                composition.danmaku_generation,
+                Some(presenter.current_generation)
+            );
+            assert_eq!(presenter.current_danmaku_viewport, Some(surface_viewport));
+            let surface_plan = presenter.current_danmaku.as_ref().unwrap();
+            assert_eq!(surface_plan.viewport, surface_viewport);
+            assert_eq!(surface_plan.media_time, Duration::from_secs(5));
+        }
+
+        presenter.set_danmaku_enabled(false);
+        presenter.capture_frame_rgba_with_danmaku(320, 180).unwrap();
+        assert!(!captured.lock().unwrap().unwrap().has_danmaku);
+        assert!(presenter.capture_frame_rgba_with_danmaku(0, 180).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn capture_danmaku_windows_follow_time_seek_and_track_offsets() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.set_danmaku_timeline(
+            DanmakuTimeline::new(vec![
+                danmaku_item(1, 1.0, "early"),
+                danmaku_item(2, 100.0, "late"),
+            ])
+            .unwrap(),
+        );
+        let viewport = DanmakuViewport::new(640, 360);
+        presenter.current_media_time = Duration::from_secs(2);
+        let early = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert!(!early.is_empty());
+        let prepared_at = presenter.capture_danmaku.as_ref().unwrap().key;
+        presenter.current_media_time = Duration::from_millis(2500);
+        let moving = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert_eq!(presenter.capture_danmaku.as_ref().unwrap().key, prepared_at);
+        assert_eq!(moving.items[0].item_id, early.items[0].item_id);
+        assert!(moving.items[0].rect[0] < early.items[0].rect[0]);
+
+        presenter.current_media_time = Duration::from_secs(101);
+        let late = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert!(!late.is_empty());
+        assert_ne!(late.items[0].item_id, early.items[0].item_id);
+        presenter.current_media_time = Duration::from_secs(2);
+        presenter.bump_danmaku_generation();
+        let sought = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert_eq!(sought.items[0].item_id, early.items[0].item_id);
+        assert_eq!(sought.generation, presenter.current_generation);
+
+        presenter.set_danmaku_global_offset(5_000_000);
+        assert!(presenter.capture_danmaku_plan(viewport).unwrap().is_empty());
+        presenter.clear_danmaku();
+        assert!(presenter.capture_danmaku_plan(viewport).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "wgpu",
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
+    fn exported_native_texture_is_composited_immutable_and_outlives_presenter() {
+        use crate::renderer::external_texture_test::read_pixels;
+        use crate::renderer::pipeline::{VideoRenderPipeline, VideoUniforms};
+        use crate::renderer::wgpu::WgpuRenderer;
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        renderer
+            .upload_nv12(64, 36, &[16; 64 * 36], &[128; 64 * 18], uniforms)
+            .unwrap();
+        let mut config = PresenterConfig::default();
+        config.player.renderer = RendererBackendPreference::WgpuFallback;
+        let mut presenter = PresenterRuntime::new(config).unwrap();
+        presenter.renderer = Box::new(renderer);
+        let mut item = danmaku_item(1, 0.0, "EXTERNAL");
+        item.mode = DanmakuMode::Top;
+        presenter.set_danmaku_timeline(DanmakuTimeline::new(vec![item]).unwrap());
+        presenter
+            .subtitles
+            .push(subtitle_frame(Duration::ZERO, Some(Duration::from_secs(3))));
+        let expected = presenter
+            .capture_frame_rgba_with_danmaku(320, 180)
+            .unwrap()
+            .unwrap();
+        let first = presenter.export_frame_texture(320, 180).unwrap().unwrap();
+        assert_eq!((first.info().width, first.info().height), (320, 180));
+        presenter.clear_danmaku();
+        let expected_second = presenter.capture_frame_rgba(320, 180).unwrap().unwrap();
+        let second = presenter.export_frame_texture(320, 180).unwrap().unwrap();
+        assert_eq!(presenter.stats().rendered_video_frames, 2);
+        assert_ne!(first.info().native_handle, second.info().native_handle);
+        assert!(presenter.export_frame_texture(0, 180).is_err());
+        assert!(presenter.export_frame_texture(u32::MAX, 180).is_err());
+        drop(presenter);
+        assert_eq!(
+            read_pixels(&first),
+            expected,
+            "native consumer sees video, subtitle and danmaku after producer destruction"
+        );
+        assert_eq!(
+            read_pixels(&second),
+            expected_second,
+            "later exports neither overwrite nor hide retained frames"
+        );
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            fn fd_identity(fd: i32) -> Option<(libc::dev_t, libc::ino_t)> {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+                    return None;
+                }
+                let stat = unsafe { stat.assume_init() };
+                Some((stat.st_dev, stat.st_ino))
+            }
+            let handles = [first.info().native_handle, second.info().native_handle]
+                .map(|fd| (fd as i32, fd_identity(fd as i32).unwrap()));
+            drop(first);
+            drop(second);
+            for (fd, identity) in handles {
+                // Other tests may reuse a closed FD number concurrently.
+                assert_ne!(
+                    fd_identity(fd),
+                    Some(identity),
+                    "the released frame must no longer own its exported FD"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn wgpu_headless_capture_composites_danmaku_pixels_and_preserves_screenshot_behavior() {
+        use crate::renderer::pipeline::{VideoRenderPipeline, VideoUniforms};
+        use crate::renderer::wgpu::WgpuRenderer;
+
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        renderer
+            .upload_nv12(64, 36, &[16; 64 * 36], &[128; 64 * 18], uniforms)
+            .unwrap();
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.renderer = Box::new(renderer);
+        let mut item = danmaku_item(1, 0.0, "CAPTURE");
+        item.mode = DanmakuMode::Top;
+        presenter.set_danmaku_timeline(DanmakuTimeline::new(vec![item]).unwrap());
+        presenter
+            .subtitles
+            .push(subtitle_frame(Duration::ZERO, Some(Duration::from_secs(3))));
+
+        let screenshot = presenter.capture_frame_rgba(320, 180).unwrap().unwrap();
+        let composed = presenter
+            .capture_frame_rgba_with_danmaku(320, 180)
+            .unwrap()
+            .unwrap();
+        assert_eq!(composed.len(), 320 * 180 * 4);
+        let bright_pixels =
+            |rgba: &[u8]| rgba.chunks_exact(4).filter(|pixel| pixel[0] > 150).count();
+        assert!(bright_pixels(&screenshot) > 0, "subtitle is captured");
+        assert!(
+            bright_pixels(&composed) > bright_pixels(&screenshot) + 100,
+            "danmaku adds visible pixels"
+        );
+        assert_eq!(
+            presenter.capture_frame_rgba(320, 180).unwrap().unwrap(),
+            screenshot
+        );
+
+        presenter.set_danmaku_enabled(false);
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            screenshot
+        );
+        presenter.set_danmaku_enabled(true);
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            composed
+        );
+        let mut config = presenter.danmaku_config().unwrap().clone();
+        config.opacity = 0.0;
+        presenter.set_danmaku_config(config);
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            screenshot
+        );
+        presenter.clear_danmaku();
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            screenshot
         );
     }
 

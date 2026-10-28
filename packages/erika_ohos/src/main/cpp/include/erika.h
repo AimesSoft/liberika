@@ -1007,12 +1007,76 @@ ErikaStatus erika_presenter_capture_frame_rgba(
     uint8_t *out_rgba,
     uintptr_t out_capacity);
 
+/* Off-screen host composition: same buffer, SDR output and error contract as
+ * capture_frame_rgba, with enabled danmaku included (no debug HUD). No surface
+ * or preceding render_tick is required. Danmaku follows the current playback
+ * clock and is laid out at width*height pixels with scale factor 1. */
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(
+    ErikaPresenterHandle *handle,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out_rgba,
+    uintptr_t out_capacity);
+
 /* Consume the latest Linux Flutter texture frame after render_tick. Includes
  * video, subtitles, danmaku and HUD. Returns NoEvent when no frame is ready.
  * The caller allocates at least surface_width*surface_height*4 bytes. */
 ErikaStatus erika_presenter_copy_flutter_frame_rgba(
     ErikaPresenterHandle *handle, uint8_t *out_rgba, uintptr_t capacity,
     uint32_t *out_width, uint32_t *out_height);
+
+typedef struct ErikaTextureFrame ErikaTextureFrame;
+typedef enum ErikaExternalTextureKind {
+    ErikaExternalTextureKind_Metal = 1,
+    ErikaExternalTextureKind_VulkanOpaqueFd = 2,
+} ErikaExternalTextureKind;
+typedef enum ErikaExternalTextureFormat {
+    ErikaExternalTextureFormat_Rgba8Unorm = 1,
+} ErikaExternalTextureFormat;
+
+typedef struct ErikaExternalTextureInfo {
+    ErikaExternalTextureKind kind;
+    ErikaExternalTextureFormat format;
+    uint32_t width;
+    uint32_t height;
+    uint64_t native_handle;
+    uint64_t device_id;
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+    uint32_t vulkan_format;
+    uint32_t vulkan_usage;
+    uint32_t vulkan_tiling;
+    uint8_t device_uuid[16];
+    uint8_t driver_uuid[16];
+} ErikaExternalTextureInfo;
+
+/* Native, immutable SDR texture: video + subtitle + enabled danmaku, no HUD.
+ * Select WgpuFallback. Supports Linux/Vulkan OPAQUE_FD and Apple/Metal. No
+ * surface, Flutter registrar, CPU pixel readback or GPU texture copy. Waits
+ * for producer GPU completion before returning. Unsupported backends fail.
+ * Call once per host frame; also pumps audio, so render_tick is not required.
+ * NoEvent means no video yet. *out_frame is null on every non-Ok result.
+ * Frames can outlive the presenter. Release only after consumer GPU work and
+ * imported aliases are retired. Native handles from get_info are borrowed:
+ * Metal is id<MTLTexture> on device_id (registryID).
+ * Metal consumers may retain MTLTexture independently before releasing the
+ * frame; that retained reference must cover all consumer GPU use.
+ * Vulkan is an OPAQUE_FD (0 is valid), to be duplicated before import. Match
+ * device AND driver UUIDs.
+ * Vulkan: dedicated allocation, identical format/usage/tiling, 2D, 1 mip/layer/
+ * sample, flags 0. Import allocation_size and memory_type_index. Acquire queue
+ * ownership from EXTERNAL, old layout GENERAL, before reading. Read-only.
+ * Pixels are sRGB-encoded RGBA in UNORM storage; the host compositor applies
+ * any needed transfer conversion. */
+ErikaStatus erika_presenter_export_frame_texture(
+    ErikaPresenterHandle *handle, uint32_t width, uint32_t height,
+    ErikaTextureFrame **out_frame);
+/* Select the wgpu renderer, including on Apple where the default presenter
+ * uses the native renderer. Returns NULL and sets last_error on failure. */
+ErikaPresenterHandle *erika_presenter_create_for_texture_export(ErikaPresenterConfig config);
+ErikaStatus erika_texture_frame_get_info(
+    const ErikaTextureFrame *frame, ErikaExternalTextureInfo *out_info);
+void erika_texture_frame_release(ErikaTextureFrame *frame);
 
 #ifdef __cplusplus
 }

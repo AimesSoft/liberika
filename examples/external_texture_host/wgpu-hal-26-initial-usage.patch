@@ -1,0 +1,78 @@
+--- a/src/vulkan/mod.rs
++++ b/src/vulkan/mod.rs
+@@ -947,11 +947,21 @@
+     format: wgt::TextureFormat,
+     copy_size: crate::CopyExtent,
+     identity: ResourceIdentity<vk::Image>,
++    initial_usage: wgt::TextureUses,
+ }
+ 
+ impl crate::DynTexture for Texture {}
+ 
+ impl Texture {
++    /// Preserve initialized external image contents on the first core transition.
++    ///
++    /// # Safety
++    /// Before any use, the image must be synchronized, owned by this queue
++    /// family and in the native layout corresponding to `usage`.
++    pub unsafe fn set_external_initial_usage(&mut self, usage: wgt::TextureUses) {
++        self.initial_usage = usage;
++    }
++
+     /// # Safety
+     ///
+     /// - The image handle must not be manually destroyed
+--- a/src/vulkan/device.rs
++++ b/src/vulkan/device.rs
+@@ -649,6 +649,7 @@
+             format: desc.format,
+             copy_size: desc.copy_extent(),
+             identity,
++            initial_usage: wgt::TextureUses::UNINITIALIZED,
+         }
+     }
+ 
+@@ -824,6 +825,7 @@
+             format: desc.format,
+             copy_size: image.copy_size,
+             identity,
++            initial_usage: wgt::TextureUses::UNINITIALIZED,
+         })
+     }
+ 
+@@ -1305,6 +1307,7 @@
+             format: desc.format,
+             copy_size: image.copy_size,
+             identity,
++            initial_usage: wgt::TextureUses::UNINITIALIZED,
+         })
+     }
+     unsafe fn destroy_texture(&self, texture: super::Texture) {
+--- a/src/vulkan/command.rs
++++ b/src/vulkan/command.rs
+@@ -246,8 +246,13 @@
+                 bar.texture.format,
+                 &self.device.private_caps,
+             );
+-            let (src_stage, src_access) = conv::map_texture_usage_to_barrier(bar.usage.from);
+-            let src_layout = conv::derive_image_layout(bar.usage.from, bar.texture.format);
++            let from = if bar.usage.from == wgt::TextureUses::UNINITIALIZED {
++                bar.texture.initial_usage
++            } else {
++                bar.usage.from
++            };
++            let (src_stage, src_access) = conv::map_texture_usage_to_barrier(from);
++            let src_layout = conv::derive_image_layout(from, bar.texture.format);
+             src_stages |= src_stage;
+             let (dst_stage, dst_access) = conv::map_texture_usage_to_barrier(bar.usage.to);
+             let dst_layout = conv::derive_image_layout(bar.usage.to, bar.texture.format);
+--- a/src/vulkan/instance.rs
++++ b/src/vulkan/instance.rs
+@@ -1192,6 +1192,7 @@
+                     depth: 1,
+                 },
+                 identity,
++                initial_usage: wgt::TextureUses::UNINITIALIZED,
+             },
+             acquire_semaphores: acquire_semaphore_arc,
+             present_semaphores: present_semaphore_arc,

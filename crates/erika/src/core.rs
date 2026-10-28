@@ -549,6 +549,73 @@ pub struct RendererFrameCapture {
     pub rgba: Vec<u8>,
 }
 
+/// Native resource type carried by an [`ExternalTextureFrame`].
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalTextureKind {
+    Metal = 1,
+    VulkanOpaqueFd = 2,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalTextureFormat {
+    Rgba8Unorm = 1,
+}
+
+/// Version-independent native texture metadata. Pixels are SDR sRGB-encoded
+/// values in RGBA8Unorm storage, matching `capture_frame_rgba`.
+///
+/// Handles are borrowed from the frame. Vulkan import consumes an FD, so import
+/// a `dup` of `native_handle`, never the original. Vulkan images use dedicated
+/// allocations, one mip/layer/sample, and the exact format/usage/tiling below.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalTextureInfo {
+    pub kind: ExternalTextureKind,
+    pub format: ExternalTextureFormat,
+    pub width: u32,
+    pub height: u32,
+    /// `id<MTLTexture>` pointer or borrowed OPAQUE_FD (zero is a valid FD).
+    pub native_handle: u64,
+    /// Metal MTLDevice registry ID; zero for Vulkan.
+    pub device_id: u64,
+    pub allocation_size: u64,
+    pub memory_type_index: u32,
+    pub vulkan_format: u32,
+    pub vulkan_usage: u32,
+    pub vulkan_tiling: u32,
+    pub device_uuid: [u8; 16],
+    pub driver_uuid: [u8; 16],
+}
+
+/// Owns an immutable, GPU-complete texture without reading pixels to the CPU.
+///
+/// Keep the frame alive until all consumer GPU work and imported aliases have
+/// been retired. Frames can outlive their presenter and renderer. The consumer
+/// must use the same GPU. Vulkan consumers must acquire queue-family ownership
+/// from EXTERNAL with old layout GENERAL before reading; do not modify pixels.
+/// Metal consumers may instead retain the native MTLTexture independently and
+/// then drop this guard; that native reference must cover all consumer GPU work.
+pub struct ExternalTextureFrame {
+    info: ExternalTextureInfo,
+    _resource: Box<dyn Send + Sync>,
+}
+
+impl ExternalTextureFrame {
+    pub fn info(&self) -> &ExternalTextureInfo {
+        &self.info
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn new(info: ExternalTextureInfo, resource: impl Send + Sync + 'static) -> Self {
+        Self {
+            info,
+            _resource: Box::new(resource),
+        }
+    }
+}
+
 impl<'a> RenderFrameContext<'a> {
     pub fn new(media_time: Duration, generation: u64) -> Self {
         Self {
@@ -843,6 +910,17 @@ pub trait RendererBackend {
         _height: u32,
     ) -> Result<Option<RendererFrameCapture>> {
         Ok(None)
+    }
+
+    /// Render video, subtitles and danmaku directly into an immutable native
+    /// texture. Unsupported backends return an error, never a CPU fallback.
+    fn export_current_frame_texture(
+        &mut self,
+        _context: RenderFrameContext<'_>,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<ExternalTextureFrame>> {
+        Err(PlayerError::Renderer("native texture export is unsupported by this renderer; select WgpuFallback on Linux/Vulkan or Apple/Metal".into()))
     }
 
     fn runtime_stats(&self) -> RendererRuntimeStats {

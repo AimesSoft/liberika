@@ -717,6 +717,8 @@ ErikaStatus erika_presenter_get_upscaler_status(ErikaPresenterHandle *, ErikaUps
 ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutputStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle *, uint32_t width, uint32_t height,
+                                                         uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
 `get_upscaler_status` 报告请求的超分模式、当前后端（off / inactive / building /
@@ -770,6 +772,31 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+自行合成 UI 的宿主（例如 Wayland 上的 Dioxus）可改用
+`erika_presenter_capture_frame_rgba_with_danmaku`，参数相同，额外包含已启用的弹幕。
+弹幕使用当前播放时钟、轨道选择、偏移、字体和绘制设置，按请求的像素尺寸独立布局，
+scale factor 为 1；捕获无需绑定 surface，也不要求先调用 `render_tick`。
+新接口不含调试 HUD，SDR RGBA8、缓冲区和错误约定与截图接口一致。
+捕获会同步准备并缓存短时间窗口；调整尺寸、seek 或修改弹幕配置后，下一次调用可能
+重新准备布局。音频输出仍需常规 `render_tick`；`audio_only_tick` 会暂停视频解码。
+
+Rust 对应入口为 `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`：
+
+```rust,ignore
+if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
+    // 将紧排 RGBA8 像素上传到宿主自己的纹理。
+}
+```
+
+此路径将像素读回 CPU，不导出共享 GPU 纹理，也不要求宿主与 liberika 的 wgpu 版本一致。
+
+原生 GPU 输出使用 `erika_presenter_create_for_texture_export(config)` 创建 presenter，
+每帧调用 `erika_presenter_export_frame_texture(p, w, h, &frame)`，通过
+`erika_texture_frame_get_info` 取得借用句柄。消费端 GPU 完成且导入别名销毁后调用
+`erika_texture_frame_release`。此循环也驱动音频。已实现 Linux Vulkan OPAQUE_FD
+和 Apple Metal，公开接口没有 wgpu 类型；格式、同步、所有权与宿主导入示例见
+[原生纹理输出](external_textures.zh.md)。
 
 ### 智能体诊断（JSON）
 
