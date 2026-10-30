@@ -127,6 +127,13 @@ HarmonyOS build は `OHOS_NDK_HOME` または `OHOS_SDK_NATIVE` が指す DevEco
 この chain を自動実行し、`liberika_capi.so` と `liberika_flutter.so` を HAP に
 package します。
 
+OpenHarmony の文字字幕には `libass` と `wgpu` の両方が必要です。
+`xtask deps build --all` で文字依存ライブラリを構築し、runtime の直接 build には
+`--no-default-features --features libass,wgpu` を指定します。`libass` を省くと
+デバッグ用 renderer が字形の代わりに矩形を描画します。ソースの修正だけでは
+ダウンロード済み runtime は置き換わりません。修正済み native release でアプリを
+再構築するか、この checkout で `ERIKA_FORCE_SOURCE_BUILD=1` を指定してください。
+
 ### Source build architecture の選択
 
 Flutter の依存 project は、macOS では `ERIKA_MACOS_ARCHS=arm64|x86_64|universal`、Windows では `ERIKA_WINDOWS_ARCH=x64|arm64`、Android では `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86` で architecture を選択します。`ERIKA_FORCE_SOURCE_BUILD=1` を設定すると prebuilt download を無効化できます。

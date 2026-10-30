@@ -5068,6 +5068,46 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     #[cfg(feature = "libass")]
     #[test]
+    fn embedded_cjk_ass_rasterizes_glyphs_instead_of_debug_rectangles() {
+        // Matroska supplies CodecPrivate and event chunks separately. A build
+        // without libass turns this text into one solid debug rectangle (#180).
+        let header = ass_test_header().replace("Arial", "Erika Missing Font 180");
+        let resources = Arc::new(AssTrackResources::new(
+            2,
+            Arc::<[u8]>::from(header.as_bytes()),
+            Arc::<[SubtitleFontAttachment]>::from([]),
+        ));
+        let mut frame =
+            ass_subtitle_frame(2, 1, Duration::ZERO, Duration::from_secs(2), 1, resources);
+        frame.frame.text[0].text =
+            "1,0,Default,,0,0,0,,中文字幕正常显示\\Nそうだ！羽依里くん".to_string();
+        let mut state = SubtitleFrameState::default();
+        state.push(frame);
+        let mut overlay = empty_overlay();
+        state.append_to_overlay(
+            Duration::from_millis(500),
+            &mut overlay,
+            &SubtitleAssStyle::default(),
+        );
+        assert!(
+            overlay.subtitle_planes.is_empty(),
+            "no debug RGBA rectangles"
+        );
+        assert!(!overlay.subtitle_alpha_planes.is_empty());
+        let coverage = overlay
+            .subtitle_alpha_planes
+            .iter()
+            .flat_map(|part| part.alpha.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(coverage.contains(&0), "glyph masks have transparent areas");
+        assert!(
+            coverage.iter().any(|&value| value > 0),
+            "glyphs are visible"
+        );
+    }
+
+    #[cfg(feature = "libass")]
+    #[test]
     fn subtitle_state_streams_ass_into_alpha_planes_and_clears_track() {
         let header = ass_test_header();
         let resources = Arc::new(AssTrackResources::new(
