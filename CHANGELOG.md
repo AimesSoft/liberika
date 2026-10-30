@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- Fixed OpenHarmony text subtitles rendering as solid rectangles by enabling
+  libass and building its text dependencies in native builds (#180).
 - Added Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` and C
   `erika_presenter_capture_frame_rgba_with_danmaku` for off-screen host
   composition, including enabled danmaku at the requested capture size.

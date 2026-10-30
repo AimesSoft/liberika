@@ -595,7 +595,7 @@ jobs:
           key: native-v1-ohos-${{ env.ERIKA_NATIVE_TARGET }}-api${{ env.OHOS_COMPATIBLE_SDK_VERSION }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
       - name: Build OpenHarmony native dependencies
         run: >-
-          cargo run --locked -p xtask -- deps build
+          cargo run --locked -p xtask -- deps build --all
           --profile "$ERIKA_NATIVE_PROFILE"
           --target "$ERIKA_NATIVE_TARGET"
       - name: Save native dependencies
@@ -612,7 +612,7 @@ jobs:
         run: >-
           cargo build --locked -p erika_capi --release
           --target "$ERIKA_NATIVE_TARGET"
-          --no-default-features --features wgpu
+          --no-default-features --features libass,wgpu
       - name: Build OpenHarmony Flutter native bridge
         run: |
           set -euo pipefail
