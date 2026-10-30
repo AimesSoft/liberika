@@ -73,7 +73,7 @@ Pod::Spec.new do |s|
     .join(' ')
 
   s.name             = 'erika_flutter'
-  s.version          = '0.3.1'
+  s.version          = '0.3.2'
   s.summary          = 'Flutter embedder glue for the liberika Rust media engine.'
   s.description      = <<-DESC
 Flutter iOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI.
