@@ -17,10 +17,10 @@ cd packages/erika_flutter
 dart pub publish --dry-run
 ```
 
-3. Set `[workspace.package].version` in `Cargo.toml` to the release version and run `cargo update -w`; commit `Cargo.lock` with it. The Release workflow rejects tags that differ from the Cargo version. Run `Release` manually on this commit and confirm all platform builds pass before tagging. Tag the release commit. The version below is an example for the next release; replace it with the intended version:
+3. Set `[workspace.package].version` in `Cargo.toml` to the release version and run `cargo update -w`; commit `Cargo.lock` with it. The Release workflow rejects tags that differ from the Cargo version. Tag that commit on `main`; the tag's own `Release` run builds every platform and publishes, so there is no separate rehearsal run. The version below is an example for the next release; replace it with the intended version:
 
 ```sh
-VERSION=0.4.0
+VERSION=0.3.1
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -40,7 +40,7 @@ git push origin "v${VERSION}"
 
 Flutter, OHPM, and Swift publishing can run in parallel. Maintainers create only the core tag. Cross-repository tags and Swift publishing use the repository secret `ERIKA_SWIFT_RELEASE_TOKEN`.
 
-A manual `Release` run through `workflow_dispatch` checks the builds and stores Actions Artifacts. A tag triggers the GitHub Release publish step.
+A tag triggers the builds and the GitHub Release publish step. The manual `workflow_dispatch` run is only for investigating a failed build; it is not a release step.
 
 ## Release artifacts
 

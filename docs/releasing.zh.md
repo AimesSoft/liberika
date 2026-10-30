@@ -17,10 +17,10 @@ cd packages/erika_flutter
 dart pub publish --dry-run
 ```
 
-3. 将 `Cargo.toml` 的 `[workspace.package].version` 改为发布版本，运行 `cargo update -w` 并一同提交 `Cargo.lock`。Release 会拒绝与 Cargo 版本不一致的 tag。先对准备发布的提交手动运行 `Release`，确认所有平台构建通过，再打核心 tag。以下版本号是下一次发布的示例，按实际版本替换：
+3. 将 `Cargo.toml` 的 `[workspace.package].version` 改为发布版本，运行 `cargo update -w` 并一同提交 `Cargo.lock`。Release 会拒绝与 Cargo 版本不一致的 tag。直接在 `main` 的该提交上打核心 tag；tag 触发的 `Release` 会构建所有平台并发布，不需要另外试跑。以下版本号是下一次发布的示例，按实际版本替换：
 
 ```sh
-VERSION=0.4.0
+VERSION=0.3.1
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -40,7 +40,7 @@ git push origin "v${VERSION}"
 
 Flutter、OHPM 和 Swift 发布可以并行进行。维护者只创建核心 tag；跨仓库 tag 和 Swift 发布使用仓库 secret `ERIKA_SWIFT_RELEASE_TOKEN`。
 
-手动运行 `Release` 的 `workflow_dispatch` 可检查构建，产物保存在 Actions Artifact；GitHub Release 的发布步骤由 tag 触发。
+tag 触发构建和 GitHub Release 发布。手动的 `workflow_dispatch` 只用于排查构建失败，不是发布步骤。
 
 ## 发布产物
 
