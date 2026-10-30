@@ -124,25 +124,25 @@ void erika_frame_export_session_close(ErikaFrameExportSession *session);
 
 | 値 | コード | 意味 |
 |----|--------|------|
-| `ErikaStatus_Ok` | 0 | 成功。スレッドローカルのエラーをクリア。 |
+| `ErikaStatus_Ok` | 0 | 成功。多くのステータス返却呼び出しはスレッドローカルエラーをクリア（イベントは後述）。 |
 | `ErikaStatus_NullPointer` | 1 | 必須の handle / out ポインタが `NULL`（または surface ポインタが 0）。 |
 | `ErikaStatus_InvalidUtf8` | 2 | `const char*` 引数が不正な UTF-8。 |
 | `ErikaStatus_PlayerError` | 3 | エンジンが呼び出しを拒否。メッセージを読む（下記）。 |
-| `ErikaStatus_Panic` | 4 | 境界で Rust panic を捕捉。panic 前に完了した分を除き呼び出しは無効。handle は疑わしい状態とみなす。 |
+| `ErikaStatus_Panic` | 4 | Rust panic を捕捉。処理が部分的に状態を変更している可能性があるため、handle は疑わしい状態とみなす。 |
 | `ErikaStatus_NoEvent` | 5 | `*_poll_event` のみ：キューが空（エラーではない）。 |
 
 戻り値は必ず確認してください。非エラーは `Ok` と `NoEvent` だけです。
 
 ### panic 安全性
 
-ABI は FFI 境界を unwind が越えることを決して許しません。各エントリーは本体を
-`catch_unwind` で包み、panic は `ErikaStatus_Panic` になりメッセージが設定されます。
-C++ の `noexcept`/SEH を気にせず境界を越えて呼べます。
+多くのステータス返却操作は Rust panic を捕捉し、メッセージと `ErikaStatus_Panic` を
+返します。ただし全エントリーの保証ではありません。例えば `erika_create`、`erika_destroy`、
+文字列ヘルパーは捕捉で囲まれていません。捕捉範囲外の panic や panic 時に abort する
+ビルドはプロセスを終了させる可能性があります。有効な引数を渡してください。
 
 ### エラーメッセージ（スレッドローカル）
 
-`Ok`/`NoEvent` 以外の結果では、liberika は可読メッセージを**スレッドローカル**スロットに
-保存します。取得：
+多くの失敗した呼び出しは可読メッセージを**スレッドローカル**スロットに保存しますが、すべてのエラーが更新するわけではありません。例えば一部の出力ポインタが `NULL` の場合は `NullPointer` を直接返すため、メッセージが空か、以前の呼び出しのものが残っている場合があります。同じスレッドで取得します。
 
 ```c
 char *msg = erika_last_error_message();   // ヒープ確保、NULL の可能性あり
@@ -150,7 +150,9 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 ```
 
 スレッドローカルなので、失敗した呼び出しを行った**同じスレッド**で、かつそのスレッドの
-次の呼び出しより前に読んでください（その後の `Ok` がクリアします）。
+次の呼び出しより前に読んでください（後続の成功呼び出しの多くはクリアします）。
+`Error`、`VideoDecoderChanged`、`AudioOutputChanged` イベントのメッセージは poll した
+同じスレッドですぐ読んでください。別のイベントでクリアされることがあります。
 `erika_last_error_message` は所有権を持つコピーを返します——`erika_string_free` で解放。
 
 ### 文字列の所有権
@@ -733,6 +735,8 @@ ErikaStatus erika_presenter_get_upscaler_status(ErikaPresenterHandle *, ErikaUps
 ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutputStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle *, uint32_t width, uint32_t height,
+                                                         uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
 `get_upscaler_status` は要求アップスケーラモード、現在の backend（off / inactive /
@@ -788,6 +792,33 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+UI を独自に合成するホスト（Wayland 上の Dioxus など）は、同じ引数で
+`erika_presenter_capture_frame_rgba_with_danmaku` を使うと有効な弾幕も含められます。
+弾幕は現在の再生クロック、トラック選択、オフセット、フォント、描画設定に従い、
+要求したピクセルサイズと scale factor 1 で独立に配置されます。capture に surface や
+事前の `render_tick` は不要です。debug HUD は含まず、SDR RGBA8、バッファとエラーの
+契約は screenshot API と同じです。短い時間窓を同期的に準備してキャッシュするため、
+リサイズ、seek、弾幕設定の変更後は次の呼び出しで再準備する場合があります。
+音声出力には通常の `render_tick` が必要です。`audio_only_tick` は映像デコードを停止します。
+
+Rust の入口は `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)` です。
+
+```rust,ignore
+if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
+    // 密に詰まった RGBA8 ピクセルをホストのテクスチャへアップロード。
+}
+```
+
+この経路は CPU にピクセルを読み戻します。共有 GPU テクスチャの export は行わず、
+liberika とホストの wgpu バージョンが一致する必要もありません。
+
+ネイティブ GPU 出力には `erika_presenter_create_for_texture_export(config)` を使い、
+各フレームで `erika_presenter_export_frame_texture(p, w, h, scale, &frame)` を呼びます。
+`erika_texture_frame_get_info` で借用 handle を取得し、consumer GPU の完了と import
+別名の破棄後に `erika_texture_frame_release` で解放します。音声もこのループで進みます。
+Linux Vulkan OPAQUE_FD と Apple Metal を実装し、公開 API に wgpu 型はありません。
+形式、同期、所有権、host importer は[ネイティブテクスチャ出力](external_textures.ja.md)を参照。
 
 ### エージェント向け診断（JSON）
 

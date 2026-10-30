@@ -41,9 +41,9 @@ Linux は FFmpeg 8、PulseAudio と liberika パッチ済み libass を使いま
 ### ビルドツール —— macOS / Unix ホスト
 
 `tar`、`make`、`clang`、`cmake`、`pkg-config`、`python3`（`venv` 付き）が `PATH` 上に
-必要です。完全な字幕スタック（`--all`）には加えて `meson` と `ninja`（Intel ホストでは
-FFmpeg の x86 アセンブリに `nasm`）が必要です。macOS では Xcode Command Line Tools と、
-上記を Homebrew で導入します。
+必要です。基本セットの dav1d に Meson と Ninja が必要で、未導入なら `xtask` が Python
+仮想環境に用意できます。x86_64 Apple ターゲットでは `--all` がなくても dav1d と FFmpeg
+のアセンブリに `nasm` が必要です。macOS では Xcode Command Line Tools と必要なツールを導入します。
 
 `erika_ffmpeg_sys` は **bindgen** を実行するため `libclang` が必要です。自動で見つから
 ない場合は `LIBCLANG_PATH` を設定します。
@@ -53,8 +53,8 @@ FFmpeg の x86 アセンブリに `nasm`）が必要です。macOS では Xcode 
 - **Visual Studio Build Tools**（MSVC）+ Windows SDK、および **CMake** コンポーネント。
 - **POSIX シェル**（Git for Windows または MSYS2）——FFmpeg の `configure` に必要。
 - **GNU make**（MSYS2 `make` または MinGW `mingw32-make`）。
-- FFmpeg アセンブリに `nasm`。
-- `--all` には **Python**（`venv` 付き）。`xtask` が `pkg-config` シムを自動で用意します。
+- x86_64 FFmpeg と dav1d のアセンブリに `nasm`。
+- Windows の依存ビルドには常に **Python**（`venv` 付き）が必要です。`xtask` は Meson/Ninja と `pkg-config` シムを自動で用意できます。
 
 MSVC 環境が有効なシェル（*"x64 Native Tools Command Prompt"* など）からコマンドを実行し、
 `xtask` がツールチェーンを見つけられるようにします。
@@ -82,6 +82,19 @@ cargo run -p xtask -- deps build --profile lgpl
 # libass 字幕スタックを含めすべて
 cargo run -p xtask -- deps build --all --profile lgpl
 ```
+
+上の例は既定の `host` を使用します。Windows では明示的な MSVC ターゲットを使用してください。
+Cargo のビルドスクリプトはターゲット別ディレクトリを推定しますが、`host` は依存を
+`dist/lgpl` に配置します。x64 の例：
+
+```powershell
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc
+$env:ERIKA_NATIVE_TARGET = "x86_64-pc-windows-msvc"
+cargo build -p erika_capi --target x86_64-pc-windows-msvc
+```
+
+Windows ARM64 では `aarch64-pc-windows-msvc` を使用します。既定の Cargo ビルドと
+workspace テストは libass を有効にするため、基本セットだけでなく `--all` が必要です。
 
 サブコマンド：`plan`（計画を表示）、`fetch`（ソースのみ取得）、`status`（存在/ビルド
 状況）、`build`（取得 + コンパイル）。
@@ -181,7 +194,8 @@ cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows
 - **`gpl-full`** —— 同じセットに `--enable-gpl`。成果物の GPL 条項を受け入れる場合のみ。
 
 Rust workspace 自体は MPL-2.0（[`LICENSE`](../LICENSE)）。`xtask` と `cargo build` で
-profile を一致させます。`cargo run -p xtask -- check license` がポリシーを検証します。
+profile を一致させます。`cargo run -p xtask -- check license` は既定 feature、FFmpeg の
+構成フラグ、dav1d のライセンス表記を検査します。ビルド済み成果物や profile の混在は検査しません。
 
 ## `dist` レイアウト
 
@@ -207,13 +221,15 @@ third_party/
 1. `ERIKA_FFMPEG_DIR`（設定されていれば明示上書き）。
 2. なければ `third_party/dist/$ERIKA_NATIVE_TARGET/$ERIKA_NATIVE_PROFILE/ffmpeg`
    （`ERIKA_NATIVE_TARGET` が設定されている場合）。
-3. なければ workspace ルート配下の `third_party/dist/<profile>/ffmpeg`（iOS 向けビルド
-   では `ios/` セグメント付き）。
+3. なければ Windows、Android、iOS（`ios`）、tvOS のターゲットディレクトリを推定します。
+   その他は一致する Cargo ターゲットディレクトリがあればそれを使用し、なければ
+   `third_party/dist/<profile>/ffmpeg` を使用します。`ERIKA_NATIVE_TARGET` で明示的に選択できます。
 
 関連する環境変数：`ERIKA_NATIVE_PROFILE`、`ERIKA_NATIVE_TARGET`、`ERIKA_FFMPEG_DIR`、
 `ERIKA_DAV1D_DIR`、`ERIKA_ZLIB_DIR`、`LIBCLANG_PATH`、`ERIKA_ALLOW_LEGACY_FFMPEG`（脱出ハッチ）。liberika は
-FFmpeg **8.x**（`libavutil >= 60`）を要求し、Windows と Android のネイティブコアはこれを強制します。
-`ERIKA_ALLOW_LEGACY_FFMPEG=1` はローカルの互換性実験のときだけ設定してください。
+FFmpeg **8.x**（`libavutil >= 60`）を要求します。`ERIKA_ALLOW_LEGACY_FFMPEG=1` はローカルの
+互換性実験専用で、bundled 依存のバージョン検査のみを省略します。Linux のシステムライブラリ
+経路では pkg-config による FFmpeg 8 の要件が引き続き適用されます。
 
 ## コンパイルとテスト
 
@@ -271,20 +287,25 @@ Flutter harness は `getOutputStatus()`、native harness は
 
 ## 再生パスの検証
 
+macOS（シェル）：
+
 ```sh
-# macOS
-export SAMPLE="/path/to/video.mp4"
+SAMPLE="/path/to/video.mp4"
 cargo run -p macos_native_demo -- "$SAMPLE"
 cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
-
-# Windows
-cargo run -p windows_native_demo -- "%SAMPLE%"
-cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl "%SAMPLE%"
 ```
 
-demo はフレームごとのパイプライン統計（デコード/描画フレーム、ゼロコピー vs CPU
-フォールバック、HDR10 のアクティブ状況、オーディオ underflow）を出力します——ハード
-デコードとゼロコピー相互運用が効いているか手早く確認できます。
+Windows（PowerShell）：
+
+```powershell
+$sample = "C:\path\to\video.mp4"
+cargo run -p windows_native_demo -- $sample
+cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl $sample
+```
+
+Windows の smoke test は終了時にデコード、ゼロコピー、HDR10、音声などの集計値を出力し、
+`--metrics-log` は約 250 ms ごとに指標を書き込みます。macOS demo は既定で再生とエラーを
+報告し、`--seek-sequence` 使用時にはデコード、描画、失敗のカウントも出力します。
 
 ## トラブルシューティング
 
@@ -301,9 +322,11 @@ demo はフレームごとのパイプライン統計（デコード/描画フ�
   （`1`）、Hybrid Composition ではない（`2`）、GLES（`3`）、`Rgba16Float` 不在（`4`）、
   dataspace API 不在（`5`）、`SCRGB_LINEAR` verification failure（`6`）です。`7` と `8` は
   surface configure failure と unsupported backend での Apple EDR request を表します。
-- **旧 FFmpeg が拒否される** —— 7.x バンドルを導入/ビルド。システム FFmpeg に依存しない。
-- **license チェック失敗** —— profile に GPL と LGPL の成果物が混在。単一 `--profile` で
-  deps を再ビルド。
+- **旧 FFmpeg が拒否される** —— FFmpeg 8.x をインストールまたはビルドします。
+  `ERIKA_ALLOW_LEGACY_FFMPEG=1` はローカルの互換性実験で bundled 依存の検査だけを省略し、
+  Linux システムライブラリの pkg-config バージョン要件は省略しません。
+- **license チェック失敗** —— エラーに従い既定 feature、FFmpeg 構成フラグ、dav1d の
+  ライセンス表記を確認します。成果物は検査しないため、依存と Cargo の profile 一致は別途確認します。
 
 開発ワークフローは [CONTRIBUTING.ja.md](../CONTRIBUTING.ja.md)、各部分の組み合わせ方は
 [architecture.ja.md](architecture.ja.md) を参照してください。

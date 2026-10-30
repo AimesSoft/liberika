@@ -1,9 +1,24 @@
 # Changelog
 
+[中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
+
 ## Unreleased
 
 - Fixed OpenHarmony text subtitles rendering as solid rectangles by enabling
   libass and building its text dependencies in native builds (#180).
+- Added Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` and C
+  `erika_presenter_capture_frame_rgba_with_danmaku` for off-screen host
+  composition, including enabled danmaku at the requested capture size.
+  The existing screenshot API continues to exclude danmaku (#175).
+- Added `export_frame_texture` with immutable, owned native frame handles for
+  host composition without a window, Flutter, CPU pixel readback or an output
+  texture copy. The wgpu renderer exports Linux Vulkan OPAQUE_FD allocations and
+  Apple Metal textures, including subtitles and enabled danmaku. Added C
+  creation/export/info/release entry points, a Vulkan C importer and a standalone
+  cross-version wgpu host example without a UI framework dependency. The
+  export loop also drives audio, lays out danmaku with the on-screen background
+  planner at the host's content scale, and rejects unsupported sizes before any
+  playback work (#175).
 
 ## 0.3.0 - 2026-10-25
 

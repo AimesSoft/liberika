@@ -142,24 +142,25 @@ if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
 
 | 值 | 码 | 含义 |
 |----|----|------|
-| `ErikaStatus_Ok` | 0 | 成功。清空线程局部错误。 |
+| `ErikaStatus_Ok` | 0 | 成功。多数返回状态的调用会清空线程局部错误；事件处理见下文。 |
 | `ErikaStatus_NullPointer` | 1 | 必需的 handle 或 out 指针为 `NULL`（或 surface 指针为 0）。 |
 | `ErikaStatus_InvalidUtf8` | 2 | 某个 `const char*` 参数不是合法 UTF-8。 |
 | `ErikaStatus_PlayerError` | 3 | 引擎拒绝该调用；读取错误信息（见下）。 |
-| `ErikaStatus_Panic` | 4 | 在边界处捕获到 Rust panic。该调用除 panic 前已完成的部分外无效；handle 应视为可疑状态。 |
+| `ErikaStatus_Panic` | 4 | 捕获到 Rust panic。调用可能已部分修改状态；handle 应视为可疑状态。 |
 | `ErikaStatus_NoEvent` | 5 | 仅 `*_poll_event`：队列为空（非错误）。 |
 
 务必检查返回值。`Ok` 和 `NoEvent` 是仅有的非错误结果。
 
 ### panic 安全
 
-ABI 永不让 unwind 穿越 FFI 边界。每个入口都把函数体包在 `catch_unwind` 里；panic
-会变成 `ErikaStatus_Panic` 并设置错误信息。你可以跨边界调用，无需担心 C++
-`noexcept`/SEH。
+许多返回状态的操作会捕获 Rust panic，返回 `ErikaStatus_Panic` 并设置错误信息；
+但这不是所有入口的保证。例如 `erika_create`、`erika_destroy` 和字符串辅助函数没有
+捕获包装。捕获范围外的 panic 或配置为 panic 时 abort 的构建可能终止进程。调用时仍须
+提供有效参数。
 
 ### 错误信息（线程局部）
 
-任何非 `Ok`/`NoEvent` 的结果，liberika 会把一条可读信息存进**线程局部**槽。读取：
+许多失败调用会将可读信息存入**线程局部**槽，但并非所有错误都会更新它。例如某些输出指针为 `NULL` 时会直接返回 `NullPointer`，消息可能为空或仍是之前的内容。可在同一线程读取：
 
 ```c
 char *msg = erika_last_error_message();   // 堆分配，可能为 NULL
@@ -167,7 +168,9 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 ```
 
 因为是线程局部的，要**在发起失败调用的同一线程**上读取，且在该线程下一次调用之前读取
-（之后一次 `Ok` 会清空它）。`erika_last_error_message` 返回的是你拥有的副本——用
+（后续多数成功调用会清空它）。轮询到 `Error`、`VideoDecoderChanged` 或
+`AudioOutputChanged` 事件时，也应立即在轮询线程读取消息；其他事件可能清空它。
+`erika_last_error_message` 返回的是你拥有的副本——用
 `erika_string_free` 释放。
 
 ### 字符串所有权
@@ -717,6 +720,8 @@ ErikaStatus erika_presenter_get_upscaler_status(ErikaPresenterHandle *, ErikaUps
 ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutputStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle *, uint32_t width, uint32_t height,
+                                                         uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
 `get_upscaler_status` 报告请求的超分模式、当前后端（off / inactive / building /
@@ -770,6 +775,31 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+自行合成 UI 的宿主（例如 Wayland 上的 Dioxus）可改用
+`erika_presenter_capture_frame_rgba_with_danmaku`，参数相同，额外包含已启用的弹幕。
+弹幕使用当前播放时钟、轨道选择、偏移、字体和绘制设置，按请求的像素尺寸独立布局，
+scale factor 为 1；捕获无需绑定 surface，也不要求先调用 `render_tick`。
+新接口不含调试 HUD，SDR RGBA8、缓冲区和错误约定与截图接口一致。
+捕获会同步准备并缓存短时间窗口；调整尺寸、seek 或修改弹幕配置后，下一次调用可能
+重新准备布局。音频输出仍需常规 `render_tick`；`audio_only_tick` 会暂停视频解码。
+
+Rust 对应入口为 `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`：
+
+```rust,ignore
+if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
+    // 将紧排 RGBA8 像素上传到宿主自己的纹理。
+}
+```
+
+此路径将像素读回 CPU，不导出共享 GPU 纹理，也不要求宿主与 liberika 的 wgpu 版本一致。
+
+原生 GPU 输出使用 `erika_presenter_create_for_texture_export(config)` 创建 presenter，
+每帧调用 `erika_presenter_export_frame_texture(p, w, h, scale, &frame)`，通过
+`erika_texture_frame_get_info` 取得借用句柄。消费端 GPU 完成且导入别名销毁后调用
+`erika_texture_frame_release`。此循环也驱动音频。已实现 Linux Vulkan OPAQUE_FD
+和 Apple Metal，公开接口没有 wgpu 类型；格式、同步、所有权与宿主导入示例见
+[原生纹理输出](external_textures.zh.md)。
 
 ### 智能体诊断（JSON）
 

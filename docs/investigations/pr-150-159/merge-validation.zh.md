@@ -1,5 +1,7 @@
 # 2026-10-13：主分支集成与真实运行验证
 
+> [中文](merge-validation.zh.md) · [English](merge-validation.en.md) · [日本語](merge-validation.ja.md)
+
 集成 PR：[AimesSoft/liberika #164](https://github.com/AimesSoft/liberika/pull/164)。
 基线：`14c1d5511a0a16c34cf2c5f5fe9132d1f17fce65`。
 最终生产代码：`211f347acf9d67fb23424d98de436d87931f9318`；后续提交仅更新验证宿主与证据。

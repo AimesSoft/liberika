@@ -13,7 +13,7 @@
 
 The host application provides a rendering surface and sends playback commands — decoding, timing, video rendering, subtitles, danmaku, and audio output are handled entirely inside Erika. Native video surfaces present directly; Flutter textures can participate in host composition.
 
-Current release: **0.3.0**. Start with the [documentation index](../docs/README.md).
+Current release: **0.3.0**. Start with the [documentation index](../docs/README.en.md).
 
 **Play MKV in the browser with its ASS subtitles and attached fonts.** The current
 source includes a [Web / WASM backend](../docs/web.md), integrated into Erika Web.
@@ -44,7 +44,7 @@ the server.
 | Rust | Git dependency pinned to `v0.3.0` | [Build guide](../docs/building.md) |
 | Linux | System FFmpeg 8 and patched libass; source build | [Linux guide](../docs/linux.md) |
 
-As of 2026-10-25, OHPM serves the approved 0.2.1 package; 0.3.0 still requires review after upload.
+As of 2026-10-30, OHPM lists 0.3.0 as the latest public version.
 Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.0).
 
 ### Browser

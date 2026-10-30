@@ -1,5 +1,7 @@
 # Linux native integration (experimental)
 
+> [中文](linux.zh.md) · [English](linux.md) · [日本語](linux.ja.md)
+
 Linux supports the Rust player, C ABI, and Flutter through system FFmpeg 8.x, liberika's patched libass, wgpu, and PulseAudio. PipeWire desktops need `pipewire-pulse`; WSL2 uses WSLg display and audio services.
 
 Video can render into X11 / Wayland windows. Flutter offers an RGBA SDR texture or a native Wayland video layer. NVIDIA uses NVDEC, Intel/AMD use VA-API, and FFmpeg software decoding is also available. Linux currently builds from source.

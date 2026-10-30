@@ -110,7 +110,8 @@ erika_presenter_attach_windows_hwnd(p, (uint64_t)(uintptr_t)hwnd,
 
 `attach_windows_hwnd` は `attach_wgpu_surface` + kind `WindowsHwnd` の便利ラッパです。
 既定の presenter 設定では、この surface は**ネイティブ Direct3D 11** レンダラ（D3D11VA
-ゼロコピー、HDR10）を駆動します。wgpu フォールバックが本当に必要なときだけ設定で渡します。
+ゼロコピー、HDR10）を駆動します。C ABI の `ErikaPresenterConfig` ではレンダラを選択
+できません。Rust ホストは `PlayerConfig.renderer` で `WgpuFallback` を選択できます。
 
 ### 汎用 —— `attach_wgpu_surface`
 
@@ -274,6 +275,13 @@ iOS Flutter プラグインは `CADisplayLink.targetTimestamp` を tick mailbox 
   Android native host は `erika_presenter_set_output_headroom` で dynamic display ratio を
   publish します。`capture_frame_rgba` は display output が extended-linear の場合も、映像 +
   字幕（弾幕は含みません）を SDR RGBA8 screenshot として返します。
+- **ホストのオフスクリーン合成:** Rust の
+  `PresenterRuntime::capture_frame_rgba_with_danmaku(w, h)` または C の
+  `erika_presenter_capture_frame_rgba_with_danmaku` は surface を接続せずに
+  有効な弾幕も含む RGBA8 を返し、ホストの UI テクスチャにアップロードできます。
+  [capture の契約と使用例](capi_reference.ja.md)を参照。
+  CPU readback のない GPU handle には `export_frame_texture` を使い、音声もその
+  ループで進めます。[ネイティブテクスチャ出力](external_textures.ja.md)を参照。
 
 ## 9. 解放
 

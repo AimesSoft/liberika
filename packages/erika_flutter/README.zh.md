@@ -11,8 +11,8 @@ liberika 媒体播放引擎的 Flutter plugin。
 - macOS 插件加载 liberika 动态库。
 - iOS 插件链接 liberika 静态库。
 - tvOS 插件链接 liberika 静态库，并在 Apple TV platform view 中承载 Metal layer。
-- Windows 插件构建并链接 liberika C ABI DLL。
-- Android 插件按 ABI 构建 `liberika_capi.so`，并由 `Choreographer` 驱动原生 surface。
+- Windows 插件链接 liberika C ABI DLL，默认下载经过校验的预编译运行库。
+- Android 插件默认按 ABI 下载经过校验的预编译 `liberika_capi.so`，并由 `Choreographer` 驱动原生 surface。两平台均可通过配置改为源码构建。
 - HarmonyOS 插件注册 Flutter 外部纹理，把它的 `OHNativeWindow` attach 给 liberika，并用 OHAudio 做低延迟 PCM 输出。
 - liberika 通过 `ErikaPresenterHandle` 负责播放、渲染、音频、时序和 overlay。
 

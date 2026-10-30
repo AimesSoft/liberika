@@ -1,5 +1,7 @@
 # iOS DFM+ presentation timing
 
+> [中文](ios-dfm-frame-pacing.zh.md) · [English](ios-dfm-frame-pacing.md) · [日本語](ios-dfm-frame-pacing.ja.md)
+
 liberika already rendered on a serial worker driven by CADisplayLink. Its DFM+
 positions nevertheless sampled the shared playback clock after audio/video
 pumping, using the worker's current time. Variable queue/pump latency therefore

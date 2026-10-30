@@ -1,6 +1,6 @@
 # Browser playback: MKV, ASS fonts and danmaku
 
-[中文](web.zh.md)
+[中文](web.zh.md) | English | [日本語](web.ja.md)
 
 liberika has a browser build containing the existing Rust danmaku engine, the
 repository's patched libass with FreeType/HarfBuzz/FriBidi, and a reduced FFmpeg

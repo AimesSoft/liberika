@@ -1,5 +1,7 @@
 # Reproducing the native checks
 
+> [中文](README.zh.md) · [English](README.md) · [日本語](README.ja.md)
+
 These are independent hosts of the actual binaries. They complement the
 baseline/head regression logs. Actual OHOS emulator results are recorded in
 `../ohos-runtime.zh.md`; Apple coverage remains separate.
