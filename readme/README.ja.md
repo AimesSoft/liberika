@@ -13,7 +13,7 @@
 
 ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて liberika 内部で完結します。
 
-現在のリリースは **0.3.0** です。[ドキュメント一覧](../docs/README.md) からガイドを選べます。
+現在のリリースは **0.3.0** です。[ドキュメント一覧](../docs/README.ja.md) からガイドを選べます。
 
 **MKV 内の ASS 字幕と添付フォントを使って、ブラウザーで直接再生できます。**
 現在のソースには [Web / WASM バックエンド](../docs/web.md) が含まれ、Erika Web に
@@ -38,12 +38,12 @@ HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは
 | ブラウザー / JavaScript / TypeScript | `liberika-web-0.3.0.zip` またはソースビルド | [Web 組み込み・配信（英語）](../docs/web.md) |
 | Flutter | `flutter pub add erika_flutter`（0.3.0） | [プラグイン](../packages/erika_flutter/README.ja.md) |
 | Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加、0.3.0 以降 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
-| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
+| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.ja.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
 | Rust | Git 依存を `v0.3.0` に固定 | [ビルド](../docs/building.ja.md) |
 | Linux | システム FFmpeg 8 とパッチ済み libass、ソースビルド | [Linux](../docs/linux.md) |
 
-2026-10-25 時点の OHPM 公開版は審査済みの 0.2.1 です。0.3.0 は upload 後に審査が必要です。
+2026-10-30 時点の OHPM 公開最新バージョンは 0.3.0 です。
 ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.0) にあります。
 
 ### ブラウザー

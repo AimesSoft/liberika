@@ -103,8 +103,9 @@ erika_presenter_attach_windows_hwnd(p, (uint64_t)(uintptr_t)hwnd,
 ```
 
 `attach_windows_hwnd` 是 `attach_wgpu_surface` + kind `WindowsHwnd` 的便捷封装。在默认
-presenter 配置下,该 surface 驱动**原生 Direct3D 11** 渲染器（D3D11VA 零拷贝、HDR10）;
-只有当你确实需要时才在配置里传 wgpu 回退渲染器。
+presenter 配置下，该 surface 驱动**原生 Direct3D 11** 渲染器（D3D11VA 零拷贝、HDR10）。
+C ABI 的 `ErikaPresenterConfig` 目前不提供渲染器选择；Rust 宿主可通过
+`PlayerConfig.renderer` 选择 `WgpuFallback`。
 
 ### 通用 —— `attach_wgpu_surface`
 

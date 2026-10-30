@@ -1,5 +1,7 @@
 # Changelog
 
+[中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
+
 ## 0.3.0 - 2026-10-25
 
 ### Default behavior changes

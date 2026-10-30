@@ -12,9 +12,8 @@ The plugin keeps Dart out of the hot path:
 - The iOS plugin links the liberika static library.
 - The tvOS plugin links the liberika static library and hosts its Metal layer in an
   Apple TV platform view.
-- The Windows plugin builds and links the liberika C ABI DLL.
-- The Android plugin builds `liberika_capi.so` per ABI and drives its native
-  surface from `Choreographer`.
+- The Windows plugin links the liberika C ABI DLL; by default it downloads a verified prebuilt runtime.
+- The Android plugin uses a verified prebuilt `liberika_capi.so` per ABI by default and drives its native surface from `Choreographer`. Both platforms can build the runtime from source when configured.
 - The HarmonyOS plugin registers a Flutter external texture, attaches its
   `OHNativeWindow` to liberika, and uses OHAudio for low-latency PCM output.
 - liberika owns playback, rendering, audio, timing, and overlays through

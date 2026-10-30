@@ -124,25 +124,25 @@ void erika_frame_export_session_close(ErikaFrameExportSession *session);
 
 | 値 | コード | 意味 |
 |----|--------|------|
-| `ErikaStatus_Ok` | 0 | 成功。スレッドローカルのエラーをクリア。 |
+| `ErikaStatus_Ok` | 0 | 成功。多くのステータス返却呼び出しはスレッドローカルエラーをクリア（イベントは後述）。 |
 | `ErikaStatus_NullPointer` | 1 | 必須の handle / out ポインタが `NULL`（または surface ポインタが 0）。 |
 | `ErikaStatus_InvalidUtf8` | 2 | `const char*` 引数が不正な UTF-8。 |
 | `ErikaStatus_PlayerError` | 3 | エンジンが呼び出しを拒否。メッセージを読む（下記）。 |
-| `ErikaStatus_Panic` | 4 | 境界で Rust panic を捕捉。panic 前に完了した分を除き呼び出しは無効。handle は疑わしい状態とみなす。 |
+| `ErikaStatus_Panic` | 4 | Rust panic を捕捉。処理が部分的に状態を変更している可能性があるため、handle は疑わしい状態とみなす。 |
 | `ErikaStatus_NoEvent` | 5 | `*_poll_event` のみ：キューが空（エラーではない）。 |
 
 戻り値は必ず確認してください。非エラーは `Ok` と `NoEvent` だけです。
 
 ### panic 安全性
 
-ABI は FFI 境界を unwind が越えることを決して許しません。各エントリーは本体を
-`catch_unwind` で包み、panic は `ErikaStatus_Panic` になりメッセージが設定されます。
-C++ の `noexcept`/SEH を気にせず境界を越えて呼べます。
+多くのステータス返却操作は Rust panic を捕捉し、メッセージと `ErikaStatus_Panic` を
+返します。ただし全エントリーの保証ではありません。例えば `erika_create`、`erika_destroy`、
+文字列ヘルパーは捕捉で囲まれていません。捕捉範囲外の panic や panic 時に abort する
+ビルドはプロセスを終了させる可能性があります。有効な引数を渡してください。
 
 ### エラーメッセージ（スレッドローカル）
 
-`Ok`/`NoEvent` 以外の結果では、liberika は可読メッセージを**スレッドローカル**スロットに
-保存します。取得：
+多くの失敗した呼び出しは可読メッセージを**スレッドローカル**スロットに保存しますが、すべてのエラーが更新するわけではありません。例えば一部の出力ポインタが `NULL` の場合は `NullPointer` を直接返すため、メッセージが空か、以前の呼び出しのものが残っている場合があります。同じスレッドで取得します。
 
 ```c
 char *msg = erika_last_error_message();   // ヒープ確保、NULL の可能性あり
@@ -150,7 +150,9 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 ```
 
 スレッドローカルなので、失敗した呼び出しを行った**同じスレッド**で、かつそのスレッドの
-次の呼び出しより前に読んでください（その後の `Ok` がクリアします）。
+次の呼び出しより前に読んでください（後続の成功呼び出しの多くはクリアします）。
+`Error`、`VideoDecoderChanged`、`AudioOutputChanged` イベントのメッセージは poll した
+同じスレッドですぐ読んでください。別のイベントでクリアされることがあります。
 `erika_last_error_message` は所有権を持つコピーを返します——`erika_string_free` で解放。
 
 ### 文字列の所有権

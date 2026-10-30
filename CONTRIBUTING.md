@@ -87,8 +87,9 @@ example for end-to-end validation.
 `crates/erika_capi` is the stable surface for every non-Rust host. When you
 change it:
 
-- **Keep panics inside.** Every export wraps its body in `catch_unwind` and maps
-  panics to `ErikaStatus_Panic` — never let an unwind cross the boundary.
+- **Contain panics.** Use `catch_unwind` where recovery is supported, and map caught
+  panics to the return type and an error message. Some exports do not currently
+  catch panics, and aborting builds cannot recover; see [panic safety](docs/capi_reference.md#panic-safety).
 - **Honor ownership.** Strings handed out are caller-owned and freed via the
   matching `*_free`; document new ones in [capi_reference.md](docs/capi_reference.md).
 - **Regenerate / hand-edit `erika.h`** to match, and annotate new functions.

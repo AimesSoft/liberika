@@ -164,11 +164,11 @@ Every fallible call returns `ErikaStatus`:
 
 | Value | Code | Meaning |
 |-------|------|---------|
-| `ErikaStatus_Ok` | 0 | Success. The thread-local error is cleared. |
+| `ErikaStatus_Ok` | 0 | Success. Most status-returning calls clear the thread-local error; see event handling below. |
 | `ErikaStatus_NullPointer` | 1 | A required handle or out-pointer was `NULL` (or a surface pointer was 0). |
 | `ErikaStatus_InvalidUtf8` | 2 | A `const char*` argument was not valid UTF-8. |
 | `ErikaStatus_PlayerError` | 3 | The engine rejected the call; read the message (see below). |
-| `ErikaStatus_Panic` | 4 | A Rust panic was caught at the boundary. The call had no effect beyond what completed before the panic; the handle should be considered suspect. |
+| `ErikaStatus_Panic` | 4 | A Rust panic was caught. The call may have partially changed state; consider the handle suspect. |
 | `ErikaStatus_NoEvent` | 5 | `*_poll_event` only: the queue is empty (not an error). |
 
 Always check the return value. `Ok` and `NoEvent` are the only non-error
@@ -176,14 +176,18 @@ results.
 
 ### Panic safety
 
-The ABI never unwinds across the FFI boundary. Every entry point wraps its body
-in `catch_unwind`; a panic becomes `ErikaStatus_Panic` with an error message
-set. You can call across the boundary without C++ `noexcept`/SEH concerns.
+Many status-returning operations catch Rust panics and return `ErikaStatus_Panic`
+with a message. This is not a guarantee for every entry point: for example,
+`erika_create`, `erika_destroy` and string helpers are not wrapped. A panic
+outside a catch boundary, or a build configured to abort on panic, can terminate
+the process. Do not rely on panic recovery as a substitute for valid arguments.
 
 ### Error messages (thread-local)
 
-On any non-`Ok`/`NoEvent` result, liberika stores a human-readable message in a
-**thread-local** slot. Retrieve it with:
+Many failing calls store a human-readable message in a **thread-local** slot,
+but not every error updates it. For example, some null output pointers return
+`NullPointer` directly, so the message can be empty or left over from an earlier call.
+Read it on the same thread:
 
 ```c
 char *msg = erika_last_error_message();   // heap-allocated, may be NULL
@@ -191,8 +195,10 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 ```
 
 Because the slot is thread-local, read it **on the same thread** that made the
-failing call, before making another call on that thread (a subsequent `Ok`
-clears it). `erika_last_error_message` returns a copy you own — free it with
+failing call, before making another call on that thread (many subsequent successful calls
+clear it). When polling an `Error`, `VideoDecoderChanged` or `AudioOutputChanged`
+event, read the message immediately on the polling thread; other events may clear
+it. `erika_last_error_message` returns a copy you own — free it with
 `erika_string_free`.
 
 ### String ownership
