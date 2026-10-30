@@ -1,5 +1,7 @@
 # Changelog
 
+[中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
+
 ## Unreleased
 
 - Added Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` and C

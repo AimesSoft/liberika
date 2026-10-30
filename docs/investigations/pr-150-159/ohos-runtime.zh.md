@@ -1,5 +1,7 @@
 # 鸿蒙模拟器真实运行记录
 
+> [中文](ohos-runtime.zh.md) · [English](ohos-runtime.en.md) · [日本語](ohos-runtime.ja.md)
+
 日期：2026-10-08。代码：`codex/pr-150-159-reviewed` 的审阅结果。
 使用完整生产 Rust runtime 和 NAPI 桥接；没有替换播放器、解码器、音频输出或 Surface 实现。
 

@@ -11,8 +11,8 @@ liberika メディア再生エンジン向けの Flutter plugin です。
 - macOS plugin は liberika の dynamic library を読み込みます。
 - iOS plugin は liberika の static library を link します。
 - tvOS plugin は liberika の static library を link し、Apple TV platform view で Metal layer を host します。
-- Windows plugin は liberika C ABI DLL を build して link します。
-- Android plugin は ABI ごとに `liberika_capi.so` を build し、`Choreographer` から native surface を駆動します。
+- Windows plugin は liberika C ABI DLL を link し、既定では検証済みの prebuilt runtime をダウンロードします。
+- Android plugin は既定で ABI ごとの検証済み prebuilt `liberika_capi.so` を使い、`Choreographer` から native surface を駆動します。両 platform とも設定によりソースから build できます。
 - HarmonyOS plugin は Flutter external texture を登録し、その `OHNativeWindow` を liberika に attach して、OHAudio で低レイテンシの PCM 出力を行います。
 - liberika は `ErikaPresenterHandle` を通じて playback、rendering、audio、timing、overlay を担当します。
 

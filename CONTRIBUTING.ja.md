@@ -82,8 +82,7 @@ third_party/              ビルドされたネイティブ依存（gitignore �
 
 `crates/erika_capi` はすべての非 Rust ホストの安定面です。変更時：
 
-- **panic を内側に留める。** 各エクスポートは本体を `catch_unwind` で包み、panic を
-  `ErikaStatus_Panic` にマップします——unwind を境界の外へ出さないこと。
+- **panic を制御する。** 復帰をサポートする箇所では `catch_unwind` を使い、捕捉した panic を戻り値の型に合うエラーとメッセージに変換します。現在、一部のエクスポートは捕捉せず、abort ビルドでは復帰できません。[panic 安全性](docs/capi_reference.ja.md#panic-安全性)を参照してください。
 - **所有権を守る。** 渡す文字列は呼び出し側の所有で対応する `*_free` で解放。新しいものは
   [capi_reference.md](docs/capi_reference.md) に記載。
 - **`erika.h` を合わせて再生成 / 手編集**し、新関数に注釈を付ける。

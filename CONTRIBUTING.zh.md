@@ -76,8 +76,7 @@ third_party/              构建出的原生依赖(gitignore 输出)
 
 `crates/erika_capi` 是所有非 Rust 宿主的稳定接入面。改它时:
 
-- **把 panic 留在里面。** 每个导出都把函数体包在 `catch_unwind`,把 panic 映射为
-  `ErikaStatus_Panic`——绝不让 unwind 穿越边界。
+- **控制 panic。** 在支持恢复的位置使用 `catch_unwind`，并将捕获的 panic 映射为适合返回类型的错误和消息。目前部分导出没有捕获，abort 构建无法恢复；见 [panic 安全](docs/capi_reference.zh.md#panic-安全)。
 - **尊重所有权。** 交出的字符串归调用方所有、由配套 `*_free` 释放;新增的要在
   [capi_reference.md](docs/capi_reference.md) 里记录。
 - **同步重生成 / 手改 `erika.h`** 以匹配,并给新函数加注释。

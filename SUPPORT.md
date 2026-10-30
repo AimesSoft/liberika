@@ -1,3 +1,5 @@
+[中文](SUPPORT.zh.md) | English | [日本語](SUPPORT.ja.md)
+
 # Support
 
 For integration help, start with the architecture, build, C ABI, Flutter embedding, and platform-matrix documents under `docs/`.

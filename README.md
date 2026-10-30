@@ -37,12 +37,12 @@ WASM 内的 libass 还原字幕字体、定位、描边与特效，Rust 弹幕�
 | 浏览器 / JavaScript / TypeScript | 下载 `liberika-web-0.3.0.zip`，或从源码构建 | [Web 接入与部署](docs/web.zh.md) |
 | Flutter | `flutter pub add erika_flutter`，当前 0.3.0 | [插件使用指南](packages/erika_flutter/README.zh.md) |
 | Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`，从 0.3.0 开始 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
-| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.md) |
+| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.zh.md) |
 | C / C++ | 下载匹配版本的 C ABI 归档与 `erika.h` | [原生接入](docs/integration.zh.md) |
 | Rust | Git 依赖，固定 `tag = "v0.3.0"` | [构建与依赖](docs/building.zh.md) |
 | Linux | 系统 FFmpeg 8 + liberika 补丁 libass，从源码构建 | [Linux 接入](docs/linux.zh.md) |
 
-截至 2026-10-25，OHPM 公开版为 0.2.1（已通过审核）；0.3.0 上传后仍需等待审核。原生二进制从
+截至 2026-10-30，OHPM 公开的最新版本为 0.3.0。原生二进制从
 [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.0) 下载。
 
 ### 浏览器

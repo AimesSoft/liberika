@@ -117,8 +117,9 @@ erika_presenter_attach_windows_hwnd(p, (uint64_t)(uintptr_t)hwnd,
 
 `attach_windows_hwnd` is a convenience wrapper over `attach_wgpu_surface` with
 kind `WindowsHwnd`. With the default presenter config the surface drives the
-**native Direct3D 11** renderer (D3D11VA zero-copy, HDR10); pass the wgpu
-fallback renderer in config only if you specifically need it.
+**native Direct3D 11** renderer (D3D11VA zero-copy, HDR10). The C ABI
+`ErikaPresenterConfig` does not expose renderer selection; Rust hosts can select
+`WgpuFallback` via `PlayerConfig.renderer`.
 
 ### Generic — `attach_wgpu_surface`
 

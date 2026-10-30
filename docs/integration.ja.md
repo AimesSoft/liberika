@@ -110,7 +110,8 @@ erika_presenter_attach_windows_hwnd(p, (uint64_t)(uintptr_t)hwnd,
 
 `attach_windows_hwnd` は `attach_wgpu_surface` + kind `WindowsHwnd` の便利ラッパです。
 既定の presenter 設定では、この surface は**ネイティブ Direct3D 11** レンダラ（D3D11VA
-ゼロコピー、HDR10）を駆動します。wgpu フォールバックが本当に必要なときだけ設定で渡します。
+ゼロコピー、HDR10）を駆動します。C ABI の `ErikaPresenterConfig` ではレンダラを選択
+できません。Rust ホストは `PlayerConfig.renderer` で `WgpuFallback` を選択できます。
 
 ### 汎用 —— `attach_wgpu_surface`
 
