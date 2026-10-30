@@ -247,7 +247,8 @@ private struct ErikaOpenOptions {
   var headerCount: UInt = 0
   var httpReadAheadBytes: UInt64 = 0
   var httpBackBufferBytes: UInt64 = 0
-  var reserved: (UInt64, UInt64) = (0, 0)
+  var startPositionMicros: UInt64 = 0
+  var reserved: UInt64 = 0
 }
 
 private struct ErikaEventC {

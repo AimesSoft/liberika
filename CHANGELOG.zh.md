@@ -2,6 +2,10 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
+## 0.3.2 - 2026-10-31
+
+- 修复 Flutter Windows 插件打开媒体时越界写 `ErikaOpenOptions`：它仍在清零 0.3.1 已改作 `start_position_micros` 的第二个保留位。MSVC 会因此停止构建（C4789 作为错误），没有该检查时则会覆盖栈上数据。iOS、tvOS、macOS 的 Swift 镜像结构改为写明 `startPositionMicros`，布局本就与头文件一致。新增打包测试，核对每个镜像的大小及写入的保留位不超出头文件。
+
 ## 0.3.1 - 2026-10-31
 
 - 新增从指定位置打开：`MediaRequest::with_start_position`；C `ErikaOpenOptions.start_position_micros`（占用原第一个保留位，清零的结构体仍从头打开）；供无法传参的宿主使用的 `erika_presenter_set_open_start_position`；JSON `open` 参数 `startPositionMicros` 与方法 `setOpenStartPosition`；Flutter `ErikaPlayer.open(startPosition:)`。引擎在工作线程启动前完成跳转，呈现的第一帧就是该位置。

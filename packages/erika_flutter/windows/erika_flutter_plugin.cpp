@@ -1654,8 +1654,6 @@ struct ErikaFlutterPlugin::PlayerHost {
       options.header_count = native_headers.size();
       options.http_read_ahead_bytes = read_ahead_bytes;
       options.http_back_buffer_bytes = back_buffer_bytes;
-      options.reserved[0] = 0;
-      options.reserved[1] = 0;
       Check(library->open_with_options(handle, uri.c_str(), &options), "open",
             library->TakeLastError());
       return;

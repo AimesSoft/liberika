@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-以下平台以 0.3.1 为基线；浏览器后端已接入 Erika Web，并随 Release 提供独立 Web 归档。
+以下平台以 0.3.2 为基线；浏览器后端已接入 Erika Web，并随 Release 提供独立 Web 归档。
 Linux 目前为实验性源码构建目标。
 
 | 平台 | 最低版本 | 解码 / 渲染 | 音频 | 分发与构建 |

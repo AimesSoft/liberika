@@ -2,6 +2,10 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
+## 0.3.2 - 2026-10-31
+
+- Flutter の Windows プラグインがメディアを開く際に `ErikaOpenOptions` の範囲外へ書き込む問題を修正しました。0.3.1 で `start_position_micros` に割り当てた 2 番目の reserved 枠を引き続きゼロクリアしていました。MSVC はこれでビルドを停止し（C4789 がエラー扱い）、そのチェックがなければスタックを上書きしていました。iOS・tvOS・macOS の Swift ミラー構造体は `startPositionMicros` を明記しました（レイアウトは元々ヘッダーと同じです）。各ミラーのサイズと書き込む reserved 枠をヘッダーと照合するパッケージテストを追加しました。
+
 ## 0.3.1 - 2026-10-31
 
 - 指定位置からの open を追加しました：`MediaRequest::with_start_position`、C `ErikaOpenOptions.start_position_micros`（最初の reserved 枠を使用。ゼロ初期化した構造体は従来どおり先頭から開きます）、`erika_presenter_set_open_start_position`、JSON `open` の `startPositionMicros` と `setOpenStartPosition`、Flutter `ErikaPlayer.open(startPosition:)`。

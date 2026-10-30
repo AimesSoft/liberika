@@ -2,7 +2,7 @@
 
 # liberika documentation
 
-The current integration guides use **0.3.1** as their baseline. Start with the
+The current integration guides use **0.3.2** as their baseline. Start with the
 installation and usage guide for your SDK, then use the references below when
 building a rendering host or developing the kernel.
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 - 2026-10-31
+
+- Windows: opening media no longer writes past `ErikaOpenOptions` (the
+  plugin cleared a reserved slot 0.3.1 had turned into the start position).
+  Builds with warnings as errors failed on it; others overwrote the stack.
+- The iOS, tvOS and macOS mirrors of the struct name `startPositionMicros`.
+
 ## 0.3.1 - 2026-10-31
 
 - `open(startPosition:)` opens the media at a position: the first frame shown
