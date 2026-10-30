@@ -616,6 +616,8 @@ jobs:
           --target "$ERIKA_NATIVE_TARGET"
           --no-default-features --features libass,wgpu
       - name: Build OpenHarmony Flutter native bridge
+        env:
+          ERIKA_FORCE_SOURCE_BUILD: "1"
         run: |
           set -euo pipefail
           cmake -S packages/erika_flutter/ohos/src/main/cpp \
@@ -660,6 +662,7 @@ jobs:
               exit 1
             }
           done
+          cmp "$runtime" "target/ohos-plugin-release/liberika_capi.so"
           bash packaging/bundle.sh erika-capi-openharmony-arm64 \
             dist/erika-capi-openharmony-arm64.zip "$runtime" "$plugin"
       - uses: actions/upload-artifact@v4

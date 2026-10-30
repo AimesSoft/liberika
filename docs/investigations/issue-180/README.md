@@ -29,6 +29,8 @@ stripped of its local symbol table.
 
 - Build the OpenHarmony text dependency stack with `xtask deps build --all`.
 - Enable `libass,wgpu` in native CI, release builds and Flutter source builds.
+- Build the CI/release bridge against the current source runtime and compare
+  the staged copy, so prebuilt downloads cannot stage an older core.
 - Check the linked libass implementation in the actual ARM64 runtime before
   accepting or packaging it; checking only C exports cannot detect this bug.
 - Use a new complete-dependency cache key, with the old partial cache as a
@@ -49,8 +51,9 @@ font despite the unavailable script font. All five API/header alignment tests,
 including the optional C++ bridge test, passed. Formatting and diff checks
 passed.
 
-OpenHarmony ARM64 compilation and linked-renderer checks are part of the
-updated PR workflow. Device playback of the reporter's MKV is not claimed:
+The first OpenHarmony ARM64 CI build passed native compilation, Flutter bridge
+linking and all linked-renderer checks. The final workflow additionally verifies
+that the bridge stages the same newly built runtime. Device playback of the reporter's MKV is not claimed:
 the original media and exact NipaPlay build were not supplied. The local host
 regression validates subtitle generation rather than an OpenHarmony display
 or a complete NipaPlay application.
