@@ -91,7 +91,7 @@ fn main() -> Result<()> {
         viewport: OverlayViewport::new(width, height),
         subtitle_planes: vec![SubtitleBitmapPlane::new(
             8,
-            (height - 8).saturating_sub(12) as i32,
+            height.saturating_sub(20) as i32,
             width.min(160),
             12,
             [220, 30, 30, 255].repeat(width.min(160) as usize * 12),

@@ -549,6 +549,9 @@ pub struct WgpuRenderer {
         Option<std::result::Result<crate::renderer::linux_vulkan::LinuxVulkanInterop, String>>,
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     linux_import_failure: Option<(u64, String)>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    linux_vulkan_export:
+        Option<std::result::Result<crate::renderer::vulkan_export::VulkanExportContext, String>>,
     adapter: wgpu::Adapter,
     #[cfg(target_os = "android")]
     android_vulkan: Option<AndroidVulkanInterop>,
@@ -1462,6 +1465,19 @@ fn request_wgpu_device(
     })
 }
 
+/// Device constants for Vulkan export, queried on first use (and kept on failure).
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn linux_vulkan_export_context<'a>(
+    slot: &'a mut Option<
+        std::result::Result<crate::renderer::vulkan_export::VulkanExportContext, String>,
+    >,
+    device: &wgpu::Device,
+) -> Result<&'a crate::renderer::vulkan_export::VulkanExportContext> {
+    slot.get_or_insert_with(|| crate::renderer::vulkan_export::VulkanExportContext::new(device))
+        .as_ref()
+        .map_err(|reason| PlayerError::Renderer(reason.clone()))
+}
+
 impl WgpuRenderer {
     pub fn new() -> Result<Self> {
         Self::new_with_config(MetalRendererConfig::default())
@@ -1667,6 +1683,8 @@ impl WgpuRenderer {
             linux_vulkan: None,
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             linux_import_failure: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_vulkan_export: None,
             flutter_metrics: None,
             flutter_frame: None,
             adapter: context.adapter,
@@ -4972,21 +4990,48 @@ impl RendererBackend for WgpuRenderer {
         self.flutter_frame.take()
     }
 
+    fn validate_export_texture_size(&mut self, width: u32, height: u32) -> Result<()> {
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
+        {
+            let _ = (width, height);
+            Err(PlayerError::Renderer(
+                "native texture export requires Linux/Vulkan or Apple/Metal".into(),
+            ))
+        }
+
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        ))]
+        {
+            let max = self.device.limits().max_texture_dimension_2d;
+            if width == 0 || height == 0 || width > max || height > max {
+                return Err(PlayerError::Renderer(format!(
+                    "invalid external texture dimensions {width}x{height} (limit {max})"
+                )));
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?
+                .check_size(width, height)
+                .map_err(PlayerError::Renderer)?;
+            Ok(())
+        }
+    }
+
     fn export_current_frame_texture(
         &mut self,
         context: RenderFrameContext<'_>,
         width: u32,
         height: u32,
     ) -> Result<Option<crate::core::ExternalTextureFrame>> {
-        if width == 0
-            || height == 0
-            || width > self.device.limits().max_texture_dimension_2d
-            || height > self.device.limits().max_texture_dimension_2d
-        {
-            return Err(PlayerError::Renderer(
-                "invalid external texture dimensions".into(),
-            ));
-        }
+        self.validate_export_texture_size(width, height)?;
         #[cfg(not(any(
             target_os = "macos",
             target_os = "ios",
@@ -5012,6 +5057,7 @@ impl RendererBackend for WgpuRenderer {
             }
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let target = crate::renderer::vulkan_export::VulkanExportTarget::new(
+                linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?,
                 &self.device,
                 width,
                 height,

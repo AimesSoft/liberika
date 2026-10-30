@@ -45,7 +45,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Enables native texture export and, when available, FFmpeg device sharing.
+/// Returns None when the adapter cannot safely share its device with FFmpeg.
 pub(crate) fn request_device(
     adapter: &wgpu::Adapter,
     desc: &wgpu::DeviceDescriptor<'_>,
@@ -64,6 +64,9 @@ pub(crate) fn request_device(
         .push_next(&mut sync2)
         .push_next(&mut timeline);
     unsafe { instance.get_physical_device_features2(physical, &mut features) };
+    if sync2.synchronization2 == 0 || timeline.timeline_semaphore == 0 {
+        return None;
+    }
     let caps = hal.physical_device_capabilities();
     // Requiring these advertised extensions also provides a reliable marker
     // that our callback enabled the features expected by the C bridge.
@@ -73,18 +76,10 @@ pub(crate) fn request_device(
         khr::synchronization2::NAME,
         khr::timeline_semaphore::NAME,
     ];
-    let decode_interop = sync2.synchronization2 != 0
-        && timeline.timeline_semaphore != 0
-        && required.iter().all(|name| caps.supports_extension(name));
-    let export_interop = caps.supports_extension(khr::external_memory_fd::NAME);
-    if !decode_interop && !export_interop {
+    if required.iter().any(|name| !caps.supports_extension(name)) {
         return None;
     }
-    let mut extensions = if decode_interop {
-        required.to_vec()
-    } else {
-        vec![khr::external_memory_fd::NAME]
-    };
+    let mut extensions = required.to_vec();
     for name in [
         ext::external_memory_dma_buf::NAME,
         ext::image_drm_format_modifier::NAME,
@@ -108,12 +103,9 @@ pub(crate) fn request_device(
                         args.extensions.push(name);
                     }
                 }
-                if decode_interop {
-                    enable_sync2.p_next = args.create_info.p_next.cast_mut();
-                    args.create_info.p_next = (&enable_sync2
-                        as *const vk::PhysicalDeviceSynchronization2Features<'_>)
-                        .cast();
-                }
+                enable_sync2.p_next = args.create_info.p_next.cast_mut();
+                args.create_info.p_next =
+                    (&enable_sync2 as *const vk::PhysicalDeviceSynchronization2Features<'_>).cast();
             })),
         )
     };

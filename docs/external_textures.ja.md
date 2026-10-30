@@ -2,7 +2,7 @@
 
 > [English](external_textures.md) · [中文](external_textures.zh.md)
 
-`PresenterRuntime::export_frame_texture(w, h)` は映像、字幕、有効な弾幕をネイティブ
+`PresenterRuntime::export_frame_texture(w, h, scale)` は映像、字幕、有効な弾幕をネイティブ
 GPU テクスチャへ直接描画します。ウィンドウ surface や Flutter registrar は不要で、
 公開 API は wgpu の Rust 型を渡しません。ホストは異なる wgpu バージョンから
 ネイティブリソースを import できます。
@@ -19,7 +19,7 @@ sRGB 値を格納した SDR RGBA8Unorm で、debug HUD は含みません。必�
 を設定します。通常どおり open/play して、ホストの各フレームで呼び出します。
 
 ```rust,ignore
-if let Some(frame) = presenter.export_frame_texture(960, 540)? {
+if let Some(frame) = presenter.export_frame_texture(1920, 1080, 2.0)? {
     let info = *frame.info();
     // info.native_handle をホストのネイティブ renderer に import。
     // consumer GPU fence が完了し import した別名を破棄するまで frame を保持。
@@ -29,12 +29,17 @@ if let Some(frame) = presenter.export_frame_texture(960, 540)? {
 呼び出しは映像、字幕、音声を進めるため、追加の `render_tick` は不要です。
 `None` は映像がまだない状態です。時刻、弾幕トラック、オフセット、設定は同じ
 presenter に従います。
+`scale` はホストの論理ポイントあたりの物理ピクセル数で、`resize_surface` と同じ
+意味です。HiDPI 出力でも弾幕は画面表示と同じ大きさと速さになります。弾幕は画面
+再生と同じバックグラウンド planner で配置され（surface がなければ export サイズ）、
+seek、トラック変更、サイズ変更の後は数フレーム遅れて表示されることがあります。
+非対応の backend やサイズは再生処理の前にエラーになります。
 
 ## C
 
 `erika_presenter_create_for_texture_export(config)` で wgpu を選びます。既存の
 `ErikaPresenterConfig` ABI は変わりません。フレームループで
-`erika_presenter_export_frame_texture(p, w, h, &frame)` を呼びます。映像がなければ
+`erika_presenter_export_frame_texture(p, w, h, scale, &frame)` を呼びます。映像がなければ
 `NoEvent`、`Ok` 以外では `frame` が null になります。
 `erika_texture_frame_get_info(frame, &info)` は借用 handle と import 情報を返します。
 consumer GPU の完了と import 別名の破棄後に `erika_texture_frame_release(frame)`

@@ -1053,8 +1053,12 @@ typedef struct ErikaExternalTextureInfo {
 /* Native, immutable SDR texture: video + subtitle + enabled danmaku, no HUD.
  * Select WgpuFallback. Supports Linux/Vulkan OPAQUE_FD and Apple/Metal. No
  * surface, Flutter registrar, CPU pixel readback or GPU texture copy. Waits
- * for producer GPU completion before returning. Unsupported backends fail.
+ * for producer GPU completion before returning. Unsupported backends and
+ * sizes fail before any playback work.
  * Call once per host frame; also pumps audio, so render_tick is not required.
+ * content_scale is physical pixels per logical point (as for resize_surface)
+ * and sets danmaku size and speed. Danmaku is planned in the background like
+ * on screen, so it can appear a few frames after a seek or size change.
  * NoEvent means no video yet. *out_frame is null on every non-Ok result.
  * Frames can outlive the presenter. Release only after consumer GPU work and
  * imported aliases are retired. Native handles from get_info are borrowed:
@@ -1070,7 +1074,7 @@ typedef struct ErikaExternalTextureInfo {
  * any needed transfer conversion. */
 ErikaStatus erika_presenter_export_frame_texture(
     ErikaPresenterHandle *handle, uint32_t width, uint32_t height,
-    ErikaTextureFrame **out_frame);
+    double content_scale, ErikaTextureFrame **out_frame);
 /* Select the wgpu renderer, including on Apple where the default presenter
  * uses the native renderer. Returns NULL and sets last_error on failure. */
 ErikaPresenterHandle *erika_presenter_create_for_texture_export(ErikaPresenterConfig config);

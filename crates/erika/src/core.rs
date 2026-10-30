@@ -549,6 +549,8 @@ pub struct RendererFrameCapture {
     pub rgba: Vec<u8>,
 }
 
+const EXPORT_UNSUPPORTED: &str = "native texture export is unsupported by this renderer; select WgpuFallback on Linux/Vulkan or Apple/Metal";
+
 /// Native resource type carried by an [`ExternalTextureFrame`].
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,7 +609,15 @@ impl ExternalTextureFrame {
         &self.info
     }
 
-    #[cfg(feature = "wgpu")]
+    #[cfg(all(
+        feature = "wgpu",
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
     pub(crate) fn new(info: ExternalTextureInfo, resource: impl Send + Sync + 'static) -> Self {
         Self {
             info,
@@ -912,6 +922,12 @@ pub trait RendererBackend {
         Ok(None)
     }
 
+    /// Checks that `export_current_frame_texture` can produce a texture of this
+    /// size, before the presenter does any per-frame work for it.
+    fn validate_export_texture_size(&mut self, _width: u32, _height: u32) -> Result<()> {
+        Err(PlayerError::Renderer(EXPORT_UNSUPPORTED.into()))
+    }
+
     /// Render video, subtitles and danmaku directly into an immutable native
     /// texture. Unsupported backends return an error, never a CPU fallback.
     fn export_current_frame_texture(
@@ -920,7 +936,7 @@ pub trait RendererBackend {
         _width: u32,
         _height: u32,
     ) -> Result<Option<ExternalTextureFrame>> {
-        Err(PlayerError::Renderer("native texture export is unsupported by this renderer; select WgpuFallback on Linux/Vulkan or Apple/Metal".into()))
+        Err(PlayerError::Renderer(EXPORT_UNSUPPORTED.into()))
     }
 
     fn runtime_stats(&self) -> RendererRuntimeStats {

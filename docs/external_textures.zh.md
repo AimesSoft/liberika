@@ -2,7 +2,7 @@
 
 > [English](external_textures.md) · [日本語](external_textures.ja.md)
 
-`PresenterRuntime::export_frame_texture(w, h)` 将视频、字幕和已启用的弹幕直接
+`PresenterRuntime::export_frame_texture(w, h, scale)` 将视频、字幕和已启用的弹幕直接
 绘制到原生 GPU 纹理，无需窗口 surface 或 Flutter registrar。公开接口不传递
 wgpu Rust 类型，宿主可以使用不同版本的 wgpu，通过原生资源导入进行合成。
 
@@ -18,7 +18,7 @@ wgpu Rust 类型，宿主可以使用不同版本的 wgpu，通过原生资源�
 正常 open/play 后，每个宿主帧调用一次：
 
 ```rust,ignore
-if let Some(frame) = presenter.export_frame_texture(960, 540)? {
+if let Some(frame) = presenter.export_frame_texture(1920, 1080, 2.0)? {
     let info = *frame.info();
     // 将 info.native_handle 导入宿主的原生渲染器。
     // 把 frame 交给宿主 submission 持有；消费端 GPU fence 完成且所有导入
@@ -28,12 +28,16 @@ if let Some(frame) = presenter.export_frame_texture(960, 540)? {
 
 该调用同时驱动视频、字幕和音频，无需额外 `render_tick`。`None` 表示尚无视频帧。
 播放时间、弹幕轨道、偏移与配置沿用同一个 presenter。
+`scale` 是宿主每个逻辑点对应的物理像素数，与 `resize_surface` 相同，使 HiDPI 输出
+上的弹幕保持与屏幕一致的大小和速度。弹幕与屏幕播放共用后台排版（未绑定 surface
+时按导出尺寸排版），seek、切换轨道或改变尺寸后，弹幕可能晚几帧出现。
+不支持的后端或尺寸会在任何播放工作之前返回错误。
 
 ## C
 
 使用 `erika_presenter_create_for_texture_export(config)` 选择 wgpu，不改变已有
 `ErikaPresenterConfig` ABI。宿主帧循环调用
-`erika_presenter_export_frame_texture(p, w, h, &frame)`；`NoEvent` 表示暂无视频，
+`erika_presenter_export_frame_texture(p, w, h, scale, &frame)`；`NoEvent` 表示暂无视频，
 所有非 `Ok` 返回都会将 `frame` 清为 null。
 `erika_texture_frame_get_info(frame, &info)` 返回借用的原生句柄与导入参数。
 消费端 GPU 完成且导入别名销毁后，调用 `erika_texture_frame_release(frame)`；允许传 null。

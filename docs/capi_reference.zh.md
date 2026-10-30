@@ -792,7 +792,7 @@ if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
 此路径将像素读回 CPU，不导出共享 GPU 纹理，也不要求宿主与 liberika 的 wgpu 版本一致。
 
 原生 GPU 输出使用 `erika_presenter_create_for_texture_export(config)` 创建 presenter，
-每帧调用 `erika_presenter_export_frame_texture(p, w, h, &frame)`，通过
+每帧调用 `erika_presenter_export_frame_texture(p, w, h, scale, &frame)`，通过
 `erika_texture_frame_get_info` 取得借用句柄。消费端 GPU 完成且导入别名销毁后调用
 `erika_texture_frame_release`。此循环也驱动音频。已实现 Linux Vulkan OPAQUE_FD
 和 Apple Metal，公开接口没有 wgpu 类型；格式、同步、所有权与宿主导入示例见

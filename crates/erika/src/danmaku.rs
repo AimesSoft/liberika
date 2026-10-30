@@ -482,13 +482,12 @@ impl DanmakuTimeline {
         if end < start || self.items.is_empty() {
             return Self::default();
         }
-        let items = self
-            .items
-            .iter()
-            .filter(|item| item.pts >= start && item.pts <= end)
-            .cloned()
-            .collect();
-        Self { items }
+        // Items are kept sorted by pts, so only the window itself is visited.
+        let first = self.items.partition_point(|item| item.pts < start);
+        let last = self.items.partition_point(|item| item.pts <= end);
+        Self {
+            items: self.items[first..last].to_vec(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2333,17 +2332,34 @@ impl DfmLayoutEngine {
         self.rasterizer.clone()
     }
 
+    /// A copy with the same settings and fonts, but without the timeline,
+    /// prepared layout or placement history.
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            timeline: DanmakuTimeline::default(),
+            config: self.config.clone(),
+            rasterizer: self.rasterizer.clone(),
+            font_selection: self.font_selection.clone(),
+            prepared: None,
+            stable_tracks: HashMap::new(),
+            rejected_items: BTreeSet::new(),
+            stable_viewport: None,
+        }
+    }
+
     pub(crate) fn set_config_with_rasterizer(
         &mut self,
         config: DanmakuLayoutConfig,
         rasterizer: DanmakuTextRasterizer,
-    ) {
-        if self.apply_config(config) == DanmakuConfigChange::Layout {
+    ) -> DanmakuConfigChange {
+        let change = self.apply_config(config);
+        if change == DanmakuConfigChange::Layout {
             // The async planner must pack glyphs into the same atlas that the
             // presenter later snapshots. This is especially important after a
             // custom-font change creates a fresh rasterizer generation.
             self.rasterizer = rasterizer;
         }
+        change
     }
 
     pub fn prepare(&mut self, viewport: DanmakuViewport, _generation: u64) -> DfmPreparedLayout {

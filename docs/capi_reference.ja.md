@@ -812,7 +812,7 @@ if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
 liberika とホストの wgpu バージョンが一致する必要もありません。
 
 ネイティブ GPU 出力には `erika_presenter_create_for_texture_export(config)` を使い、
-各フレームで `erika_presenter_export_frame_texture(p, w, h, &frame)` を呼びます。
+各フレームで `erika_presenter_export_frame_texture(p, w, h, scale, &frame)` を呼びます。
 `erika_texture_frame_get_info` で借用 handle を取得し、consumer GPU の完了と import
 別名の破棄後に `erika_texture_frame_release` で解放します。音声もこのループで進みます。
 Linux Vulkan OPAQUE_FD と Apple Metal を実装し、公開 API に wgpu 型はありません。

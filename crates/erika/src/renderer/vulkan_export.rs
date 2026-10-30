@@ -45,12 +45,57 @@ pub(crate) struct VulkanExportTarget {
     family: u32,
 }
 
+/// Device constants for export, queried once per renderer device.
+pub(crate) struct VulkanExportContext {
+    raw: ash::Device,
+    fd_api: khr::external_memory_fd::Device,
+    family: u32,
+    max_extent: vk::Extent3D,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    device_uuid: [u8; 16],
+    driver_uuid: [u8; 16],
+}
+
 fn error(stage: &str, error: vk::Result) -> String {
     format!("Vulkan external texture {stage}: {error:?}")
 }
 
-impl VulkanExportTarget {
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self, String> {
+/// Picks plain device-local memory for the exported image. Host-visible
+/// device-local types are the small BAR heap without resizable BAR, and AMD
+/// device-coherent, protected and lazily allocated types need features or
+/// usage this renderer does not enable. Software and unified-memory devices
+/// that only offer host-visible types use the first allowed one.
+fn memory_type_index(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+) -> Option<u32> {
+    let unsupported = vk::MemoryPropertyFlags::DEVICE_COHERENT_AMD
+        | vk::MemoryPropertyFlags::DEVICE_UNCACHED_AMD
+        | vk::MemoryPropertyFlags::PROTECTED
+        | vk::MemoryPropertyFlags::LAZILY_ALLOCATED;
+    let allowed = (0..properties.memory_type_count)
+        .filter(move |index| type_bits & (1 << index) != 0)
+        .map(|index| {
+            (
+                index,
+                properties.memory_types[index as usize].property_flags,
+            )
+        })
+        .filter(move |(_, flags)| !flags.intersects(unsupported));
+    let device_local =
+        |flags: &vk::MemoryPropertyFlags| flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+    allowed
+        .clone()
+        .find(|(_, flags)| {
+            device_local(flags) && !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        })
+        .or_else(|| allowed.clone().find(|(_, flags)| device_local(flags)))
+        .or_else(|| allowed.clone().next())
+        .map(|(index, _)| index)
+}
+
+impl VulkanExportContext {
+    pub fn new(device: &wgpu::Device) -> Result<Self, String> {
         let hal =
             unsafe { device.as_hal::<Api>() }.ok_or("native texture export requires Vulkan")?;
         if !hal
@@ -80,10 +125,7 @@ impl VulkanExportTarget {
             )
         }
         .map_err(|e| error("format query", e))?;
-        let limits = properties.image_format_properties;
-        if width > limits.max_extent.width || height > limits.max_extent.height {
-            return Err("external texture exceeds the Vulkan format extent limit".into());
-        }
+        let max_extent = properties.image_format_properties.max_extent;
         if !external_properties
             .external_memory_properties
             .external_memory_features
@@ -101,8 +143,37 @@ impl VulkanExportTarget {
         unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
         let raw = hal.raw_device().clone();
-        let family = hal.queue_family_index();
-        let fd_api = khr::external_memory_fd::Device::new(instance, &raw);
+        Ok(Self {
+            fd_api: khr::external_memory_fd::Device::new(instance, &raw),
+            raw,
+            family: hal.queue_family_index(),
+            max_extent,
+            memory_properties,
+            device_uuid: identity.device_uuid,
+            driver_uuid: identity.driver_uuid,
+        })
+    }
+
+    pub fn check_size(&self, width: u32, height: u32) -> Result<(), String> {
+        if width > self.max_extent.width || height > self.max_extent.height {
+            return Err("external texture exceeds the Vulkan format extent limit".into());
+        }
+        Ok(())
+    }
+}
+
+impl VulkanExportTarget {
+    pub fn new(
+        context: &VulkanExportContext,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        context.check_size(width, height)?;
+        let hal =
+            unsafe { device.as_hal::<Api>() }.ok_or("native texture export requires Vulkan")?;
+        let raw = context.raw.clone();
+        let family = context.family;
         let mut external_image =
             vk::ExternalMemoryImageCreateInfo::default().handle_types(HANDLE_TYPE);
         let image_info = vk::ImageCreateInfo::default()
@@ -130,14 +201,9 @@ impl VulkanExportTarget {
             fd: None,
         };
         let requirements = unsafe { allocation.raw.get_image_memory_requirements(image) };
-        let memory_type_index = (0..memory_properties.memory_type_count)
-            .filter(|index| requirements.memory_type_bits & (1 << index) != 0)
-            .max_by_key(|&index| {
-                memory_properties.memory_types[index as usize]
-                    .property_flags
-                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            })
-            .ok_or("external image has no compatible memory type")?;
+        let memory_type_index =
+            memory_type_index(&context.memory_properties, requirements.memory_type_bits)
+                .ok_or("external image has no compatible memory type")?;
         let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(HANDLE_TYPE);
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         let memory_info = vk::MemoryAllocateInfo::default()
@@ -156,7 +222,8 @@ impl VulkanExportTarget {
         let fd_info = vk::MemoryGetFdInfoKHR::default()
             .memory(allocation.memory)
             .handle_type(HANDLE_TYPE);
-        let fd = unsafe { fd_api.get_memory_fd(&fd_info) }.map_err(|e| error("export fd", e))?;
+        let fd =
+            unsafe { context.fd_api.get_memory_fd(&fd_info) }.map_err(|e| error("export fd", e))?;
         allocation.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
         let info = ExternalTextureInfo {
             kind: ExternalTextureKind::VulkanOpaqueFd,
@@ -174,8 +241,8 @@ impl VulkanExportTarget {
             vulkan_format: FORMAT.as_raw() as u32,
             vulkan_usage: USAGE.as_raw(),
             vulkan_tiling: vk::ImageTiling::OPTIMAL.as_raw() as u32,
-            device_uuid: identity.device_uuid,
-            driver_uuid: identity.driver_uuid,
+            device_uuid: context.device_uuid,
+            driver_uuid: context.driver_uuid,
         };
         let size = wgpu::Extent3d {
             width,
@@ -284,5 +351,50 @@ impl VulkanExportTarget {
         }?;
         queue.submit([tracked.finish(), encoder.finish()]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn properties(types: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: types.len() as u32,
+            ..Default::default()
+        };
+        for (slot, flags) in properties.memory_types.iter_mut().zip(types) {
+            slot.property_flags = *flags;
+        }
+        properties
+    }
+
+    #[test]
+    fn export_memory_prefers_plain_device_local_types() {
+        use vk::MemoryPropertyFlags as F;
+        // RADV without resizable BAR: VRAM, GTT, the BAR heap, cached GTT,
+        // then the AMD device-coherent variants.
+        let radv = properties(&[
+            F::DEVICE_LOCAL,
+            F::HOST_VISIBLE | F::HOST_COHERENT,
+            F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT,
+            F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED,
+            F::DEVICE_LOCAL | F::DEVICE_COHERENT_AMD | F::DEVICE_UNCACHED_AMD,
+            F::DEVICE_LOCAL
+                | F::HOST_VISIBLE
+                | F::HOST_COHERENT
+                | F::DEVICE_COHERENT_AMD
+                | F::DEVICE_UNCACHED_AMD,
+        ]);
+        assert_eq!(memory_type_index(&radv, 0b11_0101), Some(0));
+        assert_eq!(memory_type_index(&radv, 0b11_0100), Some(2));
+        assert_eq!(memory_type_index(&radv, 0b11_1000), Some(3));
+        assert_eq!(memory_type_index(&radv, 0b11_0000), None);
+        assert_eq!(memory_type_index(&radv, 0), None);
+
+        // llvmpipe exposes a single host-visible type.
+        let software =
+            properties(&[F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED]);
+        assert_eq!(memory_type_index(&software, 0b1), Some(0));
     }
 }

@@ -2,7 +2,7 @@
 
 > [中文](external_textures.zh.md) · [日本語](external_textures.ja.md)
 
-`PresenterRuntime::export_frame_texture(w, h)` renders video, subtitles and
+`PresenterRuntime::export_frame_texture(w, h, scale)` renders video, subtitles and
 enabled danmaku directly into a native GPU texture. It needs no window surface
 or Flutter registrar and exports no wgpu Rust types. The host can use a
 different wgpu version and import the underlying native resource.
@@ -20,7 +20,7 @@ RendererBackendPreference::WgpuFallback` before constructing the presenter.
 Open/play normally, then call once per host frame:
 
 ```rust,ignore
-if let Some(frame) = presenter.export_frame_texture(960, 540)? {
+if let Some(frame) = presenter.export_frame_texture(1920, 1080, 2.0)? {
     let info = *frame.info();
     // Import info.native_handle into the host's native renderer.
     // Transfer frame to the host submission owner; drop it only after the
@@ -31,12 +31,18 @@ if let Some(frame) = presenter.export_frame_texture(960, 540)? {
 Each call pumps video, subtitles and audio. No additional `render_tick` is
 required. `None` means no video is available yet. Playback time, danmaku
 tracks, offsets and settings follow the same presenter as RGBA capture.
+`scale` is the host's physical pixels per logical point, as for
+`resize_surface`, so danmaku keeps its on-screen size and speed on HiDPI
+outputs. Danmaku is laid out by the same background planner as on-screen
+playback (at the export size when no surface is attached); after a seek,
+track change or resize, comments can appear a few frames later. Unsupported
+backends and sizes fail before any playback work.
 
 ## C
 
 Use `erika_presenter_create_for_texture_export(config)` to select wgpu without
 changing the existing `ErikaPresenterConfig` ABI. Then call
-`erika_presenter_export_frame_texture(p, w, h, &frame)` on the host frame loop.
+`erika_presenter_export_frame_texture(p, w, h, scale, &frame)` on the host frame loop.
 `NoEvent` means no video yet; every non-`Ok` result clears `frame` to null.
 `erika_texture_frame_get_info(frame, &info)` returns borrowed handles and
 metadata. Finally call `erika_texture_frame_release(frame)` after consumer

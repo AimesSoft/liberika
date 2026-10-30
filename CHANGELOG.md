@@ -12,7 +12,9 @@
   Apple Metal textures, including subtitles and enabled danmaku. Added C
   creation/export/info/release entry points, a Vulkan C importer and a standalone
   cross-version wgpu host example without a UI framework dependency. The
-  export loop also drives audio (#175).
+  export loop also drives audio, lays out danmaku with the on-screen background
+  planner at the host's content scale, and rejects unsupported sizes before any
+  playback work (#175).
 
 ## 0.3.0 - 2026-10-25
 

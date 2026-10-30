@@ -903,7 +903,7 @@ This path reads pixels back to the CPU. It does not export a shared GPU texture
 or require matching wgpu versions between liberika and the host.
 
 For native GPU output use `erika_presenter_create_for_texture_export(config)`,
-then `erika_presenter_export_frame_texture(p, w, h, &frame)` once per host frame.
+then `erika_presenter_export_frame_texture(p, w, h, scale, &frame)` once per host frame.
 Read borrowed native handles with `erika_texture_frame_get_info` and release
 with `erika_texture_frame_release` after consumer GPU completion and alias
 destruction. This loop also pumps audio. Linux Vulkan OPAQUE_FD and Apple

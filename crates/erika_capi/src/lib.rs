@@ -4501,6 +4501,7 @@ pub unsafe extern "C" fn erika_presenter_export_frame_texture(
     handle: *mut ErikaPresenterHandle,
     width: u32,
     height: u32,
+    content_scale: f64,
     out_frame: *mut *mut ErikaTextureFrame,
 ) -> ErikaStatus {
     if out_frame.is_null() {
@@ -4509,7 +4510,10 @@ pub unsafe extern "C" fn erika_presenter_export_frame_texture(
     }
     unsafe { *out_frame = std::ptr::null_mut() };
     with_presenter_mut(handle, |handle| {
-        match handle.presenter.export_frame_texture(width, height) {
+        match handle
+            .presenter
+            .export_frame_texture(width, height, content_scale)
+        {
             Ok(Some(frame)) => {
                 unsafe { *out_frame = Box::into_raw(Box::new(ErikaTextureFrame { frame })) };
                 ErikaStatus::Ok
@@ -4585,12 +4589,7 @@ unsafe fn capture_presenter_frame_rgba_into(
         return ErikaStatus::NullPointer;
     }
     with_presenter_mut(handle, |handle| {
-        let capture = if include_danmaku {
-            capture_presenter_frame_rgba_impl(handle, width, height, true)
-        } else {
-            capture_presenter_frame_rgba(handle, width, height)
-        };
-        match capture {
+        match capture_presenter_frame_rgba(handle, width, height, include_danmaku) {
             Ok(Some(rgba)) => {
                 unsafe {
                     std::ptr::copy_nonoverlapping(rgba.as_ptr(), out_rgba, expected_len);
@@ -4614,22 +4613,6 @@ unsafe fn capture_presenter_frame_rgba_into(
     target_env = "ohos"
 ))]
 fn capture_presenter_frame_rgba(
-    handle: &mut ErikaPresenterHandle,
-    width: u32,
-    height: u32,
-) -> Result<Option<Vec<u8>>, String> {
-    capture_presenter_frame_rgba_impl(handle, width, height, false)
-}
-
-#[cfg(any(
-    target_os = "macos",
-    any(target_os = "ios", target_os = "tvos"),
-    target_os = "windows",
-    target_os = "android",
-    target_os = "linux",
-    target_env = "ohos"
-))]
-fn capture_presenter_frame_rgba_impl(
     handle: &mut ErikaPresenterHandle,
     width: u32,
     height: u32,
@@ -6358,15 +6341,18 @@ mod tests {
         assert!(!handle.is_null());
         let handle_ref = unsafe { &mut *handle };
 
-        assert_eq!(capture_presenter_frame_rgba(handle_ref, 2, 2), Ok(None));
-        let failure = capture_presenter_frame_rgba(handle_ref, 0, 2)
+        assert_eq!(
+            capture_presenter_frame_rgba(handle_ref, 2, 2, false),
+            Ok(None)
+        );
+        let failure = capture_presenter_frame_rgba(handle_ref, 0, 2, false)
             .expect_err("zero-width capture must remain a real error");
         assert!(failure.contains("capture size must be non-zero"));
         assert_eq!(
-            capture_presenter_frame_rgba_impl(handle_ref, 2, 2, true),
+            capture_presenter_frame_rgba(handle_ref, 2, 2, true),
             Ok(None)
         );
-        let failure = capture_presenter_frame_rgba_impl(handle_ref, 0, 2, true)
+        let failure = capture_presenter_frame_rgba(handle_ref, 0, 2, true)
             .expect_err("zero-width capture with danmaku must remain a real error");
         assert!(failure.contains("capture size must be non-zero"));
 
@@ -6424,22 +6410,30 @@ mod tests {
         let mut frame = std::ptr::dangling_mut::<ErikaTextureFrame>();
         assert_eq!(
             unsafe {
-                erika_presenter_export_frame_texture(std::ptr::null_mut(), 320, 180, &mut frame)
+                erika_presenter_export_frame_texture(
+                    std::ptr::null_mut(),
+                    320,
+                    180,
+                    1.0,
+                    &mut frame,
+                )
             },
             ErikaStatus::NullPointer
         );
         assert!(frame.is_null());
         assert_eq!(
-            unsafe { erika_presenter_export_frame_texture(handle, 320, 180, std::ptr::null_mut()) },
+            unsafe {
+                erika_presenter_export_frame_texture(handle, 320, 180, 1.0, std::ptr::null_mut())
+            },
             ErikaStatus::NullPointer
         );
         assert_eq!(
-            unsafe { erika_presenter_export_frame_texture(handle, 0, 180, &mut frame) },
+            unsafe { erika_presenter_export_frame_texture(handle, 0, 180, 1.0, &mut frame) },
             ErikaStatus::PlayerError
         );
         assert!(frame.is_null());
         assert_eq!(
-            unsafe { erika_presenter_export_frame_texture(handle, 320, 180, &mut frame) },
+            unsafe { erika_presenter_export_frame_texture(handle, 320, 180, 1.0, &mut frame) },
             ErikaStatus::NoEvent
         );
         assert!(frame.is_null());
@@ -6464,7 +6458,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let status =
-                unsafe { erika_presenter_export_frame_texture(handle, 320, 180, &mut frame) };
+                unsafe { erika_presenter_export_frame_texture(handle, 320, 180, 1.0, &mut frame) };
             if status == ErikaStatus::Ok {
                 break;
             }
