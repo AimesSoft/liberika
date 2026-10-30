@@ -62,13 +62,18 @@ typedef struct ErikaHttpHeader {
  * rewind budget (in bytes): how much already-played data stays cached so a
  * rewind inside it is served without a network request; 0 uses the 16 MiB
  * default (a -10 s skip at 71 Mbps covers ~89 MB, so hosts playing
- * high-bitrate media should size this from the bitrate). */
+ * high-bitrate media should size this from the bitrate).
+ * start_position_micros opens the media there instead of at its start: the
+ * engine seeks before presenting, so the first frame shown is the one at that
+ * position; 0 opens at the start (it was the first reserved slot, so callers
+ * that zero the struct keep opening at the start). */
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;
   uint64_t http_back_buffer_bytes;
-  uint64_t reserved[2];
+  uint64_t start_position_micros;
+  uint64_t reserved[1];
 } ErikaOpenOptions;
 
 /* Headless GIF export. Times are milliseconds. The function is synchronous;
@@ -206,6 +211,11 @@ typedef enum ErikaEventKind {
   ErikaEventKind_TrackSelectionChanged = 10,
   ErikaEventKind_VideoDecoderChanged = 11,
   ErikaEventKind_AudioOutputChanged = 12,
+  /* 13 is the hosts' own (a system media control asked for the previous or
+   * next item); the engine never sends it. */
+  /* The media played to its end on its own. Follows the Stopped state the
+   * end brings; a stop asked for sends no Ended. */
+  ErikaEventKind_Ended = 14,
 } ErikaEventKind;
 
 typedef enum ErikaTrackKind {
@@ -687,6 +697,14 @@ ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *handle, doub
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *handle, double volume);
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *handle, int32_t mode);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *handle, double scale);
+/* Shows subtitles later (positive delay_micros) or earlier (negative) than
+ * their timestamps, embedded and external tracks alike; clamped to ten
+ * minutes either way. 0 restores the timestamps. */
+ErikaStatus erika_presenter_set_subtitle_delay(ErikaPresenterHandle *handle, int64_t delay_micros);
+/* Where the next open on this presenter starts (microseconds) when its
+ * options leave start_position_micros at 0, for hosts whose open path cannot
+ * carry it. Taken by that open; 0 clears it. */
+ErikaStatus erika_presenter_set_open_start_position(ErikaPresenterHandle *handle, uint64_t position_micros);
 /* Fallback subtitle font. NULL or empty clears that half of the selection.
  * A container ASS script keeps its own font unless the font-name override bit
  * is passed through erika_presenter_set_subtitle_style. */

@@ -135,7 +135,12 @@ pub struct ErikaOpenOptions {
     pub header_count: usize,
     pub http_read_ahead_bytes: u64,
     pub http_back_buffer_bytes: u64,
-    pub reserved: [u64; 2],
+    /// Where the media opens, in microseconds; 0 opens at the start. The
+    /// engine seeks there before presenting, so the first frame shown is the
+    /// one at this position. (Was the first reserved slot: older callers that
+    /// zero it keep opening at the start.)
+    pub start_position_micros: u64,
+    pub reserved: [u64; 1],
 }
 
 /// Headless GIF export request. All time values are milliseconds. The call is
@@ -390,6 +395,11 @@ pub enum ErikaEventKind {
     TrackSelectionChanged = 10,
     VideoDecoderChanged = 11,
     AudioOutputChanged = 12,
+    // 13 is the hosts' own: a system media control asked for the previous or
+    // next item (the Flutter plugins send it; the engine never does).
+    /// The media played to its end on its own. Follows the `Stopped` state
+    /// the end brings; a stop asked for sends no `Ended`.
+    Ended = 14,
 }
 
 #[repr(C)]
@@ -886,6 +896,9 @@ pub struct ErikaPresenterHandle {
     presenter: PresenterRuntime,
     events: Receiver<PlayerEvent>,
     pending_events: VecDeque<PlayerEvent>,
+    /// Where the next open starts when its options do not say
+    /// (`erika_presenter_set_open_start_position`); taken by that open.
+    pending_start_position: Option<Duration>,
 }
 
 #[repr(C)]
@@ -1309,7 +1322,8 @@ pub unsafe extern "C" fn erika_open_with_options(
         let request = MediaRequest::new(uri)
             .with_http_headers(headers)
             .map_http_read_ahead_bytes(http_read_ahead_bytes)
-            .map_http_back_buffer_bytes(http_back_buffer_bytes);
+            .map_http_back_buffer_bytes(http_back_buffer_bytes)
+            .with_start_position(c_open_start_position(options));
         let status = status_from_player_result(handle.player.open(request));
         capi_trace(format!(
             "fn=erika_open.done handle={handle:p} status={status:?}"
@@ -1820,6 +1834,7 @@ fn create_presenter_handle(config: PresenterConfig) -> *mut ErikaPresenterHandle
                 presenter,
                 events,
                 pending_events: VecDeque::new(),
+                pending_start_position: None,
             }));
             capi_trace(format!("fn=create_presenter_handle.done handle={handle:p}"));
             handle
@@ -2363,7 +2378,10 @@ pub unsafe extern "C" fn erika_presenter_open_with_options(
         let request = MediaRequest::new(uri)
             .with_http_headers(headers)
             .map_http_read_ahead_bytes(http_read_ahead_bytes)
-            .map_http_back_buffer_bytes(http_back_buffer_bytes);
+            .map_http_back_buffer_bytes(http_back_buffer_bytes)
+            .with_start_position(
+                c_open_start_position(options).or(handle.pending_start_position.take()),
+            );
         let status = status_from_player_result(handle.presenter.open(request));
         retain_presenter_events_from_latest_open(handle);
         capi_trace(format!(
@@ -2547,6 +2565,51 @@ pub unsafe extern "C" fn erika_presenter_set_subtitle_scale(
 ) -> ErikaStatus {
     with_presenter_mut(handle, |handle| {
         handle.presenter.set_subtitle_scale(scale);
+        ErikaStatus::Ok
+    })
+}
+
+/// Shows subtitles later (positive `delay_micros`) or earlier (negative) than
+/// their timestamps, embedded and external tracks alike; clamped to ten
+/// minutes either way. 0 restores the timestamps.
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_subtitle_delay(
+    handle: *mut ErikaPresenterHandle,
+    delay_micros: i64,
+) -> ErikaStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.set_subtitle_delay(delay_micros);
+        ErikaStatus::Ok
+    })
+}
+
+/// Where the next open on this presenter starts, in microseconds, when its
+/// options leave `start_position_micros` at 0 (hosts whose open path cannot
+/// carry it). Taken by that open; 0 clears it.
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_open_start_position(
+    handle: *mut ErikaPresenterHandle,
+    position_micros: u64,
+) -> ErikaStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.pending_start_position =
+            (position_micros > 0).then(|| Duration::from_micros(position_micros));
         ErikaStatus::Ok
     })
 }
@@ -3670,6 +3733,38 @@ pub unsafe extern "C" fn erika_presenter_set_upscaler(
 pub unsafe extern "C" fn erika_presenter_set_subtitle_scale(
     _handle: *mut std::ffi::c_void,
     _scale: f64,
+) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_subtitle_delay(
+    _handle: *mut std::ffi::c_void,
+    _delay_micros: i64,
+) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_open_start_position(
+    _handle: *mut std::ffi::c_void,
+    _position_micros: u64,
 ) -> ErikaStatus {
     ErikaStatus::PlayerError
 }
@@ -4826,7 +4921,8 @@ fn open_options_raw(headers: *const ErikaHttpHeader, header_count: usize) -> Eri
         header_count,
         http_read_ahead_bytes: 0,
         http_back_buffer_bytes: 0,
-        reserved: [0; 2],
+        start_position_micros: 0,
+        reserved: [0; 1],
     }
 }
 
@@ -4852,6 +4948,15 @@ fn c_open_options(
     let back_buffer =
         (options.http_back_buffer_bytes > 0).then_some(options.http_back_buffer_bytes);
     Ok((headers, read_ahead, back_buffer))
+}
+
+/// [`ErikaOpenOptions::start_position_micros`]; `None` for NULL options or 0.
+fn c_open_start_position(options: *const ErikaOpenOptions) -> Option<Duration> {
+    if options.is_null() {
+        return None;
+    }
+    let micros = unsafe { (*options).start_position_micros };
+    (micros > 0).then(|| Duration::from_micros(micros))
 }
 
 /// Headers liberika derives itself for every request. Accepting a caller override
@@ -5232,6 +5337,11 @@ fn event_to_c(event: PlayerEvent) -> ErikaEvent {
                 ..ErikaEvent::default()
             }
         }
+        PlayerEvent::Ended => ErikaEvent {
+            kind: ErikaEventKind::Ended,
+            state: ErikaState::Stopped,
+            ..ErikaEvent::default()
+        },
     }
 }
 
@@ -5708,7 +5818,8 @@ mod tests {
             header_count: headers.len(),
             http_read_ahead_bytes: 16 * 1024 * 1024,
             http_back_buffer_bytes: 0,
-            reserved: [0; 2],
+            start_position_micros: 0,
+            reserved: [0; 1],
         };
         assert_eq!(
             c_open_options(&options),
@@ -5724,7 +5835,8 @@ mod tests {
             header_count: 0,
             http_read_ahead_bytes: 0,
             http_back_buffer_bytes: 0,
-            reserved: [0; 2],
+            start_position_micros: 0,
+            reserved: [0; 1],
         };
         assert_eq!(
             c_open_options(&default_read_ahead),
@@ -5739,7 +5851,8 @@ mod tests {
             header_count: 0,
             http_read_ahead_bytes: 0,
             http_back_buffer_bytes: 0,
-            reserved: [1, 0],
+            start_position_micros: 0,
+            reserved: [1],
         };
         assert_eq!(c_open_options(&options), Err(ErikaStatus::PlayerError));
         assert!(
@@ -6075,7 +6188,8 @@ mod tests {
         assert_eq!(options.header_count, headers.len());
         assert_eq!(options.http_read_ahead_bytes, 0);
         assert_eq!(options.http_back_buffer_bytes, 0);
-        assert_eq!(options.reserved, [0; 2]);
+        assert_eq!(options.start_position_micros, 0);
+        assert_eq!(options.reserved, [0; 1]);
         assert_eq!(
             c_open_options(&options),
             Ok((

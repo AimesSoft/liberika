@@ -6989,6 +6989,7 @@ mod tests {
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
             http_back_buffer_bytes: None,
+            start_position: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,
@@ -9235,6 +9236,7 @@ mod tests {
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
             http_back_buffer_bytes: None,
+            start_position: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,

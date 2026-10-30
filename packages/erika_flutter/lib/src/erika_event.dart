@@ -24,6 +24,10 @@ enum ErikaEventKind {
   videoDecoderChanged,
   audioOutputChanged,
   systemMediaNavigationRequested,
+
+  /// The media played to its end on its own (a stop asked for sends none).
+  /// Follows the `stopped` state the end brings.
+  ended,
 }
 
 enum ErikaSystemMediaCommand {

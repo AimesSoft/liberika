@@ -831,7 +831,8 @@ unsafe fn invoke_presenter(
                 header_count: headers.len(),
                 http_read_ahead_bytes: optional_open_byte_count(args, "httpReadAheadBytes")?,
                 http_back_buffer_bytes: optional_open_byte_count(args, "httpBackBufferBytes")?,
-                reserved: [0; 2],
+                start_position_micros: optional_open_byte_count(args, "startPositionMicros")?,
+                reserved: [0; 1],
             };
             let status =
                 unsafe { erika_presenter_open_with_options(handle, uri_c.as_ptr(), &options) };
