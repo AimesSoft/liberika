@@ -38,7 +38,7 @@ the server.
 |---|---|---|
 | Browser / JavaScript / TypeScript | Download `liberika-web-0.3.1.zip` or build from source | [Web integration and deployment](../docs/web.md) |
 | Flutter | `flutter pub add erika_flutter` (0.3.1) | [Plugin guide](../packages/erika_flutter/README.md) |
-| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode, from 0.3.1 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode; latest public SDK is 0.3.0 as of 2026-10-31 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | Matching C ABI bundle and `erika.h` | [Native integration](../docs/integration.md) |
 | Rust | Git dependency pinned to `v0.3.1` | [Build guide](../docs/building.md) |

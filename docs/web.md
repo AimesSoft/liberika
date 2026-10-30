@@ -10,7 +10,7 @@ required.
 
 The backend is integrated into the **Erika Web application**, including its
 playback controls, track selection, chapters, screenshots and danmaku settings.
-Release 0.3.0 includes `liberika-web-0.3.0.zip`, a complete browser runtime and
+Release 0.3.1 includes `liberika-web-0.3.1.zip`, a complete browser runtime and
 `index.html` demo with SHA-256 recorded in `SHA256SUMS`. Extract the whole archive
 and serve it over HTTPS or localhost. It is separate from the native bundles
 and is not published to npm; source builds remain available.

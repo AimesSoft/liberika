@@ -37,7 +37,7 @@ HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは
 |---|---|---|
 | ブラウザー / JavaScript / TypeScript | `liberika-web-0.3.1.zip` またはソースビルド | [Web 組み込み・配信（英語）](../docs/web.md) |
 | Flutter | `flutter pub add erika_flutter`（0.3.1） | [プラグイン](../packages/erika_flutter/README.ja.md) |
-| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加、0.3.1 以降 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加。公開済み SDK 最新版は 2026-10-31 時点で 0.3.0 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.ja.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
 | Rust | Git 依存を `v0.3.1` に固定 | [ビルド](../docs/building.ja.md) |

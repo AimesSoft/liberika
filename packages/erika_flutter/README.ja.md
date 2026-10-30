@@ -16,6 +16,39 @@ liberika メディア再生エンジン向けの Flutter plugin です。
 - HarmonyOS plugin は Flutter external texture を登録し、その `OHNativeWindow` を liberika に attach して、OHAudio で低レイテンシの PCM 出力を行います。
 - liberika は `ErikaPresenterHandle` を通じて playback、rendering、audio、timing、overlay を担当します。
 
+## 開始位置、再生終了と字幕
+
+0.3.1 のプラグインと対応するネイティブランタイムでは、`open(startPosition:)` が
+最初のフレームを表示する前に指定位置へシークするよう要求します。古いランタイムが
+その位置を受け付けない場合は `false` を返し、メディアは先頭から開きます。ホストは
+その後に seek できます。開始位置が省略された場合または正でない場合は先頭から開き、
+`true` を返します。
+
+```dart
+final player = ErikaPlayer();
+final subscription = player.events.listen((event) {
+  if (event.kind == ErikaEventKind.ended) {
+    // メディアが自然終了したら、ここで次の項目に進めます。
+  }
+});
+const start = Duration(minutes: 1, seconds: 30);
+final accepted = await player.open(mediaUrl, startPosition: start);
+if (!accepted) await player.seek(start); // 古いランタイムとの互換性。
+await player.play();
+
+final supported = await player.setSubtitleDelay(const Duration(milliseconds: 500));
+final currentText = await player.subtitleText();
+// 使用終了時には subscription を解除し、プレイヤーを解放します。
+```
+
+`ended` は自然再生終了による `stopped` 状態の後に送られ、明示的な停止では送られません。
+字幕ディレイが正なら遅く、負なら早く表示します。埋め込み・外部字幕の両方に適用され、
+範囲は ±10 分です。ネイティブランタイムが適用できない場合、`setSubtitleDelay` は
+`false` を返します。`subtitleText()` はディレイ適用後に表示中のテキストを返し、ASS の
+オーバーライドタグを除きます。ビットマップ字幕にはテキストがなく、ランタイムが
+テキストを取得できない場合は `null` です。使用後はイベント購読を解除し、プレイヤーを
+解放してください。
+
 ## Video Surfaces
 
 フルプレイヤーの macOS/iOS/tvOS UI では `ErikaWindowOverlayVideoView` を使うのが推奨です。Flutter の layout では矩形領域を予約しつつ、plugin が横に native `CAMetalLayer` を持ち、video を Flutter platform-view compositor の外に置きます。

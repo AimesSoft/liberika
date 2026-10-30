@@ -7,7 +7,7 @@ libass、FreeType、HarfBuzz、FriBidi，以及负责解封装的精简 FFmpeg�
 和媒体源，统一通过 `Player` 操作，不需要分别接入弹幕或字幕组件。
 
 这一后端已接入 **Erika Web 应用**，包括播放控件、轨道选择、章节、截图和弹幕设置。
-0.3.0 Release 提供独立的 `liberika-web-0.3.0.zip`，包含完整浏览器运行时和
+0.3.1 Release 提供独立的 `liberika-web-0.3.1.zip`，包含完整浏览器运行时和
 `index.html` 演示页，校验值记录在 `SHA256SUMS`。解压整个归档后通过 HTTPS 或本机
 HTTP 服务访问；也可从源码构建。Web 包尚未发布到 npm。
 

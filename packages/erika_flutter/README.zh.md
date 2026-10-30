@@ -16,6 +16,35 @@ liberika 媒体播放引擎的 Flutter plugin。
 - HarmonyOS 插件注册 Flutter 外部纹理，把它的 `OHNativeWindow` attach 给 liberika，并用 OHAudio 做低延迟 PCM 输出。
 - liberika 通过 `ErikaPresenterHandle` 负责播放、渲染、音频、时序和 overlay。
 
+## 起始位置、播放结束与字幕
+
+使用 0.3.1 插件及配套原生运行库时，`open(startPosition:)` 会请求引擎在呈现第一帧前
+跳转到指定位置。若旧版原生运行库不支持，返回 `false`，媒体仍从头打开，宿主可随后
+调用 seek。起始位置省略或非正数时从头打开并返回 `true`。
+
+```dart
+final player = ErikaPlayer();
+final subscription = player.events.listen((event) {
+  if (event.kind == ErikaEventKind.ended) {
+    // 媒体自然播放结束，可在这里切换到下一项。
+  }
+});
+const start = Duration(minutes: 1, seconds: 30);
+final accepted = await player.open(mediaUrl, startPosition: start);
+if (!accepted) await player.seek(start); // 兼容旧版运行库。
+await player.play();
+
+final supported = await player.setSubtitleDelay(const Duration(milliseconds: 500));
+final currentText = await player.subtitleText();
+// 宿主不再需要时取消 subscription 并释放播放器。
+```
+
+`ended` 仅在自然播放结束引起的 `stopped` 状态之后发出，主动停止不会触发。
+字幕偏移为正数时延后显示、负数时提前显示；内嵌和外挂字幕均生效，范围限制为
+±10 分钟。`setSubtitleDelay` 在原生运行库无法应用时返回 `false`。
+`subtitleText()` 获取应用偏移后当前显示的文本，并去除 ASS 覆盖标签；位图字幕没有
+文本，运行库无法提供文本时返回 `null`。不再使用时应取消事件订阅并释放播放器。
+
 ## Video Surfaces
 
 全播放器 macOS/iOS/tvOS UI 推荐使用 `ErikaWindowOverlayVideoView`。它会在 Flutter 布局中预留矩形区域，同时插件在旁边托管一个原生 `CAMetalLayer`，让视频保持在 Flutter platform-view compositor 之外。
