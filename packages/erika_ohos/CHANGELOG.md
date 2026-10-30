@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2 - 2026-10-31
+
+- Version aligned with liberika 0.3.2; no OpenHarmony changes.
+
 ## 0.3.1 - 2026-10-31
 
 - Fixed text subtitles rendering as solid rectangles by enabling libass and

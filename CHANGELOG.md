@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
+## 0.3.2 - 2026-10-31
+
+- Fixed the Flutter Windows plugin writing past `ErikaOpenOptions` when it
+  opens media: it still cleared the second reserved slot that 0.3.1 gave to
+  `start_position_micros`. MSVC stops the build on it (C4789 as an error),
+  and without that check it overwrote the stack. The Swift mirrors of the
+  struct on iOS, tvOS and macOS now name `startPositionMicros`; their layout
+  was already the header's. A packaging test checks every mirror's size and
+  every reserved slot written against the header.
+
 ## 0.3.1 - 2026-10-31
 
 - Added opening at a position: `MediaRequest::with_start_position`, C

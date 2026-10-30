@@ -20,7 +20,7 @@ dart pub publish --dry-run
 3. 将 `Cargo.toml` 的 `[workspace.package].version` 改为发布版本，运行 `cargo update -w` 并一同提交 `Cargo.lock`。Release 会拒绝与 Cargo 版本不一致的 tag。直接在 `main` 的该提交上打核心 tag；tag 触发的 `Release` 会构建所有平台并发布，不需要另外试跑。以下版本号是下一次发布的示例，按实际版本替换：
 
 ```sh
-VERSION=0.3.1
+VERSION=0.3.2
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
