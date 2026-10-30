@@ -17,6 +17,7 @@
 | OpenHarmony ArkTS SDK | [接入指南](../packages/erika_ohos/README.zh.md) | [Package guide](../packages/erika_ohos/README.md) | [組み込み](../packages/erika_ohos/README.ja.md) |
 | C/C++ などのネイティブホスト | [接入指南](integration.zh.md) | [Integration](integration.md) | [組み込み](integration.ja.md) |
 | C ABI：シグネチャ、型、所有権 | [参考手册](capi_reference.zh.md) | [C ABI reference](capi_reference.md) | [C ABI](capi_reference.ja.md) |
+| 外部 GPU テクスチャ：ネイティブ handle と同期 | [纹理输出](external_textures.zh.md) | [Texture output](external_textures.md) | [テクスチャ出力](external_textures.ja.md) |
 | Linux / WSLg（実験的） | [Linux 接入](linux.zh.md) | [Linux integration](linux.md) | [Linux 組み込み](linux.ja.md) |
 | Flutter ネイティブサーフェスとプラットフォームブリッジ | [嵌入设计](flutter_embedding.zh.md) | [Flutter embedding](flutter_embedding.md) | [Flutter 組み込み](flutter_embedding.ja.md) |
 

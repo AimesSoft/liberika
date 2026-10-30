@@ -2,6 +2,11 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
+## 未发布
+
+- 新增 Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` 与 C `erika_presenter_capture_frame_rgba_with_danmaku`，供离屏宿主合成使用，按请求的截图尺寸包含已启用的弹幕。现有截图 API 仍不含弹幕（#175）。
+- 新增 `export_frame_texture`，返回不可变、带所有权的原生帧句柄，宿主无需窗口、Flutter、CPU 像素读回或输出纹理复制即可合成。wgpu 渲染器导出 Linux Vulkan OPAQUE_FD 分配与 Apple Metal 纹理，包含字幕和已启用的弹幕。新增 C 的创建/导出/信息/释放入口、Vulkan C 导入示例，以及不依赖 UI 框架的跨 wgpu 版本独立宿主示例。导出循环同时驱动音频，按宿主的内容缩放使用与屏幕相同的后台弹幕排版，并在任何播放工作之前拒绝不支持的尺寸（#175）。
+
 ## 0.3.0 - 2026-10-25
 
 ### 默认行为变化

@@ -260,6 +260,12 @@ iOS Flutter 插件将 `CADisplayLink.targetTimestamp` 经 tick mailbox 传入此
   Android 原生宿主用 `erika_presenter_set_output_headroom` 发布动态显示 ratio。
   `capture_frame_rgba` 始终输出视频 + 字幕（不含弹幕）的 SDR RGBA8 截图，即使显示输出是
   extended-linear。
+- **宿主离屏合成:** Rust 的 `PresenterRuntime::capture_frame_rgba_with_danmaku(w, h)`
+  或 C 的 `erika_presenter_capture_frame_rgba_with_danmaku` 可在不绑定 surface 时
+  捕获视频、字幕和已启用的弹幕，供宿主上传到自己的 UI 纹理。
+  见 [捕获约定与示例](capi_reference.zh.md)。
+  不读回 CPU 的原生 GPU 句柄使用 `export_frame_texture`，其帧循环同时驱动音频；
+  见 [原生纹理输出](external_textures.zh.md)。
 
 ## 9. 释放
 

@@ -1,0 +1,11 @@
+Vulkan Instance Version: 1.4.341
+	deviceName         = llvmpipe (LLVM 21.1.8, 256 bits)
+	driverName         = llvmpipe
+	driverInfo         = Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8)
+OpenGL core profile renderer: D3D12 (NVIDIA GeForce RTX 5060 Ti)
+OpenGL core profile version: 4.6 (Core Profile) Mesa 26.0.8-1ubuntu0.3
+OpenGL ES profile renderer: D3D12 (NVIDIA GeForce RTX 5060 Ti)
+OpenGL ES profile version: OpenGL ES 3.1 Mesa 26.0.8-1ubuntu0.3
+
+Hardware-required Vulkan check (expected rejection):
+Error: hardware was required but selected AdapterInfo { name: "llvmpipe (LLVM 21.1.8, 256 bits)", vendor: 65541, device: 0, device_type: Cpu, driver: "llvmpipe", driver_info: "Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8)", backend: Vulkan }

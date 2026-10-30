@@ -549,6 +549,9 @@ pub struct WgpuRenderer {
         Option<std::result::Result<crate::renderer::linux_vulkan::LinuxVulkanInterop, String>>,
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     linux_import_failure: Option<(u64, String)>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    linux_vulkan_export:
+        Option<std::result::Result<crate::renderer::vulkan_export::VulkanExportContext, String>>,
     adapter: wgpu::Adapter,
     #[cfg(target_os = "android")]
     android_vulkan: Option<AndroidVulkanInterop>,
@@ -1462,6 +1465,19 @@ fn request_wgpu_device(
     })
 }
 
+/// Device constants for Vulkan export, queried on first use (and kept on failure).
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn linux_vulkan_export_context<'a>(
+    slot: &'a mut Option<
+        std::result::Result<crate::renderer::vulkan_export::VulkanExportContext, String>,
+    >,
+    device: &wgpu::Device,
+) -> Result<&'a crate::renderer::vulkan_export::VulkanExportContext> {
+    slot.get_or_insert_with(|| crate::renderer::vulkan_export::VulkanExportContext::new(device))
+        .as_ref()
+        .map_err(|reason| PlayerError::Renderer(reason.clone()))
+}
+
 impl WgpuRenderer {
     pub fn new() -> Result<Self> {
         Self::new_with_config(MetalRendererConfig::default())
@@ -1667,6 +1683,8 @@ impl WgpuRenderer {
             linux_vulkan: None,
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             linux_import_failure: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_vulkan_export: None,
             flutter_metrics: None,
             flutter_frame: None,
             adapter: context.adapter,
@@ -4970,6 +4988,177 @@ impl RendererBackend for WgpuRenderer {
 
     fn take_flutter_frame(&mut self) -> Option<crate::core::RendererFrameCapture> {
         self.flutter_frame.take()
+    }
+
+    fn validate_export_texture_size(&mut self, width: u32, height: u32) -> Result<()> {
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
+        {
+            let _ = (width, height);
+            Err(PlayerError::Renderer(
+                "native texture export requires Linux/Vulkan or Apple/Metal".into(),
+            ))
+        }
+
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        ))]
+        {
+            let max = self.device.limits().max_texture_dimension_2d;
+            if width == 0 || height == 0 || width > max || height > max {
+                return Err(PlayerError::Renderer(format!(
+                    "invalid external texture dimensions {width}x{height} (limit {max})"
+                )));
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?
+                .check_size(width, height)
+                .map_err(PlayerError::Renderer)?;
+            Ok(())
+        }
+    }
+
+    fn export_current_frame_texture(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<crate::core::ExternalTextureFrame>> {
+        self.validate_export_texture_size(width, height)?;
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
+        {
+            let _ = context;
+            Err(PlayerError::Renderer(
+                "native texture export requires Linux/Vulkan or Apple/Metal".into(),
+            ))
+        }
+
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        ))]
+        {
+            if !self.current_video_visible || self.current_video.is_none() {
+                return Ok(None);
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            let target = crate::renderer::vulkan_export::VulkanExportTarget::new(
+                linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?,
+                &self.device,
+                width,
+                height,
+            )
+            .map_err(PlayerError::Renderer)?;
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            let texture = &target.texture;
+
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("erika-external-metal-frame"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: OFFSCREEN_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            let info = {
+                use crate::core::{
+                    ExternalTextureFormat, ExternalTextureInfo, ExternalTextureKind,
+                };
+                use objc2_metal::{MTLDevice, MTLResource};
+                let hal =
+                    unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }.ok_or_else(|| {
+                        PlayerError::Renderer("native texture export requires Metal".into())
+                    })?;
+                let native = hal.raw_handle();
+                ExternalTextureInfo {
+                    kind: ExternalTextureKind::Metal,
+                    format: ExternalTextureFormat::Rgba8Unorm,
+                    width,
+                    height,
+                    native_handle: std::ptr::from_ref(native) as u64,
+                    device_id: native.device().registryID(),
+                    allocation_size: 0,
+                    memory_type_index: 0,
+                    vulkan_format: 0,
+                    vulkan_usage: 0,
+                    vulkan_tiling: 0,
+                    device_uuid: [0; 16],
+                    driver_uuid: [0; 16],
+                }
+            };
+            self.ensure_video_pipeline(OFFSCREEN_FORMAT);
+            if context.overlay.is_some_and(overlay_has_planes)
+                || context.danmaku.is_some_and(|plan| !plan.is_empty())
+            {
+                self.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
+            }
+            let danmaku = context.danmaku.filter(|plan| {
+                plan.generation == context.generation
+                    && plan.viewport.width == width
+                    && plan.viewport.height == height
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let draws = self.draw_current_video(
+                &view,
+                width,
+                height,
+                context.overlay,
+                danmaku,
+                OutputDescription::sdr(),
+            )?;
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            {
+                target
+                    .release_to_consumer(&self.queue)
+                    .map_err(PlayerError::Renderer)?;
+            }
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(5)),
+                })
+                .map_err(|error| {
+                    PlayerError::Renderer(format!(
+                        "external texture GPU completion failed: {error}"
+                    ))
+                })?;
+            self.stats.rendered_frames += 1;
+            self.stats.offscreen_frames += 1;
+            if draws > 0 {
+                self.stats.danmaku_passes += 1;
+                self.stats.danmaku_items += draws as u64;
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            return Ok(Some(crate::core::ExternalTextureFrame::new(
+                target.info,
+                target,
+            )));
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            Ok(Some(crate::core::ExternalTextureFrame::new(info, texture)))
+        }
     }
 
     fn capture_current_frame(

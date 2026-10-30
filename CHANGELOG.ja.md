@@ -2,6 +2,11 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
+## 未リリース
+
+- オフスクリーンのホスト合成向けに Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` と C `erika_presenter_capture_frame_rgba_with_danmaku` を追加しました。要求したキャプチャサイズで有効な弾幕を含めます。既存のスクリーンショット API は引き続き弾幕を含みません（#175）。
+- 不変で所有権を持つネイティブフレーム handle を返す `export_frame_texture` を追加しました。ウィンドウ、Flutter、CPU ピクセル readback、出力テクスチャのコピーなしでホスト合成できます。wgpu renderer は Linux Vulkan OPAQUE_FD 割り当てと Apple Metal テクスチャを、字幕と有効な弾幕を含めて export します。C の作成/export/情報取得/解放の入口、Vulkan C importer、UI フレームワークに依存しない wgpu バージョン間の独立ホスト例を追加しました。export ループは音声も進め、ホストの content scale で画面表示と同じバックグラウンド弾幕 planner を使い、非対応のサイズは再生処理の前に拒否します（#175）。
+
 ## 0.3.0 - 2026-10-25
 
 ### 既定動作の変更

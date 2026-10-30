@@ -295,6 +295,13 @@ All of these are safe to call live, between ticks:
   display ratios with `erika_presenter_set_output_headroom`. `capture_frame_rgba`
   always produces an SDR RGBA8 screenshot of video + subtitle (danmaku excluded), even
   when the display output is extended-linear.
+- **Off-screen host composition:** Rust
+  `PresenterRuntime::capture_frame_rgba_with_danmaku(w, h)` or C
+  `erika_presenter_capture_frame_rgba_with_danmaku` includes enabled danmaku
+  without attaching a surface, for hosts that upload RGBA8 to their own UI
+  texture. See [capture contracts and examples](capi_reference.md#diagnostics-and-capture).
+  For native GPU handles without readback, use `export_frame_texture`; its
+  frame loop also drives audio. See [native texture output](external_textures.md).
 
 ## 9. Teardown
 

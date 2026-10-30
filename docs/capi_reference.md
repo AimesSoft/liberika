@@ -823,6 +823,8 @@ ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutpu
 ErikaStatus erika_presenter_get_resource_status(ErikaPresenterHandle *, ErikaPresenterResourceStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle *, uint32_t width, uint32_t height,
+                                                         uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
 `get_upscaler_status` reports the requested upscaler mode, the active backend
@@ -882,6 +884,38 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+For hosts that composite their own UI (for example Dioxus on Wayland), use
+`erika_presenter_capture_frame_rgba_with_danmaku` with the same arguments to
+include enabled danmaku. It uses the current playback clock, track selection,
+offsets, font and paint settings. Danmaku is laid out independently at the
+requested pixel size with scale factor 1; no surface or preceding `render_tick`
+is required for capture. It excludes the debug HUD and has the same SDR RGBA8,
+buffer and error contract as the screenshot API. Capture prepares and caches
+short timeline windows synchronously; resizing, seeking or changing danmaku
+settings may require preparation on the next call. Audio output still needs
+regular `render_tick` calls; `audio_only_tick` suspends video decoding.
+
+The Rust equivalent is
+`PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`:
+
+```rust,ignore
+if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
+    // Upload tightly packed RGBA8 pixels to the host's own texture.
+}
+```
+
+This path reads pixels back to the CPU. It does not export a shared GPU texture
+or require matching wgpu versions between liberika and the host.
+
+For native GPU output use `erika_presenter_create_for_texture_export(config)`,
+then `erika_presenter_export_frame_texture(p, w, h, scale, &frame)` once per host frame.
+Read borrowed native handles with `erika_texture_frame_get_info` and release
+with `erika_texture_frame_release` after consumer GPU completion and alias
+destruction. This loop also pumps audio. Linux Vulkan OPAQUE_FD and Apple
+Metal are implemented; the interface contains no wgpu types. See
+[native texture output](external_textures.md) for formats, synchronization,
+ownership and the native host importer.
 
 `get_resource_status` reports memory budgeting for diagnostics: current device
 allocation, recommended working set, per-bucket GPU byte estimates (video

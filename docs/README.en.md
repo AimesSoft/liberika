@@ -18,6 +18,7 @@ The browser / WASM backend is integrated into Erika Web and supports MKV ASS sub
 | OpenHarmony ArkTS SDK | [接入指南](../packages/erika_ohos/README.zh.md) | [Package guide](../packages/erika_ohos/README.md) | [組み込み](../packages/erika_ohos/README.ja.md) |
 | Native hosts: C/C++ and others | [接入指南](integration.zh.md) | [Integration](integration.md) | [組み込み](integration.ja.md) |
 | C ABI: signatures, types and ownership | [参考手册](capi_reference.zh.md) | [C ABI reference](capi_reference.md) | [C ABI](capi_reference.ja.md) |
+| Native GPU textures: handles and synchronization | [纹理输出](external_textures.zh.md) | [Texture output](external_textures.md) | [テクスチャ出力](external_textures.ja.md) |
 | Linux / WSLg (experimental) | [Linux 接入](linux.zh.md) | [Linux integration](linux.md) | [Linux 組み込み](linux.ja.md) |
 | Flutter native surfaces and platform bridges | [嵌入设计](flutter_embedding.zh.md) | [Flutter embedding](flutter_embedding.md) | [Flutter 組み込み](flutter_embedding.ja.md) |
 

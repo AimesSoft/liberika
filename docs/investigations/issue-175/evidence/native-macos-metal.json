@@ -1,0 +1,23 @@
+{
+  "completed_frame_mean_ms": 4.095024991666667,
+  "compose_wait_mean_ms": 1.3440711916666657,
+  "consumer_adapter": "AdapterInfo { name: \"Apple M5 Pro\", vendor: 0, device: 0, device_type: IntegratedGpu, driver: \"\", driver_info: \"\", backend: Metal }",
+  "consumer_wgpu": "26.0.1",
+  "export_mean_ms": 2.734251075000001,
+  "final_verification_readback_excluded_from_timing": true,
+  "height": 540,
+  "import_mean_ms": 0.006694116666666666,
+  "measured_frames": 120,
+  "mode": "native texture import",
+  "producer_adapter": "AdapterInfo { name: \"Apple M5 Pro\", vendor: 0, device: 0, device_type: IntegratedGpu, device_pci_bus_id: \"\", driver: \"\", driver_info: \"\", backend: Metal, subgroup_min_size: 4, subgroup_max_size: 64, transient_saves_memory: true }",
+  "producer_wgpu": "29.0.3",
+  "renderer_throughput_fps": 244.198753862306,
+  "require_hardware": true,
+  "source_height": 36,
+  "source_width": 64,
+  "total_wall_seconds": 0.56836175,
+  "verification_pixel_match": true,
+  "warmup_frames": 3,
+  "width": 960,
+  "workload": "renderer-only static GPU fixture; decoding and window presentation excluded"
+}
