@@ -1,6 +1,6 @@
 # 浏览器播放：MKV、ASS 字体与弹幕
 
-[English](web.md)
+中文 | [English](web.md) | [日本語](web.ja.md)
 
 Web 后端直接属于 liberika。一次构建会同时产出原有 Rust 弹幕引擎、带本仓库补丁的
 libass、FreeType、HarfBuzz、FriBidi，以及负责解封装的精简 FFmpeg。应用提供 Canvas

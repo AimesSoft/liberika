@@ -1,5 +1,7 @@
 # liberika 平台能力矩阵
 
+> [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
+
 以下平台以 0.3.0 为基线；浏览器后端已接入 Erika Web，并随 Release 提供独立 Web 归档。
 Linux 目前为实验性源码构建目标。
 
@@ -12,7 +14,7 @@ Linux 目前为实验性源码构建目标。
 | Android | 8 / API 26 | MediaCodec / 软解 + wgpu | AAudio | 四个 ABI；Flutter |
 | OpenHarmony | API 18 | AVCodec / 软解 + wgpu | OHAudio | arm64；Flutter / ArkTS OHPM |
 | Linux（实验性） | FFmpeg 8.x | NVDEC / VA-API / 软解 + wgpu | PulseAudio / pipewire-pulse | Rust / C ABI / Flutter 源码构建，无预编译包 |
-| 浏览器 | HTTPS / localhost；WebCodecs 视频与音频、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | 当前源码构建 JS / WASM；尚未发布到 npm |
+| 浏览器 | HTTPS / localhost；WebCodecs 视频与音频、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | Release 预编译归档或源码构建 JS / WASM；尚未发布到 npm |
 
 原生平台提供 C ABI Presenter；浏览器通过 JavaScript / TypeScript `Player` 接入。
 硬件解码能力取决于编码格式、设备及驱动；浏览器会在运行时检查编码配置支持。

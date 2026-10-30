@@ -38,8 +38,9 @@ xtask 发布目标。安装依赖和构建步骤在 [Linux 接入](linux.zh.md)�
 ### 构建工具 —— macOS / Unix 宿主
 
 `tar`、`make`、`clang`、`cmake`、`pkg-config`、`python3`(带 `venv`)必须在 `PATH` 上。
-构建完整字幕栈(`--all`)还需 `meson` 和 `ninja`(Intel 宿主上 FFmpeg 的 x86 汇编需
-`nasm`)。macOS 上安装 Xcode Command Line Tools,再通过 Homebrew 装上述工具。
+基础集的 dav1d 需要 Meson 和 Ninja；缺失时 `xtask` 可通过 Python 虚拟环境安装。
+x86_64 Apple 目标即使不使用 `--all`，也需 `nasm` 构建 dav1d 与 FFmpeg 汇编。
+macOS 上安装 Xcode Command Line Tools，并按需通过 Homebrew 安装工具。
 
 `erika_ffmpeg_sys` 运行 **bindgen**,需要 `libclang`。若未自动找到,设置 `LIBCLANG_PATH`。
 
@@ -48,8 +49,8 @@ xtask 发布目标。安装依赖和构建步骤在 [Linux 接入](linux.zh.md)�
 - **Visual Studio Build Tools**(MSVC)+ Windows SDK,以及 **CMake** 组件。
 - 一个 **POSIX shell**(Git for Windows 或 MSYS2)——FFmpeg 的 `configure` 需要它。
 - **GNU make**(MSYS2 `make` 或 MinGW `mingw32-make`)。
-- FFmpeg 汇编需 `nasm`。
-- `--all` 还需 **Python**(带 `venv`);`xtask` 会自动提供 `pkg-config` shim。
+- x86_64 FFmpeg 与 dav1d 汇编需 `nasm`。
+- 每次 Windows 依赖构建均需 **Python**（带 `venv`）；`xtask` 可自动提供 Meson/Ninja 和 `pkg-config` shim。
 
 请在 MSVC 环境已激活的 shell 里运行命令(如 *"x64 Native Tools Command Prompt"*),
 以便 `xtask` 定位工具链。
@@ -86,6 +87,18 @@ cargo run -p xtask -- deps build --profile lgpl
 # 构建全部,含 libass 字幕栈
 cargo run -p xtask -- deps build --all --profile lgpl
 ```
+
+上例默认使用 `host`。Windows 上应指定 MSVC 目标：Cargo 构建脚本会自动查找目标专用目录，
+而 `host` 将依赖放在 `dist/lgpl`。例如 x64：
+
+```powershell
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc
+$env:ERIKA_NATIVE_TARGET = "x86_64-pc-windows-msvc"
+cargo build -p erika_capi --target x86_64-pc-windows-msvc
+```
+
+Windows ARM64 使用 `aarch64-pc-windows-msvc`。默认 Cargo 构建和 workspace 测试启用
+libass，因此需要 `--all`，仅构建基础集不够。
 
 子命令:`plan`(打印计划)、`fetch`(只下载源)、`status`(已有/已构建)、`build`
 (下载 + 编译)。
@@ -220,7 +233,8 @@ cdylib 与匹配 ABI 的 NDK `libc++_shared.so`。
 - **`gpl-full`** —— 同一集合加 `--enable-gpl`。仅当你接受产物的 GPL 条款时使用。
 
 Rust workspace 本身是 MPL-2.0(见 [`LICENSE`](../LICENSE))。`xtask` 与你的
-`cargo build` 之间保持 profile 一致。`cargo run -p xtask -- check license` 校验策略。
+`cargo build` 之间保持 profile 一致。`cargo run -p xtask -- check license` 检查默认 feature、
+FFmpeg 配置标志和 dav1d 许可声明，不检查已构建产物，也不检测 profile 混用。
 
 ## `dist` 布局
 
@@ -245,13 +259,14 @@ third_party/
 1. `ERIKA_FFMPEG_DIR`(若设置,显式覆盖)。
 2. 否则 `third_party/dist/$ERIKA_NATIVE_TARGET/$ERIKA_NATIVE_PROFILE/ffmpeg`
    (若 `ERIKA_NATIVE_TARGET` 已设)。
-3. 否则 workspace 根下的 `third_party/dist/<profile>/ffmpeg`(为 iOS 构建时带 `ios/`
-   段)。
+3. 否则为 Windows、Android、iOS（`ios`）与 tvOS 推断目标目录；其他目标若存在匹配的
+   Cargo 目标目录则使用它，否则使用 `third_party/dist/<profile>/ffmpeg`。设置
+   `ERIKA_NATIVE_TARGET` 可明确选择所需目录。
 
 相关环境变量:`ERIKA_NATIVE_PROFILE`、`ERIKA_NATIVE_TARGET`、`ERIKA_FFMPEG_DIR`、
 `ERIKA_DAV1D_DIR`、`ERIKA_ZLIB_DIR`、`LIBCLANG_PATH`,以及 `ERIKA_ALLOW_LEGACY_FFMPEG`(应急开关)。liberika
-需要 FFmpeg **8.x**(`libavutil >= 60`);Windows 和 Android 原生核心强制此点。仅在本地兼容性实验时
-才设 `ERIKA_ALLOW_LEGACY_FFMPEG=1`。
+需要 FFmpeg **8.x**（`libavutil >= 60`）。`ERIKA_ALLOW_LEGACY_FFMPEG=1` 仅供本地
+兼容性实验，且只跳过 bundled 依赖的版本检查；Linux 系统库路径仍通过 pkg-config 要求 FFmpeg 8。
 
 ## 编译与测试
 
@@ -305,19 +320,25 @@ Android active extended-linear 路径标为“已通过真机验证”。
 
 ## 验证播放路径
 
+macOS（shell）：
+
 ```sh
-# macOS
-export SAMPLE="/path/to/video.mp4"
+SAMPLE="/path/to/video.mp4"
 cargo run -p macos_native_demo -- "$SAMPLE"
 cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
-
-# Windows
-cargo run -p windows_native_demo -- "%SAMPLE%"
-cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl "%SAMPLE%"
 ```
 
-demo 会打印每帧流水线统计(解码/渲染帧、零拷贝 vs CPU 回退、HDR10 活动、音频
-underflow)——快速确认硬解和零拷贝互操作已生效。
+Windows（PowerShell）：
+
+```powershell
+$sample = "C:\path\to\video.mp4"
+cargo run -p windows_native_demo -- $sample
+cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl $sample
+```
+
+Windows 冒烟测试结束时打印解码、零拷贝、HDR10 和音频等汇总指标；`--metrics-log`
+约每 250 ms 写入一次指标。macOS demo 默认报告播放和错误信息；使用 `--seek-sequence`
+时还会输出解码、渲染与失败计数。
 
 ## 排错
 
@@ -336,8 +357,9 @@ underflow)——快速确认硬解和零拷贝互操作已生效。
   Hybrid Composition（`2`）、使用 GLES（`3`）、没有 `Rgba16Float`（`4`）、dataspace
   API 不可用（`5`）或 `SCRGB_LINEAR` 验证失败（`6`）。`7` 与 `8` 分别表示 surface
   configure 失败和在不支持的 backend 上请求 Apple EDR。
-- **旧版 FFmpeg 被拒** —— 原生核心要求 8.x 依赖包(`libavutil >= 60`),否则构建期直接失败;仅当设置 `ERIKA_ALLOW_LEGACY_FFMPEG=1` 时才跳过该检查(仅限本地兼容性实验)。
-- **license 校验失败** —— 你的 profile 混了 GPL 与 LGPL 工件;用单一 `--profile` 重建 deps。
+- **旧版 FFmpeg 被拒** —— 安装或构建 FFmpeg 8.x。`ERIKA_ALLOW_LEGACY_FFMPEG=1` 只在本地兼容性实验中跳过 bundled 依赖检查，不会跳过 Linux 系统库的 pkg-config 版本要求。
+- **license 校验失败** —— 根据报错检查默认 feature、FFmpeg 配置标志或 dav1d 许可声明。
+  此检查不扫描构建产物；需另行确认依赖 profile 与 Cargo 构建一致。
 
 开发工作流见 [CONTRIBUTING.zh.md](../CONTRIBUTING.zh.md),各部分如何拼接见
 [architecture.zh.md](architecture.zh.md)。

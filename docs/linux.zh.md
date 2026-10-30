@@ -1,5 +1,7 @@
 # Linux 原生接入（实验性）
 
+> [中文](linux.zh.md) · [English](linux.md) · [日本語](linux.ja.md)
+
 Linux 支持 Rust 播放器、C ABI 与 Flutter，使用系统 FFmpeg 8.x、liberika 补丁 libass、wgpu 和 PulseAudio。PipeWire 桌面需启用 `pipewire-pulse`；WSL2 使用 WSLg 的显示与音频服务。
 
 视频可通过 X11 / Wayland 窗口呈现；Flutter 可选 RGBA SDR 纹理或 Wayland 原生视频层。NVIDIA 使用 NVDEC，Intel/AMD 使用 VA-API，也可使用 FFmpeg 软件解码。Linux 当前从源码构建。

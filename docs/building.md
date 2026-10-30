@@ -24,7 +24,7 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
 
 ## Linux system-library builds
 
-Linux uses system FFmpeg 8 and PulseAudio, with Erika-patched libass. It does
+Linux uses system FFmpeg 8 and PulseAudio, with liberika-patched libass. It does
 not use the xtask release-target path below. Start with [Linux integration](linux.md).
 
 ## Prerequisites
@@ -41,9 +41,10 @@ not use the xtask release-target path below. Start with [Linux integration](linu
 ### Build tools — macOS / Unix host
 
 `tar`, `make`, `clang`, `cmake`, `pkg-config`, and `python3` (with `venv`) must
-be on `PATH`. Building the full subtitle stack (`--all`) additionally needs
-`meson` and `ninja` (and `nasm` for FFmpeg's x86 assembly on Intel hosts). On
-macOS, install the Xcode Command Line Tools plus the above via Homebrew.
+be on `PATH`. The baseline dav1d build needs Meson and Ninja; `xtask` can
+bootstrap them in a Python virtual environment when absent. An x86_64 Apple
+target also needs `nasm` for dav1d and FFmpeg assembly, including without
+`--all`. On macOS, install the Xcode Command Line Tools and needed tools via Homebrew.
 
 `erika_ffmpeg_sys` runs **bindgen**, which needs `libclang`. If it is not found
 automatically, set `LIBCLANG_PATH`.
@@ -54,9 +55,9 @@ automatically, set `LIBCLANG_PATH`.
   component.
 - A **POSIX shell** (Git for Windows or MSYS2) — FFmpeg's `configure` needs it.
 - **GNU make** (MSYS2 `make` or MinGW `mingw32-make`).
-- `nasm` for FFmpeg assembly.
-- For `--all`: **Python** (with `venv`); `xtask` provisions a `pkg-config` shim
-  automatically.
+- `nasm` for x86_64 FFmpeg and dav1d assembly.
+- **Python** (with `venv`) for every Windows dependency build; `xtask` can
+  provision Meson/Ninja and a `pkg-config` shim automatically.
 
 Run the commands from a shell where the MSVC environment is active (e.g. a
 *"x64 Native Tools Command Prompt"*), so `xtask` can locate the toolchain.
@@ -98,6 +99,19 @@ cargo run -p xtask -- deps build --profile lgpl
 # Build everything, including the libass subtitle stack
 cargo run -p xtask -- deps build --all --profile lgpl
 ```
+
+The examples above use the default `host` target. On Windows, use the explicit
+MSVC target instead: its Cargo build scripts infer that target-specific directory,
+whereas `host` stages dependencies under `dist/lgpl`. For example, on x64:
+
+```powershell
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc
+$env:ERIKA_NATIVE_TARGET = "x86_64-pc-windows-msvc"
+cargo build -p erika_capi --target x86_64-pc-windows-msvc
+```
+
+Use `aarch64-pc-windows-msvc` for Windows ARM64. Default Cargo builds and
+workspace tests enable libass, so they need `--all`, not just the baseline.
 
 Subcommands: `plan` (print the plan), `fetch` (download sources only),
 `status` (what is present/built), `build` (fetch + compile).
@@ -253,7 +267,8 @@ The native build is split into profiles so the license boundary is explicit:
 
 The Rust workspace itself is MPL-2.0 (see [`LICENSE`](../LICENSE)). Keep the
 profile consistent across `xtask` and your `cargo build`. `cargo run -p xtask --
-check license` validates the policy.
+check license` checks the default feature, configured FFmpeg flags and dav1d
+notices; it does not inspect built artifacts or detect mixed profiles.
 
 ## The `dist` layout
 
@@ -279,14 +294,17 @@ For the `host` target the `<target>` path segment is omitted
 1. `ERIKA_FFMPEG_DIR`, if set (explicit override).
 2. else `third_party/dist/$ERIKA_NATIVE_TARGET/$ERIKA_NATIVE_PROFILE/ffmpeg`,
    if `ERIKA_NATIVE_TARGET` is set.
-3. else `third_party/dist/<profile>/ffmpeg` under the workspace root (with an
-   `ios/` segment when building for iOS).
+3. else use an inferred target directory for Windows, Android, iOS (`ios`),
+   and tvOS. For other targets, a matching Cargo target directory is used if
+   present; otherwise `third_party/dist/<profile>/ffmpeg` is used. Set
+   `ERIKA_NATIVE_TARGET` to select the intended staged target explicitly.
 
 Relevant environment variables: `ERIKA_NATIVE_PROFILE`, `ERIKA_NATIVE_TARGET`,
 `ERIKA_FFMPEG_DIR`, `ERIKA_DAV1D_DIR`, `ERIKA_ZLIB_DIR`, `LIBCLANG_PATH`, and
 `ERIKA_ALLOW_LEGACY_FFMPEG` (escape hatch). liberika requires FFmpeg **8.x**
-(`libavutil >= 60`); the Windows and Android native core enforces this. Set
-`ERIKA_ALLOW_LEGACY_FFMPEG=1` only for local compatibility experiments.
+(`libavutil >= 60`). Set `ERIKA_ALLOW_LEGACY_FFMPEG=1` only for local
+compatibility experiments; it skips the bundled dependency version check, not
+the pkg-config FFmpeg 8 requirements on the Linux system-library path.
 
 ## Compile and test
 
@@ -350,20 +368,26 @@ HDR-device run above passes.
 
 ## Verify the playback path
 
+macOS (shell):
+
 ```sh
-# macOS
-export SAMPLE="/path/to/video.mp4"
+SAMPLE="/path/to/video.mp4"
 cargo run -p macos_native_demo -- "$SAMPLE"
 cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
-
-# Windows
-cargo run -p windows_native_demo -- "%SAMPLE%"
-cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl "%SAMPLE%"
 ```
 
-The demos print per-frame pipeline stats (decoded/rendered frames, zero-copy vs
-CPU fallback, HDR10 activity, audio underflow) — a quick way to confirm hardware
-decode and zero-copy interop are engaged.
+Windows (PowerShell):
+
+```powershell
+$sample = "C:\path\to\video.mp4"
+cargo run -p windows_native_demo -- $sample
+cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl $sample
+```
+
+The Windows smoke test prints a summary of decode, zero-copy, HDR10, audio and
+other metrics on exit; `--metrics-log` writes metrics approximately every 250 ms.
+The macOS demo reports playback and errors by default; `--seek-sequence` also
+prints decode, render and failure counts.
 
 ## Troubleshooting
 
@@ -385,11 +409,12 @@ decode and zero-copy interop are engaged.
   `Rgba16Float` (`4`), unavailable dataspace API (`5`), or failed
   `SCRGB_LINEAR` verification (`6`). Codes `7` and `8` identify surface
   configuration failure and an Apple-EDR request on an unsupported backend.
-- **Legacy FFmpeg rejected** — the native core requires the 8.x bundle
-  (`libavutil >= 60`) and fails at build time otherwise; the check is skipped
-  only when `ERIKA_ALLOW_LEGACY_FFMPEG=1` is set for local experiments.
-- **License check fails** — your profile mixes GPL and LGPL artifacts; rebuild
-  deps with a single `--profile`.
+- **Legacy FFmpeg rejected** — install or build FFmpeg 8.x. For local
+  compatibility experiments only, `ERIKA_ALLOW_LEGACY_FFMPEG=1` skips the
+  bundled dependency check, but not Linux system-library pkg-config requirements.
+- **License check fails** — inspect the reported default feature, FFmpeg configure
+  flags or dav1d notice. The check does not inspect built artifacts; separately
+  ensure the selected dependency profile matches the Cargo build.
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development workflow and
 [architecture.md](architecture.md) for how the pieces fit together.

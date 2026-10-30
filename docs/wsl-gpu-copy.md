@@ -1,5 +1,7 @@
 # WSL D3D12 decoded-frame import (experimental)
 
+> [中文](wsl-gpu-copy.zh.md) · [English](wsl-gpu-copy.md) · [日本語](wsl-gpu-copy.ja.md)
+
 This optional path removes the **decoded NV12/P010 frame** round trip through
 CPU memory on WSL. Mesa D3D12 VA-API decodes, D3D12 copies the two planes into
 reusable GPU textures, and Dozen imports those textures into Vulkan for wgpu.
