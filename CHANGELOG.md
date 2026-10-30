@@ -2,10 +2,8 @@
 
 ## Unreleased
 
-- Fixed OpenHarmony builds shipping the debug text subtitle renderer, which
-  displayed embedded ASS and other text subtitles as solid rectangles. CI,
-  release packaging and Flutter source builds now include libass and its text
-  dependencies, and validate the linked renderer before packaging (#180).
+- Fixed OpenHarmony text subtitles rendering as solid rectangles by enabling
+  libass and building its text dependencies in native builds (#180).
 
 ## 0.3.0 - 2026-10-25
 

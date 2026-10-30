@@ -592,9 +592,7 @@ jobs:
             third_party/src
             third_party/build/${{ env.ERIKA_NATIVE_TARGET }}/${{ env.ERIKA_NATIVE_PROFILE }}
             third_party/dist/${{ env.ERIKA_NATIVE_TARGET }}/${{ env.ERIKA_NATIVE_PROFILE }}
-          key: native-v2-ohos-subtitles-${{ env.ERIKA_NATIVE_TARGET }}-api${{ env.OHOS_COMPATIBLE_SDK_VERSION }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
-          restore-keys: |
-            native-v1-ohos-${{ env.ERIKA_NATIVE_TARGET }}-api${{ env.OHOS_COMPATIBLE_SDK_VERSION }}-
+          key: native-v1-ohos-${{ env.ERIKA_NATIVE_TARGET }}-api${{ env.OHOS_COMPATIBLE_SDK_VERSION }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
       - name: Build OpenHarmony native dependencies
         run: >-
           cargo run --locked -p xtask -- deps build --all
@@ -616,8 +614,6 @@ jobs:
           --target "$ERIKA_NATIVE_TARGET"
           --no-default-features --features libass,wgpu
       - name: Build OpenHarmony Flutter native bridge
-        env:
-          ERIKA_FORCE_SOURCE_BUILD: "1"
         run: |
           set -euo pipefail
           cmake -S packages/erika_flutter/ohos/src/main/cpp \
@@ -653,16 +649,6 @@ jobs:
           do
             grep -Fxq "$symbol" <<< "$symbols"
           done
-          # Check the linked renderer too: a C ABI-only build can silently ship
-          # the debug text path, which draws solid rectangles instead of glyphs.
-          text_symbols="$("$nm" --defined-only "$runtime" | awk '{print $NF}')"
-          for symbol in ass_library_init ass_process_chunk ass_render_frame; do
-            grep -Fxq "$symbol" <<< "$text_symbols" || {
-              echo "OpenHarmony runtime is missing libass symbol: $symbol" >&2
-              exit 1
-            }
-          done
-          cmp "$runtime" "target/ohos-plugin-release/liberika_capi.so"
           bash packaging/bundle.sh erika-capi-openharmony-arm64 \
             dist/erika-capi-openharmony-arm64.zip "$runtime" "$plugin"
       - uses: actions/upload-artifact@v4

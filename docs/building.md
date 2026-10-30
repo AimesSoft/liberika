@@ -146,14 +146,6 @@ HarmonyOS builds take the DevEco Studio `openharmony/native` directory from
 Hvigor/CMake build runs this chain automatically and packages `liberika_capi.so`
 and `liberika_flutter.so` into the HAP.
 
-OpenHarmony text subtitles require both `libass` and `wgpu`. Build native
-text dependencies with `xtask deps build --all`; a direct runtime build uses
-`--no-default-features --features libass,wgpu`. Omitting `libass` selects the
-debug text renderer, which draws solid rectangles instead of subtitle glyphs.
-The fixed source build does not replace an already downloaded prebuilt runtime;
-rebuild the application with a corrected native release, or use
-`ERIKA_FORCE_SOURCE_BUILD=1` with this checkout.
-
 ### Selecting source-build architectures
 
 Flutter consumers select macOS with `ERIKA_MACOS_ARCHS=arm64|x86_64|universal`,

@@ -134,13 +134,6 @@ HarmonyOS 使用 `OHOS_NDK_HOME` 或 `OHOS_SDK_NATIVE` 指向 DevEco Studio 的
 Hvigor/CMake 构建会自动执行这条链路，并把 `liberika_capi.so` 与
 `liberika_flutter.so` 打入 HAP。
 
-OpenHarmony 文本字幕需要同时启用 `libass` 和 `wgpu`。先用
-`xtask deps build --all` 构建文字依赖，直接构建 runtime 时传入
-`--no-default-features --features libass,wgpu`。缺少 `libass` 会进入调试文字
-渲染器，只绘制实心矩形而非字幕字形。源码修复不会替换已下载的预编译 runtime；
-需要使用修正后的原生库重新构建应用，或针对此 checkout 设置
-`ERIKA_FORCE_SOURCE_BUILD=1`。
-
 ### 选择源码构建架构
 
 Flutter 依赖项目通过 `ERIKA_MACOS_ARCHS=arm64|x86_64|universal` 选择 macOS 架构，通过 `ERIKA_WINDOWS_ARCH=x64|arm64` 选择 Windows 架构，通过 `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86` 选择 Android ABI。设置 `ERIKA_FORCE_SOURCE_BUILD=1` 可强制跳过预构建包。
