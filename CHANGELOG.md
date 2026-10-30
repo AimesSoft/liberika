@@ -2,7 +2,7 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
-## Unreleased
+## 0.4.0 - 2026-10-31
 
 - Added opening at a position: `MediaRequest::with_start_position`, C
   `ErikaOpenOptions.start_position_micros` (the first reserved slot, so zeroed

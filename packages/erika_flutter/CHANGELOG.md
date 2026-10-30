@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 - 2026-10-31
+
+- `open(startPosition:)` opens the media at a position: the first frame shown
+  is the one there. It returns whether the native library took it.
+- `ErikaEventKind.ended` follows the `stopped` state a natural end brings; a
+  stop asked for sends none.
+- `setSubtitleDelay` shows subtitles later or earlier, embedded and external
+  tracks alike; `subtitleText` returns what the subtitles say now.
+- Native runtime 0.4.0: danmaku capture and native frame texture export
+  (#175), OpenHarmony text subtitles (#180).
+
 ## 0.3.0 - 2026-10-25
 
 ### Default behavior changes

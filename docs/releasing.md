@@ -20,7 +20,7 @@ dart pub publish --dry-run
 3. Set `[workspace.package].version` in `Cargo.toml` to the release version and run `cargo update -w`; commit `Cargo.lock` with it. The Release workflow rejects tags that differ from the Cargo version. Run `Release` manually on this commit and confirm all platform builds pass before tagging. Tag the release commit. The version below is an example for the next release; replace it with the intended version:
 
 ```sh
-VERSION=0.3.0
+VERSION=0.4.0
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```

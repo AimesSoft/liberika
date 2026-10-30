@@ -2,8 +2,12 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
-## 未リリース
+## 0.4.0 - 2026-10-31
 
+- 指定位置からの open を追加しました：`MediaRequest::with_start_position`、C `ErikaOpenOptions.start_position_micros`（最初の reserved 枠を使用。ゼロ初期化した構造体は従来どおり先頭から開きます）、`erika_presenter_set_open_start_position`、JSON `open` の `startPositionMicros` と `setOpenStartPosition`、Flutter `ErikaPlayer.open(startPosition:)`。
+- 自然終了を明示する `PlayerEvent::Ended` / C `ErikaEventKind_Ended`（14）を `Stopped` の後に送ります。明示的な stop では送りません。Flutter は `ErikaEventKind.ended`。
+- 埋め込み・外部トラック共通の字幕ディレイを追加しました：`set_subtitle_delay`、C `erika_presenter_set_subtitle_delay`、JSON `setSubtitleDelay` / `subtitleDelay`、Flutter `setSubtitleDelay`。
+- 現在表示中の字幕テキストを返す JSON `subtitleText` と Flutter `subtitleText` を追加しました。
 - オフスクリーンのホスト合成向けに Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` と C `erika_presenter_capture_frame_rgba_with_danmaku` を追加しました。要求したキャプチャサイズで有効な弾幕を含めます。既存のスクリーンショット API は引き続き弾幕を含みません（#175）。
 - 不変で所有権を持つネイティブフレーム handle を返す `export_frame_texture` を追加しました。ウィンドウ、Flutter、CPU ピクセル readback、出力テクスチャのコピーなしでホスト合成できます。wgpu renderer は Linux Vulkan OPAQUE_FD 割り当てと Apple Metal テクスチャを、字幕と有効な弾幕を含めて export します。C の作成/export/情報取得/解放の入口、Vulkan C importer、UI フレームワークに依存しない wgpu バージョン間の独立ホスト例を追加しました。export ループは音声も進め、ホストの content scale で画面表示と同じバックグラウンド弾幕 planner を使い、非対応のサイズは再生処理の前に拒否します（#175）。
 
