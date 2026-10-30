@@ -1185,12 +1185,17 @@ class ErikaPlayer {
   /// without a network request. Null or zero uses the native 16 MiB default.
   /// Size it from the bitrate for high-bitrate media (a -10 s skip at 71 Mbps
   /// covers ~89 MB). Local files ignore the value.
-  Future<void> open(
+  /// [startPosition] opens the media there instead of at its start: the
+  /// engine seeks before presenting, so the first frame shown is the one at
+  /// that position. Returns whether this native library takes it (false: the
+  /// media opens at its start, and a seek is the caller's).
+  Future<bool> open(
     String uri, {
     Map<String, String>? httpHeaders,
     int? httpReadAheadBytes,
     int? httpBackBufferBytes,
     ErikaMediaMetadata? metadata,
+    Duration? startPosition,
   }) async {
     if (httpReadAheadBytes != null && httpReadAheadBytes < 0) {
       throw ArgumentError.value(
@@ -1207,6 +1212,17 @@ class ErikaPlayer {
       );
     }
     final playerId = await ensureCreated();
+    var startTaken = startPosition == null || startPosition <= Duration.zero;
+    if (!startTaken) {
+      try {
+        final reply = await invokeJson('setOpenStartPosition', {
+          'positionMicros': startPosition.inMicroseconds,
+        });
+        startTaken = reply['ok'] == true;
+      } on UnsupportedError {
+        startTaken = false;
+      }
+    }
     await _invoke('open', <String, Object?>{
       'playerId': playerId,
       'uri': uri,
@@ -1218,6 +1234,7 @@ class ErikaPlayer {
         'httpBackBufferBytes': httpBackBufferBytes,
       'metadata': metadata?.toMap(),
     });
+    return startTaken;
   }
 
   Future<void> setMediaMetadata(ErikaMediaMetadata metadata) async {
@@ -1295,6 +1312,34 @@ class ErikaPlayer {
       'playerId': playerId,
       'scale': clampedScale,
     });
+  }
+
+  /// Shows subtitles later (positive [delay]) or earlier (negative) than
+  /// their timestamps, embedded and external tracks alike; clamped to ten
+  /// minutes either way. Returns false when this native library cannot.
+  Future<bool> setSubtitleDelay(Duration delay) async {
+    try {
+      final reply = await invokeJson('setSubtitleDelay', {
+        'delayMicros': delay.inMicroseconds,
+      });
+      return reply['ok'] == true;
+    } on UnsupportedError {
+      return false;
+    }
+  }
+
+  /// What the subtitles say now, the delay applied: the text cues showing
+  /// (ASS dialogue without its override tags; bitmap subtitles have none),
+  /// joined by line breaks. Null when this native library cannot tell.
+  Future<String?> subtitleText() async {
+    try {
+      final reply = await invokeJson('subtitleText');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      return value is Map ? value['text'] as String? : null;
+    } on UnsupportedError {
+      return null;
+    }
   }
 
   Future<int> registerSubtitleMemoryFont(Uint8List data) async {

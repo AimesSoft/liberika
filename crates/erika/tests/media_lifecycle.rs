@@ -347,6 +347,7 @@ impl MediaServer {
             http_headers: vec![],
             http_read_ahead_bytes: Some(64 * 1024),
             http_back_buffer_bytes: Some(64 * 1024),
+            start_position: None,
         }
     }
 }

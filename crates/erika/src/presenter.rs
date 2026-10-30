@@ -334,6 +334,9 @@ pub struct PresenterRuntime {
     current_surface_metrics: Option<SurfaceMetrics>,
     current_danmaku_viewport: Option<DanmakuViewport>,
     subtitle_font_scale: f64,
+    /// Microseconds subtitles show later than their timestamps (earlier when
+    /// negative).
+    subtitle_delay_micros: i64,
     subtitle_resolution: SubtitleResolution,
     subtitle_style: SubtitleStyleConfig,
     subtitle_memory_fonts: SubtitleMemoryFonts,
@@ -811,6 +814,7 @@ impl PresenterRuntime {
             current_surface_metrics: None,
             current_danmaku_viewport: None,
             subtitle_font_scale: DEFAULT_SUBTITLE_FONT_SCALE,
+            subtitle_delay_micros: 0,
             subtitle_resolution: SubtitleResolution::default(),
             subtitle_style: SubtitleStyleConfig::default(),
             subtitle_memory_fonts: SubtitleMemoryFonts::default(),
@@ -1123,6 +1127,41 @@ impl PresenterRuntime {
         }
         self.subtitle_font_scale = scale;
         self.refresh_current_overlay();
+    }
+
+    /// Shows subtitles later (positive) or earlier (negative) than their
+    /// timestamps, embedded and external alike. Frames stay kept that much
+    /// past their end, so a later subtitle is not dropped before it shows.
+    pub fn set_subtitle_delay(&mut self, delay_micros: i64) {
+        let delay_micros =
+            delay_micros.clamp(-MAX_SUBTITLE_DELAY_MICROS, MAX_SUBTITLE_DELAY_MICROS);
+        if self.subtitle_delay_micros == delay_micros {
+            return;
+        }
+        self.subtitle_delay_micros = delay_micros;
+        self.subtitles.lead = Duration::from_micros(delay_micros.max(0) as u64);
+        self.refresh_current_overlay();
+    }
+
+    pub fn subtitle_delay_micros(&self) -> i64 {
+        self.subtitle_delay_micros
+    }
+
+    /// The subtitle timeline's time at media time [pts]: the delay taken out.
+    fn subtitle_time(&self, pts: Duration) -> Duration {
+        let delay = self.subtitle_delay_micros;
+        if delay >= 0 {
+            pts.saturating_sub(Duration::from_micros(delay as u64))
+        } else {
+            pts.saturating_add(Duration::from_micros(delay.unsigned_abs()))
+        }
+    }
+
+    /// What the subtitles say at the current media time, the delay applied:
+    /// each text cue showing, in start order (bitmap subtitles have no text).
+    pub fn subtitle_text_now(&self) -> Vec<SubtitleTextNow> {
+        self.subtitles
+            .spoken_at(self.subtitle_time(self.current_media_time))
     }
 
     /// Rasterize text subtitles at 2x precision without resizing the video or
@@ -2227,11 +2266,9 @@ impl PresenterRuntime {
             .overlay
             .render(self.current_media_time, capture_overlay_viewport);
         let subtitle_style = self.subtitle_ass_style(capture_overlay.viewport);
-        self.subtitles.append_to_overlay(
-            self.current_media_time,
-            &mut capture_overlay,
-            &subtitle_style,
-        );
+        let subtitle_time = self.subtitle_time(self.current_media_time);
+        self.subtitles
+            .append_to_overlay(subtitle_time, &mut capture_overlay, &subtitle_style);
         capture_overlay
     }
 
@@ -2908,8 +2945,9 @@ impl PresenterRuntime {
         // Script coordinates and user font sizes stay in the original video
         // space. Only libass's raster canvas has a higher resolution.
         let subtitle_style = self.subtitle_ass_style(source);
+        let subtitle_time = self.subtitle_time(pts);
         self.subtitles
-            .append_to_overlay(pts, &mut overlay, &subtitle_style);
+            .append_to_overlay(subtitle_time, &mut overlay, &subtitle_style);
         if viewport != source
             && !overlay.subtitle_alpha_planes.is_empty()
             && self.subtitle_resolution.record(started.elapsed())
@@ -4270,9 +4308,26 @@ fn subtitle_start(frame: &PlayerSubtitleFrame) -> Option<Duration> {
     frame.frame.start.or(frame.pts)
 }
 
+/// Longest subtitle delay either way: ten minutes.
+const MAX_SUBTITLE_DELAY_MICROS: i64 = 600_000_000;
+
+/// A subtitle cue's words, as `subtitleText` reports what is said now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTextNow {
+    pub track_id: i64,
+    pub start: Duration,
+    pub end: Option<Duration>,
+    pub text: String,
+}
+
 #[derive(Debug, Default)]
 struct SubtitleFrameState {
     frames: Vec<PlayerSubtitleFrame>,
+    /// The words of the text frames still current (ASS dialogue included,
+    /// which the libass track takes out of [frames]).
+    spoken: Vec<SubtitleTextNow>,
+    /// A positive subtitle delay: frames are kept that much past their end.
+    lead: Duration,
     #[cfg(feature = "libass")]
     ass_renderer: CachedAssTrackRenderer,
     #[cfg(feature = "libass")]
@@ -4282,6 +4337,7 @@ struct SubtitleFrameState {
 impl SubtitleFrameState {
     fn clear(&mut self) {
         self.frames.clear();
+        self.spoken.clear();
         #[cfg(feature = "libass")]
         {
             self.ass_renderer.clear();
@@ -4290,7 +4346,9 @@ impl SubtitleFrameState {
     }
 
     fn push(&mut self, mut frame: PlayerSubtitleFrame) {
-        self.retain_at(subtitle_start(&frame).unwrap_or(frame.media_time));
+        let start = subtitle_start(&frame).unwrap_or(frame.media_time);
+        self.retain_at(start.saturating_sub(self.lead));
+        self.remember_words(&frame, start);
         if frame.frame.is_empty() {
             #[cfg(feature = "libass")]
             {
@@ -4339,6 +4397,48 @@ impl SubtitleFrameState {
     fn retain_at(&mut self, pts: Duration) {
         self.frames
             .retain(|frame| !frame.frame.is_empty() && frame.frame.end.is_none_or(|end| pts < end));
+        self.spoken
+            .retain(|cue| cue.end.is_none_or(|end| pts < end));
+    }
+
+    /// Keeps what [frame] says for `subtitleText`; an empty frame or an
+    /// open-ended one ends what its track said before.
+    fn remember_words(&mut self, frame: &PlayerSubtitleFrame, start: Duration) {
+        let track_id = frame.frame.track_id;
+        if frame.frame.is_empty() || frame.frame.end.is_none() {
+            self.spoken.retain(|cue| cue.track_id != track_id);
+        }
+        let text = frame
+            .frame
+            .text
+            .iter()
+            .map(|segment| segment.display_text())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            return;
+        }
+        self.spoken.push(SubtitleTextNow {
+            track_id,
+            start,
+            end: frame.frame.end,
+            text,
+        });
+        self.spoken.sort_by_key(|cue| cue.start);
+        // Bounded: a track that never ends its cues cannot grow this.
+        if self.spoken.len() > 64 {
+            let excess = self.spoken.len() - 64;
+            self.spoken.drain(..excess);
+        }
+    }
+
+    fn spoken_at(&self, pts: Duration) -> Vec<SubtitleTextNow> {
+        self.spoken
+            .iter()
+            .filter(|cue| cue.start <= pts && cue.end.is_none_or(|end| pts < end))
+            .cloned()
+            .collect()
     }
 
     fn append_to_overlay(
@@ -5065,6 +5165,82 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         let plane = &overlay.subtitle_planes[0];
         assert_eq!(plane.rgba.len(), 4);
         assert_eq!(plane.scaled_rect(1280, 720), (0, 0, 2, 2));
+    }
+
+    #[test]
+    fn subtitle_state_says_what_the_text_cues_say_now() {
+        let mut state = SubtitleFrameState::default();
+        state.push(text_subtitle_frame(
+            3,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(3)),
+            "  first line  ",
+        ));
+        let mut ass = DecodedSubtitleFrame::new(
+            4,
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(4)),
+        );
+        ass.push_text(SubtitleTextSegment::new(
+            SubtitleTextFormat::Ass,
+            "7,0,Default,,0,0,0,,{\\pos(100,80)}second\\Nline",
+        ));
+        state.push(PlayerSubtitleFrame {
+            frame: ass,
+            pts: Some(Duration::from_secs(2)),
+            media_time: Duration::from_secs(2),
+            late_by: None,
+            generation: 1,
+        });
+
+        let words = |at: u64| -> Vec<String> {
+            state
+                .spoken_at(Duration::from_millis(at))
+                .into_iter()
+                .map(|cue| cue.text)
+                .collect()
+        };
+        assert_eq!(words(500), Vec::<String>::new());
+        assert_eq!(words(1500), vec!["first line".to_string()]);
+        assert_eq!(
+            words(2500),
+            vec!["first line".to_string(), "second\nline".to_string()]
+        );
+        assert_eq!(words(3500), vec!["second\nline".to_string()]);
+    }
+
+    #[test]
+    fn subtitle_delay_keeps_a_cue_until_it_has_shown() {
+        let mut state = SubtitleFrameState {
+            lead: Duration::from_secs(2),
+            ..SubtitleFrameState::default()
+        };
+        state.push(text_subtitle_frame(
+            3,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(2)),
+            "early",
+        ));
+        // The next cue arrives at 2.5 s; with subtitles 2 s late the first
+        // still has to show until 4 s on the media's clock.
+        state.push(text_subtitle_frame(
+            3,
+            Duration::from_millis(2500),
+            Some(Duration::from_secs(4)),
+            "late",
+        ));
+        assert_eq!(state.spoken.len(), 2);
+        assert_eq!(state.frames.len(), 2);
+        // At 3.5 s the timeline is at 1.5 s: the first cue.
+        let at = Duration::from_millis(3500).saturating_sub(state.lead);
+        assert_eq!(
+            state
+                .spoken_at(at)
+                .into_iter()
+                .map(|cue| cue.text)
+                .collect::<Vec<_>>(),
+            vec!["early".to_string()]
+        );
     }
 
     #[test]

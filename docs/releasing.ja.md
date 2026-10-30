@@ -20,7 +20,7 @@ dart pub publish --dry-run
 3. `Cargo.toml` の `[workspace.package].version` を更新し、`cargo update -w` 後の `Cargo.lock` も commit します。Release は Cargo version と異なる tag を拒否します。対象 commit で手動 `Release` を実行し、全 platform の build 成功を確認してから tag を付けます。以下は次回バージョンの例です。実際の番号に置き換えてください。
 
 ```sh
-VERSION=0.3.0
+VERSION=0.4.0
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```

@@ -2,8 +2,12 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
-## 未发布
+## 0.4.0 - 2026-10-31
 
+- 新增从指定位置打开：`MediaRequest::with_start_position`；C `ErikaOpenOptions.start_position_micros`（占用原第一个保留位，清零的结构体仍从头打开）；供无法传参的宿主使用的 `erika_presenter_set_open_start_position`；JSON `open` 参数 `startPositionMicros` 与方法 `setOpenStartPosition`；Flutter `ErikaPlayer.open(startPosition:)`。引擎在工作线程启动前完成跳转，呈现的第一帧就是该位置。
+- 新增明确的播放结束：自然播完时，在 `Stopped` 状态之后发出 `PlayerEvent::Ended` 与 C `ErikaEventKind_Ended`（14）；主动停止不发。Flutter 为 `ErikaEventKind.ended`。
+- 新增字幕时间偏移，内嵌与外挂轨道一致：`PresenterRuntime::set_subtitle_delay`、C `erika_presenter_set_subtitle_delay`、JSON `setSubtitleDelay` / `subtitleDelay`、Flutter `ErikaPlayer.setSubtitleDelay`。字幕在结束后按偏移量多保留，延后的字幕仍能显示。
+- 新增读取当前台词：JSON `subtitleText`（应用偏移后正在显示的文本字幕；ASS 对白去掉覆盖标签）与 Flutter `ErikaPlayer.subtitleText`。
 - 新增 Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` 与 C `erika_presenter_capture_frame_rgba_with_danmaku`，供离屏宿主合成使用，按请求的截图尺寸包含已启用的弹幕。现有截图 API 仍不含弹幕（#175）。
 - 新增 `export_frame_texture`，返回不可变、带所有权的原生帧句柄，宿主无需窗口、Flutter、CPU 像素读回或输出纹理复制即可合成。wgpu 渲染器导出 Linux Vulkan OPAQUE_FD 分配与 Apple Metal 纹理，包含字幕和已启用的弹幕。新增 C 的创建/导出/信息/释放入口、Vulkan C 导入示例，以及不依赖 UI 框架的跨 wgpu 版本独立宿主示例。导出循环同时驱动音频，按宿主的内容缩放使用与屏幕相同的后台弹幕排版，并在任何播放工作之前拒绝不支持的尺寸（#175）。
 

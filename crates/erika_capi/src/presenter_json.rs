@@ -175,13 +175,21 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
     method(
         "open",
         P,
-        "Opens a local path or HTTP(S) URL.",
+        "Opens a local path or HTTP(S) URL, at startPositionMicros when given (the first frame shown is the one there).",
         &[
             arg("uri", "string", true),
             arg("httpHeaders", "object", false),
             arg("httpReadAheadBytes", "integer", false),
             arg("httpBackBufferBytes", "integer", false),
+            arg("startPositionMicros", "integer", false),
         ],
+        "null",
+    ),
+    method(
+        "setOpenStartPosition",
+        P,
+        "Where the next open starts when it does not say (a host's own open path); taken by that open, 0 clears it.",
+        &[arg("positionMicros", "integer", true)],
         "null",
     ),
     method("play", P, "Starts or resumes playback.", NONE, "null"),
@@ -334,6 +342,27 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
         "Scales subtitle rendering.",
         &[arg("scale", "number", true)],
         "null",
+    ),
+    method(
+        "setSubtitleDelay",
+        P,
+        "Shows subtitles later (positive) or earlier (negative) than their timestamps, embedded and external alike; clamped to ten minutes either way.",
+        &[arg("delayMicros", "integer", true)],
+        "null",
+    ),
+    method(
+        "subtitleDelay",
+        P,
+        "The subtitle delay in force.",
+        NONE,
+        "{delayMicros}",
+    ),
+    method(
+        "subtitleText",
+        P,
+        "What the subtitles say now, the delay applied: each text cue showing (ASS dialogue without its override tags; bitmap subtitles have no text), and them joined by line breaks.",
+        NONE,
+        "{text, cues:[{trackId,startMicros,endMicros,text}], mediaOpen}",
     ),
     method(
         "setSubtitleFont",
@@ -641,7 +670,8 @@ pub(crate) unsafe fn invoke(
                 header_count: headers.headers.len(),
                 http_read_ahead_bytes: optional_open_byte_count(args, "httpReadAheadBytes")?,
                 http_back_buffer_bytes: optional_open_byte_count(args, "httpBackBufferBytes")?,
-                reserved: [0; 2],
+                start_position_micros: optional_open_byte_count(args, "startPositionMicros")?,
+                reserved: [0; 1],
             };
             call_status(unsafe {
                 erika_presenter_open_with_options(handle, uri.as_ptr(), &options)
@@ -664,6 +694,14 @@ pub(crate) unsafe fn invoke(
         "setUpscaler" => status_value(unsafe {
             erika_presenter_set_upscaler(handle, required_i64(args, "mode")? as i32)
         }),
+        "setOpenStartPosition" => status_value(unsafe {
+            erika_presenter_set_open_start_position(handle, required_u64(args, "positionMicros")?)
+        }),
+        "setSubtitleDelay" => status_value(unsafe {
+            erika_presenter_set_subtitle_delay(handle, required_i64(args, "delayMicros")?)
+        }),
+        "subtitleDelay" => unsafe { subtitle_delay_json(handle) },
+        "subtitleText" => unsafe { subtitle_text_json(handle) },
         "setSubtitleScale" => status_value(unsafe {
             erika_presenter_set_subtitle_scale(handle, required_f64(args, "scale")?)
         }),
@@ -1072,6 +1110,40 @@ unsafe fn chapters_json(handle: *mut ErikaPresenterHandle) -> Result<Value, Stri
     Ok(json!({
         "chapters": chapters,
         "mediaOpen": player.has_open_media(),
+    }))
+}
+
+unsafe fn subtitle_delay_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
+    if handle.is_null() {
+        return Err("presenter handle is null".to_string());
+    }
+    let presenter = unsafe { &*handle };
+    Ok(json!({ "delayMicros": presenter.presenter.subtitle_delay_micros() }))
+}
+
+unsafe fn subtitle_text_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
+    if handle.is_null() {
+        return Err("presenter handle is null".to_string());
+    }
+    let presenter = unsafe { &*handle };
+    let cues = presenter.presenter.subtitle_text_now();
+    let text = cues
+        .iter()
+        .map(|cue| cue.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(json!({
+        "text": text,
+        "cues": cues
+            .iter()
+            .map(|cue| json!({
+                "trackId": cue.track_id,
+                "startMicros": cue.start.as_micros().min(u64::MAX as u128) as u64,
+                "endMicros": cue.end.map(|end| end.as_micros().min(u64::MAX as u128) as u64),
+                "text": cue.text,
+            }))
+            .collect::<Vec<_>>(),
+        "mediaOpen": presenter.presenter.player().has_open_media(),
     }))
 }
 

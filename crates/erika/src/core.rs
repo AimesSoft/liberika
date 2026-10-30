@@ -172,6 +172,10 @@ pub struct MediaRequest {
     /// retains behind the reader. `None` uses the 16 MiB engine default
     /// (`HTTP_CACHE_RETAIN_BYTES`).
     pub http_back_buffer_bytes: Option<u64>,
+    /// Where the media opens: the engine seeks there before its worker starts,
+    /// so the first frame presented is the one at this position, not the
+    /// media's first. `None` (or zero, or past the end) opens at the start.
+    pub start_position: Option<Duration>,
 }
 
 /// Hand-written so that credentials carried by custom headers (`Authorization`,
@@ -204,7 +208,15 @@ impl MediaRequest {
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
             http_back_buffer_bytes: None,
+            start_position: None,
         }
+    }
+
+    /// Opens at [position] instead of the start (see [`Self::start_position`]).
+    /// Zero is treated as `None`.
+    pub fn with_start_position(mut self, position: Option<Duration>) -> Self {
+        self.start_position = position.filter(|position| !position.is_zero());
+        self
     }
 
     pub fn with_http_headers(mut self, http_headers: Vec<(String, String)>) -> Self {
@@ -481,6 +493,9 @@ pub enum PlayerEvent {
     SurfaceAttached(PlatformSurface),
     SurfaceDetached,
     Error(PlayerError),
+    /// The media played to its end on its own (not a stop asked for). Sent
+    /// right after the `Stopped` state that the end brings.
+    Ended,
 }
 
 pub struct PlayerVideoFrame {
@@ -1472,6 +1487,25 @@ impl Player {
             }
         };
         let info = engine.info().clone();
+        // Seek before the worker starts, so the first frame it presents is
+        // the one at the start position.
+        let start = media
+            .start_position
+            .filter(|start| info.duration.is_none_or(|duration| *start < duration));
+        if let Some(start) = start {
+            if let Err(error) = engine.seek(start) {
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "open_start_position",
+                        "stage": "seek_failed",
+                        "positionMicros": start.as_micros() as u64,
+                        "reason": error.to_string(),
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        let start = start.unwrap_or(Duration::ZERO);
         let decoder_events = engine.take_video_decoder_events();
         let mut lifecycle = self
             .lifecycle
@@ -1488,7 +1522,7 @@ impl Player {
             let generation = inner.playback_generation.saturating_add(1).max(1);
             inner.media = Some(media);
             inner.duration = info.duration;
-            inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
+            inner.playback_clock = PlaybackClock::paused_at(start);
             inner.playback_generation = generation;
             inner.playback_command_sequence = 0;
             inner.pending_play_sequence = None;
@@ -1513,6 +1547,9 @@ impl Player {
         }
         for event in decoder_events {
             self.emit(PlayerEvent::VideoDecoderChanged(event));
+        }
+        if !start.is_zero() {
+            self.emit(PlayerEvent::PositionChanged(start));
         }
         self.transition(PlayerState::Ready)?;
         Ok(())
@@ -3314,6 +3351,10 @@ fn publish_natural_eof_events_from_worker(
                 .is_ok()
         });
     }
+    // A stop asked for is `Stopped` too; this says the media ended.
+    inner
+        .subscribers
+        .retain(|sender| sender.send(PlayerEvent::Ended).is_ok());
     *eof_published = true;
 }
 
@@ -4747,6 +4788,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn media_request_start_position_treats_zero_as_the_start() {
+        assert_eq!(
+            MediaRequest::new("a.mkv")
+                .with_start_position(Some(Duration::ZERO))
+                .start_position,
+            None
+        );
+        assert_eq!(
+            MediaRequest::new("a.mkv")
+                .with_start_position(Some(Duration::from_secs(5)))
+                .start_position,
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn player_opens_at_the_start_position_when_env_is_set() {
+        let Some(path) = std::env::var_os("ERIKA_TEST_SAMPLE") else {
+            return;
+        };
+        let player = Player::new(PlayerConfig::default());
+        let events = player.subscribe();
+        player
+            .open(
+                MediaRequest::new(path.to_string_lossy().into_owned())
+                    .with_start_position(Some(Duration::from_secs(3))),
+            )
+            .unwrap();
+        let mut said = None;
+        loop {
+            match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                PlayerEvent::PositionChanged(position) => said = Some(position),
+                PlayerEvent::StateChanged(PlayerState::Ready) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(said, Some(Duration::from_secs(3)));
+        assert_eq!(player.current_media_time(), Duration::from_secs(3));
+        player.close().unwrap();
+    }
+
     fn ended_playback_fixture_engine() -> Option<VideoPlaybackEngine> {
         let Some(path) = std::env::var_os("ERIKA_PLAYBACK_FIXTURE") else {
             return None;
@@ -4757,6 +4840,7 @@ mod tests {
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
             http_back_buffer_bytes: None,
+            start_position: None,
         };
         let mut engine = VideoPlaybackEngine::open(
             &request,
@@ -5246,6 +5330,7 @@ mod tests {
             vec![
                 PlayerEvent::PositionChanged(Duration::from_secs(8)),
                 PlayerEvent::StateChanged(PlayerState::Stopped),
+                PlayerEvent::Ended,
             ]
         );
     }

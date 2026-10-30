@@ -305,13 +305,22 @@ Non-zero values in `reserved` are rejected so future fields can be added
 without silently changing behavior for older hosts. Both knobs only affect
 HTTP(S) playback; local files ignore them.
 
+`start_position_micros` opens the media there instead of at its start: the
+engine seeks before presenting, so the first frame shown is the one at that
+position, `Ready` reports it as the position, and no frame of the media's start
+is decoded for display. `0` opens at the start (the field was the first
+`reserved` slot, so hosts that zero the struct are unaffected). Hosts whose open
+path cannot carry it call `erika_presenter_set_open_start_position` first; the
+next open takes it.
+
 ```c
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;   /* 0 = environment override, then 2 MiB */
   uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB rewind budget */
-  uint64_t reserved[2];             /* must be zero */
+  uint64_t start_position_micros;   /* 0 = open at the start */
+  uint64_t reserved[1];             /* must be zero */
 } ErikaOpenOptions;
 ```
 
@@ -432,6 +441,8 @@ ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rat
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
+ErikaStatus erika_presenter_set_subtitle_delay(ErikaPresenterHandle *, int64_t delay_micros); // later when positive
+ErikaStatus erika_presenter_set_open_start_position(ErikaPresenterHandle *, uint64_t position_micros);
 ErikaStatus erika_presenter_set_subtitle_font(ErikaPresenterHandle *, const char *family, const char *file_path);
 ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubtitleStyle style);
 ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float headroom, bool known);
@@ -778,7 +789,8 @@ The table mirrors the C entry points — playback (`open`, `play`, `pause`,
 `stop`, `close`, `seek`, `setPlaybackRate`, `setVolume`), tracks and subtitles
 (`tracks`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
 `addExternalSubtitle`, `removeSubtitleTrack`, `setSubtitleScale`,
-`setSubtitleFont`, `setSubtitleStyle`, the subtitle memory-font calls), the
+`setSubtitleDelay`, `subtitleDelay`, `subtitleText`, `setSubtitleFont`,
+`setSubtitleStyle`, the subtitle memory-font calls), the
 danmaku family (including `getDanmakuConfig`), output and upscaler
 (`setUpscaler`, `getUpscalerStatus`, `setOutputHeadroom`, `getOutputStatus`,
 `setDebugHudEnabled`), counters (`getPresenterStats`, `getResourceStatus`), and
@@ -1038,7 +1050,7 @@ ring lives only in process memory and is read on demand.
 | Enum | Values |
 |------|--------|
 | `ErikaState` | `Idle` `Opening` `Ready` `Playing` `Paused` `Stopped` `Closed` `Error` |
-| `ErikaEventKind` | `None` `StateChanged` `DurationChanged` `PositionChanged` `TracksChanged` `BufferingChanged` `VideoParamsChanged` `SurfaceAttached` `SurfaceDetached` `Error` `TrackSelectionChanged` `VideoDecoderChanged` `AudioOutputChanged` |
+| `ErikaEventKind` | `None` `StateChanged` `DurationChanged` `PositionChanged` `TracksChanged` `BufferingChanged` `VideoParamsChanged` `SurfaceAttached` `SurfaceDetached` `Error` `TrackSelectionChanged` `VideoDecoderChanged` `AudioOutputChanged` `Ended` (14; 13 is left to hosts) |
 | `ErikaTrackKind` | `Video` `Audio` `Subtitle` |
 | `ErikaTrackSource` | `Embedded` `External` |
 | `ErikaWgpuSurfaceKind` | `Unknown` `MacOsNsView` `MacOsCaMetalLayer` `IosUiView` `WindowsHwnd` `XlibWindow` `WaylandSurface` `AndroidNativeWindow` `OhosNativeWindow` |

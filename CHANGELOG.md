@@ -2,8 +2,26 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
-## Unreleased
+## 0.4.0 - 2026-10-31
 
+- Added opening at a position: `MediaRequest::with_start_position`, C
+  `ErikaOpenOptions.start_position_micros` (the first reserved slot, so zeroed
+  structs keep opening at the start), `erika_presenter_set_open_start_position`
+  for hosts whose open path cannot carry it, the JSON `open` argument
+  `startPositionMicros` and method `setOpenStartPosition`, and Flutter
+  `ErikaPlayer.open(startPosition:)`. The engine seeks before its worker
+  starts, so the first frame presented is the one at that position.
+- Added an explicit end of media: `PlayerEvent::Ended` and C
+  `ErikaEventKind_Ended` (14) follow the `Stopped` state a natural end brings;
+  a stop asked for sends none. Flutter `ErikaEventKind.ended`.
+- Added a subtitle delay for embedded and external tracks alike:
+  `PresenterRuntime::set_subtitle_delay`, C
+  `erika_presenter_set_subtitle_delay`, JSON `setSubtitleDelay` /
+  `subtitleDelay`, Flutter `ErikaPlayer.setSubtitleDelay`. Cues stay kept that
+  long past their end so a delayed cue still shows.
+- Added what the subtitles say now: JSON `subtitleText` (text cues showing,
+  the delay applied; ASS dialogue without its override tags) and Flutter
+  `ErikaPlayer.subtitleText`.
 - Fixed OpenHarmony text subtitles rendering as solid rectangles by enabling
   libass and building its text dependencies in native builds (#180).
 - Added Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` and C
