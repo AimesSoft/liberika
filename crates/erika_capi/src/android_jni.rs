@@ -786,7 +786,7 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptur
             }
             let handle = unsafe { presenter.handle.as_mut() }
                 .ok_or_else(|| "Android screenshot presenter handle is null".to_string())?;
-            capture_presenter_frame_rgba(handle, width, height)
+            capture_presenter_frame_rgba(handle, width, height, false)
         })
     }));
 
