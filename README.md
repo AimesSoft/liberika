@@ -36,7 +36,7 @@ WASM 内的 libass 还原字幕字体、定位、描边与特效，Rust 弹幕�
 |---|---|---|
 | 浏览器 / JavaScript / TypeScript | 下载 `liberika-web-0.3.1.zip`，或从源码构建 | [Web 接入与部署](docs/web.zh.md) |
 | Flutter | `flutter pub add erika_flutter`，当前 0.3.1 | [插件使用指南](packages/erika_flutter/README.zh.md) |
-| Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`，从 0.3.1 开始 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`；SDK 最新公开版为 0.3.0（截至 2026-10-31） | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.zh.md) |
 | C / C++ | 下载匹配版本的 C ABI 归档与 `erika.h` | [原生接入](docs/integration.zh.md) |
 | Rust | Git 依赖，固定 `tag = "v0.3.1"` | [构建与依赖](docs/building.zh.md) |

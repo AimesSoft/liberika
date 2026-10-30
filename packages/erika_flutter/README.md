@@ -1,5 +1,7 @@
 # erika_flutter
 
+[中文](README.zh.md) | English | [日本語](README.ja.md)
+
 Flutter plugin for the liberika media playback engine.
 
 The plugin keeps Dart out of the hot path:
@@ -18,6 +20,40 @@ The plugin keeps Dart out of the hot path:
   `OHNativeWindow` to liberika, and uses OHAudio for low-latency PCM output.
 - liberika owns playback, rendering, audio, timing, and overlays through
   `ErikaPresenterHandle`.
+
+## Start position, playback completion and subtitles
+
+With the 0.3.1 plugin and matching native runtime, `open(startPosition:)` asks
+the engine to seek before presenting the first frame. It returns `false` when
+an older native runtime cannot accept the position; the media still opens at
+the beginning, so the host can seek afterward. A missing or non-positive start
+position opens at the beginning and returns `true`.
+
+```dart
+final player = ErikaPlayer();
+final subscription = player.events.listen((event) {
+  if (event.kind == ErikaEventKind.ended) {
+    // Natural end of media; advance the playlist here.
+  }
+});
+const start = Duration(minutes: 1, seconds: 30);
+final accepted = await player.open(mediaUrl, startPosition: start);
+if (!accepted) await player.seek(start); // Compatibility with older runtimes.
+await player.play();
+
+final supported = await player.setSubtitleDelay(const Duration(milliseconds: 500));
+final currentText = await player.subtitleText();
+// Cancel subscription and dispose the player when the host is finished.
+```
+
+`ended` follows the `stopped` state after natural completion; an explicit stop
+does not emit it. Positive subtitle delay shows text later and negative delay
+shows it earlier, clamped to ±10 minutes for embedded and external subtitles.
+`setSubtitleDelay` returns `false` when the native runtime cannot apply it.
+`subtitleText()` returns currently displayed text with the delay applied; ASS
+override tags are removed. Bitmap subtitles have no text, and `null` means the
+native runtime cannot report text. Cancel the event subscription and dispose
+the player when no longer needed.
 
 ## Video Surfaces
 
