@@ -1216,7 +1216,7 @@ class ErikaPlayer {
     if (!startTaken) {
       try {
         final reply = await invokeJson('setOpenStartPosition', {
-          'positionMicros': startPosition!.inMicroseconds,
+          'positionMicros': startPosition.inMicroseconds,
         });
         startTaken = reply['ok'] == true;
       } on UnsupportedError {
