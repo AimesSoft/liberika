@@ -2,7 +2,7 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
-## 0.4.0 - 2026-10-31
+## 0.3.1 - 2026-10-31
 
 - 新增从指定位置打开：`MediaRequest::with_start_position`；C `ErikaOpenOptions.start_position_micros`（占用原第一个保留位，清零的结构体仍从头打开）；供无法传参的宿主使用的 `erika_presenter_set_open_start_position`；JSON `open` 参数 `startPositionMicros` 与方法 `setOpenStartPosition`；Flutter `ErikaPlayer.open(startPosition:)`。引擎在工作线程启动前完成跳转，呈现的第一帧就是该位置。
 - 新增明确的播放结束：自然播完时，在 `Stopped` 状态之后发出 `PlayerEvent::Ended` 与 C `ErikaEventKind_Ended`（14）；主动停止不发。Flutter 为 `ErikaEventKind.ended`。

@@ -17,10 +17,10 @@ cd packages/erika_flutter
 dart pub publish --dry-run
 ```
 
-3. `Cargo.toml` の `[workspace.package].version` を更新し、`cargo update -w` 後の `Cargo.lock` も commit します。Release は Cargo version と異なる tag を拒否します。対象 commit で手動 `Release` を実行し、全 platform の build 成功を確認してから tag を付けます。以下は次回バージョンの例です。実際の番号に置き換えてください。
+3. `Cargo.toml` の `[workspace.package].version` を更新し、`cargo update -w` 後の `Cargo.lock` も commit します。Release は Cargo version と異なる tag を拒否します。`main` の対象 commit にそのまま tag を付けます。tag で起動する `Release` が全 platform を build して公開するため、事前の試行実行は不要です。以下は次回バージョンの例です。実際の番号に置き換えてください。
 
 ```sh
-VERSION=0.4.0
+VERSION=0.3.1
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -40,7 +40,7 @@ git push origin "v${VERSION}"
 
 Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが作成するのはコア tag だけです。別 repository の tag と Swift 公開には secret `ERIKA_SWIFT_RELEASE_TOKEN` を使います。
 
-`workflow_dispatch` による手動 `Release` は build を確認し、Actions Artifact を保存します。GitHub Release の公開は tag で開始します。
+tag で build と GitHub Release の公開が始まります。手動の `workflow_dispatch` は build 失敗の調査用で、リリース手順ではありません。
 
 ## 公開する成果物
 

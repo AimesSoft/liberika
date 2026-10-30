@@ -39,7 +39,7 @@ edition = "2024"
 license = "MPL-2.0"
 repository = "https://github.com/AimesSoft/liberika"
 rust-version = "1.92"
-version = "0.4.0"
+version = "0.3.1"
 
 [workspace.dependencies]
 ab_glyph = "0.2.32"

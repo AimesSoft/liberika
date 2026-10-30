@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.4.0 - 2026-10-31
+## 0.3.1 - 2026-10-31
 
 - Fixed text subtitles rendering as solid rectangles by enabling libass and
   building its text dependencies (#180).
-- Native runtime 0.4.0: opening at a position, the media's end reported,
+- Native runtime 0.3.1: opening at a position, the media's end reported,
   a subtitle delay and the current subtitle text through `invokeJson`,
   danmaku capture and native frame texture export (#175).
 

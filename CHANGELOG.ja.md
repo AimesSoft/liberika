@@ -2,7 +2,7 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
-## 0.4.0 - 2026-10-31
+## 0.3.1 - 2026-10-31
 
 - 指定位置からの open を追加しました：`MediaRequest::with_start_position`、C `ErikaOpenOptions.start_position_micros`（最初の reserved 枠を使用。ゼロ初期化した構造体は従来どおり先頭から開きます）、`erika_presenter_set_open_start_position`、JSON `open` の `startPositionMicros` と `setOpenStartPosition`、Flutter `ErikaPlayer.open(startPosition:)`。
 - 自然終了を明示する `PlayerEvent::Ended` / C `ErikaEventKind_Ended`（14）を `Stopped` の後に送ります。明示的な stop では送りません。Flutter は `ErikaEventKind.ended`。

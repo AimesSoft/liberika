@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-These platforms use 0.4.0 as their baseline. The browser backend is integrated into Erika Web and a separate Web archive is available in the Release. Linux is currently an experimental source-build target.
+These platforms use 0.3.1 as their baseline. The browser backend is integrated into Erika Web and a separate Web archive is available in the Release. Linux is currently an experimental source-build target.
 
 | Platform | Minimum | Decode / render | Audio | Distribution and builds |
 |---|---|---|---|---|
