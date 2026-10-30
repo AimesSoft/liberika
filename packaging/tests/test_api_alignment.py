@@ -21,6 +21,30 @@ class ApiAlignmentTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(canonical, read(path))
 
+    def test_open_options_mirrors_match_header(self):
+        # Hosts that cannot include erika.h mirror ErikaOpenOptions; a mirror
+        # or a write past the header's reserved slots corrupts the caller.
+        sizes = {"const ErikaHttpHeader *": 8, "uintptr_t": 8, "uint64_t": 8,
+                 "UnsafeRawPointer?": 8, "UInt": 8, "UInt64": 8}
+        header = read("crates/erika_capi/include/erika.h")
+        body = re.search(r"typedef struct ErikaOpenOptions \{(.*?)\} ErikaOpenOptions;", header, re.S)[1]
+        header_bytes = 0
+        for kind, name, count in re.findall(r"^\s*(const ErikaHttpHeader \*|\w+)\s*(\w+)(?:\[(\d+)\])?;", body, re.M):
+            header_bytes += sizes[kind] * int(count or 1)
+        reserved = int(re.search(r"uint64_t reserved\[(\d+)\];", body)[1])
+        for platform in ["ios", "macos", "tvos"]:
+            with self.subTest(platform=platform):
+                swift = read(f"packages/erika_flutter/{platform}/Classes/ErikaFlutterPlugin.swift")
+                mirror = re.search(r"private struct ErikaOpenOptions \{(.*?)\n\}", swift, re.S)[1]
+                mirror_bytes = 0
+                for kind in re.findall(r"var \w+: ([\w?]+|\([^)]*\))", mirror):
+                    parts = [t.strip() for t in kind.strip("()").split(",")] if kind.startswith("(") else [kind]
+                    mirror_bytes += sum(sizes[t] for t in parts)
+                self.assertEqual(header_bytes, mirror_bytes)
+        windows = read("packages/erika_flutter/windows/erika_flutter_plugin.cpp")
+        for index in re.findall(r"options\.reserved\[(\d+)\]", windows):
+            self.assertLess(int(index), reserved)
+
     def test_declared_and_exported_names(self):
         header = re.sub(r"/\*.*?\*/", "", read("crates/erika_capi/include/erika.h"), flags=re.S)
         declared = set(re.findall(r"\b(erika_\w+)\s*\(", header))
