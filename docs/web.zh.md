@@ -41,11 +41,11 @@ HTTP 服务访问；也可从源码构建。Web 包尚未发布到 npm。
 ## 构建和运行
 
 需要 Rust、Python 3、Node、CMake、Meson、Ninja、make、pkg-config，以及
-Emscripten 4.0.23 和 wasm-bindgen-cli 0.2.126。
+Emscripten 4.0.23 和 wasm-bindgen-cli 0.2.130。
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.126 --locked
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
 git clone https://github.com/emscripten-core/emsdk.git target/web-tools/emsdk
 target/web-tools/emsdk/emsdk install 4.0.23
 target/web-tools/emsdk/emsdk activate 4.0.23
