@@ -51,11 +51,11 @@ audio/video software decoder or server-transcoding fallback.
 ## Build
 
 Prerequisites: Rust (see workspace rust-version), Node, Python 3, CMake, Meson,
-Ninja, make, pkg-config, Emscripten **4.0.23**, wasm-bindgen-cli **0.2.126**.
+Ninja, make, pkg-config, Emscripten **4.0.23**, wasm-bindgen-cli **0.2.130**.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.126 --locked
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
 # Install locally; nothing is added to the shell's startup files.
 git clone https://github.com/emscripten-core/emsdk.git target/web-tools/emsdk
 target/web-tools/emsdk/emsdk install 4.0.23
