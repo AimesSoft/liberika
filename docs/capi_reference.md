@@ -966,7 +966,7 @@ handle call.
 |---------|----------|
 | `schema`, `capturedAtUnixMs` | Document version and wall-clock capture time. |
 | `playback` | `state`, `playing`, `mediaTimeSeconds`, `durationSeconds`, `playbackRate`, `generation`, `audioOnly` (background video suspension), `buffering` `{active, events, currentMs, totalMs}`. |
-| `media` | The `container` (`format`, the demuxer's short name such as `matroska,webm`; `bitRate`, the overall bit rate), selected `video` (`codec`, `profile`, `level`, `width`, `height`, `pixelFormat`, `frameRate`, `bitRate`), `audio` (`codec`, `sampleRate`, `channels`, `sampleFormat`, `bitRate`) and `subtitle` tracks, each `null` when unknown or absent. |
+| `media` | The `container` (`format`, the demuxer's short name such as `matroska,webm`; `bitRate`, the overall bit rate), selected `video` (`codec`, `profile`, `level`, `width`, `height`, `pixelFormat`, `frameRate`, `bitRate`, `dolbyVisionProfile`), `audio` (`codec`, `sampleRate`, `channels`, `sampleFormat`, `bitRate`) and `subtitle` tracks, each `null` when unknown or absent. |
 | `decoder` | Latest decoder transition, queryable instead of event-only: `requestedBackend`, `activeBackend`, `previousBackend`, `hardware`, `fellBack`, `fallbackCount`, `stage`, `reason`, `codec`, `pixelFormat`, `lineSizes`. `null` before the first transition. |
 | `video` | Decoded/rendered frames, hardware/software/zero-copy/direct-zero-copy/shared-handle frames, `cpuFallbackFrames`, `importFailures`, `renderFailures`, `backpressureDrops`, `rejectedImportRoute`. |
 | `presenter` | Surface attachment and size, last tick/pump/audio/subtitle/video/clock/danmaku-plan/render/GPU durations, test/overlay/subtitle/danmaku counters. |

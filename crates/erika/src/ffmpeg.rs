@@ -4457,6 +4457,7 @@ fn inspect_format_context(
             track.pixel_format = probe.pixel_format.clone();
             track.profile = probe.profile.clone();
             track.level = probe.level;
+            track.dolby_vision_profile = unsafe { codec_parameters_dolby_vision_profile(codecpar) };
             video.push(probe);
         }
         if kind == TrackKind::Audio {
@@ -6530,6 +6531,7 @@ mod tests {
             .find(|track| track.kind == TrackKind::Video)
             .unwrap();
 
+        assert_eq!(video.dolby_vision_profile, None);
         let parameters = demuxer.owned_codec_parameters(video.id as i32).unwrap();
         assert_eq!(parameters.dolby_vision_profile(), None);
     }
@@ -6547,6 +6549,7 @@ mod tests {
             .find(|track| track.kind == TrackKind::Video)
             .expect("DV sample must contain a video stream");
 
+        assert_eq!(video.dolby_vision_profile, Some(5));
         let parameters = demuxer.owned_codec_parameters(video.id as i32).unwrap();
         assert_eq!(parameters.dolby_vision_profile(), Some(5));
     }
@@ -6564,6 +6567,7 @@ mod tests {
             .find(|track| track.kind == TrackKind::Video)
             .expect("DV Profile 8 sample must contain a video stream");
 
+        assert_eq!(video.dolby_vision_profile, Some(8));
         let parameters = demuxer.owned_codec_parameters(video.id as i32).unwrap();
         assert_eq!(parameters.dolby_vision_profile(), Some(8));
     }

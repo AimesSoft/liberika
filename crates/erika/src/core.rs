@@ -328,6 +328,9 @@ pub struct TrackInfo {
     pub level: Option<i32>,
     pub bit_rate: Option<u64>,
     pub frame_rate: Option<FrameRate>,
+    /// The Dolby Vision profile the container signals for a video track
+    /// (`dvcC`/`dvvC`), `None` when it signals none.
+    pub dolby_vision_profile: Option<u8>,
     pub selected: bool,
     pub source: TrackSource,
     pub can_remove: bool,
@@ -351,6 +354,7 @@ impl TrackInfo {
             level: None,
             bit_rate: None,
             frame_rate: None,
+            dolby_vision_profile: None,
             selected: false,
             source: TrackSource::Embedded,
             can_remove: false,

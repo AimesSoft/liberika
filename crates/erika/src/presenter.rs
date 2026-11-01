@@ -2374,6 +2374,7 @@ impl PresenterRuntime {
                 "pixelFormat": track.pixel_format,
                 "frameRate": track.frame_rate.as_ref().map(|rate| rate.frames_per_second()),
                 "bitRate": track.bit_rate,
+                "dolbyVisionProfile": track.dolby_vision_profile,
             })
         });
         let audio_track = find_track(selection.audio).map(|track| {

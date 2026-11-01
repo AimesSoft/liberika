@@ -290,7 +290,7 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
     method(
         "tracks",
         P,
-        "Every track with codec and format details.",
+        "Every track with codec and format details (dolbyVisionProfile: the profile a video track's container signals).",
         NONE,
         "[track]",
     ),
@@ -1062,6 +1062,19 @@ unsafe fn set_danmaku_config(
 }
 
 unsafe fn tracks_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
+    // What the C struct has no field for, by track id.
+    let dolby_vision: std::collections::HashMap<i64, u8> = if handle.is_null() {
+        Default::default()
+    } else {
+        let presenter = unsafe { &*handle };
+        presenter
+            .presenter
+            .player()
+            .tracks()
+            .into_iter()
+            .filter_map(|track| Some((track.id, track.dolby_vision_profile?)))
+            .collect()
+    };
     let mut len = 0;
     call_status(unsafe { erika_presenter_tracks(handle, ptr::null_mut(), 0, &mut len) })?;
     let mut tracks = vec![ErikaTrackInfo::default(); len];
@@ -1088,6 +1101,7 @@ unsafe fn tracks_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String
                     "sampleFormat": unsafe { borrowed_string(track.sample_format) },
                     "profile": unsafe { borrowed_string(track.profile) },
                     "level": track.level,
+                    "dolbyVisionProfile": dolby_vision.get(&track.id),
                 });
                 unsafe { erika_track_info_free(track) };
                 value
