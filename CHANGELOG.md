@@ -2,6 +2,33 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
+## 0.3.3 - 2026-11-01
+
+- Added mute that keeps the volume: `PresenterRuntime::set_muted`, C
+  `erika_presenter_set_muted`, JSON `setMuted` and `volume`
+  (`{volume, muted}`), Flutter `ErikaPlayer.setMuted` and `getVolume`. A
+  volume set while muted applies on unmute; `volume()` reports the chosen
+  volume either way.
+- Diagnostics name the container: `media.container` carries `format`, the
+  demuxer's short name (`matroska,webm`, `mov,mp4,m4a,3gp,3g2,mj2`), and
+  `bitRate`, the overall bit rate the container states or FFmpeg estimates.
+  The JSON method `container` (`{format, bitRate, mediaOpen}`) reads them
+  without a whole snapshot; Rust has `Player::container()` (`ContainerInfo`).
+- A video track names the Dolby Vision profile its container signals
+  (`dvcC`/`dvvC`): `TrackInfo::dolby_vision_profile`, and
+  `dolbyVisionProfile` in the JSON `tracks` method and in the diagnostics
+  `media.video`.
+- A video track whose own bit rate is not stated is inferred from the overall
+  bit rate again when the file carries subtitle tracks: subtitles that state
+  no bit rate no longer count as unknown streams.
+- Fixed macOS keeping the first screen's EDR headroom under the fallback
+  timer (`ERIKA_FLUTTER_TARGET_FPS`, or a CVDisplayLink that would not
+  start): screen changes are observed while a surface is attached, whichever
+  driver ticks it (#140).
+- The browser build uses wasm-bindgen 0.2.130 and js-sys 0.3.107, so an app
+  that also depends on wgpu 30 resolves on Linux; building the Web package
+  needs `wasm-bindgen-cli` 0.2.130 (#188).
+
 ## 0.3.2 - 2026-10-31
 
 - Fixed the Flutter Windows plugin writing past `ErikaOpenOptions` when it

@@ -2,6 +2,15 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
+## 0.3.3 - 2026-11-01
+
+- 新增保留音量的静音：`PresenterRuntime::set_muted`、C `erika_presenter_set_muted`、JSON `setMuted` 与 `volume`（`{volume, muted}`）、Flutter `ErikaPlayer.setMuted` 与 `getVolume`。静音期间设置的音量在取消静音时生效；`volume()` 始终报告宿主选择的音量。
+- 诊断报出容器：`media.container` 含 `format`（解复用器短名，如 `matroska,webm`、`mov,mp4,m4a,3gp,3g2,mj2`）与 `bitRate`（容器声明或 FFmpeg 估算的整体码率）。JSON 方法 `container`（`{format, bitRate, mediaOpen}`）无需整份快照即可读取；Rust 侧为 `Player::container()`（`ContainerInfo`）。
+- 视频轨报出容器声明的 Dolby Vision profile（`dvcC`/`dvvC`）：`TrackInfo::dolby_vision_profile`，JSON `tracks` 方法与诊断 `media.video` 中的 `dolbyVisionProfile`。
+- 视频轨没有声明码率时，即使文件带字幕轨也能再从整体码率推算：未声明码率的字幕轨不再被当作未知码流。
+- 修复 macOS 在备用 timer（`ERIKA_FLUTTER_TARGET_FPS`，或 CVDisplayLink 无法启动）下一直沿用第一块屏幕的 EDR headroom：只要 surface 挂载，无论由哪种驱动渲染都会观察屏幕变化（#140）。
+- 浏览器版本改用 wasm-bindgen 0.2.130 与 js-sys 0.3.107，同时依赖 wgpu 30 的应用在 Linux 上可以正常解析依赖；构建 Web 包需要 `wasm-bindgen-cli` 0.2.130（#188）。
+
 ## 0.3.2 - 2026-10-31
 
 - 修复 Flutter Windows 插件打开媒体时越界写 `ErikaOpenOptions`：它仍在清零 0.3.1 已改作 `start_position_micros` 的第二个保留位。MSVC 会因此停止构建（C4789 作为错误），没有该检查时则会覆盖栈上数据。iOS、tvOS、macOS 的 Swift 镜像结构改为写明 `startPositionMicros`，布局本就与头文件一致。新增打包测试，核对每个镜像的大小及写入的保留位不超出头文件。

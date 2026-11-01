@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3 - 2026-11-01
+
+- `setMuted(bool)` silences the output without losing the volume, and
+  `getVolume()` reports `(volume, muted)`; both go through the JSON method
+  table, so older native runtimes return `false` / `null`.
+- `getDiagnosticsSnapshot()` reports the container under `media.container`
+  (its `format` and overall `bitRate`) and a video's `dolbyVisionProfile`.
+  Video bit rates are inferred again for files that carry subtitle tracks.
+- macOS: with the fallback timer (`ERIKA_FLUTTER_TARGET_FPS`), moving the
+  window to a screen of other EDR capability updates the headroom and the
+  output mode.
+
 ## 0.3.2 - 2026-10-31
 
 - Windows: opening media no longer writes past `ErikaOpenOptions` (the

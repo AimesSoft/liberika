@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3 - 2026-11-01
+
+- Version aligned with liberika 0.3.3; the header adds `erika_presenter_set_muted`. No ArkTS API changes.
+
 ## 0.3.2 - 2026-10-31
 
 - Version aligned with liberika 0.3.2; no OpenHarmony changes.

@@ -2,6 +2,15 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
+## 0.3.3 - 2026-11-01
+
+- 音量を保持するミュートを追加しました：`PresenterRuntime::set_muted`、C `erika_presenter_set_muted`、JSON `setMuted` と `volume`（`{volume, muted}`）、Flutter `ErikaPlayer.setMuted` と `getVolume`。ミュート中に設定した音量はミュート解除時に適用され、`volume()` は常にホストが選んだ音量を返します。
+- 診断がコンテナを報告するようになりました。`media.container` に `format`（デマルチプレクサーの短い名前。`matroska,webm`、`mov,mp4,m4a,3gp,3g2,mj2` など）と `bitRate`（コンテナが示す、または FFmpeg が推定した全体ビットレート）が入ります。JSON メソッド `container`（`{format, bitRate, mediaOpen}`）でスナップショット全体を取らずに読めます。Rust では `Player::container()`（`ContainerInfo`）です。
+- 映像トラックがコンテナの示す Dolby Vision プロファイル（`dvcC`/`dvvC`）を報告します：`TrackInfo::dolby_vision_profile`、JSON `tracks` メソッドと診断 `media.video` の `dolbyVisionProfile`。
+- 映像トラック自身のビットレートが示されていない場合、字幕トラックを含むファイルでも全体ビットレートから再び推定します。ビットレートを示さない字幕トラックは不明なストリームとして数えません。
+- macOS で代替タイマー（`ERIKA_FLUTTER_TARGET_FPS`、または CVDisplayLink が起動できない場合）を使うと最初の画面の EDR ヘッドルームのままになる問題を修正しました。サーフェスが接続されている間は、どの駆動方式でも画面の変化を監視します（#140）。
+- ブラウザ版は wasm-bindgen 0.2.130 と js-sys 0.3.107 を使います。wgpu 30 にも依存するアプリが Linux で依存関係を解決できます。Web パッケージのビルドには `wasm-bindgen-cli` 0.2.130 が必要です（#188）。
+
 ## 0.3.2 - 2026-10-31
 
 - Flutter の Windows プラグインがメディアを開く際に `ErikaOpenOptions` の範囲外へ書き込む問題を修正しました。0.3.1 で `start_position_micros` に割り当てた 2 番目の reserved 枠を引き続きゼロクリアしていました。MSVC はこれでビルドを停止し（C4789 がエラー扱い）、そのチェックがなければスタックを上書きしていました。iOS・tvOS・macOS の Swift ミラー構造体は `startPositionMicros` を明記しました（レイアウトは元々ヘッダーと同じです）。各ミラーのサイズと書き込む reserved 枠をヘッダーと照合するパッケージテストを追加しました。
