@@ -1390,6 +1390,7 @@ private final class ErikaPlayerHost {
 
   deinit {
     stopDisplayDriver()
+    stopObservingDisplayConfigurationChanges()
     withNativeCall {
       _ = library.detachSurface(handle)
       library.destroy(handle)
@@ -2115,6 +2116,7 @@ private final class ErikaPlayerHost {
       "drawable=\(view.metalLayer.drawableSize) reattach=\(isReattach)"
     )
     try attachOrResize(view: view, attach: true)
+    observeDisplayConfigurationChanges()
     startDisplayDriverIfNeeded(resetClock: !isReattach)
   }
 
@@ -2140,6 +2142,7 @@ private final class ErikaPlayerHost {
         operation: "attach_flutter_texture"
       )
     }
+    observeDisplayConfigurationChanges()
     startDisplayDriverIfNeeded(resetClock: !isReattach)
   }
 
@@ -2153,6 +2156,7 @@ private final class ErikaPlayerHost {
     attachedTexture = nil
     attachedViewId = nil
     stopDisplayDriver()
+    stopObservingDisplayConfigurationChanges()
     withNativeCall {
       _ = library.detachSurface(handle)
     }
@@ -2312,6 +2316,9 @@ private final class ErikaPlayerHost {
           operation: "resize_surface"
         )
       }
+      // A backing change (another screen's scale) comes as a resize; the
+      // headroom may have moved with it.
+      reportDisplayHeadroom()
     }
   }
 
@@ -2355,7 +2362,6 @@ private final class ErikaPlayerHost {
       if let driver, driver.start() {
         displayLinkDriver = driver
         displayLinkDisplayID = displayID
-        observeDisplayConfigurationChanges()
         return
       }
     }
@@ -2363,13 +2369,16 @@ private final class ErikaPlayerHost {
     startFallbackDisplayTimerIfNeeded()
   }
 
-  /// Re-targets the display link when the window changes screen, or when the
-  /// screen layout itself changes.
+  /// Republishes the headroom and re-targets the display driver when the
+  /// window changes screen, or when the screen layout itself changes, for as
+  /// long as a surface is attached — whichever driver ticks it.
   ///
   /// A `CVDisplayLink` is bound to the display it was created for. Without
   /// this, dragging the window to a second screen keeps it ticking at the old
   /// refresh rate, and unplugging that screen stops the callbacks entirely —
   /// with the fallback timer already torn down, rendering would simply stop.
+  /// The fallback timer (the FPS override, or a display link that would not
+  /// start) needs the headroom and the new screen's rate all the same.
   private func observeDisplayConfigurationChanges() {
     guard displayConfigurationObservers.isEmpty else {
       return
@@ -2396,6 +2405,11 @@ private final class ErikaPlayerHost {
 
   private func retargetDisplayDriverIfScreenChanged() {
     guard displayLinkDriver != nil else {
+      // The fallback timer follows the screen's rate, and a display link
+      // that would not start on the old screen may on the new one.
+      if displayTimer != nil {
+        startDisplayDriverIfNeeded(resetClock: false)
+      }
       return
     }
     let displayID = resolvedDisplayID()
@@ -2434,7 +2448,6 @@ private final class ErikaPlayerHost {
   }
 
   private func stopDisplayDriver() {
-    stopObservingDisplayConfigurationChanges()
     displayLinkDriver?.invalidate()
     displayLinkDriver = nil
     displayLinkDisplayID = nil
