@@ -825,7 +825,7 @@ ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t sinc
 |----|------|
 | `schema`、`capturedAtUnixMs` | 文档版本与采集时刻（墙钟）。 |
 | `playback` | `state`、`playing`、`mediaTimeSeconds`、`durationSeconds`、`playbackRate`、`generation`、`audioOnly`（后台暂停视频解码）、`buffering` `{active, events, currentMs, totalMs}`。 |
-| `media` | 选中的 `video`（`codec`、`profile`、`level`、`width`、`height`、`pixelFormat`、`frameRate`、`bitRate`）、`audio`（`codec`、`sampleRate`、`channels`、`sampleFormat`、`bitRate`）、`subtitle`，没有则为 `null`。 |
+| `media` | `container`（`format` 为解复用器短名，如 `matroska,webm`；`bitRate` 为整体码率），以及选中的 `video`（`codec`、`profile`、`level`、`width`、`height`、`pixelFormat`、`frameRate`、`bitRate`、`dolbyVisionProfile`）、`audio`（`codec`、`sampleRate`、`channels`、`sampleFormat`、`bitRate`）、`subtitle`；未知或没有则为 `null`。 |
 | `decoder` | 最近一次解码器切换，可直接查询而不再只靠事件：`requestedBackend`、`activeBackend`、`previousBackend`、`hardware`、`fellBack`、`fallbackCount`、`stage`、`reason`、`codec`、`pixelFormat`、`lineSizes`。首次切换前为 `null`。 |
 | `video` | 解码/渲染帧、硬件/软件/零拷贝/直接零拷贝/共享句柄帧、`cpuFallbackFrames`、`importFailures`、`renderFailures`、`backpressureDrops`、`rejectedImportRoute`。 |
 | `presenter` | surface 挂载与尺寸，最近一次 tick/pump/音频/字幕/视频/时钟/弹幕规划/渲染/GPU 耗时，测试帧/叠加/字幕/弹幕计数。 |

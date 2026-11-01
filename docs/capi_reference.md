@@ -787,7 +787,7 @@ All three wrap their result in an envelope:
 dispatch table in `crates/erika_capi/src/presenter_json.rs` (`JSON_METHODS`).
 The table mirrors the C entry points — playback (`open`, `play`, `pause`,
 `stop`, `close`, `seek`, `setPlaybackRate`, `setVolume`), tracks and subtitles
-(`tracks`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
+(`tracks`, `chapters`, `container`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
 `addExternalSubtitle`, `removeSubtitleTrack`, `setSubtitleScale`,
 `setSubtitleDelay`, `subtitleDelay`, `subtitleText`, `setSubtitleFont`,
 `setSubtitleStyle`, the subtitle memory-font calls), the
@@ -966,7 +966,7 @@ handle call.
 |---------|----------|
 | `schema`, `capturedAtUnixMs` | Document version and wall-clock capture time. |
 | `playback` | `state`, `playing`, `mediaTimeSeconds`, `durationSeconds`, `playbackRate`, `generation`, `audioOnly` (background video suspension), `buffering` `{active, events, currentMs, totalMs}`. |
-| `media` | Selected `video` (`codec`, `profile`, `level`, `width`, `height`, `pixelFormat`, `frameRate`, `bitRate`), `audio` (`codec`, `sampleRate`, `channels`, `sampleFormat`, `bitRate`) and `subtitle` tracks, or `null`. |
+| `media` | The `container` (`format`, the demuxer's short name such as `matroska,webm`; `bitRate`, the overall bit rate), selected `video` (`codec`, `profile`, `level`, `width`, `height`, `pixelFormat`, `frameRate`, `bitRate`, `dolbyVisionProfile`), `audio` (`codec`, `sampleRate`, `channels`, `sampleFormat`, `bitRate`) and `subtitle` tracks, each `null` when unknown or absent. |
 | `decoder` | Latest decoder transition, queryable instead of event-only: `requestedBackend`, `activeBackend`, `previousBackend`, `hardware`, `fellBack`, `fallbackCount`, `stage`, `reason`, `codec`, `pixelFormat`, `lineSizes`. `null` before the first transition. |
 | `video` | Decoded/rendered frames, hardware/software/zero-copy/direct-zero-copy/shared-handle frames, `cpuFallbackFrames`, `importFailures`, `renderFailures`, `backpressureDrops`, `rejectedImportRoute`. |
 | `presenter` | Surface attachment and size, last tick/pump/audio/subtitle/video/clock/danmaku-plan/render/GPU durations, test/overlay/subtitle/danmaku counters. |

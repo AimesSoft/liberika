@@ -844,7 +844,7 @@ ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t sinc
 JSON エンコード込みで中央値 約 0.3 ms）。スレッド規則は他のハンドル呼び出しと同じです。
 
 セクション: `playback`（状態、位置、長さ、倍速、`audioOnly`、`buffering`）、`media`
-（選択中の映像/音声/字幕トラック）、`decoder`（直近のデコーダ遷移: 要求/実際/直前の
+（コンテナ `container` の `format` と全体ビットレート `bitRate`、選択中の映像/音声/字幕トラック）、`decoder`（直近のデコーダ遷移: 要求/実際/直前の
 バックエンド、`hardware`、`fellBack`、`fallbackCount`、`stage`、`reason` など。初回遷移前は
 `null`）、`video`（ハードウェア/ソフトウェア/ゼロコピー各フレーム数、CPU フォールバック、
 失敗、バックプレッシャー破棄）、`presenter`（surface、各段の直近所要時間）、`output`、
