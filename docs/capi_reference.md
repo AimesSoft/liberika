@@ -439,6 +439,7 @@ ErikaStatus erika_presenter_close(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_seek(ErikaPresenterHandle *, uint64_t position_micros);
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
+ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *, bool muted);       // keeps the volume
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
 ErikaStatus erika_presenter_set_subtitle_delay(ErikaPresenterHandle *, int64_t delay_micros); // later when positive
@@ -786,7 +787,7 @@ All three wrap their result in an envelope:
 `arguments_json` must be a JSON object. `method` selects an entry of the
 dispatch table in `crates/erika_capi/src/presenter_json.rs` (`JSON_METHODS`).
 The table mirrors the C entry points — playback (`open`, `play`, `pause`,
-`stop`, `close`, `seek`, `setPlaybackRate`, `setVolume`), tracks and subtitles
+`stop`, `close`, `seek`, `setPlaybackRate`, `setVolume`, `setMuted`, `volume`), tracks and subtitles
 (`tracks`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
 `addExternalSubtitle`, `removeSubtitleTrack`, `setSubtitleScale`,
 `setSubtitleDelay`, `subtitleDelay`, `subtitleText`, `setSubtitleFont`,

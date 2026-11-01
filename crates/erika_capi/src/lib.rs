@@ -2569,6 +2569,27 @@ pub unsafe extern "C" fn erika_presenter_set_subtitle_scale(
     })
 }
 
+/// Silences the output (true) or restores it (false) without losing the
+/// volume: `set_volume` while muted is kept and applied on unmute.
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_muted(
+    handle: *mut ErikaPresenterHandle,
+    muted: bool,
+) -> ErikaStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.set_muted(muted);
+        ErikaStatus::Ok
+    })
+}
+
 /// Shows subtitles later (positive `delay_micros`) or earlier (negative) than
 /// their timestamps, embedded and external tracks alike; clamped to ten
 /// minutes either way. 0 restores the timestamps.
@@ -3733,6 +3754,22 @@ pub unsafe extern "C" fn erika_presenter_set_upscaler(
 pub unsafe extern "C" fn erika_presenter_set_subtitle_scale(
     _handle: *mut std::ffi::c_void,
     _scale: f64,
+) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_muted(
+    _handle: *mut std::ffi::c_void,
+    _muted: bool,
 ) -> ErikaStatus {
     ErikaStatus::PlayerError
 }

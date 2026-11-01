@@ -1297,6 +1297,34 @@ class ErikaPlayer {
     });
   }
 
+  /// Silences the output, or restores it, without losing the volume: a
+  /// volume set while muted applies on unmute. Returns `false` when the
+  /// native runtime cannot.
+  Future<bool> setMuted(bool muted) async {
+    try {
+      final reply = await invokeJson('setMuted', {'muted': muted});
+      return reply['ok'] == true;
+    } on UnsupportedError {
+      return false;
+    }
+  }
+
+  /// The volume chosen (kept while muted) and whether the output is muted;
+  /// null when the native runtime cannot tell.
+  Future<({double volume, bool muted})?> getVolume() async {
+    try {
+      final reply = await invokeJson('volume');
+      final value = reply['value'];
+      if (reply['ok'] != true || value is! Map) return null;
+      final volume = value['volume'];
+      final muted = value['muted'];
+      if (volume is! num || muted is! bool) return null;
+      return (volume: volume.toDouble(), muted: muted);
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
   Future<void> setUpscaler(ErikaUpscalerMode mode) async {
     final playerId = await ensureCreated();
     await _invoke('setUpscaler', <String, Object?>{

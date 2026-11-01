@@ -337,6 +337,8 @@ pub struct PresenterRuntime {
     /// Microseconds subtitles show later than their timestamps (earlier when
     /// negative).
     subtitle_delay_micros: i64,
+    volume: f32,
+    muted: bool,
     subtitle_resolution: SubtitleResolution,
     subtitle_style: SubtitleStyleConfig,
     subtitle_memory_fonts: SubtitleMemoryFonts,
@@ -815,6 +817,8 @@ impl PresenterRuntime {
             current_danmaku_viewport: None,
             subtitle_font_scale: DEFAULT_SUBTITLE_FONT_SCALE,
             subtitle_delay_micros: 0,
+            volume: 1.0,
+            muted: false,
             subtitle_resolution: SubtitleResolution::default(),
             subtitle_style: SubtitleStyleConfig::default(),
             subtitle_memory_fonts: SubtitleMemoryFonts::default(),
@@ -1104,12 +1108,31 @@ impl PresenterRuntime {
         Ok(())
     }
 
+    /// The volume the host chose. While muted it is kept, and applied on
+    /// unmute.
     pub fn set_volume(&mut self, volume: f64) {
-        self.audio_output.set_volume(volume as f32);
+        self.volume = crate::audio::normalize_volume(volume as f32);
+        self.apply_volume();
     }
 
+    /// The volume the host chose, muted or not.
     pub fn volume(&self) -> f64 {
-        self.audio_output.volume() as f64
+        self.volume as f64
+    }
+
+    /// Silences the output without losing the volume.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        self.apply_volume();
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    fn apply_volume(&mut self) {
+        self.audio_output
+            .set_volume(if self.muted { 0.0 } else { self.volume });
     }
 
     pub fn set_debug_hud_enabled(&mut self, enabled: bool) {
@@ -6692,6 +6715,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         assert_eq!(presenter.volume(), 0.0);
         presenter.set_volume(f64::NAN);
         assert_eq!(presenter.volume(), 1.0);
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn mute_keeps_the_volume_and_applies_changes_on_unmute() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+
+        presenter.set_volume(0.6);
+        presenter.set_muted(true);
+        assert!(presenter.muted());
+        assert_eq!(presenter.audio_output.volume(), 0.0);
+        assert!((presenter.volume() - 0.6).abs() < 0.000_001);
+
+        presenter.set_volume(0.3);
+        assert_eq!(presenter.audio_output.volume(), 0.0);
+        assert!((presenter.volume() - 0.3).abs() < 0.000_001);
+
+        presenter.set_muted(false);
+        assert!(!presenter.muted());
+        assert!((presenter.audio_output.volume() - 0.3).abs() < 0.000_001);
     }
 
     #[test]

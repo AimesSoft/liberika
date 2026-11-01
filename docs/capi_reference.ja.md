@@ -366,6 +366,7 @@ ErikaStatus erika_presenter_close(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_seek(ErikaPresenterHandle *, uint64_t position_micros);
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
+ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *, bool muted);       // 音量を保持
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
 ErikaStatus erika_presenter_set_subtitle_font(ErikaPresenterHandle *, const char *family, const char *file_path);

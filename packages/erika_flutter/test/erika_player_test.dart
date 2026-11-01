@@ -1024,6 +1024,36 @@ void main() {
     await player.dispose();
   });
 
+  test('mute and the volume go through the JSON method table', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      if (call.method == 'create') return 7;
+      if (call.method != 'invokeJson') return null;
+      final method = (call.arguments as Map)['method'];
+      return switch (method) {
+        'setMuted' => '{"ok":true,"status":0,"value":null}',
+        'volume' =>
+          '{"ok":true,"status":0,"value":{"volume":0.5,"muted":true}}',
+        _ => '{"ok":false,"status":3,"code":"unknown_method","error":"x"}',
+      };
+    });
+    final player = ErikaPlayer();
+
+    expect(await player.setMuted(true), isTrue);
+    final call = playerCalls.lastWhere((c) => c.method == 'invokeJson');
+    expect(call.arguments, <String, Object?>{
+      'playerId': 7,
+      'method': 'setMuted',
+      'arguments': <String, Object?>{'muted': true},
+    });
+    final volume = await player.getVolume();
+    expect(volume?.volume, 0.5);
+    expect(volume?.muted, isTrue);
+
+    await player.dispose();
+  });
+
   test('playback rate is forwarded to native player clock', () async {
     final player = ErikaPlayer();
 
