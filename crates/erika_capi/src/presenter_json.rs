@@ -351,6 +351,20 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
         "null",
     ),
     method(
+        "setMuted",
+        P,
+        "Silences the output or restores it; the volume is kept, and a volume set while muted applies on unmute.",
+        &[arg("muted", "boolean", true)],
+        "null",
+    ),
+    method(
+        "volume",
+        P,
+        "The volume the host chose (kept while muted) and whether the output is muted.",
+        NONE,
+        "{volume, muted}",
+    ),
+    method(
         "setSubtitleDelay",
         P,
         "Shows subtitles later (positive) or earlier (negative) than their timestamps, embedded and external alike; clamped to ten minutes either way.",
@@ -704,6 +718,10 @@ pub(crate) unsafe fn invoke(
         "setOpenStartPosition" => status_value(unsafe {
             erika_presenter_set_open_start_position(handle, required_u64(args, "positionMicros")?)
         }),
+        "setMuted" => status_value(unsafe {
+            erika_presenter_set_muted(handle, required_bool(args, "muted")?)
+        }),
+        "volume" => unsafe { volume_json(handle) },
         "setSubtitleDelay" => status_value(unsafe {
             erika_presenter_set_subtitle_delay(handle, required_i64(args, "delayMicros")?)
         }),
@@ -1146,6 +1164,17 @@ unsafe fn container_json(handle: *mut ErikaPresenterHandle) -> Result<Value, Str
         "format": container.format,
         "bitRate": container.bit_rate,
         "mediaOpen": player.has_open_media(),
+    }))
+}
+
+unsafe fn volume_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
+    if handle.is_null() {
+        return Err("presenter handle is null".to_string());
+    }
+    let presenter = unsafe { &*handle };
+    Ok(json!({
+        "volume": presenter.presenter.volume(),
+        "muted": presenter.presenter.muted(),
     }))
 }
 
@@ -1686,6 +1715,10 @@ fn optional_bool(args: &Map<String, Value>, name: &str) -> Option<bool> {
     args.get(name).and_then(Value::as_bool)
 }
 
+fn required_bool(args: &Map<String, Value>, name: &str) -> Result<bool, String> {
+    optional_bool(args, name).ok_or_else(|| format!("{name} must be a boolean"))
+}
+
 fn required_c_string(value: &str, name: &str) -> Result<CString, String> {
     CString::new(value).map_err(|_| format!("{name} contains a NUL byte"))
 }
@@ -1988,6 +2021,28 @@ mod tests {
             .find(|entry| entry["name"] == "exportFrame")
             .unwrap();
         assert_eq!(export["scope"], "global");
+    }
+
+    #[test]
+    fn mute_keeps_the_volume_it_reports() {
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+
+        let set = invoke(handle, c"setVolume", r#"{"volume":0.5}"#);
+        assert_eq!(set["ok"], true, "{set}");
+        let muted = invoke(handle, c"setMuted", r#"{"muted":true}"#);
+        assert_eq!(muted["ok"], true, "{muted}");
+        let report = invoke(handle, c"volume", "{}");
+        assert_eq!(report["value"], json!({"volume": 0.5, "muted": true}));
+
+        let unmuted = invoke(handle, c"setMuted", r#"{"muted":false}"#);
+        assert_eq!(unmuted["ok"], true, "{unmuted}");
+        assert_eq!(invoke(handle, c"volume", "{}")["value"]["muted"], false);
+
+        let wrong = invoke(handle, c"setMuted", r#"{"muted":"yes"}"#);
+        assert_eq!(wrong["ok"], false, "{wrong}");
+
+        unsafe { erika_presenter_destroy(handle) };
     }
 
     #[test]
