@@ -695,6 +695,9 @@ ErikaStatus erika_presenter_close(ErikaPresenterHandle *handle);
 ErikaStatus erika_presenter_seek(ErikaPresenterHandle *handle, uint64_t position_micros);
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *handle, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *handle, double volume);
+/* Silences the output (true) or restores it (false) without losing the
+ * volume: set_volume while muted is kept and applied on unmute. */
+ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *handle, bool muted);
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *handle, int32_t mode);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *handle, double scale);
 /* Shows subtitles later (positive delay_micros) or earlier (negative) than
