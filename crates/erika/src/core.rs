@@ -302,6 +302,15 @@ fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
     left
 }
 
+/// What the opened media's container says of itself: its demuxer's short
+/// name (`matroska,webm`, `mov,mp4,m4a,3gp,3g2,mj2`) and its overall bit
+/// rate, when the container states one or FFmpeg estimates it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerInfo {
+    pub format: Option<String>,
+    pub bit_rate: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackInfo {
     pub id: i64,
@@ -1104,6 +1113,7 @@ struct PlayerInner {
     surface: Option<PlatformSurface>,
     tracks: Vec<TrackInfo>,
     chapters: Vec<ChapterInfo>,
+    container: ContainerInfo,
     track_selection: TrackSelection,
     subscribers: Vec<Sender<PlayerEvent>>,
     video_frame_sender: Option<Sender<PlayerVideoFrame>>,
@@ -1295,6 +1305,7 @@ impl Player {
                 surface: None,
                 tracks: Vec::new(),
                 chapters: Vec::new(),
+                container: ContainerInfo::default(),
                 track_selection: TrackSelection::default(),
                 subscribers: Vec::new(),
                 video_frame_sender: None,
@@ -1529,6 +1540,7 @@ impl Player {
             inner.ended = false;
             inner.tracks = info.tracks.clone();
             inner.chapters = info.chapters.clone();
+            inner.container = info.container.clone();
             inner.track_selection = info.track_selection();
             generation
         };
@@ -1752,6 +1764,15 @@ impl Player {
             .lock()
             .expect("player mutex poisoned")
             .track_selection
+    }
+
+    /// The container of the current media, as read while opening it.
+    pub fn container(&self) -> ContainerInfo {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .container
+            .clone()
     }
 
     /// Chapters read while opening the current media; empty when absent.
@@ -2054,6 +2075,7 @@ impl Player {
             inner.media = None;
             inner.tracks.clear();
             inner.chapters.clear();
+            inner.container = ContainerInfo::default();
             inner.track_selection = TrackSelection::default();
             inner.duration = None;
             inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
@@ -2152,6 +2174,7 @@ impl Player {
         let previous = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             inner.chapters.clear();
+            inner.container = ContainerInfo::default();
             // A racing Play may have cloned the old worker sender before this
             // Open took the lifecycle lock, then queued behind Shutdown. The
             // old worker is joined above, so invalidate that orphaned intent

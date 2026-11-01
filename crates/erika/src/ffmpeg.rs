@@ -186,6 +186,7 @@ pub struct MediaProbe {
     pub duration: Option<Duration>,
     pub tracks: Vec<TrackInfo>,
     pub chapters: Vec<ChapterInfo>,
+    pub container: crate::core::ContainerInfo,
     pub video: Vec<VideoProbe>,
     pub audio: Vec<AudioProbe>,
     pub subtitles: Vec<SubtitleTrackConfig>,
@@ -4483,6 +4484,10 @@ fn inspect_format_context(
             duration,
             tracks,
             chapters: inspect_chapters(raw, duration),
+            container: crate::core::ContainerInfo {
+                format: unsafe { input_format_name(raw) },
+                bit_rate: container_bit_rate,
+            },
             video,
             audio,
             subtitles,
@@ -4548,6 +4553,28 @@ fn inspect_chapters(
     chapters
 }
 
+/// The demuxer's short name for the container (`matroska,webm`).
+unsafe fn input_format_name(raw: *const sys::AVFormatContext) -> Option<String> {
+    let format = unsafe { (*raw).iformat };
+    if format.is_null() {
+        return None;
+    }
+    let name = unsafe { (*format).name };
+    if name.is_null() {
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// A single video track without a stated bit rate (Matroska states none)
+/// takes the container's, less what the audio tracks state (every one must
+/// state it) and what subtitle tracks state. A subtitle track stating none
+/// does not stop the estimate: text and bitmap subtitles are a few kbit/s
+/// beside the picture, and Matroska never states theirs.
 fn infer_single_video_bit_rate(tracks: &mut [TrackInfo], container_bit_rate: Option<u64>) {
     let Some(container_bit_rate) = container_bit_rate else {
         return;
@@ -4567,10 +4594,8 @@ fn infer_single_video_bit_rate(tracks: &mut [TrackInfo], container_bit_rate: Opt
         .enumerate()
         .filter(|(index, track)| {
             *index != video_index
-                && matches!(
-                    track.kind,
-                    TrackKind::Video | TrackKind::Audio | TrackKind::Subtitle
-                )
+                && (matches!(track.kind, TrackKind::Video | TrackKind::Audio)
+                    || track.kind == TrackKind::Subtitle && track.bit_rate.is_some())
         })
         .map(|(_, track)| track.bit_rate)
         .collect::<Option<Vec<_>>>();
@@ -5977,6 +6002,7 @@ mod tests {
             .find(|track| track.kind == TrackKind::Video)
             .unwrap();
 
+        assert_eq!(probe.container.format.as_deref(), Some("matroska,webm"));
         assert_eq!(video.codec.as_deref(), Some("mpeg4"));
         assert_eq!((video.width, video.height), (160, 90));
         assert_eq!(video.bit_rate, None);
@@ -6045,10 +6071,12 @@ mod tests {
         infer_single_video_bit_rate(&mut tracks, Some(1_256_000));
         assert_eq!(tracks[0].bit_rate, Some(1_000_000));
 
+        // A subtitle track stating no bit rate (Matroska's ASS) does not
+        // stop the estimate.
         subtitle.bit_rate = None;
         let mut tracks = vec![video.clone(), audio.clone(), subtitle];
         infer_single_video_bit_rate(&mut tracks, Some(1_256_000));
-        assert_eq!(tracks[0].bit_rate, None);
+        assert_eq!(tracks[0].bit_rate, Some(1_128_000));
 
         audio.bit_rate = None;
         let mut tracks = vec![video.clone(), audio];

@@ -2387,6 +2387,11 @@ impl PresenterRuntime {
                 "bitRate": track.bit_rate,
             })
         });
+        let container = {
+            let container = self.player.container();
+            (container.format.is_some() || container.bit_rate.is_some())
+                .then(|| json!({ "format": container.format, "bitRate": container.bit_rate }))
+        };
         let subtitle_track = find_track(selection.subtitle).map(|track| {
             json!({ "trackId": track.id, "codec": track.codec, "language": track.language })
         });
@@ -2410,6 +2415,7 @@ impl PresenterRuntime {
                 "buffering": timing.buffering_json(),
             },
             "media": {
+                "container": container,
                 "video": video_track,
                 "audio": audio_track,
                 "subtitle": subtitle_track,
@@ -7162,6 +7168,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         assert!(snapshot["playback"]["durationSeconds"].is_null());
         assert_eq!(snapshot["playback"]["buffering"]["active"], false);
         assert!(snapshot["media"]["video"].is_null());
+        assert!(snapshot["media"]["container"].is_null());
         assert!(snapshot["decoder"].is_null());
         assert!(snapshot["buffers"]["playback"].is_null());
         assert!(snapshot["timing"]["scheduler"]["dropToleranceMs"].is_null());

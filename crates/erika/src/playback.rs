@@ -754,6 +754,7 @@ pub struct OpenedMediaInfo {
     pub duration: Option<Duration>,
     pub tracks: Vec<TrackInfo>,
     pub chapters: Vec<ChapterInfo>,
+    pub container: crate::core::ContainerInfo,
     pub video_params: Option<VideoParams>,
     pub selected_video_track: Option<i64>,
     pub selected_audio_track: Option<i64>,
@@ -1357,6 +1358,7 @@ impl PlaybackSession {
             duration: probe.duration,
             tracks: probe.tracks,
             chapters: probe.chapters,
+            container: probe.container,
             video_params,
             selected_video_track: selected_video_track.map(i64::from),
             selected_audio_track: selected_audio_track.map(i64::from),
@@ -7683,6 +7685,7 @@ mod tests {
             duration: Some(Duration::from_secs(12)),
             tracks: vec![video_track],
             chapters: Vec::new(),
+            container: crate::core::ContainerInfo::default(),
             video_params: Some(VideoParams {
                 width: 3840,
                 height: 2160,
