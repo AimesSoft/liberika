@@ -681,7 +681,7 @@ jobs:
           python3 -m venv /tmp/erika-web-tools
           /tmp/erika-web-tools/bin/pip install meson
           echo /tmp/erika-web-tools/bin >> "$GITHUB_PATH"
-          cargo install wasm-bindgen-cli --version 0.2.126 --locked
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
       - name: Build complete browser package
         run: cargo run --locked -p xtask -- web build
       - name: Core regression

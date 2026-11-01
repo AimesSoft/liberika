@@ -2,7 +2,7 @@
 """Build the complete liberika browser package from the pinned native sources.
 
 Requires emsdk 4.0.23 (or EMCC on PATH), Rust wasm32-unknown-unknown,
-wasm-bindgen-cli 0.2.126, CMake, Meson, Ninja, make and pkg-config.
+wasm-bindgen-cli 0.2.130, CMake, Meson, Ninja, make and pkg-config.
 No globally installed SDK or native artifacts are modified.
 """
 import argparse
