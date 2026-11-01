@@ -302,6 +302,13 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
         "{chapters:[{index,title,startMs,endMs}], mediaOpen}",
     ),
     method(
+        "container",
+        P,
+        "The opened media's container: its demuxer's short name and overall bit rate; mediaOpen is false when no media is open.",
+        NONE,
+        "{format, bitRate, mediaOpen} (null when unknown)",
+    ),
+    method(
         "trackSelection",
         P,
         "Selected track ids.",
@@ -757,6 +764,7 @@ pub(crate) unsafe fn invoke(
         }),
         "tracks" => unsafe { tracks_json(handle) },
         "chapters" => unsafe { chapters_json(handle) },
+        "container" => unsafe { container_json(handle) },
         "loadDanmakuFile" => {
             let uri = required_c_string(required_string(args, "uri")?, "uri")?;
             status_value(unsafe { erika_presenter_load_danmaku_file(handle, uri.as_ptr()) })
@@ -1109,6 +1117,20 @@ unsafe fn chapters_json(handle: *mut ErikaPresenterHandle) -> Result<Value, Stri
         .collect::<Vec<_>>();
     Ok(json!({
         "chapters": chapters,
+        "mediaOpen": player.has_open_media(),
+    }))
+}
+
+unsafe fn container_json(handle: *mut ErikaPresenterHandle) -> Result<Value, String> {
+    if handle.is_null() {
+        return Err("presenter handle is null".to_string());
+    }
+    let presenter = unsafe { &*handle };
+    let player = presenter.presenter.player();
+    let container = player.container();
+    Ok(json!({
+        "format": container.format,
+        "bitRate": container.bit_rate,
         "mediaOpen": player.has_open_media(),
     }))
 }
@@ -1999,6 +2021,37 @@ mod tests {
         let after = invoke(handle, c"chapters", "{}");
         assert_eq!(after["value"]["mediaOpen"], false);
         assert_eq!(after["value"]["chapters"], json!([]));
+
+        unsafe { erika_presenter_destroy(handle) };
+    }
+
+    #[test]
+    fn container_reports_the_format_and_explains_no_media() {
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+
+        let before = invoke(handle, c"container", "{}");
+        assert_eq!(before["ok"], true, "{before}");
+        assert_eq!(
+            before["value"],
+            json!({"format": null, "bitRate": null, "mediaOpen": false})
+        );
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../erika/testdata/chapters/chapters.mkv");
+        let uri = path.to_string_lossy().into_owned();
+        let opened = invoke(handle, c"open", &json!({"uri": uri}).to_string());
+        assert_eq!(opened["ok"], true, "{opened}");
+
+        let report = invoke(handle, c"container", "{}");
+        assert_eq!(report["value"]["mediaOpen"], true, "{report}");
+        assert_eq!(report["value"]["format"], "matroska,webm");
+
+        let closed = invoke(handle, c"close", "{}");
+        assert_eq!(closed["ok"], true, "{closed}");
+        let after = invoke(handle, c"container", "{}");
+        assert_eq!(after["value"]["mediaOpen"], false);
+        assert!(after["value"]["format"].is_null());
 
         unsafe { erika_presenter_destroy(handle) };
     }

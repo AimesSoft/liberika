@@ -787,7 +787,7 @@ All three wrap their result in an envelope:
 dispatch table in `crates/erika_capi/src/presenter_json.rs` (`JSON_METHODS`).
 The table mirrors the C entry points — playback (`open`, `play`, `pause`,
 `stop`, `close`, `seek`, `setPlaybackRate`, `setVolume`), tracks and subtitles
-(`tracks`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
+(`tracks`, `chapters`, `container`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
 `addExternalSubtitle`, `removeSubtitleTrack`, `setSubtitleScale`,
 `setSubtitleDelay`, `subtitleDelay`, `subtitleText`, `setSubtitleFont`,
 `setSubtitleStyle`, the subtitle memory-font calls), the
