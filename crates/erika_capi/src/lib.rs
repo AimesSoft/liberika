@@ -6945,13 +6945,14 @@ mod tests {
             status.requested_mode,
             ErikaLumaUpscalerMode::ArtCnnC4F16 as i32
         );
-        let expected_backend = if cfg!(all(
+        let wgpu_renderer = cfg!(all(
             any(
                 target_os = "android",
                 all(target_os = "linux", not(target_env = "ohos"))
             ),
             feature = "wgpu"
-        )) {
+        ));
+        let expected_backend = if wgpu_renderer {
             ErikaUpscalerBackendStatus::Scalar
         } else if cfg!(target_os = "windows") {
             // D3D11 initializes the requested GPU upscaler after attaching a
@@ -6966,6 +6967,12 @@ mod tests {
             // GLES adapters can render video without the storage buffers and
             // compute limits ArtCNN needs. Capability fallback is observable.
             assert!(status.fallback_count > 0);
+        } else if wgpu_renderer
+            && status.active_backend == ErikaUpscalerBackendStatus::Building as i32
+        {
+            // Selecting a network mode compiles its kernels on a worker; the
+            // status stays Building until they are ready.
+            assert_eq!(status.fallback_count, 0);
         } else {
             assert_eq!(status.active_backend, expected_backend as i32);
             assert_eq!(status.fallback_count, 0);
