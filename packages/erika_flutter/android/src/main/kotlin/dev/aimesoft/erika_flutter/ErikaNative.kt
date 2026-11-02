@@ -33,6 +33,9 @@ internal object ErikaNative {
     external fun nativeRegisterSubtitleMemoryFont(handle: Long, data: ByteArray): String
 
     @JvmStatic
+    external fun nativeLoadUpscalerModel(handle: Long, name: String, data: ByteArray): String
+
+    @JvmStatic
     external fun nativeAttachSurface(
         handle: Long,
         surface: Surface,

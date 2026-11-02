@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.13)
+project(erika_presenter_tests LANGUAGES CXX)
+enable_testing()
+find_package(Threads REQUIRED)
+add_executable(presenter_worker_test presenter_worker_test.cpp)
+target_compile_features(presenter_worker_test PRIVATE cxx_std_17)
+target_link_libraries(presenter_worker_test PRIVATE Threads::Threads)
+add_test(NAME presenter_worker COMMAND presenter_worker_test)

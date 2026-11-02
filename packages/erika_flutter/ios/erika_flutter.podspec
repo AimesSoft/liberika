@@ -60,6 +60,8 @@ Pod::Spec.new do |s|
   # produced defines (erika_optional_ldflags.rsp). They move to
   # erika_cabi_symbols in the release whose artifacts ship them.
   erika_cabi_optional_symbols = %w[
+    erika_presenter_clear_upscaler_model
+    erika_presenter_load_upscaler_model
     erika_export_frame
     erika_frame_export_result_free
     erika_frame_export_session_close

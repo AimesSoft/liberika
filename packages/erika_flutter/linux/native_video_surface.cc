@@ -52,7 +52,8 @@ std::shared_ptr<TransparentHost> transparent_host(GtkWidget* window) {
 struct NativeVideoSurface::Impl {
   FlView* view = nullptr;
   std::shared_ptr<TransparentHost> transparency;
-  ErikaPresenterHandle* presenter = nullptr;  // The owning Player outlives us.
+  std::function<void(Operation)> post;
+  std::function<void()> detach_fence;
   wl_display* display = nullptr;             // GTK owns the display/parent.
   wl_event_queue* queue = nullptr;
   wl_registry* registry = nullptr;
@@ -67,7 +68,7 @@ struct NativeVideoSurface::Impl {
 
   ~Impl() {
     // The renderer must release its wl_egl_window / VkSurface before wl_surface.
-    if (attached) erika_presenter_detach_surface(presenter);
+    if (attached) detach_fence();
     if (subsurface) wl_subsurface_destroy(subsurface);
     if (surface) wl_surface_destroy(surface);
     if (subcompositor) wl_subcompositor_destroy(subcompositor);
@@ -90,7 +91,8 @@ struct NativeVideoSurface::Impl {
   static void removed(void*, wl_registry*, uint32_t) {}
 };
 
-NativeVideoSurface::NativeVideoSurface(FlView* view, ErikaPresenterHandle* presenter)
+NativeVideoSurface::NativeVideoSurface(FlView* view, std::function<void(Operation)> post,
+                                     std::function<void()> detach_fence)
     : impl_(std::make_unique<Impl>()) {
   auto& s = *impl_;
   GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(view));
@@ -105,7 +107,8 @@ NativeVideoSurface::NativeVideoSurface(FlView* view, ErikaPresenterHandle* prese
   s.view = view;
   s.transparency = transparent_host(top);
   g_object_add_weak_pointer(G_OBJECT(view), reinterpret_cast<gpointer*>(&s.view));
-  s.presenter = presenter;
+  s.post = std::move(post);
+  s.detach_fence = std::move(detach_fence);
   s.parent_surface = parent_surface;
   s.display = gdk_wayland_display_get_wl_display(display);
   s.queue = wl_display_create_queue(s.display);
@@ -150,7 +153,7 @@ void NativeVideoSurface::update(double x, double y, double w, double h, bool vis
   if (!visible || w <= 0 || h <= 0) {
     s.shown = false;
     if (s.attached) {
-      checked(erika_presenter_detach_surface(s.presenter));
+      s.detach_fence();
       s.attached = false;
     }
     wl_surface_attach(s.surface, nullptr, 0, 0);
@@ -167,11 +170,20 @@ void NativeVideoSurface::update(double x, double y, double w, double h, bool vis
                              static_cast<int>(std::clamp(y + oy, -32768.0, 32768.0)));
   wl_surface_set_buffer_scale(s.surface, scale);
   if (!s.attached) {
-    checked(erika_presenter_attach_wgpu_surface(s.presenter, ErikaWgpuSurfaceKind_WaylandSurface,
-        reinterpret_cast<uintptr_t>(s.surface), reinterpret_cast<uintptr_t>(s.display), width, height, scale));
+    // GTK and parent/subsurface protocol operations stay on the platform.
+    // libwayland supports requests from multiple threads. EGL/Vulkan and the
+    // presenter belong to the owner; destruction fences before releasing wl_surface.
+    auto* surface = s.surface;
+    auto* display = s.display;
+    s.post([surface, display, width, height, scale](ErikaPresenterHandle* presenter) {
+      checked(erika_presenter_attach_wgpu_surface(presenter, ErikaWgpuSurfaceKind_WaylandSurface,
+          reinterpret_cast<uintptr_t>(surface), reinterpret_cast<uintptr_t>(display), width, height, scale));
+    });
     s.attached = true;
   } else if (width != s.width || height != s.height || scale != s.scale) {
-    checked(erika_presenter_resize_surface(s.presenter, width, height, scale));
+    s.post([width, height, scale](ErikaPresenterHandle* presenter) {
+      checked(erika_presenter_resize_surface(presenter, width, height, scale));
+    });
   }
   s.width = width; s.height = height; s.scale = scale; s.shown = true;
   wl_display_dispatch_queue_pending(s.display, s.queue);

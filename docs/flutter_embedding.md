@@ -250,6 +250,29 @@ extended-linear scRGB; GLES and failed capability negotiation explicitly fall
 back to SDR. Android SDR is verified, while the API 35 HDR-device active-path
 acceptance remains pending. Linux provides experimental X11/Wayland and Flutter integration.
 
+On Windows each presenter runs on its own native worker thread: create, commands, surface
+attach/resize/detach, render ticks, capture and destroy all execute there, and frame requests
+coalesce (at most one tick queued or running per presenter). Method results, `EventSink` events,
+SMTC updates, texture registration and HWND/DirectComposition operations stay on the platform
+thread, so a slow render tick no longer blocks the window message loop. Set
+`ERIKA_FLUTTER_FRAME_TRACE=1` to log `presenter_worker ... platform_thread=... render_thread=...
+off_platform=true` once per presenter and slow ticks (`frame_tick ... work_ms=`) measured on the worker.
+
+The other platforms use the same owner model. Linux shares the canonical
+`windows/erika_presenter_worker.h` and drives its own 16 ms monotonic clock; GTK, view and Flutter
+texture registration stay on the platform thread, and results and events reach it through an idle
+source. OpenHarmony (the Flutter plugin and the `erika_ohos` package) has one owner thread per
+presenter behind `presenter_bridge.h`; every N-API function also has an `...Async` variant that
+resolves a promise on the ArkTS thread, and the legacy C helper `ErikaOhosPlayerFromId` now returns
+null because native code must not reach into a presenter owned by another thread. Android keeps a
+dedicated `HandlerThread` per presenter. On macOS, iOS and tvOS each presenter owns a dedicated
+thread (`ErikaPresenterOwner.swift`) that performs create, every native command, rendering, event
+polling, capture and destroy in FIFO order with coalesced frame ticks; `CVDisplayLink` and
+`CADisplayLink` only wake it, while the main thread decodes arguments, delivers results and events in
+order, and does the AppKit/UIKit work (now-playing, remote commands, views). A slow `open`, `seek` or
+`dispose` therefore neither blocks the UI thread nor delays rendering, and `ERIKA_FLUTTER_FRAME_TRACE=1`
+logs the thread of each tick and command.
+
 ## Dart API
 
 Installation, player controls, HTTP cache options, events and view examples are
@@ -327,12 +350,13 @@ release: macOS, iOS and tvOS resolve the new symbols optionally; Linux,
 HarmonyOS and Android route through the shared JSON table; Windows throws
 `UnsupportedError`.
 
-On macOS and iOS the plugin runs these three calls on a background queue and
-answers on the main thread, so a call that takes long (`addExternalSubtitle` of a
-large file, `exportFrame`) does not occupy it. While a presenter method runs,
-the plugin's main-thread timers (stats, event polling, macOS rendering) skip a
-tick instead of waiting for the player's lock; methods whose `scope` is `global`
-(`exportFrame`, `exportFrames`, `getLogs`, `listMethods`) run without that lock.
+On macOS and iOS the plugin runs `invokeJson` and `getDiagnosticsSnapshot` on the
+presenter's owner thread and `getLogs` on a utility queue, and answers on the main
+thread, so a call that takes long (`addExternalSubtitle` of a large file,
+`exportFrame`) does not occupy it. A long presenter method delays that presenter's
+next frame (frames run between commands) but never the interface; methods whose
+`scope` is `global` (`exportFrame`, `exportFrames`, `getLogs`, `listMethods`) run
+without a presenter handle.
 `listMethods` marks each method `blocking` (returns when the work is done, and
 the work grows with its input) and `writesFiles` (creates files; the result
 lists their paths).
@@ -354,24 +378,45 @@ build under test.
 
 ## Neural Upscaler Status
 
-`setUpscaler` requests a mode; the kernels are compiled on a background thread,
-so the host should poll `getUpscalerStatus` to drive its UI:
+`setUpscaler(ErikaUpscalerMode)` requests a mode (ArtCNN, Anime4K, `fsr1`,
+`platformVideo`, `metalFxSpatial`, `custom`; see
+[integration.md](integration.md#upscaler) for the modes and what runs on each
+platform). Kernels are compiled on a background thread, so the host should poll
+`getUpscalerStatus` to drive its UI:
 
 | `activeBackend` | Meaning |
 |-----------------|---------|
 | `off` | No mode requested. |
-| `building` | Kernels compiling (first use of a mode); frames render unscaled until ready. |
-| `inactive` | Mode requested but not applied — kernels not ready (and not compiling), or the backend recorded a fallback/failure. |
-| `scalar` | Running on the Metal scalar or wgpu compute backend. |
-| `simdgroupMatrix` | Running on the `simdgroup_matrix` backend (Apple Silicon default). |
+| `inactive` | Mode requested but not runnable here (or the backend recorded a fallback/failure); native sampling is used and the reason is in the diagnostics `upscaler` object. |
+| `building` | Kernels compiling in the background; frames render with native sampling until ready. |
+| `scalar` | Generic compute shaders. |
+| `simdgroupMatrix` | Apple `simdgroup_matrix` (M1-M4/A14+). |
+| `cooperativeMatrix` | Vulkan `VK_KHR_cooperative_matrix` next to D3D11 (Tensor Cores / WMMA / XMX). |
+| `linalgMatrix` | D3D12 SM 6.10 `linalg::Matrix`, an opt-in preview. |
+| `videoProcessor` | D3D11 video processor vendor extension: NVIDIA RTX Video / Intel VSR. |
+| `videoToolbox` | VideoToolbox super resolution. |
+| `metalFx` | MetalFX spatial scaler. |
+| `tensorOps` | Metal 4 tensor ops (Apple10 GPUs: M5/A19). |
 
-The upscaler only engages when the drawable shows the video larger than its
-source resolution, so a 1080p source in a 1080p (or smaller) view stays
-`inactive`. C4F16 is the real-time recommendation; C4F16 DS targets heavily
-compressed or noisy sources at the same compute cost. On Apple, C4F32 generally
-needs an M-Pro/Max-class GPU at 1080p input; on Android, both models use Vulkan
-compute and GLES reports an explicit `inactive` fallback. See
-`docs/architecture.md` for the renderer-side design.
+`getUpscalerStatus().lastGpuDuration` is now filled on Windows as well
+(D3D11 timestamp queries).
+
+Limits worth surfacing in a UI: RTX Video Super Resolution (`platformVideo` on
+Windows) needs an RTX GPU, the NVIDIA App / Control Panel setting enabled, and
+SDR video; the VideoToolbox scaler accepts only 2x, 8-bit 4:2:0 sources between
+96x96 and 960x960 on macOS/iOS/tvOS 26+; D3D12 linalg is an opt-in preview; the
+wgpu renderers (Linux, Android, OpenHarmony, Windows wgpu fallback) run every
+network mode and `fsr1`, while `platformVideo` and `metalFxSpatial` report
+`inactive`. R8F64 is only practical on matrix units and SD/720p sources.
+
+`loadUpscalerModel(Uint8List data, {String name = 'custom'})` loads a custom
+network (an Erika `.esr` file or an FSRCNNX / Anime4K CNN mpv hook shader; the
+host supplies the file because FSRCNNX is not bundled for licensing reasons),
+then call `setUpscaler(ErikaUpscalerMode.custom)`. `clearUpscalerModel()`
+unloads it. The Linux plugin exposes only the JSON file-path method
+(`loadUpscalerModelFile`).
+
+See `docs/architecture.md` for the renderer-side design.
 
 ## Ownership Rule
 

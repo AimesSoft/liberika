@@ -207,6 +207,10 @@ Windows plugin は CMake build で検証済み `erika_capi.dll` を download し
 
 Windows plugin は System Media Transport Controls（SMTC）を通じてタイトル、アーティスト、アルバム、artwork、再生状態、timeline を公開し、system の再生、一時停止、seek を処理します。C++/WinRT を含む Windows SDK が必要で、必要な WinRT system library は plugin が自動的に link します。
 
+Windows では各 presenter が専用のネイティブ worker thread で動きます（create、コマンド、surface の attach/resize/detach、render tick、capture、destroy）。フレーム要求は集約されます。メソッドの結果、`EventSink` event、SMTC 更新、texture 登録、HWND/DirectComposition の操作は platform thread に残ります。`ERIKA_FLUTTER_FRAME_TRACE=1` を設定すると presenter ごとに 1 回 `presenter_worker` を、worker 上で計測した遅い tick を `frame_tick ... work_ms=` として log に出します。
+
+Linux も同じ owner モデルです（16 ms の単調クロック。GTK、view、texture の登録は platform thread に残ります）。OpenHarmony は presenter ごとに 1 つの owner thread を持ち、すべての N-API 関数に ArkTS thread で promise を resolve する `...Async` 版があります。`ErikaOhosPlayerFromId` は null を返すようになりました。Android は presenter ごとに専用の `HandlerThread` を使います。macOS、iOS、tvOS では各 presenter が専用スレッド（`ErikaPresenterOwner.swift`）で create、コマンド、render、event の polling、capture、destroy を実行し、`CVDisplayLink`/`CADisplayLink` はそれを起こすだけです。遅い `open`、`seek`、`dispose` が UI スレッドを塞いだり描画を遅らせたりすることはなくなりました。
+
 ## Android Setup
 
 Android Gradle は選択された ABI の検証済み runtime を download します。Android API 26 以降が必要です。生成された `jniLibs` は `liberika_capi.so` と同じ ABI の NDK `libc++_shared.so` を含みます。既定は arm64 と x86_64。`-PerikaAndroidAbis=arm64-v8a,x86_64` または `ERIKA_ANDROID_ABIS` で指定できます。
@@ -383,11 +387,24 @@ multiple player、SDR screenshot の acceptance が必要です。
 
 ## Upscaler
 
-作成時に ArtCNN を選択することも、runtime で切り替えることもできます。
+作成時にモードを選択することも、runtime で切り替えることもできます。
 
 ```dart
 final player = ErikaPlayer(upscaler: ErikaUpscalerMode.artCnnC4F16Ds);
-await player.setUpscaler(ErikaUpscalerMode.artCnnC4F16Ds);
+await player.setUpscaler(ErikaUpscalerMode.anime4kM);
 ```
 
-`ErikaUpscalerMode.off` で無効化します。`player.getUpscalerStatus()` では要求モード、実行 backend、fallback 回数、upscaled frame 数、最近の GPU timing を確認できます。Apple は Metal、Android は planar と MediaCodec Surface frame の両方で wgpu/Vulkan compute を使います。GLES 3.0 は通常再生を維持し、明示的な `inactive` fallback を報告します。
+`ErikaUpscalerMode` には ArtCNN（`artCnnC4F16`、`artCnnC4F32`、`artCnnC4F16Ds`、`artCnnC4F16Dn`、`artCnnC4F32Ds`、`artCnnC4F32Dn`、`artCnnR8F64`）、Anime4K（`anime4kS` ... `anime4kUl`、`anime4kDenoiseS` ... `anime4kDenoiseUl`）、`fsr1`（輝度に対する AMD FSR 1.0、任意の content 向け）、`platformVideo`（プラットフォーム標準の映像スーパー解像度）、`metalFxSpatial`（Apple のみ）、`custom` があります。`ErikaUpscalerMode.off` で無効化します。ネットワーク系モードは輝度プレーンを 2 倍にし、`fsr1` と `metalFxSpatial` は輝度を表示サイズまでスケールし、`platformVideo` はフレーム全体をスケールします。
+
+`player.getUpscalerStatus()` では要求モード、実行 backend（`off`、`inactive`、`building`、`scalar`、`simdgroupMatrix`、`cooperativeMatrix`、`linalgMatrix`、`videoProcessor`、`videoToolbox`、`metalFx`、`tensorOps`）、fallback 回数、upscaled frame 数、最近の GPU timing を確認できます（`lastGpuDuration` は Windows でも報告されるようになりました）。`building` は kernel を background で compile 中で、その間は native sampling で再生すること、`inactive` はこの platform ではそのモードを動かせないこと（理由は診断の `upscaler` オブジェクト）を表します。
+
+`await player.loadUpscalerModel(bytes, name: 'my-model')` で独自のネットワーク（Erika `.esr` ファイル、または FSRCNNX / Anime4K CNN の mpv hook shader。ライセンス上 FSRCNNX は同梱しません）を読み込み、`setUpscaler(ErikaUpscalerMode.custom)` を呼びます。`clearUpscalerModel()` で外します。Linux では JSON のファイルパス方式（`loadUpscalerModelFile`）のみ利用できます。
+
+Platform ごとの注意:
+
+- Windows（D3D11）: `custom` を含むすべてのネットワークモード、`fsr1`、NVIDIA RTX Video Super Resolution（RTX GPU が必要で、NVIDIA App / コントロールパネルで有効化、SDR 映像のみ）または Intel VSR による `platformVideo`。`metalFxSpatial` は `inactive`。
+- Apple（Metal）: `custom` を含むすべてのネットワークモード、`fsr1`、`metalFxSpatial`、VideoToolbox 経由の `platformVideo`（2x のみ、8 ビット 4:2:0 で 96x96 から 960x960 のソース、macOS/iOS/tvOS 26+。それ以外は `inactive`）。
+- Linux、Android、OpenHarmony（wgpu/Vulkan）: `custom` を含むすべてのネットワークモードと `fsr1`。`platformVideo` と `metalFxSpatial` は `inactive`。GLES 3.0 は通常再生を維持し、明示的な `inactive` fallback を報告します。
+- Web: アップスケーラ無し。
+
+完全なマトリクスと実測値は [docs/integration.ja.md](https://github.com/AimesSoft/liberika/blob/main/docs/integration.ja.md#アップスケーラ) を参照してください。

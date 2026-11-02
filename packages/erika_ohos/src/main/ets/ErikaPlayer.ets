@@ -44,7 +44,8 @@ function byteCountOption(value: number | undefined, name: string): number {
  * Native ArkTS wrapper around ErikaPresenterHandle.
  *
  * This package does not depend on Flutter. Hosts provide an XComponent surface
- * id to attachSurface(), then drive renderTick() from their frame scheduler.
+ * id to attachSurface(), then drive renderTick() from their frame scheduler or
+ * enable startRendering(). Native operations are serialized on one owner thread.
  */
 export class ErikaPlayer {
   private readonly nativeId: number;
@@ -104,6 +105,27 @@ export class ErikaPlayer {
     return this.invokeOrThrow('setVolume', { volume: volume });
   }
 
+  setUpscaler(mode: number): ESObject | null {
+    return this.invokeOrThrow('setUpscaler', { mode: mode });
+  }
+
+  /**
+   * Loads a custom super-resolution network from memory: an Erika `.esr`
+   * network or an mpv hook shader (FSRCNNX / Anime4K CNN dialect). FSRCNNX is
+   * not bundled for licensing reasons; the host supplies the file. Select it
+   * afterwards with setUpscaler(64). Throws with the native error on failure.
+   */
+  loadUpscalerModel(data: ArrayBuffer | Uint8Array, name: string = 'custom'): void {
+    this.ensureAlive();
+    const status: number = erikaNative.nativeLoadUpscalerModel(this.nativeId, name, data) as number;
+    this.checkStatus(status, 'loadUpscalerModel');
+  }
+
+  /** Unloads the network loaded by loadUpscalerModel(). */
+  clearUpscalerModel(): ESObject | null {
+    return this.invokeOrThrow('clearUpscalerModel');
+  }
+
   attachSurface(options: ErikaSurfaceOptions): void {
     const scale: number = options.scale ?? 1.0;
     const status: number = erikaNative.nativeAttachSurface(
@@ -135,6 +157,26 @@ export class ErikaPlayer {
     this.ensureAlive();
     const raw: string = erikaNative.nativeRenderTick(this.nativeId, timeSeconds) as string;
     return JSON.parse(raw) as ErikaNativeResponse;
+  }
+
+  /** Native monotonic frame clock; events are delivered on ArkUI through N-API. */
+  startRendering(onEvent: (event: ErikaNativeResponse) => void): void {
+    this.ensureAlive();
+    erikaNative.nativeStartFrames(this.nativeId, (raw: string): void => {
+      if (!this.disposed) onEvent(JSON.parse(raw) as ErikaNativeResponse);
+    });
+  }
+
+  /** Returns to host-driven renderTick()/pollEvent(). */
+  stopRendering(): void {
+    this.ensureAlive();
+    erikaNative.nativeStopFrames(this.nativeId);
+  }
+
+  /** Enables native owner/slow-frame hilog diagnostics for this module. */
+  setFrameTrace(enabled: boolean): void {
+    this.ensureAlive();
+    erikaNative.nativeSetFrameTrace(enabled);
   }
 
   audioOnlyTick(): void {

@@ -169,6 +169,10 @@ path を共有します。Vulkan は FP16 extended-linear scRGB を negotiate �
 capability negotiation failure は明示的に SDR へ fallback します。Android SDR は検証済み、
 API 35 HDR device の active-path acceptance は未完了です。Linux は実験的な X11/Wayland と Flutter 接続を提供します。
 
+Windows では各 presenter が専用のネイティブ worker thread で動きます。create、コマンド、surface の attach/resize/detach、render tick、capture、destroy はすべてそこで実行され、フレーム要求は集約されます（presenter ごとに queue 済みまたは実行中の tick は最大 1 つ）。メソッドの結果、`EventSink` event、SMTC 更新、texture 登録、HWND/DirectComposition の操作は platform thread に残るため、遅い render tick がウィンドウのメッセージループを塞ぐことはなくなりました。`ERIKA_FLUTTER_FRAME_TRACE=1` を設定すると、presenter ごとに 1 回 `presenter_worker ... platform_thread=... render_thread=... off_platform=true` を、worker 上で計測した遅い tick を `frame_tick ... work_ms=` として log に出します。
+
+他のプラットフォームも同じ owner モデルです。Linux は正規の `windows/erika_presenter_worker.h` を共有し、独自の 16 ms 単調クロックで駆動します。GTK、view、Flutter texture の登録は platform thread に残り、結果と event は idle source 経由で渡されます。OpenHarmony（Flutter プラグインと `erika_ohos` パッケージ）は `presenter_bridge.h` の背後に presenter ごと 1 つの owner thread を持ち、すべての N-API 関数に ArkTS thread で promise を resolve する `...Async` 版もあります。従来の C ヘルパー `ErikaOhosPlayerFromId` は、別スレッドが所有する presenter にネイティブコードが触れてはならないため、null を返すようになりました。Android は引き続き presenter ごとに専用の `HandlerThread` を使います。macOS、iOS、tvOS では各 presenter が専用スレッド（`ErikaPresenterOwner.swift`）を持ち、create、すべてのネイティブコマンド、render、event の polling、capture、destroy を FIFO 順で実行し、フレーム tick は集約されます。`CVDisplayLink` と `CADisplayLink` はそのスレッドを起こすだけで、メインスレッドは引数のデコード、結果と event の順序どおりの配送、AppKit/UIKit の処理（now-playing、リモートコマンド、view）を行います。このため遅い `open`、`seek`、`dispose` が UI スレッドを塞いだり描画を遅らせたりすることはなく、`ERIKA_FLUTTER_FRAME_TRACE=1` は各 tick とコマンドのスレッドを log に出します。
+
 ## Dart API
 
 インストール、再生制御、HTTP キャッシュ、イベント、ビューの例は
@@ -225,12 +229,12 @@ output negotiation、danmaku item count を表示します。FPS は隣接 sampl
 状況: macOS・iOS・tvOS は新シンボルをオプションで解決、Linux・HarmonyOS・Android は共有
 JSON table を経由、Windows は `UnsupportedError`。
 
-macOS と iOS では、プラグインがこの 3 つの呼び出しをバックグラウンドキューで実行し、メインスレッドで
-応答するため、時間のかかる呼び出し（大きな字幕ファイルの `addExternalSubtitle`、`exportFrame`）が
-メインスレッドを占有しません。presenter メソッドの実行中、プラグインのメインスレッドのタイマー
-（統計、イベントのポーリング、macOS の描画）はプレーヤーのロックを待たずに 1 周期を飛ばします。
-`scope` が `global` のメソッド（`exportFrame`、`exportFrames`、`getLogs`、`listMethods`）はそのロックを
-取りません。`listMethods` は各メソッドに `blocking`（処理が終わってから返り、時間が入力に応じて増える）と
+macOS と iOS では、プラグインが `invokeJson` と `getDiagnosticsSnapshot` を presenter の owner thread で、
+`getLogs` をユーティリティキューで実行し、メインスレッドで応答するため、時間のかかる呼び出し（大きな字幕
+ファイルの `addExternalSubtitle`、`exportFrame`）がメインスレッドを占有しません。時間のかかる presenter
+メソッドはその presenter の次のフレームを遅らせます（フレームはコマンドの合間に実行されます）が、UI は
+止めません。`scope` が `global` のメソッド（`exportFrame`、`exportFrames`、`getLogs`、`listMethods`）は
+presenter ハンドルなしで実行されます。`listMethods` は各メソッドに `blocking`（処理が終わってから返り、時間が入力に応じて増える）と
 `writesFiles`（ファイルを作り、結果にパスを列挙する）を付けます。
 
 ## プレーヤーなしで画像を取る
@@ -247,22 +251,38 @@ FFI の書き出しを検証中のビルドに向けられます。
 
 ## Neural Upscaler Status
 
-`setUpscaler` はモードを要求するだけで、kernel は background thread で compile されます。そのため host は `getUpscalerStatus` を poll して UI を更新する必要があります。
+`setUpscaler(ErikaUpscalerMode)` でモード（ArtCNN、Anime4K、`fsr1`、`platformVideo`、`metalFxSpatial`、`custom`。
+モードと各 platform での実行内容は [統合ガイド](integration.ja.md#アップスケーラ) を参照）を要求します。kernel は
+background thread で compile されるため、host は `getUpscalerStatus` を poll して UI を更新する必要があります。
 
 | `activeBackend` | 意味 |
 |-----------------|------|
 | `off` | どの mode も要求されていない。 |
-| `building` | kernel を compile 中（その mode の初回使用）。準備完了まで frame は未拡大で描画される。 |
-| `inactive` | mode は要求されたが適用されていない——kernel が未準備（かつビルド中でもない）、または backend が fallback/failure を記録した。 |
-| `scalar` | Metal scalar または wgpu compute backend で動作中。 |
-| `simdgroupMatrix` | `simdgroup_matrix` backend で動作中（Apple Silicon の既定）。 |
+| `inactive` | mode は要求されたがここでは動かせない（または backend が fallback/failure を記録した）。native sampling を使い、理由は診断の `upscaler` オブジェクトに出る。 |
+| `building` | kernel を background で compile 中。準備完了まで native sampling で描画される。 |
+| `scalar` | 汎用 compute shader。 |
+| `simdgroupMatrix` | Apple `simdgroup_matrix`（M1-M4/A14+）。 |
+| `cooperativeMatrix` | D3D11 と併用する Vulkan `VK_KHR_cooperative_matrix`（Tensor Core / WMMA / XMX）。 |
+| `linalgMatrix` | D3D12 SM 6.10 `linalg::Matrix`。opt-in の preview。 |
+| `videoProcessor` | D3D11 video processor の vendor extension: NVIDIA RTX Video / Intel VSR。 |
+| `videoToolbox` | VideoToolbox のスーパー解像度。 |
+| `metalFx` | MetalFX spatial scaler。 |
+| `tensorOps` | Metal 4 tensor ops（Apple10 GPU: M5/A19）。 |
 
-upscaler は drawable が source resolution より大きく video を表示している場合にのみ有効に
-なります。そのため、1080p source を 1080p（またはそれ以下）の view に出している間は
-`inactive` のままです。C4F16 は realtime の推奨です。Apple の C4F32 は 1080p input で通常
-M-Pro/Max クラスの GPU を必要とします。Android では両 model が Vulkan compute を使い、
-GLES は明示的な `inactive` fallback を報告します。renderer 側の設計は
-`docs/architecture.md` を参照してください。
+`getUpscalerStatus().lastGpuDuration` は Windows でも埋まるようになりました（D3D11 timestamp query）。
+
+UI で伝えておきたい制限: RTX Video Super Resolution（Windows の `platformVideo`）は RTX GPU、NVIDIA App /
+コントロールパネルでの設定有効化、SDR 映像が必要です。VideoToolbox のスケーラは 2x、8 ビット 4:2:0 で 96x96 から
+960x960 のソースのみ、macOS/iOS/tvOS 26+ が必要です。D3D12 linalg は opt-in の preview です。wgpu renderer
+（Linux、Android、OpenHarmony、Windows の wgpu fallback）はすべてのネットワークモードと `fsr1` を実行し、`platformVideo` と
+`metalFxSpatial` は `inactive` を報告します。R8F64 は行列ユニットと SD/720p 素材でのみ実用的です。
+
+`loadUpscalerModel(Uint8List data, {String name = 'custom'})` はカスタムネットワーク（Erika `.esr` ファイル、または
+FSRCNNX / Anime4K CNN の mpv hook shader。ライセンス上 FSRCNNX は同梱せず、host がファイルを用意）を読み込み、
+続けて `setUpscaler(ErikaUpscalerMode.custom)` を呼びます。`clearUpscalerModel()` で外します。Linux plugin は
+JSON のファイルパス方式（`loadUpscalerModelFile`）のみです。
+
+renderer 側の設計は `docs/architecture.md` を参照してください。
 
 ## Ownership Rule
 

@@ -15,7 +15,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -48,9 +51,11 @@ class ErikaEventStreamHandler
 
 class ErikaFlutterPlugin : public flutter::Plugin {
  public:
-  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
+  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar,
+                                   FlutterDesktopMessengerRef messenger);
 
-  explicit ErikaFlutterPlugin(flutter::PluginRegistrarWindows* registrar);
+  ErikaFlutterPlugin(flutter::PluginRegistrarWindows* registrar,
+                     FlutterDesktopMessengerRef messenger);
   ~ErikaFlutterPlugin() override;
 
   ErikaFlutterPlugin(const ErikaFlutterPlugin&) = delete;
@@ -91,6 +96,11 @@ class ErikaFlutterPlugin : public flutter::Plugin {
                                                  WPARAM wparam,
                                                  LPARAM lparam);
   void OnFrameTimer();
+  void PostCompletion(std::function<void()> completion);
+  void DrainCompletions();
+  void DispatchNativeMethod(PlayerHost& host, std::string method,
+                            flutter::EncodableMap args,
+                            std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   std::optional<LRESULT> OnTopLevelWindowProc(HWND hwnd,
                                               UINT message,
                                               WPARAM wparam,
@@ -123,6 +133,8 @@ class ErikaFlutterPlugin : public flutter::Plugin {
   void HandleSmtcCommand(ErikaSmtcCommand command, uint64_t position_micros);
 
   flutter::PluginRegistrarWindows* registrar_ = nullptr;
+  // Retained so availability can be checked after the engine invalidates it.
+  FlutterDesktopMessengerRef native_messenger_ = nullptr;
   std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>>
       event_channel_;
   std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink_;
@@ -143,7 +155,11 @@ class ErikaFlutterPlugin : public flutter::Plugin {
   std::atomic<uint64_t> frame_timer_generation_{0};
   double frame_timer_target_fps_ = 0.0;
   double frame_timer_interval_ms_ = 0.0;
-  bool in_frame_timer_ = false;
+  bool joining_presenter_ = false;
+  std::mutex completion_mutex_;
+  std::deque<std::function<void()>> completions_;
+  bool completion_message_pending_ = false;
+  uint64_t event_sink_generation_ = 0;
 };
 
 }  // namespace erika_flutter

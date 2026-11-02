@@ -290,6 +290,20 @@ timeline through System Media Transport Controls (SMTC), and handles system
 play, pause, and seek commands. A Windows SDK with C++/WinRT is required; the
 plugin links the required WinRT system libraries automatically.
 
+Each presenter runs on its own native worker thread on Windows (create, commands, surface
+attach/resize/detach, render ticks, capture and destroy), and frame requests coalesce. Method results,
+`EventSink` events, SMTC updates, texture registration and HWND/DirectComposition operations stay on the
+platform thread. Set `ERIKA_FLUTTER_FRAME_TRACE=1` to log `presenter_worker` once per presenter and slow
+ticks (`frame_tick ... work_ms=`) measured on the worker.
+
+Linux uses the same owner model (a 16 ms monotonic clock; GTK, view and texture registration stay on
+the platform thread). OpenHarmony has one owner thread per presenter, and every N-API function also
+has an `...Async` variant that resolves a promise on the ArkTS thread; `ErikaOhosPlayerFromId` now
+returns null. Android uses a dedicated `HandlerThread` per presenter. On macOS, iOS and tvOS each
+presenter owns a dedicated thread (`ErikaPresenterOwner.swift`) for create, commands, rendering, event
+polling, capture and destroy; `CVDisplayLink`/`CADisplayLink` only wake it, and a slow `open`, `seek` or
+`dispose` no longer blocks the UI thread or delays rendering.
+
 ## Android Setup
 
 The Android Gradle plugin downloads the verified runtime for each selected ABI.
@@ -491,15 +505,48 @@ multiple players, and SDR screenshot checks.
 
 ## Upscaler
 
-Select ArtCNN at creation time, or switch it later at runtime:
+Select a mode at creation time, or switch it later at runtime:
 
 ```dart
 final player = ErikaPlayer(upscaler: ErikaUpscalerMode.artCnnC4F16Ds);
-await player.setUpscaler(ErikaUpscalerMode.artCnnC4F16Ds);
+await player.setUpscaler(ErikaUpscalerMode.anime4kM);
 ```
 
-Use `ErikaUpscalerMode.off` to disable it. Call
-`player.getUpscalerStatus()` to inspect the requested mode, active backend,
-fallback count, upscaled frame count, and recent GPU timings. Apple uses Metal;
-Android uses wgpu/Vulkan compute for both planar and MediaCodec Surface frames.
-GLES 3.0 keeps normal playback and reports an explicit `inactive` fallback.
+`ErikaUpscalerMode` covers ArtCNN (`artCnnC4F16`, `artCnnC4F32`, `artCnnC4F16Ds`,
+`artCnnC4F16Dn`, `artCnnC4F32Ds`, `artCnnC4F32Dn`, `artCnnR8F64`), Anime4K
+(`anime4kS` ... `anime4kUl`, `anime4kDenoiseS` ... `anime4kDenoiseUl`), `fsr1`
+(AMD FSR 1.0 on luma, any content), `platformVideo` (the platform's video super
+resolution), `metalFxSpatial` (Apple only) and `custom`. Use
+`ErikaUpscalerMode.off` to disable it. Network modes upscale the luma plane 2x;
+`fsr1` and `metalFxSpatial` scale luma to the presented size and `platformVideo`
+scales the whole frame.
+
+Call `player.getUpscalerStatus()` to inspect the requested mode, active backend
+(`off`, `inactive`, `building`, `scalar`, `simdgroupMatrix`, `cooperativeMatrix`,
+`linalgMatrix`, `videoProcessor`, `videoToolbox`, `metalFx`, `tensorOps`), fallback
+count, upscaled frame count, and recent GPU timings (`lastGpuDuration` is now
+reported on Windows too). `building` means kernels are compiling in the background
+and playback uses native sampling meanwhile; `inactive` means the mode cannot run on
+this platform (the reason is in the diagnostics `upscaler` object).
+
+Load your own network with `await player.loadUpscalerModel(bytes, name: 'my-model')`
+(an Erika `.esr` file or an FSRCNNX / Anime4K CNN mpv hook shader; FSRCNNX is not
+bundled for licensing reasons), then `setUpscaler(ErikaUpscalerMode.custom)`;
+`clearUpscalerModel()` unloads it. On Linux only the JSON file-path method
+(`loadUpscalerModelFile`) is available.
+
+Platform notes:
+
+- Windows (D3D11): every network mode including `custom`, `fsr1`, and `platformVideo`
+  through NVIDIA RTX Video Super Resolution (an RTX GPU, enabled in the NVIDIA App /
+  Control Panel, SDR video only) or Intel VSR. `metalFxSpatial` is `inactive`.
+- Apple (Metal): every network mode including `custom`, `fsr1`, `metalFxSpatial`, and
+  `platformVideo` through VideoToolbox (2x only, 8-bit 4:2:0 sources between 96x96 and
+  960x960, macOS/iOS/tvOS 26+; otherwise `inactive`).
+- Linux, Android and OpenHarmony (wgpu/Vulkan): every network mode including
+  `custom`, and `fsr1`; `platformVideo` and `metalFxSpatial` are `inactive`. GLES
+  3.0 keeps normal playback and reports an explicit `inactive` fallback.
+- Web: no upscaler.
+
+See [docs/integration.md](https://github.com/AimesSoft/liberika/blob/main/docs/integration.md#upscaler) for the full matrix and
+measured timings.
