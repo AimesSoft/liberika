@@ -571,6 +571,24 @@ pub enum ErikaLumaUpscalerMode {
     ArtCnnC4F16 = 1,
     ArtCnnC4F32 = 2,
     ArtCnnC4F16Ds = 3,
+    ArtCnnC4F16Dn = 4,
+    ArtCnnC4F32Ds = 5,
+    ArtCnnC4F32Dn = 6,
+    ArtCnnR8F64 = 7,
+    Anime4kS = 16,
+    Anime4kM = 17,
+    Anime4kL = 18,
+    Anime4kVl = 19,
+    Anime4kUl = 20,
+    Anime4kDenoiseS = 21,
+    Anime4kDenoiseM = 22,
+    Anime4kDenoiseL = 23,
+    Anime4kDenoiseVl = 24,
+    Anime4kDenoiseUl = 25,
+    Fsr1 = 32,
+    PlatformVideo = 48,
+    MetalFxSpatial = 49,
+    Custom = 64,
 }
 
 impl ErikaLumaUpscalerMode {
@@ -579,6 +597,24 @@ impl ErikaLumaUpscalerMode {
             1 => Self::ArtCnnC4F16,
             2 => Self::ArtCnnC4F32,
             3 => Self::ArtCnnC4F16Ds,
+            4 => Self::ArtCnnC4F16Dn,
+            5 => Self::ArtCnnC4F32Ds,
+            6 => Self::ArtCnnC4F32Dn,
+            7 => Self::ArtCnnR8F64,
+            16 => Self::Anime4kS,
+            17 => Self::Anime4kM,
+            18 => Self::Anime4kL,
+            19 => Self::Anime4kVl,
+            20 => Self::Anime4kUl,
+            21 => Self::Anime4kDenoiseS,
+            22 => Self::Anime4kDenoiseM,
+            23 => Self::Anime4kDenoiseL,
+            24 => Self::Anime4kDenoiseVl,
+            25 => Self::Anime4kDenoiseUl,
+            32 => Self::Fsr1,
+            48 => Self::PlatformVideo,
+            49 => Self::MetalFxSpatial,
+            64 => Self::Custom,
             _ => Self::Off,
         }
     }
@@ -592,6 +628,12 @@ pub enum ErikaUpscalerBackendStatus {
     Building = 2,
     Scalar = 3,
     SimdgroupMatrix = 4,
+    CooperativeMatrix = 5,
+    LinalgMatrix = 6,
+    VideoProcessor = 7,
+    VideoToolbox = 8,
+    MetalFx = 9,
+    TensorOps = 10,
 }
 
 #[repr(C)]
@@ -1999,6 +2041,24 @@ fn luma_upscaler_mode_from_c(mode: i32) -> LumaUpscalerMode {
         ErikaLumaUpscalerMode::ArtCnnC4F16 => LumaUpscalerMode::ArtCnnC4F16,
         ErikaLumaUpscalerMode::ArtCnnC4F32 => LumaUpscalerMode::ArtCnnC4F32,
         ErikaLumaUpscalerMode::ArtCnnC4F16Ds => LumaUpscalerMode::ArtCnnC4F16Ds,
+        ErikaLumaUpscalerMode::ArtCnnC4F16Dn => LumaUpscalerMode::ArtCnnC4F16Dn,
+        ErikaLumaUpscalerMode::ArtCnnC4F32Ds => LumaUpscalerMode::ArtCnnC4F32Ds,
+        ErikaLumaUpscalerMode::ArtCnnC4F32Dn => LumaUpscalerMode::ArtCnnC4F32Dn,
+        ErikaLumaUpscalerMode::ArtCnnR8F64 => LumaUpscalerMode::ArtCnnR8F64,
+        ErikaLumaUpscalerMode::Anime4kS => LumaUpscalerMode::Anime4kS,
+        ErikaLumaUpscalerMode::Anime4kM => LumaUpscalerMode::Anime4kM,
+        ErikaLumaUpscalerMode::Anime4kL => LumaUpscalerMode::Anime4kL,
+        ErikaLumaUpscalerMode::Anime4kVl => LumaUpscalerMode::Anime4kVl,
+        ErikaLumaUpscalerMode::Anime4kUl => LumaUpscalerMode::Anime4kUl,
+        ErikaLumaUpscalerMode::Anime4kDenoiseS => LumaUpscalerMode::Anime4kDenoiseS,
+        ErikaLumaUpscalerMode::Anime4kDenoiseM => LumaUpscalerMode::Anime4kDenoiseM,
+        ErikaLumaUpscalerMode::Anime4kDenoiseL => LumaUpscalerMode::Anime4kDenoiseL,
+        ErikaLumaUpscalerMode::Anime4kDenoiseVl => LumaUpscalerMode::Anime4kDenoiseVl,
+        ErikaLumaUpscalerMode::Anime4kDenoiseUl => LumaUpscalerMode::Anime4kDenoiseUl,
+        ErikaLumaUpscalerMode::Fsr1 => LumaUpscalerMode::Fsr1,
+        ErikaLumaUpscalerMode::PlatformVideo => LumaUpscalerMode::PlatformVideo,
+        ErikaLumaUpscalerMode::MetalFxSpatial => LumaUpscalerMode::MetalFxSpatial,
+        ErikaLumaUpscalerMode::Custom => LumaUpscalerMode::Custom,
     }
 }
 
@@ -2016,6 +2076,24 @@ fn luma_upscaler_mode_to_c(mode: LumaUpscalerMode) -> i32 {
         LumaUpscalerMode::ArtCnnC4F16 => ErikaLumaUpscalerMode::ArtCnnC4F16 as i32,
         LumaUpscalerMode::ArtCnnC4F32 => ErikaLumaUpscalerMode::ArtCnnC4F32 as i32,
         LumaUpscalerMode::ArtCnnC4F16Ds => ErikaLumaUpscalerMode::ArtCnnC4F16Ds as i32,
+        LumaUpscalerMode::ArtCnnC4F16Dn => ErikaLumaUpscalerMode::ArtCnnC4F16Dn as i32,
+        LumaUpscalerMode::ArtCnnC4F32Ds => ErikaLumaUpscalerMode::ArtCnnC4F32Ds as i32,
+        LumaUpscalerMode::ArtCnnC4F32Dn => ErikaLumaUpscalerMode::ArtCnnC4F32Dn as i32,
+        LumaUpscalerMode::ArtCnnR8F64 => ErikaLumaUpscalerMode::ArtCnnR8F64 as i32,
+        LumaUpscalerMode::Anime4kS => ErikaLumaUpscalerMode::Anime4kS as i32,
+        LumaUpscalerMode::Anime4kM => ErikaLumaUpscalerMode::Anime4kM as i32,
+        LumaUpscalerMode::Anime4kL => ErikaLumaUpscalerMode::Anime4kL as i32,
+        LumaUpscalerMode::Anime4kVl => ErikaLumaUpscalerMode::Anime4kVl as i32,
+        LumaUpscalerMode::Anime4kUl => ErikaLumaUpscalerMode::Anime4kUl as i32,
+        LumaUpscalerMode::Anime4kDenoiseS => ErikaLumaUpscalerMode::Anime4kDenoiseS as i32,
+        LumaUpscalerMode::Anime4kDenoiseM => ErikaLumaUpscalerMode::Anime4kDenoiseM as i32,
+        LumaUpscalerMode::Anime4kDenoiseL => ErikaLumaUpscalerMode::Anime4kDenoiseL as i32,
+        LumaUpscalerMode::Anime4kDenoiseVl => ErikaLumaUpscalerMode::Anime4kDenoiseVl as i32,
+        LumaUpscalerMode::Anime4kDenoiseUl => ErikaLumaUpscalerMode::Anime4kDenoiseUl as i32,
+        LumaUpscalerMode::Fsr1 => ErikaLumaUpscalerMode::Fsr1 as i32,
+        LumaUpscalerMode::PlatformVideo => ErikaLumaUpscalerMode::PlatformVideo as i32,
+        LumaUpscalerMode::MetalFxSpatial => ErikaLumaUpscalerMode::MetalFxSpatial as i32,
+        LumaUpscalerMode::Custom => ErikaLumaUpscalerMode::Custom as i32,
     }
 }
 
@@ -2036,6 +2114,16 @@ fn upscaler_backend_status_to_c(status: LumaUpscalerBackendStatus) -> i32 {
         LumaUpscalerBackendStatus::SimdgroupMatrix => {
             ErikaUpscalerBackendStatus::SimdgroupMatrix as i32
         }
+        LumaUpscalerBackendStatus::CooperativeMatrix => {
+            ErikaUpscalerBackendStatus::CooperativeMatrix as i32
+        }
+        LumaUpscalerBackendStatus::LinalgMatrix => ErikaUpscalerBackendStatus::LinalgMatrix as i32,
+        LumaUpscalerBackendStatus::VideoProcessor => {
+            ErikaUpscalerBackendStatus::VideoProcessor as i32
+        }
+        LumaUpscalerBackendStatus::VideoToolbox => ErikaUpscalerBackendStatus::VideoToolbox as i32,
+        LumaUpscalerBackendStatus::MetalFx => ErikaUpscalerBackendStatus::MetalFx as i32,
+        LumaUpscalerBackendStatus::TensorOps => ErikaUpscalerBackendStatus::TensorOps as i32,
     }
 }
 
@@ -2546,6 +2634,52 @@ pub unsafe extern "C" fn erika_presenter_set_upscaler(
         handle
             .presenter
             .set_luma_upscaler(luma_upscaler_mode_from_c(mode));
+        ErikaStatus::Ok
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_load_upscaler_model(
+    handle: *mut ErikaPresenterHandle,
+    name: *const c_char,
+    data: *const u8,
+    data_len: usize,
+) -> ErikaStatus {
+    if data.is_null() || data_len == 0 {
+        return ErikaStatus::NullPointer;
+    }
+    let name = optional_c_string(name).unwrap_or_else(|| "custom".to_string());
+    with_presenter_mut(handle, |handle| {
+        let bytes = unsafe { std::slice::from_raw_parts(data, data_len) };
+        match handle.presenter.load_custom_upscaler_model(&name, bytes) {
+            Ok(()) => ErikaStatus::Ok,
+            Err(error) => player_error(error.to_string()),
+        }
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_clear_upscaler_model(
+    handle: *mut ErikaPresenterHandle,
+) -> ErikaStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.clear_custom_upscaler_model();
         ErikaStatus::Ok
     })
 }
@@ -3738,6 +3872,39 @@ pub unsafe extern "C" fn erika_presenter_set_volume(
 pub unsafe extern "C" fn erika_presenter_set_upscaler(
     _handle: *mut std::ffi::c_void,
     _mode: i32,
+) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_load_upscaler_model(
+    _handle: *mut std::ffi::c_void,
+    _name: *const c_char,
+    _data: *const u8,
+    _data_len: usize,
+) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    any(target_os = "ios", target_os = "tvos"),
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+)))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_clear_upscaler_model(
+    _handle: *mut std::ffi::c_void,
 ) -> ErikaStatus {
     ErikaStatus::PlayerError
 }

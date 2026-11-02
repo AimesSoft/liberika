@@ -132,7 +132,7 @@ Apple platform の主 renderer です。
 - YCbCr sampling、transfer decode、gamut mapping（BT.2020→BT.709、Display P3→BT.709）。
 - Tone mapping: Mobius、Reinhard、clip with absolute nits。
 - SDR output（`BGRA8Unorm`）と Apple EDR output（`RGBA16Float` + EDR headroom）。
-- Neural luma upscaler（`LumaUpscalerMode`）: ArtCNN C4F16/C4F16 DS/C4F32 2x doubler を Metal compute pass として decoded Y plane に適用し、render pass と同じ command buffer で実行します（`renderer/metal/upscaler.rs`）。Chroma は source resolution のままです。動画が source resolution より大きく表示される場合のみ動作し、network output は decoded frame ごとに cache されるため、同じ frame の繰り返し vsync tick では compute を再実行しません。weights は upstream ONNX release（`assets/artcnn/`）から変換し、`tests/artcnn_upscaler.rs` の onnxruntime reference で検証しています。backend は `simdgroup_matrix` matmul（Apple Silicon default）と scalar texture fallback の 2 つで、どちらも background thread で compile され、準備完了までは未拡大で再生を続けます。blob validation、model layout、execution policy、frame-token cache は platform-neutral な `renderer/artcnn.rs` にあり、wgpu backend も共有します。
+- 輝度アップスケーラ（`LumaUpscalerMode`）: ネットワーク系モード（ArtCNN、Anime4K、`Custom`）を Metal compute として decoded Y plane に適用し、render pass と同じ command buffer に encode します。クロマは source resolution のままです。ネットワーク出力は decoded frame ごとにキャッシュされ、同じフレームの vsync tick では compute を省略します。kernel は background thread で compile されるため、準備ができるまで再生は未アップスケールのまま続きます。各エンジンファミリー（汎用ネットワークエンジン、FSR1、MetalFX spatial、VideoToolbox）は [スーパー解像度](#スーパー解像度) を参照してください。
 - Subtitle overlay: RGBA plane upload と alpha blending。
 - Danmaku: atlas からの instanced glyph quad drawing（shadow → outline → fill）。
 - Presentation layout は source aspect ratio を保ちます。
@@ -143,7 +143,7 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 
 - ゼロコピー D3D11VA デコードテクスチャ相互運用：デコードされた `ID3D11Texture2D` surface を render device に共有し、CPU を経由しません。
 - YCbCr サンプリングと色空間変換（HLSL shader）、Metal と同じ pipeline model。
-- ゼロコピー D3D11VA luma plane 上で ArtCNN C4F16/C4F16 DS/C4F32 を tiled compute。bounded RGBA16F feature array、source-sized packed DepthToSpace output、decoded-frame cache を使います。動画の表示サイズが source より大きい場合だけ実行し、feature level 11.0 未満または optional compute failure 時は `Inactive` fallback を明示します。
+- ゼロコピー D3D11VA luma plane 上で、生成した compute kernel によるニューラル / プラットフォームのスーパー解像度を実行します。計測によるバックエンド選択、RTX/Intel VSR、opt-in の Vulkan / D3D12 アクセラレータ sidecar を含みます（[スーパー解像度](#スーパー解像度) 参照）。アップスケール後の輝度は通常の 2x `R16_FLOAT` テクスチャで、decoded frame ごとにキャッシュされます。動かせないモードは理由付きで明示的に `Inactive` fallback を報告します。
 - HDR10 出力：`R10G10B10A2_UNORM` swapchain + `DXGI_HDR_METADATA_HDR10`、SDR（`BGRA8`）fallback あり。
 - 字幕 overlay の alpha-atlas upload と blending、atlas からの instanced danmaku glyph quad 描画。
 - `render_tick` で駆動される window-hosted swapchain。
@@ -157,7 +157,7 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 - Android MediaCodec Surface を AHardwareBuffer/Vulkan で import。native interop が使えない場合は ByteBuffer/CPU upload に明示的に fallback します。
 - 共通の `renderer/frame.rs` boundary は geometry/color metadata と、FFmpeg decoded frame または独立した prepared AHardwareBuffer を保持します。MediaCodec Surface の AVFrame は decoder callback context が有効な playback worker 上で解放され、presenter と GPU recovery は decoder-owned AVFrame を保持しません。
 - 色空間変換と tone mapping（Metal と同じ pipeline model）。
-- bounded feature texture と source-sized packed DepthToSpace output を使う tiled ArtCNN C4F16/C4F16 DS/C4F32 compute（`renderer/wgpu_artcnn.rs`）。native luma と Android の converted nonlinear RGB の両方を扱い、`rgb + (Y_sr - Y)` で chroma を保持します。GLES 3.0 は compute を試さず、`Inactive` と `native_luma_sampling` fallback を明示します。
+- 超解像（`renderer/wgpu_sr.rs` と `renderer/sr/wgsl.rs`）: D3D11、Metal と同じ `SrModel` IR から、すべてのネットワークモード（ArtCNN 1-7、Anime4K 16-25、`Custom`）と `Fsr1` を実行します。ネットワークの出力は packed 2x2 depth-to-space quad を持つ source-sized の `Rgba16Float` texture で、FSR1 は表示サイズの luma texture を書き出します。native luma と Android の変換済み nonlinear RGB texture の両方を受け付け、chroma は `rgb + (Y_sr - Y)` で保持します。`PlatformVideo` と `MetalFxSpatial` は `Inactive` です。GLES 3.0 は compute を試さず、構造化された `native_luma_sampling` fallback とともに `Inactive` を報告します。
 - subtitle/danmaku composite、frame capture、headless testing 用 offscreen target。display surface が extended-linear の場合も screenshot は常に SDR RGBA8 target へ offscreen render し、未マップの scRGB 値を SDR pixel として返しません。
 - surface handle model は macOS NSView、iOS UIView、Windows HWND、X11/Wayland、Android native window、OpenHarmony `OHNativeWindow` をカバーします。
 - OpenHarmony では AVCodec の Surface 出力を `OHNativeBuffer` 由来の Vulkan external image として import し、Vulkan YCbCr sampler で YUV 変換を GPU 上で行うため、decode したフレームは CPU コピーなしで wgpu compositor に到達します。必要な Vulkan extension がない端末では software decode と CPU upload に fallback し、その経緯は diagnostics event から確認できます。
@@ -166,6 +166,28 @@ Windows のネイティブ renderer（`renderer/d3d11.rs`）：
 - API 34+ では Android host が `Display.registerHdrSdrRatioChangedListener` で display を監視し、実際の変化を `erika_presenter_set_output_headroom` で liberika に publish します。wgpu は surface を reattach せず、後続 frame の effective content headroom と queryable output status を更新します。ratio が available なら `activeHeadroomKnown` は true で、known flag または ratio が実際に変わった場合だけ `headroomUpdates` が増えます。
 - Flutter extended-linear player で `edrHeadroom` を明示しない場合、content ceiling は default 4x、`SurfaceView` の desired headroom は system auto を意味する `0` です。明示値は content ceiling となり、API 35 では per-`SurfaceView` desired headroom にもなります。global Window は変更しません。
 - emulator / non-HDR device では明示的な SDR fallback branch を検証済みです。API 35 HDR 実機で `Rgba16Float + SCRGB_LINEAR` の acceptance が完了するまで、active extended-linear path を実機検証済みとは表現しません。
+
+### スーパー解像度
+
+ネットワーク系モードは `crates/erika/src/renderer/sr/` にあるバックエンド非依存のネットワーク IR を共有します。
+
+- `model.rs`: ネットワークグラフ（1 チャンネル輝度入力に対する畳み込み、入力ごとの kernel、CReLU 変換、残差、ReLU/SiLU/PReLU、2x depth-to-space ヘッド）と `.esr` シリアライズ。
+- `catalog.rs` はモードを同梱モデルに対応付け、`mpv.rs` は Anime4K / FSRCNNX の mpv hook shader を取り込み（重みのみで shader コードは実行しません）、`artcnn.rs` は従来の ArtCNN blob を変換し、`fsr1.rs` は FSR 1.0 です。
+- `fold.rs` は厳密な最適化を行います。兄弟 pass の統合と、線形レイヤーの隣接レイヤーへの代数的な畳み込み（ArtCNN の conv0 を conv1 へ、conv5 を conv6 へ）で、9 種類の境界クラス別重みにより画像の端も厳密に保ちます。ArtCNN の MAC は 26-33% 減ります。
+- `reference.rs` は CPU oracle で、すべての GPU backend がこれを基準にテストされます。
+- `hlsl.rs` は D3D11 の kernel generator、`wgsl.rs` は wgpu 用です。
+
+Direct3D 11（`renderer/d3d11_sr.rs` と関連ファイル）:
+
+- `d3d11_sr.rs` は executor です。レイヤーごとの kernel、リテラルインデックスで constant buffer に置いた重み、groupshared による入力のステージング、epilogue/head の融合、境界用の ring dispatch 1 回、192 MB 予算内での tiling、background FXC compile とディスクキャッシュ、timestamp query による GPU 時間計測を行います。
+- `d3d11_sr_select.rs` はネットワークごとにスカラーと各アクセラレータを計測して最速のものを選び、計測した候補を列挙する `luma_upscaler_backend_selection` 診断イベントを出します。
+- `d3d11_vsr.rs` は video processor の vendor extension で NVIDIA RTX Video / Intel VSR を駆動します。
+- Sidecar: `d3d11_vk_coopmat.rs` と `vk_coopmat/`（Vulkan cooperative matrix）、`d3d11_d3d12_linalg.rs` と `d3d12_linalg/`（opt-in の D3D12 SM 6.10 preview）。
+
+Metal（`renderer/metal/`）: `upscaler_network.rs` が汎用ネットワークエンジン（M5/A19 は Metal 4 tensor ops、それ以外は `simdgroup_matrix` またはスカラー）で、`upscaler_fsr.rs`、`upscaler_metalfx.rs`、`upscaler_vt.rs` がそれぞれ FSR1、MetalFX spatial、VideoToolbox を担当し、`upscaler.rs` が選択と status を扱います。手書きの ArtCNN kernel は `ERIKA_SR_BACKEND=legacy` で引き続き選択できます。
+
+wgpu（`renderer/wgpu_sr.rs`、`renderer/sr/wgsl.rs`）: `wgsl.rs` が `SrModel` IR から WGSL を生成し（`reference.rs` で検証）、`wgpu_sr.rs` が executor として background compile（`Building` status）、scratch 予算内での tiling、モデルキャッシュを担当します。生成される kernel は、workgroup memory による入力のステージング、bias/residual/activation の epilogue と depth-to-space head の融合、畳み込み済みレイヤーの境界クラス用 perimeter dispatch 1 回、adapter が `SHADER_F16` を持つ場合の fp16、対応を公表する Vulkan adapter（NVIDIA）での 16x16 cooperative matrix を使います。adapter ごとの既定値は最初の数フレームで kernel variant を少数計測して調整されます（プロセス内キャッシュ。`ERIKA_WGPU_SR_AUTOTUNE=0` で無効化）。FSR1 は EASU+RCAS を融合した kernel です。`wgpu_artcnn.rs`（従来の ArtCNN executor）は回帰比較のためだけに残っています。
+
 
 ### Render Pipeline
 

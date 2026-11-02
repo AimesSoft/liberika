@@ -1,0 +1,56 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#define SPECIALIZED_LAYER
+#include "common.glsl"
+
+// The four-channel head wastes 3/4 of a minimum 16-row matrix tile.
+// Use the vector ALUs for this small epilogue layer while hidden convolutions
+// use the cooperative-matrix pipelines. Inputs and weights are reused from
+// shared memory over an 8x8 spatial tile. Head coefficients use the constant
+// cache, avoiding repeated shared loads and allowing uniform FMA operands.
+layout(constant_id=4) const uint MAX_KERNEL=9;
+layout(constant_id=21) const uint COMMON_KERNEL=0;
+layout(constant_id=22) const uint COMMON_CHANNELS=0;
+layout(constant_id=23) const uint COMMON_TRANSFORM=0xffffffffu;
+layout(constant_id=29) const uint COMMON_REAL_CHANNELS=0;
+layout(constant_id=31) const uint SINGLE_INPUT=0;
+layout(set=0,binding=5,std140) uniform HeadWeights { vec4 headWeights[1024]; };
+layout(local_size_x=8,local_size_y=8) in;
+const uint CHANNELS=16;
+shared float tile[CHANNELS*(8+MAX_KERNEL-1)*(8+MAX_KERNEL-1)];
+void main() {
+    uint lane=gl_LocalInvocationIndex;
+    uvec2 start=p.region.xy+gl_WorkGroupID.xy*8;
+    uvec2 pos=start+gl_LocalInvocationID.xy;
+    vec4 acc=vec4(0.0);
+    for(uint tap=0;tap<h(14);) {
+        uint d=h(13)+tap*8;
+        uint kernel=COMMON_KERNEL!=0 ? COMMON_KERNEL : uint(1-2*int(data[d+1]));
+        uint side=8+kernel-1,area=side*side;
+        uint channels=COMMON_CHANNELS!=0 ? COMMON_CHANNELS : data[d+4];
+        [[unroll]] for(uint c0=0;c0<channels;c0+=CHANNELS) {
+            for(uint i=lane;i<CHANNELS*area;i+=64) {
+                ivec2 at=ivec2(start+uvec2(i%side,(i/side)%side))-ivec2(kernel/2);
+                float16_t v=float16_t(0.0);
+                if(all(greaterThanEqual(at,ivec2(0))) && all(lessThan(at,ivec2(p.size.zw))))
+                    v=features[feature_index(data[d]+c0+i/area,uint(at.y)*p.size.z+uint(at.x))];
+                uint t=COMMON_TRANSFORM!=0xffffffffu ? COMMON_TRANSFORM : data[d+3];
+                tile[i]=float(t==1 ? max(v,float16_t(0.0)) : t==2 ? max(-v,float16_t(0.0)) : v);
+            }
+            barrier();
+            uint realChannels=COMMON_REAL_CHANNELS!=0 ? COMMON_REAL_CHANNELS : data[d+6];
+            [[unroll]] for(uint c=0;c<min(CHANNELS,realChannels-c0);++c) {
+                [[unroll]] for(uint ky=0;ky<kernel;++ky) [[unroll]] for(uint kx=0;kx<kernel;++kx) {
+                    float v=float(tile[c*area+(gl_LocalInvocationID.y+ky)*side+gl_LocalInvocationID.x+kx]);
+                    uint t=((c0+c)*kernel+ky)*kernel+kx;
+                    acc+=v*headWeights[(SINGLE_INPUT!=0 ? 0 : data[d+7]&0x7fffffffu)+t];
+                }
+            }
+            barrier();
+        }
+        tap+=kernel*kernel;
+    }
+    if(all(lessThan(pos,p.size.zw)) && all(lessThan(pos,p.region.xy+p.region.zw)))
+        for(uint c=0;c<4;++c) epilogue(acc[c],c,pos.y*p.size.z+pos.x,0);
+}

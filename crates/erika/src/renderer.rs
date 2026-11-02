@@ -5,7 +5,15 @@ pub mod artcnn;
 #[cfg(target_os = "windows")]
 pub mod d3d11;
 #[cfg(target_os = "windows")]
-mod d3d11_artcnn;
+mod d3d11_d3d12_linalg;
+#[cfg(target_os = "windows")]
+mod d3d11_sr;
+#[cfg(target_os = "windows")]
+mod d3d11_sr_select;
+#[cfg(target_os = "windows")]
+mod d3d11_vk_coopmat;
+#[cfg(target_os = "windows")]
+mod d3d11_vsr;
 #[cfg(all(
     test,
     feature = "wgpu",
@@ -28,6 +36,8 @@ pub(crate) mod ohos_vulkan;
 pub mod output;
 pub mod pipeline;
 pub(crate) mod presentation;
+#[doc(hidden)]
+pub mod sr;
 #[cfg(all(feature = "wgpu", target_os = "linux", not(target_env = "ohos")))]
 pub(crate) mod vulkan_export;
 #[cfg(feature = "wgpu")]
@@ -35,5 +45,7 @@ pub mod wgpu;
 #[cfg(feature = "wgpu")]
 #[doc(hidden)]
 pub mod wgpu_artcnn;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_sr;
 
 pub use frame::{VideoFrameDescriptor, VideoFramePayload};

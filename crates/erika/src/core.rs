@@ -1001,6 +1001,22 @@ pub trait RendererBackend {
     /// upscaler implementation ignore the request.
     fn set_luma_upscaler(&mut self, _mode: crate::renderer::pipeline::LumaUpscalerMode) {}
 
+    /// Why the upscaler is `Inactive` or degraded, and the engine running it
+    /// (for example `scalar`, `cooperative_matrix`, `metal4_tensor_ops`,
+    /// `fsr1`, `nvidia_rtx_video`). Reported in diagnostics JSON.
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        (None, None)
+    }
+
+    /// Installs the network run by `LumaUpscalerMode::Custom` (already
+    /// validated and optimized); `None` clears it. Backends without a network
+    /// engine ignore it.
+    fn set_custom_upscaler_model(
+        &mut self,
+        _model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+    }
+
     /// Publishes the display's current HDR/SDR headroom ratio. Android uses
     /// this for queryable runtime status; renderers that do not expose dynamic
     /// display headroom may ignore the update.
@@ -1039,10 +1055,27 @@ pub trait RendererBackend {
 pub enum LumaUpscalerBackendStatus {
     #[default]
     Off,
+    /// The mode is not available on this backend or failed; native sampling
+    /// is used and diagnostics carry the reason.
     Inactive,
     Building,
+    /// Generic compute shaders (scalar ALUs).
     Scalar,
+    /// Apple `simdgroup_matrix` kernels.
     SimdgroupMatrix,
+    /// Vulkan `VK_KHR_cooperative_matrix` kernels (NVIDIA Tensor Cores, AMD
+    /// WMMA, Intel XMX) driven next to a D3D11 renderer.
+    CooperativeMatrix,
+    /// Direct3D 12 Shader Model 6.10 `linalg::Matrix` kernels.
+    LinalgMatrix,
+    /// A D3D11 video processor vendor extension (NVIDIA RTX Video, Intel VSR).
+    VideoProcessor,
+    /// VideoToolbox super resolution.
+    VideoToolbox,
+    /// MetalFX spatial scaling.
+    MetalFx,
+    /// Metal 4 tensor ops on the GPU matrix units of Apple10 GPUs (M5/A19).
+    TensorOps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

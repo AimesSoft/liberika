@@ -59,8 +59,9 @@ use crate::renderer::output::{
 };
 use crate::renderer::pipeline::{LumaUpscalerMode, SourceColorState, VideoRenderPipeline};
 use crate::renderer::presentation::{PresentationLayout, PresentationRect};
-use crate::renderer::wgpu_artcnn::{
-    WgpuArtCnn, WgpuArtCnnInput, WgpuArtCnnInputKind, WgpuArtCnnStatus,
+use crate::renderer::wgpu_sr::{
+    Input as WgpuArtCnnInput, InputKind as WgpuArtCnnInputKind, Status as WgpuArtCnnStatus,
+    WgpuSr as WgpuArtCnn,
 };
 use crate::subtitle::AssColor;
 
@@ -593,6 +594,7 @@ pub struct WgpuRenderer {
     output_status: OutputRuntimeStatus,
     output_headroom: OutputHeadroomState,
     upscaler_mode: LumaUpscalerMode,
+    custom_upscaler_model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
     upscaler: WgpuArtCnn,
     upscaler_failed_frame_token: Option<u64>,
     upscaler_active_frame_reported: bool,
@@ -775,7 +777,9 @@ fn requested_device_limits(adapter_limits: wgpu::Limits, backend: wgpu::Backend)
     // GLES 3.0 adapters legitimately expose no compute workgroups. Request the
     // WebGL2/GLES baseline there instead of accidentally asking for the GLES 3.1
     // compute minima and rejecting an otherwise valid presentation backend.
-    let baseline = if backend == wgpu::Backend::Gl {
+    let has_compute = adapter_limits.max_compute_workgroups_per_dimension > 0
+        && adapter_limits.max_storage_buffers_per_shader_stage >= 4;
+    let baseline = if backend == wgpu::Backend::Gl && !has_compute {
         wgpu::Limits::downlevel_webgl2_defaults()
     } else {
         wgpu::Limits::downlevel_defaults()
@@ -783,6 +787,13 @@ fn requested_device_limits(adapter_limits: wgpu::Limits, backend: wgpu::Backend)
     let mut limits = baseline
         .using_resolution(adapter_limits.clone())
         .using_alignment(adapter_limits.clone());
+    if has_compute {
+        limits.max_uniform_buffer_binding_size =
+            adapter_limits.max_uniform_buffer_binding_size.min(65536);
+        limits.max_compute_workgroup_storage_size = adapter_limits
+            .max_compute_workgroup_storage_size
+            .min(28 * 1024);
+    }
     if backend == wgpu::Backend::Gl {
         // Some phone emulators expose fewer varyings than the WebGL2 baseline.
         // Our presentation shaders use only a few; asking for all 15 prevents
@@ -1337,6 +1348,24 @@ fn request_wgpu_device(
     } else {
         wgpu::Features::empty()
     };
+    let required_features = required_features
+        | (adapter.features()
+            & (wgpu::Features::SHADER_F16
+                | wgpu::Features::SUBGROUP
+                | wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES));
+    let required_features = required_features
+        | if matches!(
+            adapter_info.backend,
+            wgpu::Backend::Metal | wgpu::Backend::Vulkan
+        ) && (std::env::var("ERIKA_WGPU_SR_COOPERATIVE").as_deref() == Ok("1")
+            || (std::env::var_os("ERIKA_WGPU_SR_COOPERATIVE").is_none()
+                && crate::renderer::wgpu_sr::Config::vulkan_matrix_supported(&adapter)))
+        {
+            adapter.features() & wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+        } else {
+            wgpu::Features::empty()
+        };
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     let required_features = required_features
         | if adapter_info.backend == wgpu::Backend::Vulkan {
@@ -1381,7 +1410,14 @@ fn request_wgpu_device(
         required_features,
         required_limits,
         memory_hints: wgpu::MemoryHints::default(),
-        experimental_features: wgpu::ExperimentalFeatures::default(),
+        experimental_features: if required_features
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        {
+            // SR matrices are gated by adapter properties or an explicit override.
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::default()
+        },
         trace: wgpu::Trace::Off,
     };
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -1715,6 +1751,7 @@ impl WgpuRenderer {
             output_status: OutputRuntimeStatus::requested(output_mode),
             output_headroom: OutputHeadroomState::default(),
             upscaler_mode: LumaUpscalerMode::Off,
+            custom_upscaler_model: None,
             gamut_lut: None,
             gamut_lut_job: None,
             dummy_lut: None,
@@ -1747,6 +1784,7 @@ impl WgpuRenderer {
             self.video_alpha_mode,
             surface,
         )?;
+        replacement.set_custom_upscaler_model(self.custom_upscaler_model.clone());
         replacement.set_luma_upscaler(self.upscaler_mode);
         replacement.upload_serial = self.upload_serial;
         if let Some((frame, uniforms, color)) = self.linux_frame.as_ref() {
@@ -3065,6 +3103,7 @@ impl WgpuRenderer {
             target_width,
             target_height,
         );
+        self.upscaler.poll_build();
         let upscale_requested = !self.video_alpha_mode.has_alpha()
             && self.upscaler_mode.is_enabled()
             && self.upscaler.status() == WgpuArtCnnStatus::Scalar
@@ -3103,6 +3142,15 @@ impl WgpuRenderer {
                 input,
                 video_width,
                 video_height,
+                [
+                    viewport.width.round().max(1.0) as u32,
+                    viewport.height.round().max(1.0) as u32,
+                ],
+                if source_is_rgb || video_uniforms.full_range != 0 {
+                    crate::renderer::sr::reference::LumaRange::Full
+                } else {
+                    crate::renderer::sr::reference::LumaRange::Limited
+                },
                 Some(frame_token),
             );
             let compute_commands = compute_encoder.finish();
@@ -3144,6 +3192,11 @@ impl WgpuRenderer {
                                     video_uniforms.packed_d2s_rgb_detail_input()
                                 }
                             };
+                            if !output.packed {
+                                // 4: ordinary luma, 5: nonlinear RGB detail.
+                                video_uniforms.input_mode = (video_uniforms.input_mode & !255)
+                                    | if source_is_rgb { 5 } else { 4 };
+                            }
                             self.upscaler_failed_frame_token = None;
                             if !self.upscaler_active_frame_reported {
                                 self.upscaler_active_frame_reported = true;
@@ -5239,6 +5292,9 @@ impl RendererBackend for WgpuRenderer {
             last_danmaku_vertex_count: 0,
             upscaler_mode: self.upscaler_mode,
             upscaler_backend: match self.upscaler.status() {
+                WgpuArtCnnStatus::Scalar if self.upscaler.is_tuning() => {
+                    LumaUpscalerBackendStatus::Building
+                }
                 WgpuArtCnnStatus::Off => LumaUpscalerBackendStatus::Off,
                 WgpuArtCnnStatus::Building => LumaUpscalerBackendStatus::Building,
                 WgpuArtCnnStatus::Inactive => LumaUpscalerBackendStatus::Inactive,
@@ -5273,7 +5329,11 @@ impl RendererBackend for WgpuRenderer {
         if mode == self.upscaler_mode
             && self.upscaler.mode() == mode
             && ((mode == LumaUpscalerMode::Off && self.upscaler.status() == WgpuArtCnnStatus::Off)
-                || (mode.is_enabled() && self.upscaler.status() == WgpuArtCnnStatus::Scalar))
+                || (mode.is_enabled()
+                    && matches!(
+                        self.upscaler.status(),
+                        WgpuArtCnnStatus::Scalar | WgpuArtCnnStatus::Building
+                    )))
         {
             return;
         }
@@ -5288,7 +5348,12 @@ impl RendererBackend for WgpuRenderer {
                 crate::trace::diagnostic(
                     serde_json::json!({
                         "event": "luma_upscaler",
-                        "stage": if mode.is_enabled() { "active" } else { "disabled" },
+                        "stage": match self.upscaler.status() {
+                            WgpuArtCnnStatus::Building => "building",
+                            WgpuArtCnnStatus::Scalar => "active",
+                            WgpuArtCnnStatus::Off => "disabled",
+                            WgpuArtCnnStatus::Inactive => "inactive",
+                        },
                         "renderer": "wgpu",
                         "requestedMode": format!("{mode:?}"),
                         "activeBackend": format!("{:?}", self.upscaler.status()),
@@ -5301,6 +5366,31 @@ impl RendererBackend for WgpuRenderer {
                 crate::trace::diagnostic(failure.diagnostic_json().to_string());
             }
         }
+    }
+
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        self.custom_upscaler_model = model.clone();
+        self.upscaler.set_custom_model(&self.device, model);
+        self.upscaler_failed_frame_token = None;
+        self.upscaler_active_frame_reported = false;
+    }
+
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        (
+            self.upscaler.last_failure().map(|f| f.reason.clone()),
+            (self.upscaler.status() == WgpuArtCnnStatus::Scalar).then_some(
+                if self.upscaler_mode == LumaUpscalerMode::Fsr1 {
+                    "wgpu_fsr1_fused"
+                } else if self.upscaler.half() {
+                    "wgpu_f16"
+                } else {
+                    "wgpu_f32"
+                },
+            ),
+        )
     }
 
     fn set_output_headroom(&mut self, headroom: f32, known: bool) {
@@ -5378,6 +5468,7 @@ pub struct AndroidRecoveringWgpuRenderer {
     output_headroom: OutputHeadroomState,
     upscaler_mode: LumaUpscalerMode,
     retired_stats: RendererRuntimeStats,
+    custom_upscaler_model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
     retired_output_status: OutputRuntimeStatus,
     terminal_failure: Option<String>,
     recovery_sequence: u64,
@@ -5407,6 +5498,7 @@ impl AndroidRecoveringWgpuRenderer {
             output_headroom: OutputHeadroomState::default(),
             upscaler_mode: LumaUpscalerMode::Off,
             retired_stats: RendererRuntimeStats::default(),
+            custom_upscaler_model: None,
             retired_output_status: OutputRuntimeStatus::requested(config.output_mode),
             terminal_failure: None,
             recovery_sequence: 0,
@@ -5604,6 +5696,8 @@ impl AndroidRecoveringWgpuRenderer {
             self.active.output_status(),
         );
         self.active = replacement;
+        self.active
+            .set_custom_upscaler_model(self.custom_upscaler_model.clone());
         self.active.set_luma_upscaler(self.upscaler_mode);
         self.active
             .update_output_headroom_state(self.output_headroom, false);
@@ -5906,6 +6000,18 @@ impl RendererBackend for AndroidRecoveringWgpuRenderer {
     fn set_luma_upscaler(&mut self, mode: LumaUpscalerMode) {
         self.upscaler_mode = mode;
         self.active.set_luma_upscaler(mode);
+    }
+
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        self.custom_upscaler_model = model.clone();
+        self.active.set_custom_upscaler_model(model);
+    }
+
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        self.active.upscaler_status_detail()
     }
 
     fn set_output_headroom(&mut self, headroom: f32, known: bool) {
@@ -7345,6 +7451,104 @@ mod tests {
                 (got - want).abs() <= 2,
                 "y={y} tone_map={tone_map} ({nits} nits) = {got}, expected {want}"
             );
+        }
+    }
+
+    #[test]
+    fn wgpu_sr_presentation_preserves_planar_and_rgb_chroma() {
+        use crate::renderer::sr::model::*;
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let model = std::sync::Arc::new(SrModel {
+            name: "identity residual".into(),
+            padding: Padding::Clamp,
+            input_range: InputRange::Full,
+            tensors: vec![1, 4],
+            layers: vec![ConvLayer {
+                output: 1,
+                out_channels: 4,
+                inputs: vec![ConvInput {
+                    tensor: 0,
+                    transform: InputTransform::Identity,
+                    kernel: 1,
+                    weights: vec![0.0; 4],
+                }],
+                bias: vec![0.0; 4],
+                residual: None,
+                activation: Activation::None,
+                border: None,
+            }],
+            head: Head {
+                tensor: 1,
+                order: SubpixelOrder::RowMajor,
+                base: HeadBase::Bilinear,
+                clamp: true,
+            },
+        });
+        renderer.set_custom_upscaler_model(Some(model));
+        for rgb in [false, true] {
+            renderer.set_luma_upscaler(LumaUpscalerMode::Off);
+            let uniforms =
+                VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+            if rgb {
+                let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("SR RGB presentation test"),
+                    size: wgpu::Extent3d {
+                        width: 4,
+                        height: 4,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                renderer.queue.write_texture(
+                    texture.as_image_copy(),
+                    &[51, 102, 153, 255].repeat(16),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(16),
+                        rows_per_image: Some(4),
+                    },
+                    texture.size(),
+                );
+                renderer.current_video = Some(UploadedVideoFrame {
+                    textures: UploadedVideoTextures::Rgb { texture },
+                    width: 4,
+                    height: 4,
+                    uniforms: uniforms.rgb_texture_input(),
+                    source_color: None,
+                    frame_token: renderer.next_upload_serial(),
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                    _linux_direct: None,
+                });
+                renderer.current_video_visible = true;
+            } else {
+                let (y, uv) = build_solid_nv12(4, 4, 128, 80, 160);
+                renderer.upload_nv12(4, 4, &y, &uv, uniforms).unwrap();
+            }
+            let baseline = renderer
+                .render_current_offscreen_sized(8, 8, None, None)
+                .unwrap()
+                .unwrap();
+            for mode in [LumaUpscalerMode::Custom, LumaUpscalerMode::Fsr1] {
+                renderer.set_luma_upscaler(mode);
+                renderer.upscaler.wait_ready().unwrap();
+                let before = renderer.upscaler.stats().upscaled_frames;
+                let enhanced = renderer
+                    .render_current_offscreen_sized(8, 8, None, None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(renderer.upscaler.stats().upscaled_frames, before + 1);
+                for (&a, &b) in baseline.rgba.iter().zip(&enhanced.rgba) {
+                    assert!(
+                        (i16::from(a) - i16::from(b)).abs() <= 2,
+                        "{mode:?} rgb={rgb}: {a} vs {b}"
+                    );
+                }
+            }
         }
     }
 

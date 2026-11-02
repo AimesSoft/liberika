@@ -21,11 +21,14 @@ mod windows_demo {
         WgpuSurfaceKind,
         danmaku::{DanmakuColor, DanmakuItem, DanmakuMode, DanmakuShadowStyle, DanmakuTimeline},
         presenter::{PresenterConfig, PresenterRuntime},
+        renderer::pipeline::LumaUpscalerMode,
     };
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT, VK_SPACE};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_SPACE,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW,
         GetClientRect, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
@@ -44,6 +47,8 @@ mod windows_demo {
         danmaku_path: Option<String>,
         synthetic_danmaku_rate: Option<f64>,
         renderer: RendererBackendPreference,
+        upscaler: LumaUpscalerMode,
+        upscaler_model: Option<String>,
     }
 
     #[derive(Debug, Default)]
@@ -69,6 +74,10 @@ mod windows_demo {
         TogglePlayback,
         SeekBackward,
         SeekForward,
+        /// `U` / `Shift+U`: next / previous upscaler mode.
+        CycleUpscaler(bool),
+        /// `I`: print the upscaler status.
+        PrintUpscaler,
     }
 
     pub fn run() -> erika::Result<()> {
@@ -76,6 +85,13 @@ mod windows_demo {
         let hwnd = unsafe { create_window()? };
         let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
         let mut presenter = PresenterRuntime::new(presenter_config(&options)?)?;
+        if let Some(path) = options.upscaler_model.as_deref() {
+            let bytes = std::fs::read(path).map_err(|error| {
+                erika::PlayerError::Renderer(format!("cannot read {path}: {error}"))
+            })?;
+            presenter.load_custom_upscaler_model(path, &bytes)?;
+        }
+        presenter.set_luma_upscaler(options.upscaler);
         let (mut width, mut height) = client_size(hwnd);
         let mut scale = dpi_scale(hwnd);
         presenter.attach_surface(PlatformSurface::Wgpu(WgpuSurfaceHandle::new(
@@ -146,6 +162,8 @@ mod windows_demo {
         let mut danmaku_path = None;
         let mut synthetic_danmaku_rate = None;
         let mut renderer = RendererBackendPreference::PlatformNative;
+        let mut upscaler = LumaUpscalerMode::Off;
+        let mut upscaler_model = None;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -189,6 +207,31 @@ mod windows_demo {
                 "--platform-native" => {
                     renderer = RendererBackendPreference::PlatformNative;
                 }
+                "--upscaler" => {
+                    let value = args.next().ok_or_else(|| {
+                        erika::PlayerError::Renderer("--upscaler requires a mode".to_string())
+                    })?;
+                    upscaler = LumaUpscalerMode::ALL
+                        .into_iter()
+                        .find(|mode| mode.label() == value.replace('-', "_"))
+                        .ok_or_else(|| {
+                            let modes: Vec<&str> = LumaUpscalerMode::ALL
+                                .iter()
+                                .map(|mode| mode.label())
+                                .collect();
+                            erika::PlayerError::Renderer(format!(
+                                "invalid --upscaler value `{value}` (expected {})",
+                                modes.join("|")
+                            ))
+                        })?;
+                }
+                "--upscaler-model" => {
+                    upscaler_model = Some(args.next().ok_or_else(|| {
+                        erika::PlayerError::Renderer(
+                            "--upscaler-model requires an .esr or mpv shader path".to_string(),
+                        )
+                    })?);
+                }
                 _ if media.is_none() => media = Some(arg),
                 _ => {
                     return Err(erika::PlayerError::Renderer(format!(
@@ -204,6 +247,8 @@ mod windows_demo {
             danmaku_path,
             synthetic_danmaku_rate,
             renderer,
+            upscaler,
+            upscaler_model,
         })
     }
 
@@ -330,6 +375,10 @@ mod windows_demo {
             VK_SPACE => Some(DemoCommand::TogglePlayback),
             VK_LEFT => Some(DemoCommand::SeekBackward),
             VK_RIGHT => Some(DemoCommand::SeekForward),
+            0x55 => Some(DemoCommand::CycleUpscaler(unsafe {
+                GetKeyState(i32::from(VK_SHIFT)) < 0
+            })),
+            0x49 => Some(DemoCommand::PrintUpscaler),
             _ => None,
         }
     }
@@ -357,6 +406,31 @@ mod windows_demo {
                     .map_or(target, |duration| target.min(duration));
                 presenter.seek(target)
             }
+            DemoCommand::CycleUpscaler(backwards) => {
+                let modes = LumaUpscalerMode::ALL;
+                let current = presenter.runtime_snapshot().renderer.upscaler_mode;
+                let index = modes.iter().position(|mode| *mode == current).unwrap_or(0);
+                let next = if backwards {
+                    (index + modes.len() - 1) % modes.len()
+                } else {
+                    (index + 1) % modes.len()
+                };
+                presenter.set_luma_upscaler(modes[next]);
+                println!("upscaler -> {}", modes[next].label());
+                Ok(())
+            }
+            DemoCommand::PrintUpscaler => {
+                let renderer = presenter.runtime_snapshot().renderer;
+                println!(
+                    "upscaler mode={} backend={:?} frames={} fallbacks={} gpu_ms={:.3}",
+                    renderer.upscaler_mode.label(),
+                    renderer.upscaler_backend,
+                    renderer.upscaled_frames,
+                    renderer.upscaler_fallbacks,
+                    renderer.last_gpu_duration.as_secs_f64() * 1000.0
+                );
+                Ok(())
+            }
         };
         if let Err(error) = result {
             eprintln!("Erika Windows native demo command {command:?} failed: {error}");
@@ -367,7 +441,10 @@ mod windows_demo {
         let snapshot = presenter.runtime_snapshot();
         let duration = snapshot.media_time.as_secs_f64().max(0.0);
         let title = format!(
-            "Erika Windows Native Demo  t={duration:.2}s  sw={} hw={} zero={} direct={} shared={} cpu={} hdr10={} hdr_src={} sdr_tm={} audio_q={} underflow={}",
+            "Erika Windows Native Demo  t={duration:.2}s  sr={}/{:?} {:.2}ms  sw={} hw={} zero={} direct={} shared={} cpu={} hdr10={} hdr_src={} sdr_tm={} audio_q={} underflow={}",
+            snapshot.renderer.upscaler_mode.label(),
+            snapshot.renderer.upscaler_backend,
+            snapshot.renderer.last_gpu_duration.as_secs_f64() * 1000.0,
             snapshot.renderer.software_video_frames,
             snapshot.renderer.hardware_video_frames,
             snapshot.renderer.zero_copy_video_frames,

@@ -1074,7 +1074,7 @@ impl MetalRendererImpl {
             self.stats.drawable_width,
             self.stats.drawable_height,
         );
-        // The neural doubler only pays off when the video is actually shown
+        // Super resolution only pays off when the video is actually shown
         // larger than its source resolution.
         let upscale_requested = self.upscaler.mode().is_enabled()
             && layout.is_source_upscaled()
@@ -1082,6 +1082,13 @@ impl MetalRendererImpl {
                 luma.pixelFormat(),
                 MTLPixelFormat::R8Unorm | MTLPixelFormat::R16Unorm
             );
+        if self.upscaler.mode().is_enabled() && !upscale_requested {
+            self.upscaler.note_skipped(if layout.is_source_upscaled() {
+                "unsupported luma plane format"
+            } else {
+                "the video is not presented above its source size"
+            });
+        }
 
         unsafe {
             let pipeline = self.video_pipeline_state()?;
@@ -1092,19 +1099,38 @@ impl MetalRendererImpl {
                 ));
             };
 
-            let mut upscaled_luma = None;
+            let mut upscaled = None;
             if upscale_requested {
                 let encode_start = Instant::now();
-                match self.upscaler.encode_with_token(
-                    &self.device,
-                    &command_buffer,
+                // The luma plane as presented, in luma texels: spatial and
+                // platform scalers scale straight to it (packed alpha frames
+                // keep both halves, so scale the whole plane).
+                let scale_x = f64::from(layout.target_rect[2]) / f64::from(logical_width.max(1));
+                let scale_y =
+                    f64::from(layout.target_rect[3]) / (frame.frame.info.height.max(1) as f64);
+                let presented = (
+                    ((luma.width() as f64) * scale_x).round().max(1.0) as usize,
+                    ((luma.height() as f64) * scale_y).round().max(1.0) as usize,
+                );
+                let request = crate::renderer::metal::upscaler::UpscaleRequest {
                     luma,
-                    luma.pixelFormat(),
-                    frame.frame_token,
-                ) {
-                    Ok(texture) => {
+                    chroma: Some(chroma),
+                    output_format: luma.pixelFormat(),
+                    range: if matches!(frame.pipeline.source.range, ColorRange::Full) {
+                        crate::renderer::metal::upscaler::LumaRange::Full
+                    } else {
+                        crate::renderer::metal::upscaler::LumaRange::Limited
+                    },
+                    presented,
+                    frame_token: frame.frame_token,
+                };
+                match self
+                    .upscaler
+                    .encode_frame(&self.device, &command_buffer, &request)
+                {
+                    Ok(frame) => {
                         self.stats.last_upscaler_encode_duration = encode_start.elapsed();
-                        upscaled_luma = texture;
+                        upscaled = frame;
                     }
                     Err(error) => {
                         crate::trace::diagnostic_at(
@@ -1115,12 +1141,18 @@ impl MetalRendererImpl {
                     }
                 }
             }
-            if upscaled_luma.is_some() {
+            if upscaled.is_some() {
                 self.stats.upscaled_frames += 1;
                 frame.pipeline = frame.pipeline.with_luma_upscaler(self.upscaler.mode());
                 upscaled_luma_used = true;
             }
-            let luma: &ProtocolObject<dyn MTLTexture> = upscaled_luma.as_deref().unwrap_or(luma);
+            let luma: &ProtocolObject<dyn MTLTexture> =
+                upscaled.as_ref().map_or(luma, |upscaled| &*upscaled.luma);
+            // Platform video scalers return the whole frame at the new size.
+            let chroma: &ProtocolObject<dyn MTLTexture> = upscaled
+                .as_ref()
+                .and_then(|upscaled| upscaled.chroma.as_deref())
+                .unwrap_or(chroma);
 
             let (drawable, texture) = if let Some(layer) = &self.layer {
                 let Some(drawable): Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> =
@@ -1527,6 +1559,22 @@ impl MetalRendererImpl {
 
     pub fn set_luma_upscaler(&mut self, mode: LumaUpscalerMode) {
         self.upscaler.set_mode(mode);
+    }
+
+    pub fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        self.upscaler.set_custom_model(model);
+    }
+
+    /// Why the upscaler is inactive (or runs on a downgraded kernel family),
+    /// plus the engine actually executing it, for diagnostics.
+    pub fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        (
+            self.upscaler.status_reason().map(str::to_string),
+            self.upscaler.engine_label(),
+        )
     }
 
     /// Records the GPU time of the previous frame's command buffer once it

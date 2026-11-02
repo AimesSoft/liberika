@@ -2,6 +2,57 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
+## Unreleased
+
+### Super resolution (#193, #194)
+
+- Super resolution is rebuilt around one backend-neutral network description
+  (`renderer/sr/`): ArtCNN, Anime4K and runtime-loaded networks are lowered to
+  it, linear layers are folded exactly into their neighbours (ArtCNN needs
+  26-33% fewer multiply-adds; dedicated weights for the one-pixel image border
+  keep the output identical), and every GPU backend is checked against its CPU
+  reference.
+- New modes: ArtCNN C4F16 DN, C4F32 DS/DN and R8F64 (desktop only);
+  Anime4K v3.2 Upscale CNN x2 S/M/L/VL/UL and Upscale+Denoise S/M/L/VL/UL;
+  AMD FSR 1.0 (EASU + RCAS, fused); `PlatformVideo` (NVIDIA RTX Video Super
+  Resolution / Intel VSR through the D3D11 video processor on Windows,
+  VideoToolbox low-latency super resolution on Apple); `MetalFxSpatial`; and
+  `Custom`, a network loaded at runtime from an Erika `.esr` file or an mpv
+  FSRCNNX/Anime4K shader with `erika_presenter_load_upscaler_model` (FSRCNNX
+  weights are LGPL and are not bundled).
+- Windows (D3D11): kernels are generated per layer with constant-buffer
+  weights, `groupshared` input staging, fused epilogues and a fused
+  depth-to-space head; Anime4K's final layer is accumulated while the earlier
+  layers run, and FSR1 fetches with `GatherRed`. Shaders compile on a
+  background thread and are cached on disk, so switching modes no longer
+  stalls rendering. On an RTX 5060 Ti, 1080p input: ArtCNN C4F16 2.44 ms (was
+  12.4 ms), C4F32 7.3 ms (was 39.4 ms), Anime4K S/M/L/VL/UL
+  0.35/0.78/0.83/2.07/4.11 ms, FSR1 to 4K 0.31 ms.
+- Windows Tensor Core backends: a Vulkan `VK_KHR_cooperative_matrix` executor
+  and an opt-in D3D12 SM 6.10 linalg preview share textures and fences with
+  D3D11. The fastest of scalar, cooperative matrix and linalg is measured on
+  real frames per network and frame size; the matrix backends win for the
+  wide models (C4F32, R8F64).
+- Apple (Metal): Metal 4 tensor ops on M5/A19, `simdgroup_matrix` on
+  M1-M4/A14+, fp16 accumulators where the reference still matches, and
+  Anime4K's final layer computed as per-layer partials. On an M5 Pro, 1080p
+  input: C4F16 2.65 ms, C4F32 6.35 ms, Anime4K UL 7.3 ms, FSR1 to 4K 0.77 ms.
+- wgpu (Linux, Android, OpenHarmony, Windows wgpu fallback): every network
+  mode and `Fsr1` now run (previously legacy ArtCNN only), with generated
+  WGSL kernels, fp16 where the adapter supports it, 16x16 cooperative
+  matrices on Vulkan adapters that expose them, and per-adapter kernel choices
+  refined by timing a few variants on the first frames. On an RTX 5060 Ti
+  through Vulkan, C4F16 takes 2.77 ms for 1080p input (was 12.6 ms) and
+  C4F32 11.4 ms (was 73 ms). Android and OpenHarmony hardware has not been
+  benchmarked yet.
+- The upscaled luma is a plain 2x `R16_FLOAT` texture on D3D11 and Metal;
+  GPU time is reported in `lastGpuMicros`, and the diagnostics `upscaler`
+  object adds `engine`, `reason` and `lastGpuMs`.
+- New backend states report how a mode runs: `CooperativeMatrix`,
+  `LinalgMatrix`, `VideoProcessor`, `VideoToolbox`, `MetalFx` and
+  `TensorOps`. Backends that cannot run a mode keep native sampling and report
+  `Inactive`.
+
 ## 0.3.3 - 2026-11-01
 
 - Added mute that keeps the volume: `PresenterRuntime::set_muted`, C

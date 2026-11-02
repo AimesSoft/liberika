@@ -33,7 +33,6 @@ use crate::renderer::artcnn::{
     ArtCnnExecutionPolicy, ArtCnnModel, ArtCnnModelLayout, CONVOLUTION_TAPS as TAPS,
     FrameTokenCache, MIDDLE_LAYER_COUNT as MID_LAYERS,
 };
-use crate::renderer::pipeline::LumaUpscalerMode;
 
 /// Simdgroups per threadgroup; each handles one output row.
 const SIMDS: usize = 4;
@@ -77,7 +76,6 @@ struct MatPool {
 }
 
 pub(super) struct Resources {
-    mode: LumaUpscalerMode,
     channels: usize,
     pxf: usize,
     offsets: MatOffsets,
@@ -90,10 +88,6 @@ pub(super) struct Resources {
 }
 
 impl Resources {
-    pub(super) fn mode(&self) -> LumaUpscalerMode {
-        self.mode
-    }
-
     pub(super) fn allocated_bytes(&self) -> u64 {
         let pool_bytes = self.pool.as_ref().map_or(0, |pool| {
             pool.features
@@ -267,7 +261,6 @@ pub(super) fn build_resources(
     };
 
     Ok(Resources {
-        mode,
         channels,
         pxf,
         offsets,

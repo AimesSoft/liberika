@@ -648,13 +648,9 @@ impl WindowLabState {
     }
 }
 
-fn upscaler_label(mode: LumaUpscalerMode) -> &'static str {
-    match mode {
-        LumaUpscalerMode::Off => "off",
-        LumaUpscalerMode::ArtCnnC4F16 => "artcnn-c4f16",
-        LumaUpscalerMode::ArtCnnC4F16Ds => "artcnn-c4f16-ds",
-        LumaUpscalerMode::ArtCnnC4F32 => "artcnn-c4f32",
-    }
+/// CLI spelling of a mode: its diagnostics label with dashes.
+fn upscaler_label(mode: LumaUpscalerMode) -> String {
+    mode.label().replace('_', "-")
 }
 
 fn upscaler_backend_label(status: LumaUpscalerBackendStatus) -> &'static str {
@@ -664,6 +660,12 @@ fn upscaler_backend_label(status: LumaUpscalerBackendStatus) -> &'static str {
         LumaUpscalerBackendStatus::Building => "building",
         LumaUpscalerBackendStatus::Scalar => "scalar",
         LumaUpscalerBackendStatus::SimdgroupMatrix => "matmul",
+        LumaUpscalerBackendStatus::CooperativeMatrix => "cooperative-matrix",
+        LumaUpscalerBackendStatus::LinalgMatrix => "linalg-matrix",
+        LumaUpscalerBackendStatus::VideoProcessor => "video-processor",
+        LumaUpscalerBackendStatus::VideoToolbox => "video-toolbox",
+        LumaUpscalerBackendStatus::MetalFx => "metalfx",
+        LumaUpscalerBackendStatus::TensorOps => "tensor-ops",
     }
 }
 
@@ -1422,17 +1424,19 @@ fn parse_args(args: &[String]) -> Result<PerfOptions, String> {
             "--software" => options.decode_preference = VideoDecodePreference::Software,
             "--upscaler" => {
                 let value = next_string(args, &mut index, "--upscaler")?;
-                options.luma_upscaler = match value.as_str() {
-                    "off" => LumaUpscalerMode::Off,
-                    "artcnn-c4f16" => LumaUpscalerMode::ArtCnnC4F16,
-                    "artcnn-c4f16-ds" => LumaUpscalerMode::ArtCnnC4F16Ds,
-                    "artcnn-c4f32" => LumaUpscalerMode::ArtCnnC4F32,
-                    other => {
-                        return Err(format!(
-                            "invalid --upscaler value: {other} (expected off|artcnn-c4f16|artcnn-c4f16-ds|artcnn-c4f32)"
-                        ));
-                    }
-                };
+                options.luma_upscaler = LumaUpscalerMode::ALL
+                    .into_iter()
+                    .find(|mode| upscaler_label(*mode) == value.replace('_', "-"))
+                    .ok_or_else(|| {
+                        let expected: Vec<String> = LumaUpscalerMode::ALL
+                            .into_iter()
+                            .map(upscaler_label)
+                            .collect();
+                        format!(
+                            "invalid --upscaler value: {value} (expected {})",
+                            expected.join("|")
+                        )
+                    })?;
             }
             "--videotoolbox" => options.decode_preference = VideoDecodePreference::VideoToolbox,
             "--d3d11va" => options.decode_preference = VideoDecodePreference::D3d11va,

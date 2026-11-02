@@ -128,7 +128,7 @@ Apple 平台的主渲染器：
 - YCbCr 采样、transfer decode、gamut mapping（BT.2020→BT.709、Display P3→BT.709）。
 - Tone mapping：Mobius、Reinhard、clip，支持绝对 nits。
 - SDR 输出（`BGRA8Unorm`）与 Apple EDR 输出（`RGBA16Float` + EDR headroom）。
-- 神经亮度超分（`LumaUpscalerMode`）：ArtCNN C4F16/C4F16 DS/C4F32 2x doubler，以 Metal compute pass 跑在解码后的 Y plane 上，并与 render pass 使用同一 command buffer（`renderer/metal/upscaler.rs`）。色度保持原分辨率。仅在视频显示尺寸大于源分辨率时启用；网络输出会按解码帧缓存，重复 vsync tick 直接复用结果。权重来自上游 ONNX 发布（`assets/artcnn/`），并用 `tests/artcnn_upscaler.rs` 中的 onnxruntime 参考验证。提供 `simdgroup_matrix` matmul 后端（Apple Silicon 默认）和 scalar texture fallback；两者都在后台线程编译，编译完成前播放会先以未放大状态继续。blob 校验、模型布局、执行策略和 frame-token cache 已抽到平台中立的 `renderer/artcnn.rs`，并由 wgpu 后端共同使用。
+- 亮度超分（`LumaUpscalerMode`）：网络类模式（ArtCNN、Anime4K、`Custom`）以 Metal compute 跑在解码后的 Y plane 上，并与 render pass 使用同一 command buffer。色度保持原分辨率。网络输出会按解码帧缓存，重复 vsync tick 直接复用结果。kernel 在后台线程编译，编译完成前播放会先以未放大状态继续。各引擎族（通用网络引擎、FSR1、MetalFX spatial、VideoToolbox）见[超分](#超分)。
 - 字幕 overlay：RGBA plane 上传与 alpha blending。
 - 弹幕：来自 atlas 的 instanced glyph quad 绘制（shadow → outline → fill）。
 - 呈现布局保持源宽高比。
@@ -139,7 +139,7 @@ Windows 平台的原生渲染器（`renderer/d3d11.rs`）：
 
 - 零拷贝 D3D11VA 解码纹理互操作：解码出的 `ID3D11Texture2D` 表面共享进渲染设备，不经过 CPU。
 - YCbCr 采样与色彩空间转换（HLSL shader），与 Metal 保持同一流水线模型。
-- 在零拷贝 D3D11VA luma plane 上分块执行 ArtCNN C4F16/C4F16 DS/C4F32，复用有界 RGBA16F feature array，并输出源分辨率 packed DepthToSpace 纹理和按解码帧缓存。仅当视频显示尺寸大于源尺寸时运行；低于 feature level 11.0 或可选 compute 失败时明确报告 `Inactive` 回退。
+- 在零拷贝 D3D11VA luma plane 上通过生成的 compute kernel 执行神经超分与平台超分，包含实测后端选择、RTX/Intel VSR，以及可选的 Vulkan / D3D12 加速器 sidecar（见[超分](#超分)）。放大后的亮度是普通的 2x `R16_FLOAT` 纹理，按解码帧缓存。无法运行的模式会明确报告 `Inactive` 回退并给出原因。
 - HDR10 输出：`R10G10B10A2_UNORM` swapchain + `DXGI_HDR_METADATA_HDR10`，并提供 SDR（`BGRA8`）回退。
 - 字幕 overlay alpha-atlas 上传与 blending；来自 atlas 的 instanced 弹幕 glyph quad 绘制。
 - window-hosted swapchain，由 `render_tick` 驱动。
@@ -153,7 +153,7 @@ Windows 平台的原生渲染器（`renderer/d3d11.rs`）：
 - Android 通过 AHardwareBuffer/Vulkan 导入 MediaCodec Surface；原生互操作不可用时明确切到 ByteBuffer/CPU upload。
 - 公共 `renderer/frame.rs` 边界统一携带尺寸/色彩元数据，以及 FFmpeg 解码帧或独立的 prepared AHardwareBuffer。MediaCodec Surface 的 AVFrame 会在 playback worker 上、decoder callback context 仍存活时释放；presenter 与 GPU recovery 不再持有 decoder-owned AVFrame。
 - 色彩空间转换、tone mapping（与 Metal 保持同一流水线模型）。
-- 分块执行 ArtCNN C4F16/C4F16 DS/C4F32（`renderer/wgpu_artcnn.rs`），用有界 feature texture 和源分辨率 packed DepthToSpace 输出控制显存。既支持原生 luma plane，也支持 Android 已转换的 nonlinear RGB texture，并通过 `rgb + (Y_sr - Y)` 保持色度。GLES 3.0 不尝试 compute，而是明确报告 `Inactive` 和 `native_luma_sampling` 回退。
+- 超分辨率（`renderer/wgpu_sr.rs` 与 `renderer/sr/wgsl.rs`）：支持全部网络模式（ArtCNN 1-7、Anime4K 16-25、`Custom`）以及 `Fsr1`，与 D3D11、Metal 共用同一份 `SrModel` IR。网络输出是源分辨率的 `Rgba16Float` texture，存放 packed 2x2 depth-to-space 四元组；FSR1 输出呈现分辨率的 luma texture。既支持原生 luma plane，也支持 Android 已转换的 nonlinear RGB texture，并通过 `rgb + (Y_sr - Y)` 保持色度。`PlatformVideo` 与 `MetalFxSpatial` 为 `Inactive`。GLES 3.0 不尝试 compute，而是明确报告 `Inactive` 和 `native_luma_sampling` 回退。
 - 字幕/弹幕合成、截图，以及可用于无头验证的离屏 render target。即使显示 surface 是 extended-linear，截图也始终离屏渲染到 SDR RGBA8 target，避免把未映射的 scRGB 值当成 SDR 像素输出。
 - 表面句柄模型覆盖 macOS NSView、iOS UIView、Windows HWND、X11/Wayland、Android native window、OpenHarmony `OHNativeWindow`。
 - OpenHarmony 把 AVCodec 的 Surface 输出作为 `OHNativeBuffer` 支撑的 Vulkan 外部图像导入，并用 Vulkan YCbCr sampler 在 GPU 上完成 YUV 转换，解码帧无需 CPU 拷贝即可进入 wgpu 合成器。缺少所需 Vulkan 扩展的设备回退到软解 + CPU 上传，回退过程通过诊断事件上报。
@@ -162,6 +162,28 @@ Windows 平台的原生渲染器（`renderer/d3d11.rs`）：
 - API 34+ 上，Android 宿主通过 `Display.registerHdrSdrRatioChangedListener` 观察显示器，并把真实变化经 `erika_presenter_set_output_headroom` 发布给 liberika。wgpu 无需重新 attach surface，就会让后续帧使用更新后的有效内容 headroom，并同步可查询状态。ratio 可用时 `activeHeadroomKnown` 为 true；只有 known 标志或 ratio 确实变化时，`headroomUpdates` 才增长。
 - Flutter extended-linear player 未显式传 `edrHeadroom` 时，内容上限默认为 4x，同时给 `SurfaceView` 传 `0` 表示系统 auto desired headroom。显式数值会成为内容上限，并在 API 35 上作为 per-`SurfaceView` desired headroom；liberika 不修改全局 Window。
 - 模拟器/非 HDR 设备覆盖已经验证明确的 SDR 回退分支；在完成 API 35 HDR 真机上的 `Rgba16Float + SCRGB_LINEAR` 验收前，不把 active extended-linear 路径描述为“已通过真机验证”。
+
+### 超分
+
+网络类模式共用位于 `crates/erika/src/renderer/sr/` 的平台中立网络 IR：
+
+- `model.rs`：网络图（单通道亮度输入上的卷积，每个输入有各自的 kernel，CReLU 变换、残差、ReLU/SiLU/PReLU，以及 2x depth-to-space 头）及其 `.esr` 序列化。
+- `catalog.rs` 把模式映射到内置模型；`mpv.rs` 导入 Anime4K / FSRCNNX 的 mpv hook shader（只取权重，从不执行 shader 代码）；`artcnn.rs` 降级转换旧版 ArtCNN blob；`fsr1.rs` 是 FSR 1.0。
+- `fold.rs` 做精确的优化：合并同级 pass，并把线性层代数折叠进相邻层（ArtCNN 的 conv0 折进 conv1、conv5 折进 conv6），用九组边界类别权重保证图像边缘仍然精确。ArtCNN 的 MAC 减少 26-33%。
+- `reference.rs` 是 CPU oracle，所有 GPU 后端都以它为测试基准。
+- `hlsl.rs` 是 D3D11 kernel 生成器，`wgsl.rs` 是 wgpu 的。
+
+Direct3D 11（`renderer/d3d11_sr.rs` 及相邻文件）：
+
+- `d3d11_sr.rs` 是执行器：逐层 kernel，权重以字面索引放在 constant buffer 中，groupshared 暂存输入，融合 epilogue/head，边缘用一次 ring dispatch，在 192 MB 预算内分块，后台 FXC 编译加磁盘缓存，并用 timestamp query 统计 GPU 耗时。
+- `d3d11_sr_select.rs` 按网络实测标量与各加速器，选择最快者，并发出 `luma_upscaler_backend_selection` 诊断事件，列出实测的候选。
+- `d3d11_vsr.rs` 通过 video processor 厂商扩展驱动 NVIDIA RTX Video / Intel VSR。
+- Sidecar：`d3d11_vk_coopmat.rs` 与 `vk_coopmat/`（Vulkan cooperative matrix），以及 `d3d11_d3d12_linalg.rs` 与 `d3d12_linalg/`（可选的 D3D12 SM 6.10 预览）。
+
+Metal（`renderer/metal/`）：`upscaler_network.rs` 是通用网络引擎（M5/A19 用 Metal 4 tensor ops，其余为 `simdgroup_matrix` 或标量），`upscaler_fsr.rs`、`upscaler_metalfx.rs`、`upscaler_vt.rs` 分别对应 FSR1、MetalFX spatial 与 VideoToolbox；`upscaler.rs` 负责选择与状态。手写的 ArtCNN kernel 仍可通过 `ERIKA_SR_BACKEND=legacy` 选用。
+
+wgpu（`renderer/wgpu_sr.rs`、`renderer/sr/wgsl.rs`）：`wgsl.rs` 从 `SrModel` IR 生成 WGSL，并以 `reference.rs` 校验；`wgpu_sr.rs` 是执行器，负责后台编译（`Building` 状态）、在 scratch 预算内分块和模型缓存。生成的 kernel 使用 workgroup memory 暂存输入、融合 bias/residual/激活 epilogue 与 depth-to-space head、用一次 perimeter dispatch 处理折叠层的边界类别，在适配器具备 `SHADER_F16` 时使用 fp16，在声明支持的 Vulkan 适配器（NVIDIA）上使用 16x16 cooperative matrix。每个适配器的默认值会在最初几帧通过计时少量 kernel 变体来校准（进程内缓存；`ERIKA_WGPU_SR_AUTOTUNE=0` 可关闭）。FSR1 是融合的 EASU+RCAS kernel。`wgpu_artcnn.rs`（旧版 ArtCNN 执行器）仅保留用于回归对比。
+
 
 ### Render Pipeline
 

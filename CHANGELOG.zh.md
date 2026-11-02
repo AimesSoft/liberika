@@ -2,6 +2,19 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
+## Unreleased
+
+### 超分（#193、#194）
+
+- 超分改为围绕一份与后端无关的网络描述（`renderer/sr/`）重建：ArtCNN、Anime4K 与运行时加载的网络都转换到这份描述；线性层被精确合并进相邻层（ArtCNN 少 26-33% 的乘加；图像边缘一圈像素使用专用权重，输出与原网络一致），每个 GPU 后端都与 CPU 参考实现比对。
+- 新模式：ArtCNN C4F16 DN、C4F32 DS/DN 与 R8F64（仅桌面）；Anime4K v3.2 Upscale CNN x2 S/M/L/VL/UL 与 Upscale+Denoise S/M/L/VL/UL；AMD FSR 1.0（EASU + RCAS，合并为一个 kernel）；`PlatformVideo`（Windows 上经 D3D11 video processor 调用 NVIDIA RTX Video Super Resolution / Intel VSR，Apple 上为 VideoToolbox 低延迟超分）；`MetalFxSpatial`；以及 `Custom`：用 `erika_presenter_load_upscaler_model` 在运行时加载 Erika `.esr` 文件或 mpv FSRCNNX/Anime4K shader（FSRCNNX 权重为 LGPL，不内置）。
+- Windows（D3D11）：按层生成 kernel，权重放在常量缓冲，输入经 `groupshared` 暂存，epilogue 与 depth-to-space 输出层合并；Anime4K 的最后一层在前面各层运行时累加，FSR1 用 `GatherRed` 取样。shader 在后台线程编译并缓存到磁盘，切换模式不再卡住渲染。RTX 5060 Ti、1080p 输入：ArtCNN C4F16 2.44 ms（原 12.4 ms），C4F32 7.3 ms（原 39.4 ms），Anime4K S/M/L/VL/UL 0.35/0.78/0.83/2.07/4.11 ms，FSR1 到 4K 0.31 ms。
+- Windows Tensor Core 后端：Vulkan `VK_KHR_cooperative_matrix` 执行器与可选的 D3D12 SM 6.10 linalg 预览，经共享纹理与 fence 和 D3D11 协作。按网络和帧尺寸在真实帧上实测标量、cooperative matrix 与 linalg，选最快者；宽模型（C4F32、R8F64）由矩阵后端胜出。
+- Apple（Metal）：M5/A19 用 Metal 4 tensor ops，M1-M4/A14+ 用 `simdgroup_matrix`；在仍与参考实现一致的地方使用 fp16 累加；Anime4K 的最后一层按层计算部分和。M5 Pro、1080p 输入：C4F16 2.65 ms，C4F32 6.35 ms，Anime4K UL 7.3 ms，FSR1 到 4K 0.77 ms。
+- wgpu（Linux、Android、OpenHarmony、Windows 的 wgpu 回退）：所有网络模式与 `Fsr1` 现在都能运行（此前只有旧版 ArtCNN），使用生成的 WGSL kernel；适配器支持时用 fp16，在提供 16x16 cooperative matrix 的 Vulkan 适配器上使用矩阵单元，并在最初几帧实测少量 kernel 变体来调整各适配器的选择。RTX 5060 Ti 走 Vulkan 时，1080p 输入的 C4F16 为 2.77 ms（原 12.6 ms），C4F32 为 11.4 ms（原 73 ms）。Android 与 OpenHarmony 真机尚未实测。
+- D3D11 与 Metal 上的超分亮度输出为普通 2x `R16_FLOAT` 纹理；GPU 耗时报告在 `lastGpuMicros`，诊断 `upscaler` 对象新增 `engine`、`reason` 与 `lastGpuMs`。
+- 新的后端状态说明模式的运行方式：`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx` 与 `TensorOps`。无法运行某模式的后端保持原生采样并报告 `Inactive`。
+
 ## 0.3.3 - 2026-11-01
 
 - 新增保留音量的静音：`PresenterRuntime::set_muted`、C `erika_presenter_set_muted`、JSON `setMuted` 与 `volume`（`{volume, muted}`）、Flutter `ErikaPlayer.setMuted` 与 `getVolume`。静音期间设置的音量在取消静音时生效；`volume()` 始终报告宿主选择的音量。

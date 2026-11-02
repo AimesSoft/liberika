@@ -2,6 +2,19 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
+## Unreleased
+
+### 超解像（#193、#194）
+
+- 超解像を、バックエンドに依存しない 1 つのネットワーク記述（`renderer/sr/`）を中心に作り直しました。ArtCNN、Anime4K、実行時に読み込むネットワークはすべてこの記述に変換され、線形層は隣の層へ厳密に畳み込まれます（ArtCNN の積和は 26-33% 減。画像端 1 ピクセルには専用の重みを使い、出力は元のネットワークと一致します）。すべての GPU バックエンドを CPU 参照実装と照合しています。
+- 新しいモード：ArtCNN C4F16 DN、C4F32 DS/DN、R8F64（デスクトップのみ）、Anime4K v3.2 Upscale CNN x2 S/M/L/VL/UL と Upscale+Denoise S/M/L/VL/UL、AMD FSR 1.0（EASU + RCAS を 1 つの kernel に融合）、`PlatformVideo`（Windows では D3D11 video processor 経由の NVIDIA RTX Video Super Resolution / Intel VSR、Apple では VideoToolbox の低遅延超解像）、`MetalFxSpatial`、そして `Custom`：`erika_presenter_load_upscaler_model` で Erika `.esr` ファイルまたは mpv の FSRCNNX/Anime4K shader を実行時に読み込みます（FSRCNNX の重みは LGPL のため同梱しません）。
+- Windows（D3D11）：層ごとに kernel を生成し、重みは定数バッファ、入力は `groupshared` に置き、epilogue と depth-to-space の出力層を融合しました。Anime4K の最終層は前の層の実行中に累積し、FSR1 は `GatherRed` で取得します。shader はバックグラウンドスレッドでコンパイルしてディスクにキャッシュするため、モード切り替えで描画が止まりません。RTX 5060 Ti、1080p 入力：ArtCNN C4F16 2.44 ms（従来 12.4 ms）、C4F32 7.3 ms（従来 39.4 ms）、Anime4K S/M/L/VL/UL 0.35/0.78/0.83/2.07/4.11 ms、FSR1 で 4K へ 0.31 ms。
+- Windows の Tensor Core バックエンド：Vulkan `VK_KHR_cooperative_matrix` の実行器と opt-in の D3D12 SM 6.10 linalg preview が、共有テクスチャと fence で D3D11 と連携します。ネットワークとフレームサイズごとに実フレームでスカラー、cooperative matrix、linalg を計測して最速を選び、幅の広いモデル（C4F32、R8F64）では行列バックエンドが選ばれます。
+- Apple（Metal）：M5/A19 では Metal 4 tensor ops、M1-M4/A14+ では `simdgroup_matrix` を使い、参照実装と一致する範囲で fp16 累積を使います。Anime4K の最終層は層ごとの部分和として計算します。M5 Pro、1080p 入力：C4F16 2.65 ms、C4F32 6.35 ms、Anime4K UL 7.3 ms、FSR1 で 4K へ 0.77 ms。
+- wgpu（Linux、Android、OpenHarmony、Windows の wgpu fallback）：すべてのネットワークモードと `Fsr1` が動くようになりました（以前は従来の ArtCNN のみ）。生成した WGSL kernel を使い、adapter が対応すれば fp16、16x16 cooperative matrix を公開する Vulkan adapter では行列ユニットを使い、最初の数フレームで少数の kernel 候補を計測して adapter ごとの選択を調整します。RTX 5060 Ti の Vulkan では 1080p 入力の C4F16 が 2.77 ms（従来 12.6 ms）、C4F32 が 11.4 ms（従来 73 ms）です。Android と OpenHarmony の実機ではまだ計測していません。
+- D3D11 と Metal の超解像輝度出力は通常の 2x `R16_FLOAT` テクスチャになりました。GPU 時間は `lastGpuMicros` に報告され、診断の `upscaler` オブジェクトに `engine`、`reason`、`lastGpuMs` が加わりました。
+- 新しいバックエンド状態がモードの実行方法を示します：`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx`、`TensorOps`。モードを実行できないバックエンドはネイティブのサンプリングを保ち、`Inactive` を報告します。
+
 ## 0.3.3 - 2026-11-01
 
 - 音量を保持するミュートを追加しました：`PresenterRuntime::set_muted`、C `erika_presenter_set_muted`、JSON `setMuted` と `volume`（`{volume, muted}`）、Flutter `ErikaPlayer.setMuted` と `getVolume`。ミュート中に設定した音量はミュート解除時に適用され、`volume()` は常にホストが選んだ音量を返します。

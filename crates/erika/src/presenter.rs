@@ -1531,6 +1531,20 @@ impl PresenterRuntime {
         self.renderer.set_luma_upscaler(mode);
     }
 
+    /// Parses `bytes` (an Erika `.esr` network or an mpv hook shader such as
+    /// FSRCNNX) and installs it for `LumaUpscalerMode::Custom`.
+    pub fn load_custom_upscaler_model(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let model = crate::renderer::sr::catalog::load_custom(name, bytes)?;
+        let optimized = crate::renderer::sr::fold::optimize(&model);
+        self.renderer
+            .set_custom_upscaler_model(Some(std::sync::Arc::new(optimized)));
+        Ok(())
+    }
+
+    pub fn clear_custom_upscaler_model(&mut self) {
+        self.renderer.set_custom_upscaler_model(None);
+    }
+
     pub fn set_output_headroom(&mut self, headroom: f32, known: bool) {
         self.renderer.set_output_headroom(headroom, known);
     }
@@ -2486,7 +2500,7 @@ impl PresenterRuntime {
             "output": diag::output_json(&snapshot.output),
             "hdr": diag::hdr_json(renderer),
             "resources": diag::resources_json(&snapshot.resources, snapshot.current_danmaku_atlas_bytes),
-            "upscaler": diag::upscaler_json(renderer),
+            "upscaler": diag::upscaler_json(renderer, self.renderer.upscaler_status_detail()),
             "audio": {
                 "outputState": format!("{:?}", self.audio_output.state()).to_lowercase(),
                 "configured": self.audio_configured,

@@ -50,16 +50,90 @@ ErikaPresenterConfig cfg = {
     .output_mode  = ErikaPresenterOutputMode_Sdr,   // AppleEdr / Android ExtendedLinear
     .edr_headroom = 1.0f,                            // requested content-headroom ceiling
     .video_alpha_mode = ErikaVideoAlphaMode_Opaque,
-    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // または ArtCnnC4F16 / C4F16Ds / C4F32
+    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // または任意の ErikaLumaUpscalerMode（例: ArtCnnC4F16）
 };
 ErikaPresenterHandle *p = erika_presenter_create_with_config(cfg);
 if (!p) { /* erika_last_error_message() を読む */ }
 ```
 
-`erika_presenter_create()` は既定値（SDR、アップスケーラ無し）。神経輝度アップスケーラは
-Apple platform では Metal、Android を含む compute-capable Vulkan/wgpu adapter では
-wgpu、Windows では D3D11 compute が実行します。compute 非対応 backend（主に GLES 3.0）は
-native luma sampling を維持し、`Inactive` status と fallback reason を明示します。
+`erika_presenter_create()` は既定値（SDR、アップスケーラ無し）。使えるモードとプラットフォームごとの
+実行内容は [アップスケーラ](#アップスケーラ) を参照してください。
+
+### アップスケーラ
+
+`set_upscaler(mode)` でモード（`ErikaLumaUpscalerMode`、値はファミリーごとにまとまっています）を選びます。
+
+| 値 | ファミリー | 対象 |
+|---|---|---|
+| 1-7 | ArtCNN: C4F16、C4F32、C4F16 DS、C4F16 DN、C4F32 DS、C4F32 DN、R8F64 | アニメ。DS = ノイズ除去 + シャープ化（劣化した素材向け）、DN = ノイズ除去。R8F64（約 926K パラメータ）は行列ユニットと SD/720p 素材でのみ実用的で、デスクトップビルドにのみ同梱 |
+| 16-25 | Anime4K v3.2 Upscale CNN x2（S、M、L、VL、UL）と Upscale+Denoise（21-25） | アニメ |
+| 32 | `Fsr1`: 輝度に対する AMD FSR 1.0 EASU + RCAS（RCAS シャープネス 0.2 stops） | 任意 |
+| 48 | `PlatformVideo`: プラットフォーム標準の映像スーパー解像度 | 実写 / 任意 |
+| 49 | `MetalFxSpatial`（Apple のみ） | 任意 |
+| 64 | `Custom`: 実行時に読み込むネットワーク | - |
+
+ネットワーク系モードはデコード済み輝度プレーンを 2 倍にします（クロマはソース解像度のままで、通常のスケーラが
+再構成します）。`Fsr1` と `MetalFxSpatial` は輝度を表示サイズまで直接スケールし、`PlatformVideo` は
+フレーム全体をスケールします。
+
+| プラットフォーム | 実行内容 |
+|---|---|
+| Windows（D3D11） | すべてのネットワークモード（`Custom` を含む。生成した compute kernel で、スカラー、Vulkan cooperative matrix、D3D12 linalg のうち最速のものをネットワークとフレームサイズごとに計測して選択）、`Fsr1`、`PlatformVideo`: NVIDIA RTX Video Super Resolution（RTX GPU が必要で、NVIDIA App / コントロールパネルで有効化）または Intel VSR（VSR 対応ドライバの Arc/Xe）。SDR 映像のみ、D3D11VA でデコードした NV12/P010 フレーム。`MetalFxSpatial` は `Inactive`。D3D12 linalg は opt-in の preview。 |
+| Apple（Metal: macOS、iOS、tvOS） | すべてのネットワークモード（`Custom` を含む。M5/A19 は Metal 4 tensor ops、M1-M4/A14+ は `simdgroup_matrix`、それ以外はスカラー）、`Fsr1`、`MetalFxSpatial`、VideoToolbox `VTLowLatencySuperResolutionScaler` 経由の `PlatformVideo`: 2x のみ、8 ビット 4:2:0 で 96x96 から 960x960 のソース、macOS/iOS/tvOS 26+。それ以外は理由付きで `Inactive`。 |
+| wgpu renderer（Linux、Android、OpenHarmony、Windows の wgpu fallback） | `Custom` を含むすべてのネットワークモードと `Fsr1`（生成した WGSL kernel。adapter が `SHADER_F16` を持てば fp16、16x16 cooperative matrix を公開する Vulkan adapter（NVIDIA など）では行列ユニットを使用。adapter ごとの既定値を、最初の数フレームで少数の kernel 候補を計測して最速のものに置き換えます）。`PlatformVideo` と `MetalFxSpatial` は `Inactive`。Android/OpenHarmony の実機ではまだ計測していません。 |
+| Web | アップスケーラ無し。 |
+
+動かせないモードは `Inactive` の backend status を報告して native luma sampling を維持し、理由は診断の
+`upscaler` オブジェクト（`reason`、`engine`、`lastGpuMs`）に出ます。すべての backend で kernel を background
+thread で compile し、準備ができるまでの status は `Building` で native sampling を使うため、host は
+`get_upscaler_status` を poll して UI を更新してください。
+
+実測 GPU 時間（指定ソースの 2 倍拡大。中央値、GPU timestamp）:
+
+| モデル（1080p ソース） | Windows、RTX 5060 Ti（自動選択した backend） | Apple M5 Pro（Metal） | RTX 5060 Ti の wgpu/Vulkan（Linux の経路） | Intel UHD 770（D3D11） |
+|---|---|---|---|---|
+| ArtCNN C4F16 | 2.44 ms スカラー（従来 12.38 ms） | 2.65 ms tensor ops | 2.77 ms | 68 ms |
+| ArtCNN C4F32 | 7.29 ms cooperative matrix（スカラー 9.5 ms、従来 39.4 ms） | 6.35 ms | 11.4 ms | 267 ms |
+| Anime4K S / M / L / VL / UL | 0.35 / 0.78 / 0.83 / 2.07 / 4.11 ms | 1.0 / 2.8 / 2.0 / 4.96 / 7.3 ms | 0.45 / 1.04 / 1.03 / 2.85 / 5.80 ms | 8.9 / 18.7 / 22.4 / 54.5 / 173 ms |
+| ArtCNN R8F64（720p ソース） | 71 ms cooperative matrix（D3D12 linalg で 58 ms） | 64.6 ms | 183 ms | 再生には不向き |
+| FSR1（1080p から 4K） | 0.31 ms | 0.77 ms | 0.55 ms | 10 ms |
+| MetalFX（1080p から 4K） | なし | 0.67 ms | なし | なし |
+
+デノイズ/シャープ版（ArtCNN DS/DN、Anime4K Denoise）の時間は元のモデルと同じです。R8F64 はどの GPU でも
+リアルタイムではありません。
+
+Windows アクセラレータ、RTX 5060 Ti（特記なしは 1080p ソース。selector は実フレームで候補を計測して最速を
+残すため、これらが選ばれるのは幅の広いモデルだけです）:
+
+| モデル | D3D11 スカラー | Vulkan cooperative matrix | D3D12 linalg（opt-in） |
+|---|---|---|---|
+| ArtCNN C4F16 | 2.44 ms | 3.59 ms | 3.14 ms |
+| ArtCNN C4F32 | 9.5 ms | 7.29 ms | 6.53 ms |
+| ArtCNN C4F32、4K ソース | 39.5 ms | 27.7 ms | - |
+| Anime4K UL | 4.11 ms | 7.39 ms | 20.2 ms |
+| ArtCNN R8F64、720p ソース | 243 ms | 71.4 ms | 58.1 ms |
+
+cooperative matrix の時間は既定の fp32 累積です。`ERIKA_VK_FP16_ACCUMULATION=1` では C4F32 が 6.24 ms、
+R8F64 が 58.7 ms になり、精度はわずかに下がります。
+
+**カスタムモデル。** `erika_presenter_load_upscaler_model(handle, name, data, len)` は Erika `.esr` ネットワーク
+（`crates/erika/assets/artcnn/export_artcnn_esr.py` で ArtCNN ONNX をエクスポート。たとえば同梱されない R16F96）
+または FSRCNNX / Anime4K CNN 方言の mpv hook shader を読み込みます。その後
+`set_upscaler(handle, ErikaLumaUpscalerMode_Custom)` で選択し、`erika_presenter_clear_upscaler_model` で外します。
+重みだけを解析し、shader コードは実行しません。FSRCNNX（GPL-3.0/LGPL-3.0）と RAVU/NNEDI3（LGPL-3.0）は
+liberika が MPL-2.0 のため同梱せず、host がファイルを用意します。presenter JSON bridge では
+`loadUpscalerModelFile {path, name?}` と `clearUpscalerModel` を使います。
+
+**Windows のチューニング（診断用）。**
+
+| 変数 | 効果 |
+|---|---|
+| `ERIKA_SR_BACKEND` | `scalar`、`coopmat`、`linalg` で D3D11 側の executor を固定（既定: 計測による自動選択）。Apple: `scalar`、`matmul`、`tensor`、`legacy`、`legacy-scalar`。 |
+| `ERIKA_SR_NO_SHADER_CACHE=1` | D3D11 kernel のディスクキャッシュを無効化（`%LOCALAPPDATA%\liberika\sr-shader-cache`）。 |
+| `ERIKA_SR_TILE_BUDGET_MB` | D3D11 の中間テンソル予算（既定はネットワークごとに 24-192 から選択）。 |
+| `ERIKA_VK_FP16_ACCUMULATION=1` | Vulkan cooperative matrix backend で fp16 累積を使います。 |
+| `ERIKA_WGPU_SR_AUTOTUNE=0` | wgpu（全プラットフォーム）: 最初の数フレームで候補を計測せず、adapter ごとの kernel 既定値を使います。その他の `ERIKA_WGPU_SR_*` 変数で個々の kernel 選択を固定できます。`crates/erika/src/renderer/wgpu_sr.rs` を参照。 |
+| `ERIKA_SR_D3D12_LINALG=1` と `ERIKA_D3D12_AGILITY_SDK_PATH`、`ERIKA_D3D12_DXCOMPILER_PATH`、`ERIKA_D3D12_DXC_INCLUDE_PATH` | D3D12 SM 6.10 preview backend を opt-in（Agility SDK 1.722-preview と SM 6.10 preview の DXC。実験的 shader model には Windows の開発者モードが必要。正式版は Agility SDK 1.621 で 2026 年 12 月の見込み）。`crates/erika/src/renderer/d3d12_linalg/README.md` を参照。 |
 
 ### 字幕・弾幕の高画質設定の既定値
 
@@ -270,7 +344,7 @@ iOS Flutter プラグインは `CADisplayLink.targetTimestamp` を tick mailbox 
   `add_danmaku_track_*`）、トグル（`set_danmaku_enabled`）、`set_danmaku_config` で調整、
   トラックのオフセット、フォント設定、ブロックワード設定。
   [danmaku_architecture.md](danmaku_architecture.md) 参照。
-- **アップスケーラ:** `set_upscaler(mode)`。`get_upscaler_status` で確認。
+- **アップスケーラ:** `set_upscaler(mode)`、`Custom` は `load_upscaler_model` / `clear_upscaler_model`。`get_upscaler_status` で確認。[アップスケーラ](#アップスケーラ) 参照。
 - **出力:** `erika_presenter_get_output_status` で active mode と fallback counter を確認。
   Android native host は `erika_presenter_set_output_headroom` で dynamic display ratio を
   publish します。`capture_frame_rgba` は display output が extended-linear の場合も、映像 +

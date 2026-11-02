@@ -220,8 +220,22 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
     method(
         "setUpscaler",
         P,
-        "Selects the luma upscaler: 0 off, 1 ArtCNN C4F16, 2 C4F32, 3 C4F16 DS.",
+        "Selects the upscaler (ErikaLumaUpscalerMode): 0 off, 1-7 ArtCNN, 16-25 Anime4K, 32 FSR 1.0, 48 platform video super resolution, 49 MetalFX, 64 custom.",
         &[arg("mode", "integer", true)],
+        "null",
+    ),
+    method(
+        "loadUpscalerModelFile",
+        P,
+        "Loads the custom-mode network from an .esr file or an mpv FSRCNNX/Anime4K shader.",
+        &[arg("path", "string", true), arg("name", "string", false)],
+        "null",
+    ),
+    method(
+        "clearUpscalerModel",
+        P,
+        "Drops the custom-mode network.",
+        NONE,
         "null",
     ),
     method(
@@ -727,6 +741,28 @@ pub(crate) unsafe fn invoke(
         }),
         "subtitleDelay" => unsafe { subtitle_delay_json(handle) },
         "subtitleText" => unsafe { subtitle_text_json(handle) },
+        "loadUpscalerModelFile" => {
+            let path = required_string(args, "path")?;
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(path)
+                .to_string();
+            let name = std::ffi::CString::new(name).unwrap_or_default();
+            status_value(unsafe {
+                erika_presenter_load_upscaler_model(
+                    handle,
+                    name.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                )
+            })
+        }
+        "clearUpscalerModel" => {
+            status_value(unsafe { erika_presenter_clear_upscaler_model(handle) })
+        }
         "setSubtitleScale" => status_value(unsafe {
             erika_presenter_set_subtitle_scale(handle, required_f64(args, "scale")?)
         }),
