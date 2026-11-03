@@ -382,7 +382,13 @@ Windows (PowerShell):
 $sample = "C:\path\to\video.mp4"
 cargo run -p windows_native_demo -- $sample
 cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl $sample
+cargo run --release -p windows_native_demo -- --upscaler anime4k_ul $sample
+cargo run --release -p windows_native_demo -- --upscaler custom --upscaler-model FSRCNNX_x2_8-0-4-1.glsl $sample
 ```
+
+In the Windows demo, Space toggles playback, Left/Right seek, `U` / `Shift+U`
+cycles the upscaler modes and `I` prints the upscaler status; the window title
+shows the active mode, backend and GPU time.
 
 The Windows smoke test prints a summary of decode, zero-copy, HDR10, audio and
 other metrics on exit; `--metrics-log` writes metrics approximately every 250 ms.

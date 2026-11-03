@@ -6,6 +6,7 @@
 
 | 記録 | 範囲 |
 |---|---|
+| [Vulkan fp16 空間ヘッド最適化（中文）](sr-gpu-head-2026-11-03/README.md) | 2026-11-03、RTX 5060 Ti。配置・精度検証と約 7–8% のネットワーク GPU 時間短縮 |
 | [PR #150–#159 の目的、トレードオフと実行検証](pr-150-159/review.ja.md) · [中文](pr-150-159/review.zh.md) · [English](pr-150-159/review.en.md) | 2026-10-05 の調査、10-08 の OHOS 追記、10-13 の main 統合。HTTP、メディア識別、タイムスタンプ、音声、GPU、ライフサイクル |
 | [main 統合と実行検証](pr-150-159/merge-validation.ja.md) · [中文](pr-150-159/merge-validation.zh.md) · [English](pr-150-159/merge-validation.en.md) | 2026-10-13、PR #164 の統合と Windows / Linux / OHOS の実機・実行確認 |
 | [OHOS エミュレーターの実行記録](pr-150-159/ohos-runtime.ja.md) · [中文](pr-150-159/ohos-runtime.zh.md) · [English](pr-150-159/ohos-runtime.en.md) | 2026-10-08、完全な Rust runtime、NAPI ブリッジとエミュレーター |

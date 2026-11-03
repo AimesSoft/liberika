@@ -1,0 +1,29 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=128) in;
+// Re-evaluate just the true image ring. Folded layers have independent
+// weights/biases for all nine border classes (including degenerate images).
+void main() {
+    uint perimeter=2*p.size.x+2*p.size.y;
+    uint index=gl_GlobalInvocationID.x;
+    uint channel=index/perimeter, t=index%perimeter;
+    if(channel>=h(1)) return;
+    ivec2 q;
+    if(t<p.size.x) q=ivec2(t,0);
+    else if(t<2*p.size.x) { if(p.size.y==1) return; q=ivec2(t-p.size.x,p.size.y-1); }
+    else {
+        t-=2*p.size.x;
+        q=ivec2(t/p.size.y==0 ? 0 : int(p.size.x)-1,t%p.size.y);
+        if(q.y==0 || q.y==int(p.size.y)-1 || (p.size.x==1 && t/p.size.y!=0)) return;
+    }
+    ivec2 local=q-p.origin.xy;
+    if(any(lessThan(local,ivec2(0))) || any(greaterThanEqual(local,ivec2(p.size.zw)))) return;
+    if(any(lessThan(local,ivec2(p.region.xy))) || any(greaterThanEqual(local,ivec2(p.region.xy+p.region.zw)))) return;
+    uint row=q.y==0 ? 0 : q.y==int(p.size.y)-1 ? 2 : 1;
+    uint col=q.x==0 ? 0 : q.x==int(p.size.x)-1 ? 2 : 1;
+    uint variant=1+row*3+col; // slot 0 is the interior, slots 1..9 are exact variants
+    float v=0.0;
+    for(uint k=0;k<h(2);++k) v+=float(weights[h(3)+variant*h(10)+channel*h(2)+k])*operand(k,q);
+    epilogue(v,channel,uint(local.y)*p.size.z+uint(local.x),variant);
+}

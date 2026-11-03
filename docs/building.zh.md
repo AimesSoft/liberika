@@ -334,7 +334,11 @@ Windows（PowerShell）：
 $sample = "C:\path\to\video.mp4"
 cargo run -p windows_native_demo -- $sample
 cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl $sample
+cargo run --release -p windows_native_demo -- --upscaler anime4k_ul $sample
+cargo run --release -p windows_native_demo -- --upscaler custom --upscaler-model FSRCNNX_x2_8-0-4-1.glsl $sample
 ```
+
+Windows demo 中，空格切换播放/暂停，左右方向键跳转，`U` / `Shift+U` 循环切换超分模式，`I` 打印超分状态；窗口标题显示当前模式、后端和 GPU 耗时。
 
 Windows 冒烟测试结束时打印解码、零拷贝、HDR10 和音频等汇总指标；`--metrics-log`
 约每 250 ms 写入一次指标。macOS demo 默认报告播放和错误信息；使用 `--seek-sequence`

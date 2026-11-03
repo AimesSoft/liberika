@@ -525,6 +525,38 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeRegist
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeLoadUpscalerModel(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    data: JByteArray<'_>,
+) -> jstring {
+    let response = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = env
+            .convert_byte_array(&data)
+            .map_err(|error| format!("invalid upscaler model byte array: {error}"))?;
+        let name: String = env
+            .get_string(&name)
+            .map_err(|error| format!("invalid upscaler model name: {error}"))?
+            .into();
+        let name = CString::new(name)
+            .map_err(|_| "upscaler model name contains a NUL byte".to_string())?;
+        with_registered_presenter(handle, "loadUpscalerModel", |presenter| {
+            status_value(unsafe {
+                erika_presenter_load_upscaler_model(
+                    presenter.handle,
+                    name.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                )
+            })
+        })
+    }));
+    response_to_jstring(&mut env, response)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeAttachSurface(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -858,6 +890,9 @@ unsafe fn invoke_presenter(
         "setUpscaler" => {
             let mode = required_i64(args, "mode")? as i32;
             status_value(unsafe { erika_presenter_set_upscaler(handle, mode) })
+        }
+        "clearUpscalerModel" => {
+            status_value(unsafe { erika_presenter_clear_upscaler_model(handle) })
         }
         "setSubtitleScale" => {
             let scale = required_f64(args, "scale")?;

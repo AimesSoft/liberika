@@ -1,0 +1,4 @@
+running 2 tests
+test backend::integration_tests::vk_half_head_requires_the_validated_weights ... ok
+test backend::integration_tests::vk_half_head_uniform_layout ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

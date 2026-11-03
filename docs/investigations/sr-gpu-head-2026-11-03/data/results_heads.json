@@ -1,0 +1,344 @@
+[
+  {
+    "acc_bits": 16,
+    "median_ms": 3.381472,
+    "model": "artcnn_c4f16_dn",
+    "round": 0,
+    "samples_ms": [
+      3.4567360000000003,
+      3.3443840000000002,
+      3.33408,
+      3.636064,
+      3.374688,
+      3.359136,
+      3.381472,
+      3.385824,
+      3.400992
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.326272,
+    "model": "artcnn_c4f16_dn",
+    "round": 0,
+    "samples_ms": [
+      3.326272,
+      3.2915520000000003,
+      3.8398719999999997,
+      3.293472,
+      3.323296,
+      3.6759039999999996,
+      3.318816,
+      3.3274559999999997,
+      3.896832
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "coalesced"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.482592,
+    "model": "artcnn_c4f16_dn",
+    "round": 0,
+    "samples_ms": [
+      3.478688,
+      3.799808,
+      3.482592,
+      3.4856000000000003,
+      3.451936,
+      3.4509440000000002,
+      3.800288,
+      3.4819199999999997,
+      3.48624
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "swizzled"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.415168,
+    "model": "artcnn_c4f16_dn",
+    "round": 1,
+    "samples_ms": [
+      3.767776,
+      3.3942080000000003,
+      3.384896,
+      3.4016960000000003,
+      3.420736,
+      3.708544,
+      3.415168,
+      3.410304,
+      3.4162879999999998
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.357568,
+    "model": "artcnn_c4f16_dn",
+    "round": 1,
+    "samples_ms": [
+      3.358912,
+      3.300608,
+      3.336224,
+      3.3528640000000003,
+      3.362496,
+      3.33056,
+      3.5322560000000003,
+      3.357568,
+      3.363136
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "coalesced"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.5250239999999997,
+    "model": "artcnn_c4f16_dn",
+    "round": 1,
+    "samples_ms": [
+      3.491136,
+      3.469376,
+      3.79744,
+      3.925536,
+      3.5250239999999997,
+      3.549056,
+      3.5194240000000003,
+      3.5144960000000003,
+      3.873056
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "swizzled"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.413376,
+    "model": "artcnn_c4f16_dn",
+    "round": 2,
+    "samples_ms": [
+      3.3795840000000004,
+      3.5871039999999996,
+      3.371616,
+      3.405344,
+      3.375936,
+      3.419712,
+      3.673056,
+      3.7735999999999996,
+      3.413376
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.361024,
+    "model": "artcnn_c4f16_dn",
+    "round": 2,
+    "samples_ms": [
+      3.71504,
+      3.3532480000000002,
+      3.338464,
+      3.7195840000000002,
+      3.327648,
+      3.363232,
+      3.361024,
+      3.3724480000000003,
+      3.3598399999999997
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "coalesced"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.5176320000000003,
+    "model": "artcnn_c4f16_dn",
+    "round": 2,
+    "samples_ms": [
+      3.5211840000000003,
+      3.516064,
+      3.503488,
+      3.50784,
+      3.890208,
+      3.5176320000000003,
+      3.523936,
+      3.5136,
+      3.527584
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "swizzled"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.290208000000001,
+    "model": "artcnn_c4f32_dn",
+    "round": 0,
+    "samples_ms": [
+      6.2233920000000005,
+      6.282623999999999,
+      6.548,
+      6.652512,
+      6.290208000000001,
+      6.254560000000001,
+      6.266144000000001,
+      6.535232000000001,
+      6.520608
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.345376,
+    "model": "artcnn_c4f32_dn",
+    "round": 0,
+    "samples_ms": [
+      6.345376,
+      6.326592,
+      6.096448,
+      6.44272,
+      6.400864,
+      6.36928,
+      6.096064,
+      6.1097920000000006,
+      6.416288
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "coalesced"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.350784,
+    "model": "artcnn_c4f32_dn",
+    "round": 0,
+    "samples_ms": [
+      6.276032,
+      6.276288,
+      6.324448,
+      6.3872,
+      6.35456,
+      6.350112,
+      6.655712,
+      6.6399680000000005,
+      6.350784
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "swizzled"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.32416,
+    "model": "artcnn_c4f32_dn",
+    "round": 1,
+    "samples_ms": [
+      6.32416,
+      6.63056,
+      6.818112,
+      6.2970559999999995,
+      6.279872,
+      6.661824,
+      6.861184000000001,
+      6.302816,
+      6.3121599999999995
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.127936,
+    "model": "artcnn_c4f32_dn",
+    "round": 1,
+    "samples_ms": [
+      6.454879999999999,
+      6.127936,
+      6.109216,
+      6.461215999999999,
+      6.474912,
+      6.112416,
+      6.10992,
+      6.438688,
+      6.10944
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "coalesced"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.362016,
+    "model": "artcnn_c4f32_dn",
+    "round": 1,
+    "samples_ms": [
+      6.367552,
+      6.584384,
+      6.352064,
+      6.350208,
+      6.362016,
+      6.6834240000000005,
+      6.350848,
+      6.320416,
+      6.612512
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "swizzled"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.621312,
+    "model": "artcnn_c4f32_dn",
+    "round": 2,
+    "samples_ms": [
+      6.655808,
+      6.621312,
+      6.305024,
+      6.335872,
+      6.6665600000000005,
+      6.700032,
+      6.355391999999999,
+      6.368672,
+      6.685952
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.146656,
+    "model": "artcnn_c4f32_dn",
+    "round": 2,
+    "samples_ms": [
+      6.1167679999999995,
+      6.1167679999999995,
+      6.5795200000000005,
+      6.128992,
+      6.126624,
+      6.146656,
+      6.615712,
+      6.168672,
+      6.159999999999999
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "coalesced"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.67392,
+    "model": "artcnn_c4f32_dn",
+    "round": 2,
+    "samples_ms": [
+      6.697568,
+      6.353184,
+      6.37264,
+      6.67392,
+      6.71536,
+      6.356352,
+      6.35344,
+      6.680512,
+      6.729088
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "swizzled"
+  }
+]

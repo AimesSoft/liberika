@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=128) in;
+// Materialize clamp padding after exact border correction, so subsequent
+// matrix loads can address contiguous channel planes without per-tap clamps.
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    if(i>=p.region.z*p.region.w) return;
+    uvec2 at=p.region.xy+uvec2(i%p.region.z,i/p.region.z);
+    uint pixel=at.y*p.size.z+at.x;
+    ivec2 q=p.origin.xy+ivec2(pixel%p.size.z,pixel/p.size.z);
+    if(inside(q)) return;
+    ivec2 local=clamp(q,ivec2(0),ivec2(p.size.xy)-1)-p.origin.xy;
+    if(any(lessThan(local,ivec2(0))) || any(greaterThanEqual(local,ivec2(p.size.zw)))) return;
+    for(uint c=0;c<h(1);++c)
+        features[feature_index(h(0)+c,pixel)]=features[feature_index(h(0)+c,uint(local.y)*p.size.z+uint(local.x))];
+}

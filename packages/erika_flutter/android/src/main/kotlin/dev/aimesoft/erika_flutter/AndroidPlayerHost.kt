@@ -435,6 +435,23 @@ internal class AndroidPlayerHost(
         onComplete(runCatching { registerSubtitleMemoryFont(data) })
     }
 
+    fun loadUpscalerModel(name: String, data: ByteArray): NativeResponse {
+        check(!destroyed) { "Erika player $handle has been destroyed" }
+        return presenterThread.call {
+            NativeJson.decodeResponse(
+                ErikaNative.nativeLoadUpscalerModel(handle, name, data),
+            )
+        }
+    }
+
+    fun loadUpscalerModelAsync(
+        name: String,
+        data: ByteArray,
+        onComplete: (Result<NativeResponse>) -> Unit,
+    ): Boolean = presenterThread.post {
+        onComplete(runCatching { loadUpscalerModel(name, data) })
+    }
+
     fun destroyAsync(onComplete: (Result<Unit>) -> Unit = {}): Boolean {
         if (destroyed) {
             onComplete(Result.success(Unit))

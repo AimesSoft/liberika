@@ -301,7 +301,11 @@ Windows（PowerShell）：
 $sample = "C:\path\to\video.mp4"
 cargo run -p windows_native_demo -- $sample
 cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl $sample
+cargo run --release -p windows_native_demo -- --upscaler anime4k_ul $sample
+cargo run --release -p windows_native_demo -- --upscaler custom --upscaler-model FSRCNNX_x2_8-0-4-1.glsl $sample
 ```
+
+Windows demo では Space で再生/一時停止、左右キーでシーク、`U` / `Shift+U` でアップスケーラのモードを切り替え、`I` でアップスケーラの状態を出力します。ウィンドウタイトルには現在のモード、バックエンド、GPU 時間が表示されます。
 
 Windows の smoke test は終了時にデコード、ゼロコピー、HDR10、音声などの集計値を出力し、
 `--metrics-log` は約 250 ms ごとに指標を書き込みます。macOS demo は既定で再生とエラーを

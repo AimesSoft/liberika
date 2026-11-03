@@ -6,6 +6,7 @@ Read each record in the context of its date, commit and devices. Current integra
 
 | Record | Scope |
 |---|---|
+| [Vulkan packed fp16 spatial head (Chinese)](sr-gpu-head-2026-11-03/README.md) | 2026-11-03; RTX 5060 Ti, layout/precision analysis and approximately 7–8% network GPU-time reduction |
 | [PR #150–#159: goals, trade-offs and runtime validation](pr-150-159/review.en.md) · [中文](pr-150-159/review.zh.md) · [日本語](pr-150-159/review.ja.md) | Investigation on 2026-10-05, OHOS follow-up on 10-08 and main-branch integration on 10-13; HTTP, media detection, timestamps, audio, GPU and lifecycle |
 | [Main-branch integration and runtime validation](pr-150-159/merge-validation.en.md) · [中文](pr-150-159/merge-validation.zh.md) · [日本語](pr-150-159/merge-validation.ja.md) | 2026-10-13, PR #164 integration and live checks on Windows, Linux and OHOS |
 | [OHOS emulator runtime record](pr-150-159/ohos-runtime.en.md) · [中文](pr-150-159/ohos-runtime.zh.md) · [日本語](pr-150-159/ohos-runtime.ja.md) | 2026-10-08, full Rust runtime, NAPI bridge and emulator |

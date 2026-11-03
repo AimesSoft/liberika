@@ -385,6 +385,9 @@ ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rat
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
 ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *, bool muted);       // 保留音量
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
+ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle *, const char *name,
+                                               const uint8_t *data, uintptr_t len);
+ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
 ErikaStatus erika_presenter_set_subtitle_font(ErikaPresenterHandle *, const char *family, const char *file_path);
 ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubtitleStyle style);
@@ -394,10 +397,21 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 `set_playback_rate(1.0)` 为正常速度。`erika_presenter_open_with_options` 是
 `erika_open_with_options` 的推送模型对应版本，接受同样的
 `ErikaOpenOptions`（请求头加 `http_read_ahead_bytes` / `http_back_buffer_bytes`；见
-[`erika_open_with_options`](#erikahandle--拉取模型)）。`set_upscaler` 在运行时切换神经亮度超分（见
-[`erika_presenter_get_upscaler_status`](#诊断与截图)）。Metal 与具备 compute 能力的
-wgpu renderer，以及 feature level 11.0+ 的 D3D11 renderer 会执行 ArtCNN；其他后端保留原生 luma sampling，并明确报告
-`Inactive` 回退。
+[`erika_open_with_options`](#erikahandle--拉取模型)）。`set_upscaler` 在运行时切换亮度超分（见
+[`erika_presenter_get_upscaler_status`](#诊断与截图)）。模式值按族分组：1-15 为 ArtCNN，16-31 为
+Anime4K，32-47 为空间 shader（`Fsr1`），48-63 为平台缩放器（`PlatformVideo`、`MetalFxSpatial`），
+64 为 `Custom`。网络类模式把解码后的亮度平面放大 2 倍；`Fsr1` 与 `MetalFxSpatial` 把亮度直接缩放到
+呈现尺寸；`PlatformVideo` 缩放整帧。Metal 与 D3D11 运行各自支持的全部模式；wgpu renderer（Linux、
+Android、OpenHarmony、Windows 的 wgpu 回退）运行全部网络模式（ArtCNN 1-7、Anime4K、`Custom`）和 `Fsr1`，`PlatformVideo` 与 `MetalFxSpatial` 在这里报告 `Inactive`。当前后端无法运行的模式保留原生
+luma sampling，报告 `Inactive`，原因见诊断 `upscaler` 对象。Web 没有超分。各平台支持情况见
+[集成指南](integration.zh.md#超分)。
+
+`erika_presenter_load_upscaler_model` 从内存加载 `ErikaLumaUpscalerMode_Custom` 使用的网络
+（`name` 为标签，`data`/`len` 为文件内容）；`erika_presenter_clear_upscaler_model` 将其清除。之后用
+`set_upscaler(handle, ErikaLumaUpscalerMode_Custom)` 选用。数据可以是 Erika `.esr` 网络（用
+`crates/erika/assets/artcnn/export_artcnn_esr.py` 导出 ArtCNN ONNX），或 FSRCNNX / Anime4K CNN 方言的
+mpv hook shader。只解析权重，从不执行 shader 代码。liberika 不打包 FSRCNNX 与 RAVU/NNEDI3（GPL/LGPL），
+需要由宿主提供这类文件。
 
 `set_subtitle_font` 与 `set_subtitle_style` 设置字幕的**回退**外观。family 或
 path 传空即清除该项。颜色为 `0xRRGGBBAA`，默认不透明白色文字（`0xFFFFFFFF`）与
@@ -689,7 +703,7 @@ char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 `selectAudioTrack`、`selectSubtitleTrack`、`addExternalSubtitle`、
 `removeSubtitleTrack`、`setSubtitleScale`、`setSubtitleFont`、`setSubtitleStyle`、
 字幕内存字体系列）、弹幕系列（含 `getDanmakuConfig`）、输出与超分（`setUpscaler`、
-`getUpscalerStatus`、`setOutputHeadroom`、`getOutputStatus`、`setDebugHudEnabled`）、
+`getUpscalerStatus`、`loadUpscalerModelFile`、`clearUpscalerModel`、`setOutputHeadroom`、`getOutputStatus`、`setDebugHudEnabled`）、
 计数（`getPresenterStats`、`getResourceStatus`），以及下文的诊断
 （`getDiagnosticsSnapshot`、`getLogs`）。
 
@@ -725,9 +739,16 @@ ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle
                                                          uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
-`get_upscaler_status` 报告请求的超分模式、当前后端（off / inactive / building /
-scalar / simdgroup-matrix）、fallback 次数、超分帧数，以及最近的 encode/GPU 耗时
-（微秒）。
+`get_upscaler_status` 报告请求的超分模式、当前后端（`Off`、`Inactive`、`Building`、`Scalar`、
+`SimdgroupMatrix`、`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx`、
+`TensorOps`）、fallback 次数、超分帧数，以及最近的 encode/GPU 耗时（微秒）。`Inactive` 表示该模式在此处
+无法运行、使用原生采样（原因见诊断）；`Building` 表示 kernel 正在后台编译，期间使用原生采样。
+`CooperativeMatrix` 是与 D3D11 并行的 Vulkan `VK_KHR_cooperative_matrix`；`LinalgMatrix` 是可选的
+D3D12 SM 6.10 预览；`VideoProcessor` 是 D3D11 video processor 厂商扩展（NVIDIA RTX Video / Intel VSR）；
+`TensorOps` 是 Metal 4 tensor ops（M5/A19）。D3D11 现在也会通过 timestamp query 在 `last_gpu_micros`
+中报告 GPU 耗时。
+
+`loadUpscalerModelFile`（`{path, name?}`）与 `clearUpscalerModel` 是上述加载/清除函数在 JSON 桥上的对应方法。
 
 `get_output_status` 返回实际协商到的输出，而不只是请求值。13 个字段如下：
 
@@ -833,7 +854,7 @@ ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t sinc
 | `output` | 请求模式、实际编码、surface 格式、dataspace、请求/实际余量（未知为 `null`）、回退原因标签与计数。 |
 | `hdr` | HDR 源帧、HDR10 输出帧、色调映射到 SDR 的帧、元数据更新/失败、输出失败、`outputActive`。 |
 | `resources` | 与 `ErikaPresenterResourceStatus` 相同。 |
-| `upscaler` | 请求模式与实际后端（标签）、回退次数、超分帧数、最近编码耗时。 |
+| `upscaler` | 请求模式与实际后端（标签）、`engine`（如 `scalar_compute`、`cooperative_matrix`、`linalg_matrix`、`metal4_tensor_ops`、`simdgroup_matrix`、`fsr1`、`metalfx_spatial`、`vt_low_latency_super_resolution`、`nvidia_rtx_video`、`intel_vsr`）、`reason`（模式为 `Inactive` 或降级的原因）、回退次数、超分帧数、最近编码耗时、`lastGpuMs`。 |
 | `audio` | 输出状态、configured/started、音量、推入帧、失败数、队列帧与 `queuedMs`、读/写/欠载帧、环形缓冲 `ringDroppedFrames`、设备恢复 `recovery`。 |
 | `buffers` | 播放线程发布的队列深度 `playback`（`demuxPackets`、`pendingVideoPackets`、`decodedVideoFrames`、`decodedAudioFrames`、`decodedSubtitleFrames`，形如 `{queued, capacity}`；`demuxEof`、`updatedAgoMs`；open 前为 `null`）、presenter 帧通道、`audioOutputQueuedMs`。 |
 | `timing.scheduler` | `leadTimeMs`、`dropToleranceMs`、`maxConsecutiveDrops`；`presentedFrames`；`lateDroppedFrames`（因超过丢帧容忍度被丢弃，过去没有计数）；`forcedLatePresents`（超过容忍度但连续丢帧额度用尽而照常显示）；`maxDropBurst`、`maxDroppedLateMs`、`lastDropAgoMs`、`seekPrerollDroppedFrames`；最近 128 个已呈现帧的 `lateByMs` 窗口 `{samples, meanMs, p50Ms, p95Ms, maxMs}`；`lateHistogram`（`le10ms` … `gt120ms`）。 |
@@ -908,8 +929,8 @@ WARNING → `warn`；libass 0–1 → `error`、2 → `warn`。其它结构化�
 | `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` `LinuxExtendedLinearScRgb` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
 | `ErikaOutputFallbackReason` | `None` `DisplayHdrUnsupported` `HybridCompositionRequired` `WgpuBackendNotVulkan` `Rgba16FloatSurfaceFormatUnavailable` `NativeWindowDataSpaceApiUnavailable` `ScrgbDataSpaceVerificationFailed` `SurfaceConfigureFailed` `LegacyAppleEdrUnsupported` |
-| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` |
-| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` |
+| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` `ArtCnnC4F16Dn` `ArtCnnC4F32Ds` `ArtCnnC4F32Dn` `ArtCnnR8F64` `Anime4kS` `Anime4kM` `Anime4kL` `Anime4kVl` `Anime4kUl` `Anime4kDenoiseS` `Anime4kDenoiseM` `Anime4kDenoiseL` `Anime4kDenoiseVl` `Anime4kDenoiseUl` `Fsr1` `PlatformVideo` `MetalFxSpatial` `Custom` |
+| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` `CooperativeMatrix` `LinalgMatrix` `VideoProcessor` `VideoToolbox` `MetalFx` `TensorOps` |
 
 ## 结构体
 

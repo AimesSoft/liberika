@@ -1,0 +1,47 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#include "common.glsl"
+layout(constant_id=0) const uint M=16;
+layout(constant_id=1) const uint N=16;
+layout(constant_id=2) const uint K=16;
+layout(constant_id=3) const uint LANES=32;
+layout(local_size_x_id=3,local_size_y=4) in;
+#ifdef HALF_ACCUM
+#define ACC float16_t
+#else
+#define ACC float
+#endif
+void main() {
+    coopmat<float16_t,gl_ScopeSubgroup,M,K,gl_MatrixUseA> a;
+    coopmat<float16_t,gl_ScopeSubgroup,K,N,gl_MatrixUseB> b0,b1,b2,b3;
+    coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator> c0,c1,c2,c3;
+    coopMatLoad(a,weights,0,K,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b0,weights,M*K,N,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b1,weights,M*K+K*N,N,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b2,weights,M*K+2*K*N,N,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b3,weights,M*K+3*K*N,N,gl_CooperativeMatrixLayoutRowMajor);
+    c0=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(0.0);
+    c1=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(1.0);
+    c2=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(2.0);
+    c3=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(3.0);
+    for(uint i=0;i<p.core.z;++i) {
+        c0=coopMatMulAdd(a,b0,c0);c1=coopMatMulAdd(a,b1,c1);
+        c2=coopMatMulAdd(a,b2,c2);c3=coopMatMulAdd(a,b3,c3);
+    }
+    // Keep every matrix component live. Storing only c[0] lets the driver
+    // remove part of a decomposed MMA and inflates nominal throughput.
+    // The production arena stores fp16, so explicitly convert fp32 results.
+    coopmat<float16_t,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator> s0,s1,s2,s3;
+    s0=coopmat<float16_t,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(c0);
+    s1=coopmat<float16_t,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(c1);
+    s2=coopmat<float16_t,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(c2);
+    s3=coopmat<float16_t,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(c3);
+    uint outIndex=(gl_WorkGroupID.x*4+gl_SubgroupID)*4*M*N;
+    coopMatStore(s0,features,outIndex,N,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(s1,features,outIndex+M*N,N,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(s2,features,outIndex+2*M*N,N,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(s3,features,outIndex+3*M*N,N,gl_CooperativeMatrixLayoutRowMajor);
+}

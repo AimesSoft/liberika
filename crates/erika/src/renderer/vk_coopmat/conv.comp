@@ -1,0 +1,192 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#define SPECIALIZED_LAYER
+#include "common.glsl"
+
+layout(constant_id=0) const uint M=16;
+layout(constant_id=1) const uint N=16;
+layout(constant_id=2) const uint K=16;
+layout(constant_id=3) const uint LANES=32;
+layout(constant_id=4) const uint MAX_KERNEL=9;
+layout(constant_id=21) const uint COMMON_KERNEL=0;
+layout(constant_id=22) const uint COMMON_CHANNELS=0;
+layout(constant_id=23) const uint COMMON_TRANSFORM=0xffffffffu;
+layout(constant_id=25) const uint FIRST_INPUT=0;
+layout(constant_id=26) const uint GROUPS=4;
+layout(constant_id=27) const uint BLOCKS=1;
+layout(constant_id=28) const uint SINGLE_LUMA=0;
+#ifdef ELEMENT_EPILOGUE
+layout(constant_id=32) const uint COORDINATES=0;
+layout(set=0,binding=2,std430) readonly buffer FloatMetadata { float floatData[]; };
+#endif
+layout(local_size_x_id=3,local_size_y_id=26) in;
+#ifndef DIRECT_LOAD
+shared float16_t slab[SINGLE_LUMA!=0 ? 1 : (K+8)*MAX_KERNEL*(N*GROUPS+MAX_KERNEL-1)];
+#endif
+// Only the one-channel luma stem needs a flattened im2col slab. Hidden
+// tensors are pixel-major in shared memory, so every spatial tap is aligned.
+shared float16_t packedB[K*(N*GROUPS+8)];
+shared float16_t lumaTile[MAX_KERNEL*(N*GROUPS+MAX_KERNEL-1)];
+#ifdef HALF_ACCUM
+#ifndef ELEMENT_EPILOGUE
+shared float16_t sums[M*N*GROUPS*BLOCKS];
+#endif
+#define ACC float16_t
+#else
+#ifndef ELEMENT_EPILOGUE
+shared float sums[M*N*GROUPS*BLOCKS];
+#endif
+#define ACC float
+#endif
+
+void stageLuma(uint firstX,uint row,uint kernel,uint transform) {
+    uint width=N*GROUPS+kernel-1;
+    for(uint i=gl_LocalInvocationIndex;i<kernel*width;i+=LANES*GROUPS) {
+        ivec2 q=p.origin.xy+ivec2(firstX+i%width,row+i/width)-ivec2(kernel/2);
+        float16_t v=float16_t(inside(q) || p.core.w!=0 ? (raw(q)-p.norm.x)*p.norm.y : 0.0);
+        lumaTile[i]=transform==1 ? max(v,float16_t(0.0)) : transform==2 ? max(-v,float16_t(0.0)) : v;
+    }
+    barrier();
+}
+void packLuma(uint k0,uint kernel) {
+    uint width=N*GROUPS+kernel-1;
+    for(uint i=gl_LocalInvocationIndex;i<K*N*GROUPS;i+=LANES*GROUPS) {
+        uint col=i%(N*GROUPS),r=k0+i/(N*GROUPS);
+        packedB[(i/(N*GROUPS))*(N*GROUPS+8)+col]=r<kernel*kernel ? lumaTile[(r/kernel)*width+col+r%kernel] : float16_t(0.0);
+    }
+    barrier();
+}
+
+#define MULTIPLY(BASE,STRIDE) \
+    coopMatLoad(a,weights,BASE,STRIDE,gl_CooperativeMatrixLayoutRowMajor); \
+    acc=coopMatMulAdd(a,b,acc); \
+    if(BLOCKS>1) { \
+        coopMatLoad(a,weights,(BASE)+M*(STRIDE),STRIDE,gl_CooperativeMatrixLayoutRowMajor); \
+        acc1=coopMatMulAdd(a,b,acc1); \
+    } \
+    if(BLOCKS>2) { \
+        coopMatLoad(a,weights,(BASE)+2*M*(STRIDE),STRIDE,gl_CooperativeMatrixLayoutRowMajor); \
+        acc2=coopMatMulAdd(a,b,acc2); \
+    } \
+    if(BLOCKS>3) { \
+        coopMatLoad(a,weights,(BASE)+3*M*(STRIDE),STRIDE,gl_CooperativeMatrixLayoutRowMajor); \
+        acc3=coopMatMulAdd(a,b,acc3); \
+    }
+
+void main() {
+    uint lane=gl_LocalInvocationIndex,subgroup=gl_SubgroupID;
+    uint firstX=p.region.x+gl_WorkGroupID.x*N*GROUPS,row=p.region.y+gl_WorkGroupID.z;
+    uint firstPixel=row*p.size.z+firstX,firstChannel=gl_WorkGroupID.y*M*BLOCKS;
+#ifdef ELEMENT_EPILOGUE
+    coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator> coordinates;
+#ifdef HALF_ACCUM
+    coopMatLoad(coordinates,weights,COORDINATES,M,gl_CooperativeMatrixLayoutColumnMajor);
+#else
+    coopMatLoad(coordinates,floatData,COORDINATES,M,gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+#endif
+    coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator> acc,acc1,acc2,acc3;
+    acc=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(0.0);
+    acc1=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(0.0);
+    acc2=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(0.0);
+    acc3=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(0.0);
+    if(SINGLE_LUMA!=0) {
+        // Flatten the stem's spatial taps into K instead of padding one
+        // input channel to K for every tap of the luma filter.
+        stageLuma(firstX,row,MAX_KERNEL,COMMON_TRANSFORM);
+        for(uint k0=0;k0<h(2);k0+=K) {
+            packLuma(k0,MAX_KERNEL);
+            coopmat<float16_t,gl_ScopeSubgroup,M,K,gl_MatrixUseA> a;
+            coopmat<float16_t,gl_ScopeSubgroup,K,N,gl_MatrixUseB> b;
+            coopMatLoad(b,packedB,subgroup*N,N*GROUPS+8,gl_CooperativeMatrixLayoutRowMajor);
+            MULTIPLY(h(3)+firstChannel*h(2)+k0,h(2))
+            barrier();
+        }
+    } else {
+        uint flatBase=0;
+        for(uint tap=0;tap<h(14);) {
+            uint d=h(13)+tap*8;
+            uint kernel=COMMON_KERNEL!=0 ? COMMON_KERNEL : uint(1-2*int(data[d+1]));
+            uint tileWidth=N*GROUPS+kernel-1,tilePlane=tileWidth*kernel;
+            uint channels=COMMON_CHANNELS!=0 ? COMMON_CHANNELS : data[d+4];
+            uint inputChannel=(COMMON_KERNEL!=0 && h(14)==COMMON_KERNEL*COMMON_KERNEL) ? FIRST_INPUT : data[d];
+            if((data[d+7]&0x80000000u)!=0) {
+                uint transform=COMMON_TRANSFORM!=0xffffffffu ? COMMON_TRANSFORM : data[d+3];
+                stageLuma(firstX,row,kernel,transform);
+                for(uint k0=0;k0<kernel*kernel;k0+=K) {
+                    packLuma(k0,kernel);
+                    coopmat<float16_t,gl_ScopeSubgroup,M,K,gl_MatrixUseA> a;
+                    coopmat<float16_t,gl_ScopeSubgroup,K,N,gl_MatrixUseB> b;
+                    coopMatLoad(b,packedB,subgroup*N,N*GROUPS+8,gl_CooperativeMatrixLayoutRowMajor);
+                    MULTIPLY(h(3)+firstChannel*h(2)+flatBase+k0,h(2))
+                    barrier();
+                }
+                flatBase+=kernel*kernel;
+                tap+=kernel*kernel;
+                continue;
+            }
+            for(uint c=0;c<channels;c+=K) {
+#ifndef DIRECT_LOAD
+                for(uint i=lane;i<K*tilePlane;i+=LANES*GROUPS) {
+                    uint pixel=i/K,channel=i%K;
+                    ivec2 at=ivec2(firstX+pixel%tileWidth,row+pixel/tileWidth)-ivec2(kernel/2);
+                    float16_t v=float16_t(0.0);
+                    if(all(greaterThanEqual(at,ivec2(0))) && all(lessThan(at,ivec2(p.size.zw))))
+                        v=features[feature_index(inputChannel+c+channel,uint(at.y)*p.size.z+uint(at.x))];
+                    uint t=COMMON_TRANSFORM!=0xffffffffu ? COMMON_TRANSFORM : data[d+3];
+                    slab[pixel*(K+8)+channel]=t==1 ? max(v,float16_t(0.0)) : t==2 ? max(-v,float16_t(0.0)) : v;
+                }
+                barrier();
+#endif
+                [[unroll]] for(uint ky=0;ky<kernel;++ky) [[unroll]] for(uint kx=0;kx<kernel;++kx) {
+                    coopmat<float16_t,gl_ScopeSubgroup,M,K,gl_MatrixUseA> a;
+                    coopmat<float16_t,gl_ScopeSubgroup,K,N,gl_MatrixUseB> b;
+#ifdef DIRECT_LOAD
+                    uint pixel=(row+ky-kernel/2)*p.size.z+firstX+subgroup*N+kx-kernel/2;
+                    coopMatLoad(b,features,feature_index(inputChannel+c,pixel),16,gl_CooperativeMatrixLayoutColumnMajor);
+                    uint transform=COMMON_TRANSFORM!=0xffffffffu ? COMMON_TRANSFORM : data[d+3];
+                    if(transform!=0) [[unroll]] for(uint e=0;e<b.length();++e)
+                        b[e]=transform==1 ? max(b[e],float16_t(0.0)) : max(-b[e],float16_t(0.0));
+#else
+                    coopMatLoad(b,slab,(ky*tileWidth+kx+subgroup*N)*(K+8),K+8,gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+                    uint base=data[d+(ky*kernel+kx)*8+5]+firstChannel*channels+c;
+                    MULTIPLY(base,channels)
+                }
+#ifndef DIRECT_LOAD
+                barrier();
+#endif
+            }
+            tap+=kernel*kernel;
+            flatBase+=data[d+6]*kernel*kernel;
+        }
+    }
+#ifdef ELEMENT_EPILOGUE
+    [[unroll]] for(uint e=0;e<coordinates.length();++e) {
+        uint rc=uint(coordinates[e]);
+        uint x=firstX+subgroup*N+rc/M;
+        if(x>=p.region.x+p.region.z || x>=p.size.z) continue;
+        uint ch=firstChannel+rc%M,pixel=row*p.size.z+x;
+        epilogue(float(acc[e]),ch,pixel,0);
+        if(BLOCKS>1) epilogue(float(acc1[e]),ch+M,pixel,0);
+        if(BLOCKS>2) epilogue(float(acc2[e]),ch+2*M,pixel,0);
+        if(BLOCKS>3) epilogue(float(acc3[e]),ch+3*M,pixel,0);
+    }
+#else
+    coopMatStore(acc,sums,subgroup*M*N,M,gl_CooperativeMatrixLayoutColumnMajor);
+    if(BLOCKS>1) coopMatStore(acc1,sums,M*N*GROUPS+subgroup*M*N,M,gl_CooperativeMatrixLayoutColumnMajor);
+    if(BLOCKS>2) coopMatStore(acc2,sums,M*N*GROUPS*2+subgroup*M*N,M,gl_CooperativeMatrixLayoutColumnMajor);
+    if(BLOCKS>3) coopMatStore(acc3,sums,M*N*GROUPS*3+subgroup*M*N,M,gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+    for(uint i=lane;i<M*N*GROUPS*BLOCKS;i+=LANES*GROUPS) {
+        uint block=i/(M*N*GROUPS),sg=(i/(M*N))%GROUPS,rc=i%(M*N);
+        uint x=firstX+sg*N+rc/M;
+        if(x<p.region.x+p.region.z && x<p.size.z)
+            epilogue(float(sums[i]),firstChannel+block*M+rc%M,row*p.size.z+x,0);
+    }
+#endif
+}

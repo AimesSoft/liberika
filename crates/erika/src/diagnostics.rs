@@ -762,12 +762,7 @@ pub(crate) fn output_mode_label(mode: OutputMode) -> &'static str {
 }
 
 pub(crate) fn upscaler_mode_label(mode: LumaUpscalerMode) -> &'static str {
-    match mode {
-        LumaUpscalerMode::Off => "off",
-        LumaUpscalerMode::ArtCnnC4F16 => "artcnn_c4f16",
-        LumaUpscalerMode::ArtCnnC4F16Ds => "artcnn_c4f16_ds",
-        LumaUpscalerMode::ArtCnnC4F32 => "artcnn_c4f32",
-    }
+    mode.label()
 }
 
 pub(crate) fn upscaler_backend_label(backend: LumaUpscalerBackendStatus) -> &'static str {
@@ -777,6 +772,12 @@ pub(crate) fn upscaler_backend_label(backend: LumaUpscalerBackendStatus) -> &'st
         LumaUpscalerBackendStatus::Building => "building",
         LumaUpscalerBackendStatus::Scalar => "scalar",
         LumaUpscalerBackendStatus::SimdgroupMatrix => "simdgroup_matrix",
+        LumaUpscalerBackendStatus::CooperativeMatrix => "cooperative_matrix",
+        LumaUpscalerBackendStatus::LinalgMatrix => "linalg_matrix",
+        LumaUpscalerBackendStatus::VideoProcessor => "video_processor",
+        LumaUpscalerBackendStatus::VideoToolbox => "video_toolbox",
+        LumaUpscalerBackendStatus::MetalFx => "metalfx",
+        LumaUpscalerBackendStatus::TensorOps => "tensor_ops",
     }
 }
 
@@ -848,13 +849,19 @@ pub(crate) fn resources_json(
     })
 }
 
-pub(crate) fn upscaler_json(renderer: &RendererRuntimeStats) -> Value {
+pub(crate) fn upscaler_json(
+    renderer: &RendererRuntimeStats,
+    detail: (Option<String>, Option<&'static str>),
+) -> Value {
     json!({
         "requestedMode": upscaler_mode_label(renderer.upscaler_mode),
         "activeBackend": upscaler_backend_label(renderer.upscaler_backend),
+        "engine": detail.1,
+        "reason": detail.0,
         "fallbackCount": renderer.upscaler_fallbacks,
         "upscaledFrames": renderer.upscaled_frames,
         "lastEncodeMs": duration_ms(renderer.last_upscaler_encode_duration),
+        "lastGpuMs": duration_ms(renderer.last_gpu_duration),
     })
 }
 

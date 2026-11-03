@@ -108,9 +108,9 @@ pub struct ArtCnnModelLayout {
 impl ArtCnnModelLayout {
     pub fn for_mode(mode: LumaUpscalerMode) -> Option<Self> {
         let feature_count = match mode {
-            LumaUpscalerMode::Off => return None,
             LumaUpscalerMode::ArtCnnC4F16 | LumaUpscalerMode::ArtCnnC4F16Ds => 16,
             LumaUpscalerMode::ArtCnnC4F32 => 32,
+            _ => return None,
         };
         let feature_slices = (feature_count / FEATURE_SLICE_WIDTH) as u32;
         Some(Self {
@@ -138,10 +138,10 @@ pub struct ArtCnnModel<'a> {
 /// Selects and validates the embedded model for `mode`.
 pub fn model_for_mode(mode: LumaUpscalerMode) -> Result<ArtCnnModel<'static>> {
     let blob = match mode {
-        LumaUpscalerMode::Off => None,
         LumaUpscalerMode::ArtCnnC4F16 => Some(BLOB_C4F16),
         LumaUpscalerMode::ArtCnnC4F16Ds => Some(BLOB_C4F16_DS),
         LumaUpscalerMode::ArtCnnC4F32 => Some(BLOB_C4F32),
+        _ => None,
     }
     .ok_or_else(no_weights)?;
     parse_model_blob(mode, blob)
@@ -228,9 +228,9 @@ impl ArtCnnExecutionPolicy {
         matrix_pixel_fragments: Option<&str>,
     ) -> Self {
         let default_scalar_block = match mode {
-            LumaUpscalerMode::Off => (1, 1),
             LumaUpscalerMode::ArtCnnC4F16 | LumaUpscalerMode::ArtCnnC4F16Ds => (2, 2),
             LumaUpscalerMode::ArtCnnC4F32 => (2, 1),
+            _ => (1, 1),
         };
         Self {
             scalar_block: scalar_block

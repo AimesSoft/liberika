@@ -168,6 +168,10 @@ Apple HDR 路径仍使用 native Metal，Windows 使用 native Direct3D 11 渲�
 GLES 或能力协商失败会明确回退 SDR。Android SDR 已验证，API 35 HDR 真机 active path
 仍待验收；Linux 提供实验性 X11 / Wayland 与 Flutter 接入。
 
+Windows 上每个 presenter 在自己的原生 worker 线程上运行：create、命令、surface attach/resize/detach、渲染 tick、截图和 destroy 都在该线程执行，帧请求会合并（每个 presenter 至多一个排队或运行中的 tick）。方法结果、`EventSink` 事件、SMTC 更新、texture 注册和 HWND/DirectComposition 操作仍留在平台线程，所以较慢的渲染 tick 不再阻塞窗口消息循环。设置 `ERIKA_FLUTTER_FRAME_TRACE=1` 会在每个 presenter 首次启动时记录一次 `presenter_worker ... platform_thread=... render_thread=... off_platform=true`，并记录在 worker 上测得的慢 tick（`frame_tick ... work_ms=`）。
+
+其他平台采用同样的 owner 模型。Linux 共用规范的 `windows/erika_presenter_worker.h`，并由自己的 16 ms 单调时钟驱动；GTK、view 与 Flutter texture 注册仍留在平台线程，结果和事件通过 idle source 送回平台线程。OpenHarmony（Flutter 插件与 `erika_ohos` 包）在 `presenter_bridge.h` 之后为每个 presenter 提供一个 owner 线程；每个 N-API 函数还有对应的 `...Async` 变体，在 ArkTS 线程上 resolve promise，而旧版 C 辅助函数 `ErikaOhosPlayerFromId` 现在返回 null，因为原生代码不得访问由其他线程持有的 presenter。Android 仍为每个 presenter 使用专用的 `HandlerThread`。在 macOS、iOS 和 tvOS 上，每个 presenter 拥有一个专用线程（`ErikaPresenterOwner.swift`），按 FIFO 顺序执行 create、所有原生命令、渲染、事件轮询、截图和 destroy，帧 tick 会合并；`CVDisplayLink` 与 `CADisplayLink` 只负责唤醒它，主线程则解析参数、按顺序送回结果和事件，并处理 AppKit/UIKit 工作（now-playing、远程命令、view）。因此缓慢的 `open`、`seek` 或 `dispose` 既不会阻塞 UI 线程，也不会延迟渲染；`ERIKA_FLUTTER_FRAME_TRACE=1` 会记录每个 tick 与命令所在的线程。
+
 ## Dart API
 
 安装、播放控制、HTTP 缓存参数、事件与视图示例统一维护在
@@ -233,10 +237,11 @@ HUD 的驱动机制，数据新鲜度取决于已挂载 surface 的显示循环�
 macOS、iOS、tvOS 以可选方式加载新符号；Linux、鸿蒙、Android 走共享 JSON 方法表；
 Windows 抛出 `UnsupportedError`。
 
-在 macOS 和 iOS 上，插件把这三个调用放到后台队列执行，再回到主线程应答，因此耗时的调用
-（大字幕文件的 `addExternalSubtitle`、`exportFrame`）不会占用主线程。presenter 方法执行期间，
-插件在主线程上的定时器（统计、事件轮询、macOS 的渲染）跳过一轮，而不是等播放器的锁；
-`scope` 为 `global` 的方法（`exportFrame`、`exportFrames`、`getLogs`、`listMethods`）不持有该锁。
+在 macOS 和 iOS 上，插件在 presenter 的 owner 线程上执行 `invokeJson` 与 `getDiagnosticsSnapshot`，
+在工具队列上执行 `getLogs`，再回到主线程应答，因此耗时的调用（大字幕文件的 `addExternalSubtitle`、
+`exportFrame`）不会占用主线程。耗时的 presenter 方法会推迟该 presenter 的下一帧（帧在命令之间执行），
+但不会卡住界面；`scope` 为 `global` 的方法（`exportFrame`、`exportFrames`、`getLogs`、`listMethods`）
+不使用 presenter 句柄。
 `listMethods` 为每个方法标出 `blocking`（做完才返回，耗时随输入增长）与 `writesFiles`
 （会创建文件，结果列出路径）。
 
@@ -252,20 +257,37 @@ tvOS、Android、Windows、Linux、鸿蒙）每个会话一个后台 isolate。�
 
 ## Neural Upscaler Status
 
-`setUpscaler` 只是在请求一个模式；kernel 会在后台线程编译，所以宿主应该轮询 `getUpscalerStatus` 来驱动 UI：
+`setUpscaler(ErikaUpscalerMode)` 请求一个模式（ArtCNN、Anime4K、`fsr1`、`platformVideo`、`metalFxSpatial`、
+`custom`；模式及各平台运行内容见[集成指南](integration.zh.md#超分)）。kernel 会在后台线程编译，所以宿主应该轮询
+`getUpscalerStatus` 来驱动 UI：
 
 | `activeBackend` | 含义 |
 |-----------------|------|
 | `off` | 没有请求任何模式。 |
-| `building` | kernel 正在编译（首次使用该模式）；在准备好之前视频会保持未放大。 |
-| `inactive` | 请求了模式但未生效——内核未就绪（且不在编译中），或后端记录了回退/失败。 |
-| `scalar` | 运行在 Metal scalar 或 wgpu compute backend 上。 |
-| `simdgroupMatrix` | 运行在 `simdgroup_matrix` backend 上（Apple Silicon 默认）。 |
+| `inactive` | 请求了模式但在此无法运行（或后端记录了回退/失败）；使用原生采样，原因见诊断 `upscaler` 对象。 |
+| `building` | kernel 正在后台编译；在准备好之前使用原生采样渲染。 |
+| `scalar` | 通用 compute shader。 |
+| `simdgroupMatrix` | Apple `simdgroup_matrix`（M1-M4/A14+）。 |
+| `cooperativeMatrix` | 与 D3D11 并行的 Vulkan `VK_KHR_cooperative_matrix`（Tensor Core / WMMA / XMX）。 |
+| `linalgMatrix` | D3D12 SM 6.10 `linalg::Matrix`，可选预览。 |
+| `videoProcessor` | D3D11 video processor 厂商扩展：NVIDIA RTX Video / Intel VSR。 |
+| `videoToolbox` | VideoToolbox 超分。 |
+| `metalFx` | MetalFX spatial scaler。 |
+| `tensorOps` | Metal 4 tensor ops（Apple10 GPU：M5/A19）。 |
 
-只有当 drawable 显示的视频尺寸大于源分辨率时，upscaler 才会生效，所以 1080p 源在
-1080p（或更小）视图里会保持 `inactive`。C4F16 是实时推荐；C4F16 DS 以相同算力成本面向严重压制或噪声片源；Apple 上的 C4F32 在 1080p
-输入下通常需要 M-Pro/Max 级别 GPU。Android 上两个模型都使用 Vulkan compute，GLES 会
-明确报告 `inactive` fallback。渲染器侧设计见 `docs/architecture.md`。
+`getUpscalerStatus().lastGpuDuration` 现在在 Windows 上也会填充（D3D11 timestamp query）。
+
+适合在 UI 里提示的限制：RTX Video Super Resolution（Windows 上的 `platformVideo`）需要 RTX GPU、在 NVIDIA App /
+控制面板中启用对应设置，且仅限 SDR 视频；VideoToolbox 缩放器只接受 2x、8 位 4:2:0、尺寸 96x96 到 960x960 的片源，
+且需要 macOS/iOS/tvOS 26+；D3D12 linalg 是可选预览；wgpu renderer（Linux、Android、OpenHarmony、Windows 的
+wgpu 回退）运行全部网络模式和 `fsr1`，`platformVideo` 与 `metalFxSpatial` 报告 `inactive`。R8F64 只在矩阵单元和 SD/720p 片源上实用。
+
+`loadUpscalerModel(Uint8List data, {String name = 'custom'})` 加载自定义网络（Erika `.esr` 文件，或 FSRCNNX /
+Anime4K CNN 的 mpv hook shader；因授权原因不内置 FSRCNNX，由宿主提供文件），随后调用
+`setUpscaler(ErikaUpscalerMode.custom)`。`clearUpscalerModel()` 将其卸载。Linux 插件只提供 JSON 文件路径方法
+（`loadUpscalerModelFile`）。
+
+渲染器侧设计见 `docs/architecture.md`。
 
 ## Ownership Rule
 

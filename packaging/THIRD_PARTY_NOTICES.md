@@ -22,7 +22,9 @@ The liberika binary also embeds these assets:
 | Asset | Copyright / author | License |
 |-------|--------------------|---------|
 | Droid Sans Fallback (`subfont.ttf`) | Digitized data copyright Google Corporation © 2006; designed by Steve Matteson / Ascender Corporation | Apache-2.0 |
-| ArtCNN C4F16 / C4F32 model weights | Copyright © 2024 João Chrisóstomo | MIT |
+| ArtCNN C4F16 / C4F32 / R8F64 model weights (incl. DS/DN variants) | Copyright © 2024 João Chrisóstomo | MIT |
+| Anime4K v3.2 CNN model weights | Copyright © 2019-2021 bloc97 | MIT |
+| AMD FidelityFX Super Resolution 1.0 (EASU/RCAS, ported) | Copyright © 2021 Advanced Micro Devices, Inc. | MIT |
 
 The release archive includes the corresponding attribution and complete license
 texts under `licenses/`.

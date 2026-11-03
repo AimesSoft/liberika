@@ -246,6 +246,7 @@ class ErikaFlutterPlugin :
                 "setMediaMetadata" -> setMediaMetadata(arguments(call), result)
                 "setSystemMediaNavigation" -> setSystemMediaNavigation(arguments(call), result)
                 "registerSubtitleMemoryFont" -> registerSubtitleMemoryFont(arguments(call), result)
+                "loadUpscalerModel" -> loadUpscalerModel(arguments(call), result)
                 in NATIVE_METHODS -> invokePlayer(call.method, arguments(call), result)
                 else -> result.notImplemented()
             }
@@ -836,6 +837,43 @@ class ErikaFlutterPlugin :
                 "ERIKA_ERROR",
                 "Android presenter thread is unavailable",
                 mapOf("stage" to "register_subtitle_memory_font"),
+            )
+        }
+    }
+
+    private fun loadUpscalerModel(
+        arguments: Map<String, Any?>,
+        result: MethodChannel.Result,
+    ) {
+        val host = player(arguments)
+        val data = arguments["data"] as? ByteArray
+            ?: throw IllegalArgumentException("Missing byte array argument 'data'")
+        val name = arguments["name"] as? String ?: "custom"
+        val posted = host.loadUpscalerModelAsync(name, data) { response ->
+            postMainSafely(
+                source = "upscaler model completion",
+                onFailure = { error ->
+                    runCatching {
+                        result.error(
+                            "ERIKA_ERROR",
+                            error.message,
+                            mapOf("stage" to "load_upscaler_model"),
+                        )
+                    }
+                },
+            ) {
+                val nativeResponse = response.getOrThrow()
+                if (nativeResponse.ok) {
+                    host.requestRender()
+                }
+                complete(result, nativeResponse)
+            }
+        }
+        if (!posted) {
+            result.error(
+                "ERIKA_ERROR",
+                "Android presenter thread is unavailable",
+                mapOf("stage" to "load_upscaler_model"),
             )
         }
     }
@@ -3051,6 +3089,7 @@ class ErikaFlutterPlugin :
             "close",
             "seek",
             "setUpscaler",
+            "clearUpscalerModel",
             "setSubtitleScale",
             "setSubtitleStyle",
             "selectSubtitleMemoryFonts",
@@ -3083,6 +3122,7 @@ class ErikaFlutterPlugin :
             "setPlaybackRate",
             "setVolume",
             "setUpscaler",
+            "clearUpscalerModel",
             "setSubtitleScale",
             "setSubtitleStyle",
             "selectSubtitleMemoryFonts",

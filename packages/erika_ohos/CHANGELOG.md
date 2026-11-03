@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Presenter operations now run on a serialized native owner. Existing synchronous
+  APIs, including `renderTick()`, remain available; `startRendering()` enables a
+  native frame clock and ArkUI event callbacks. `stopRendering()` restores manual
+  scheduling, and `setFrameTrace()` enables hilog ownership/slow-tick diagnostics.
+  Dispose joins native work before releasing its NativeWindow. The legacy
+  `ErikaOhosPlayerFromId` symbol now returns null to prevent raw-handle escape.
+- Added `ErikaPlayer.setUpscaler`, `loadUpscalerModel` and `clearUpscalerModel`
+  to load a custom super-resolution network (Erika `.esr` or an FSRCNNX /
+  Anime4K CNN mpv hook shader, supplied by the host); select it with
+  `setUpscaler(64)`.
+
 ## 0.3.3 - 2026-11-01
 
 - Version aligned with liberika 0.3.3; the header adds `erika_presenter_set_muted`. No ArkTS API changes.

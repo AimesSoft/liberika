@@ -1607,6 +1607,39 @@ void main() {
     await player.dispose();
   });
 
+  test('custom upscaler model bytes are forwarded to native presenter',
+      () async {
+    final player = ErikaPlayer();
+    final data = Uint8List.fromList(<int>[1, 2, 3]);
+
+    await player.loadUpscalerModel(data, name: 'fsrcnnx');
+    await player.setUpscaler(ErikaUpscalerMode.custom);
+    await player.clearUpscalerModel();
+
+    final load = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'loadUpscalerModel',
+    );
+    expect(load.arguments, <String, Object?>{
+      'playerId': 7,
+      'name': 'fsrcnnx',
+      'data': data,
+    });
+    expect(
+      playerCalls.singleWhere((c) => c.method == 'setUpscaler').arguments,
+      <String, Object?>{'playerId': 7, 'mode': 64},
+    );
+    expect(
+      playerCalls.singleWhere((c) => c.method == 'clearUpscalerModel').arguments,
+      <String, Object?>{'playerId': 7},
+    );
+    expect(
+      () => player.loadUpscalerModel(Uint8List(0)),
+      throwsArgumentError,
+    );
+
+    await player.dispose();
+  });
+
   test('DS upscaler status mode is decoded from native presenter', () {
     expect(
       ErikaUpscalerMode.fromNativeValue(3),

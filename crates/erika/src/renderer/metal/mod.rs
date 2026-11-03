@@ -683,6 +683,22 @@ impl MetalRenderer {
             MetalRendererStats::default()
         }
     }
+
+    /// Diagnostics detail for the luma upscaler: the reason it is
+    /// `Inactive` (or why it runs on a simpler kernel family) and the engine
+    /// executing it (`metal4_tensor_ops`, `simdgroup_matrix`, `scalar`,
+    /// `legacy_*`, `fsr1`, `metalfx_spatial`,
+    /// `vt_low_latency_super_resolution`).
+    pub fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.upscaler_status_detail()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            (None, None)
+        }
+    }
 }
 
 fn inspect_overlay_frame(frame: &OverlayFrame) -> Result<PreparedOverlayFrameInfo> {
@@ -772,6 +788,10 @@ pub fn fourcc_string(value: u32) -> String {
 }
 
 impl RendererBackend for MetalRenderer {
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        MetalRenderer::upscaler_status_detail(self)
+    }
+
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
         match surface {
             PlatformSurface::Metal(handle) => unsafe {
@@ -1157,6 +1177,20 @@ impl RendererBackend for MetalRenderer {
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
             let _ = mode;
+        }
+    }
+
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.set_custom_upscaler_model(model);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let _ = model;
         }
     }
 

@@ -43,15 +43,17 @@ use ::windows::core::{BOOL, IUnknown, Interface, PCSTR};
 
 use crate::core::{
     ColorPrimaries, FlutterTextureKind, LumaUpscalerBackendStatus, PlatformSurface, PlayerError,
-    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererRuntimeStats, Result,
-    SurfaceMetrics, TransferFunction, WgpuSurfaceKind,
+    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererResourceStats,
+    RendererRuntimeStats, Result, SurfaceMetrics, TransferFunction, WgpuSurfaceKind,
 };
 use crate::danmaku::{
     DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan,
 };
 use crate::ffmpeg::{Frame, PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
-use crate::renderer::d3d11_artcnn::D3d11ArtCnn;
+use crate::renderer::d3d11_sr::{D3d11Fsr1, UpscaledLuma};
+use crate::renderer::d3d11_sr_select::{D3d11Upscaler, SrAccelerator};
+use crate::renderer::d3d11_vsr::{D3d11VideoSuperResolution, VsrColorSpace, VsrMatrix, VsrOutput};
 use crate::renderer::gamut::{
     GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
 };
@@ -61,9 +63,10 @@ use crate::renderer::output::{
 };
 use crate::renderer::pipeline::{
     Chromaticity, LumaUpscalerMode, PrimariesCoordinates, SourceColorState, TargetColorState,
-    VideoRenderPipeline, VideoUniforms, primaries_coordinates,
+    UpscalerFamily, VideoRenderPipeline, VideoUniforms, primaries_coordinates,
 };
 use crate::renderer::presentation::PresentationLayout;
+use crate::renderer::sr::reference::LumaRange;
 use crate::subtitle::AssColor;
 
 const SDR_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1230,7 +1233,14 @@ pub struct D3d11Renderer {
     requested_output_mode: crate::renderer::output::OutputMode,
     video_alpha_mode: VideoAlphaMode,
     upscaler_mode: LumaUpscalerMode,
-    upscaler: D3d11ArtCnn,
+    upscaler: D3d11Upscaler,
+    fsr1: D3d11Fsr1,
+    /// NVIDIA RTX Video / Intel VSR, created on first use per device.
+    /// `Err` keeps the reason it is unavailable.
+    vsr: Option<std::result::Result<D3d11VideoSuperResolution, String>>,
+    vsr_frames: u64,
+    vsr_last_error: Option<String>,
+    scene_upscaler_status: LumaUpscalerBackendStatus,
     next_frame_token: u64,
     hdr10_output_unavailable: bool,
     /// Cached perceptual gamut LUT (3D RGBA16F SRV), keyed the same way as
@@ -1240,6 +1250,40 @@ pub struct D3d11Renderer {
     /// path renders until the LUT lands.
     gamut_lut_job: Option<GamutLutJob>,
     stats: D3d11RendererStats,
+}
+
+/// Matrix-unit accelerators available beside the D3D11 renderer; the
+/// upscaler measures them against scalar compute per network.
+pub(crate) fn sr_accelerators(
+    device: &ID3D11Device,
+) -> Vec<std::result::Result<Box<dyn SrAccelerator>, String>> {
+    let mut accelerators = vec![
+        crate::renderer::d3d11_vk_coopmat::VkCoopMatUpscaler::new(device)
+            .map(|accelerator| Box::new(accelerator) as Box<dyn SrAccelerator>)
+            .map_err(|error| format!("Vulkan cooperative matrix: {error}")),
+    ];
+    // Shader Model 6.10 is a preview until Agility SDK 1.621; the backend
+    // only initializes when ERIKA_SR_D3D12_LINALG=1 and an SDK is configured.
+    if std::env::var("ERIKA_SR_D3D12_LINALG").as_deref() == Ok("1") {
+        accelerators.push(
+            crate::renderer::d3d11_d3d12_linalg::D3d12LinalgUpscaler::new(device)
+                .map(|accelerator| {
+                    Box::new(crate::renderer::d3d11_sr_select::LinalgAccelerator(
+                        accelerator,
+                    )) as Box<dyn SrAccelerator>
+                })
+                .map_err(|error| format!("D3D12 linalg: {error}")),
+        );
+    }
+    accelerators
+}
+
+/// Planes that replace the decoded ones for presentation.
+enum VideoOverride {
+    /// Network output: 2x luma, chroma stays at source resolution.
+    Luma(UpscaledLuma),
+    /// Video processor output: both planes at the target size.
+    Planes(VsrOutput),
 }
 
 impl D3d11Renderer {
@@ -1259,7 +1303,12 @@ impl D3d11Renderer {
             requested_output_mode: config.output_mode,
             video_alpha_mode: config.video_alpha_mode,
             upscaler_mode: config.luma_upscaler,
-            upscaler: D3d11ArtCnn::default(),
+            upscaler: D3d11Upscaler::new(sr_accelerators),
+            fsr1: D3d11Fsr1::default(),
+            vsr: None,
+            vsr_frames: 0,
+            vsr_last_error: None,
+            scene_upscaler_status: LumaUpscalerBackendStatus::Off,
             next_frame_token: 0,
             hdr10_output_unavailable: false,
             gamut_lut: None,
@@ -1367,6 +1416,160 @@ impl D3d11Renderer {
         self.state = None;
     }
 
+    fn upscaler_backend_status(&self) -> LumaUpscalerBackendStatus {
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Off => LumaUpscalerBackendStatus::Off,
+            UpscalerFamily::Network if self.state.is_none() => LumaUpscalerBackendStatus::Building,
+            UpscalerFamily::Network => self.upscaler.status(),
+            UpscalerFamily::Spatial => self.fsr1.status(),
+            UpscalerFamily::Platform
+                if self.upscaler_mode == LumaUpscalerMode::PlatformVideo
+                    && matches!(self.vsr, Some(Ok(_)))
+                    && self.vsr_last_error.is_none() =>
+            {
+                LumaUpscalerBackendStatus::VideoProcessor
+            }
+            _ => LumaUpscalerBackendStatus::Inactive,
+        }
+    }
+
+    /// Runs the selected upscaler for the current frame. Failures disable
+    /// the network for the session or skip the video processor for this
+    /// frame; presentation falls back to native sampling either way.
+    fn upscale_current_video(
+        &mut self,
+        target_rect: D3d11DrawRect,
+        native_luma: ID3D11ShaderResourceView,
+        frame_token: u64,
+    ) -> Option<VideoOverride> {
+        let (device, context) = {
+            let state = self.state.as_ref()?;
+            (state.device.clone(), state.context.clone())
+        };
+        let video = self.current_video.as_ref()?;
+        let (width, height) = (video.width, video.height);
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Network => {
+                let range = if video.constants.full_range != 0 {
+                    LumaRange::Full
+                } else {
+                    LumaRange::Limited
+                };
+                match self.upscaler.encode(
+                    &device,
+                    &context,
+                    &native_luma,
+                    width,
+                    height,
+                    range,
+                    Some(frame_token),
+                ) {
+                    Ok(output) => output.map(VideoOverride::Luma),
+                    Err(error) => {
+                        self.upscaler.record_runtime_failure(&error);
+                        report_upscaler_failure("frame_encode", self.upscaler_mode, &error);
+                        None
+                    }
+                }
+            }
+            UpscalerFamily::Spatial => {
+                let target = (
+                    (target_rect.width.round() as u32).clamp(width, width * 4),
+                    (target_rect.height.round() as u32).clamp(height, height * 4),
+                );
+                match self.fsr1.encode(
+                    &device,
+                    &context,
+                    &native_luma,
+                    (width, height),
+                    target,
+                    Some(frame_token),
+                ) {
+                    Ok(output) => output.map(VideoOverride::Luma),
+                    Err(error) => {
+                        report_upscaler_failure("frame_encode", self.upscaler_mode, &error);
+                        None
+                    }
+                }
+            }
+            UpscalerFamily::Platform if self.upscaler_mode == LumaUpscalerMode::PlatformVideo => {
+                // Vendor video super resolution is specified for SDR only.
+                let transfer = video.constants.source_transfer;
+                if transfer == 3 || transfer == 4 || video.constants.dovi.flags[0] != 0.0 {
+                    self.note_vsr_error("RTX Video / Intel VSR only process SDR video".to_string());
+                    return None;
+                }
+                let texture = video._texture.clone();
+                let array_index = video._array_index;
+                let coefficients = video.constants.luma_coefficients;
+                let full_range = video.constants.full_range != 0;
+                let vsr = self.vsr.get_or_insert_with(|| {
+                    D3d11VideoSuperResolution::new(&device).map_err(|error| error.to_string())
+                });
+                let vsr = match vsr {
+                    Ok(vsr) => vsr,
+                    Err(reason) => {
+                        let reason = reason.clone();
+                        self.note_vsr_error(reason);
+                        return None;
+                    }
+                };
+                let matrix = if (coefficients[0] - 0.299).abs() < 0.01 {
+                    VsrMatrix::Bt601
+                } else if (coefficients[0] - 0.2627).abs() < 0.01 {
+                    VsrMatrix::Bt2020
+                } else {
+                    VsrMatrix::Bt709
+                };
+                let target = (
+                    (target_rect.width.round() as u32).clamp(width, width * 4),
+                    (target_rect.height.round() as u32).clamp(height, height * 4),
+                );
+                match vsr.process(
+                    &context,
+                    &texture,
+                    array_index,
+                    (width, height),
+                    target,
+                    VsrColorSpace { matrix, full_range },
+                ) {
+                    Ok(output) => {
+                        self.vsr_frames = self.vsr_frames.saturating_add(1);
+                        self.vsr_last_error = None;
+                        Some(VideoOverride::Planes(output))
+                    }
+                    Err(error) => {
+                        self.note_vsr_error(error.to_string());
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn poll_upscalers(&mut self) {
+        let Some(device) = self.state.as_ref().map(|state| state.device.clone()) else {
+            return;
+        };
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Network => self.upscaler.poll(&device),
+            UpscalerFamily::Spatial => self.fsr1.poll(&device),
+            _ => {}
+        }
+    }
+
+    fn note_vsr_error(&mut self, reason: String) {
+        if self.vsr_last_error.as_deref() != Some(reason.as_str()) {
+            report_upscaler_failure(
+                "frame_encode",
+                self.upscaler_mode,
+                &PlayerError::Renderer(reason.clone()),
+            );
+            self.vsr_last_error = Some(reason);
+        }
+    }
+
     fn set_device(&mut self, device: ID3D11Device, context: ID3D11DeviceContext) -> Result<()> {
         if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
             unsafe {
@@ -1374,11 +1577,19 @@ impl D3d11Renderer {
             }
         }
         let state = D3d11DeviceState::new(device, context)?;
-        if let Err(error) = self
-            .upscaler
-            .attach_device(&state.device, self.upscaler_mode)
-        {
-            report_upscaler_failure("pipeline_build", self.upscaler_mode, &error);
+        self.vsr = None;
+        self.fsr1.reset();
+        if self.upscaler_mode.family() == UpscalerFamily::Network {
+            if let Err(error) = self
+                .upscaler
+                .attach_device(&state.device, self.upscaler_mode)
+            {
+                report_upscaler_failure("pipeline_build", self.upscaler_mode, &error);
+            }
+        } else {
+            let _ = self
+                .upscaler
+                .attach_device(&state.device, LumaUpscalerMode::Off);
         }
         // The existing swap chain belongs to the previous device; ResizeBuffers
         // cannot migrate it. Drop it so recreate_surface_targets creates a new
@@ -2196,6 +2407,14 @@ impl D3d11Renderer {
             .as_ref()
             .expect("video checked")
             .frame_token;
+        // A network that finished building must refresh an unchanged
+        // (paused) frame, so the cached scene is keyed on the backend too.
+        self.poll_upscalers();
+        let upscaler_status = self.upscaler_backend_status();
+        if upscaler_status != self.scene_upscaler_status {
+            self.scene_upscaler_status = upscaler_status;
+            self.flutter_scene = None;
+        }
         if flutter_texture
             && self.surface.as_ref().unwrap().published_texture.is_some()
             && self
@@ -2231,28 +2450,9 @@ impl D3d11Renderer {
         );
         let upscale_requested = !self.video_alpha_mode.has_alpha()
             && self.upscaler_mode.is_enabled()
-            && self.upscaler.status() == LumaUpscalerBackendStatus::Scalar
             && target_rect.width > video_width as f32;
-        let upscaled_luma = if upscale_requested {
-            let (device, device_context) = {
-                let state = self.state.as_ref().expect("device ensured");
-                (state.device.clone(), state.context.clone())
-            };
-            match self.upscaler.encode(
-                &device,
-                &device_context,
-                &native_luma,
-                video_width,
-                video_height,
-                Some(frame_token),
-            ) {
-                Ok(output) => output,
-                Err(error) => {
-                    self.upscaler.record_runtime_failure(&error);
-                    report_upscaler_failure("frame_encode", self.upscaler_mode, &error);
-                    None
-                }
-            }
+        let video_override = if upscale_requested {
+            self.upscale_current_video(target_rect, native_luma.clone(), frame_token)
         } else {
             None
         };
@@ -2304,7 +2504,7 @@ impl D3d11Renderer {
         state.draw_video(
             video,
             video_constants,
-            upscaled_luma.as_ref(),
+            video_override.as_ref(),
             gamut_lut.as_ref(),
             scene_rtv,
             target_rect,
@@ -2563,6 +2763,15 @@ impl RendererBackend for D3d11Renderer {
         self.render_video(context)
     }
 
+    fn resource_stats(&self) -> RendererResourceStats {
+        let upscaler_bytes = self.upscaler.allocated_bytes() + self.fsr1.allocated_bytes();
+        RendererResourceStats {
+            upscaler_bytes,
+            renderer_tracked_bytes: upscaler_bytes,
+            ..RendererResourceStats::default()
+        }
+    }
+
     fn runtime_stats(&self) -> RendererRuntimeStats {
         RendererRuntimeStats {
             surface_width: self.stats.surface_width,
@@ -2589,14 +2798,11 @@ impl RendererBackend for D3d11Renderer {
             hdr10_output_failures: self.stats.hdr10_output_failures,
             hdr10_output_active: self.stats.hdr10_output_active,
             upscaler_mode: self.upscaler_mode,
-            upscaler_backend: if self.upscaler_mode.is_enabled() && self.state.is_none() {
-                LumaUpscalerBackendStatus::Building
-            } else {
-                self.upscaler.status()
-            },
+            upscaler_backend: self.upscaler_backend_status(),
             upscaler_fallbacks: self.upscaler.fallback_count(),
-            upscaled_frames: self.upscaler.upscaled_frames(),
+            upscaled_frames: self.upscaler.upscaled_frames() + self.vsr_frames + self.fsr1.frames(),
             last_upscaler_encode_duration: self.upscaler.last_encode_duration(),
+            last_gpu_duration: self.upscaler.last_gpu_duration(),
             ..Default::default()
         }
     }
@@ -2631,9 +2837,60 @@ impl RendererBackend for D3d11Renderer {
     fn set_luma_upscaler(&mut self, mode: LumaUpscalerMode) {
         self.upscaler_mode = mode;
         if let Some(state) = self.state.as_ref() {
-            if let Err(error) = self.upscaler.set_mode(&state.device, mode) {
+            let network = if mode.family() == UpscalerFamily::Network {
+                mode
+            } else {
+                LumaUpscalerMode::Off
+            };
+            if let Err(error) = self.upscaler.set_mode(&state.device, network) {
                 report_upscaler_failure("mode_switch", mode, &error);
             }
+            if mode.family() == UpscalerFamily::Platform && mode != LumaUpscalerMode::PlatformVideo
+            {
+                report_upscaler_failure(
+                    "mode_switch",
+                    mode,
+                    &PlayerError::Renderer(format!("{} is not available on Windows", mode.label())),
+                );
+            }
+        }
+    }
+
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Off => (None, None),
+            UpscalerFamily::Network => (self.upscaler.reason(), Some(self.upscaler.engine())),
+            UpscalerFamily::Spatial => (self.fsr1.last_failure().map(str::to_string), Some("fsr1")),
+            UpscalerFamily::Platform if self.upscaler_mode == LumaUpscalerMode::PlatformVideo => {
+                match &self.vsr {
+                    Some(Ok(vsr)) => (
+                        self.vsr_last_error.clone(),
+                        Some(match vsr.vendor() {
+                            crate::renderer::d3d11_vsr::VsrVendor::Nvidia => "nvidia_rtx_video",
+                            crate::renderer::d3d11_vsr::VsrVendor::Intel => "intel_vsr",
+                        }),
+                    ),
+                    Some(Err(reason)) => (Some(reason.clone()), None),
+                    None => (self.vsr_last_error.clone(), None),
+                }
+            }
+            UpscalerFamily::Platform => (
+                Some(format!(
+                    "{} is not available on Windows",
+                    self.upscaler_mode.label()
+                )),
+                None,
+            ),
+        }
+    }
+
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        match self.state.as_ref() {
+            Some(state) => self.upscaler.set_custom_model(&state.device, model),
+            None => self.upscaler.store_custom_model(model),
         }
     }
 
@@ -2760,7 +3017,7 @@ impl D3d11DeviceState {
         &self,
         video: &ImportedVideoFrame,
         constants: VideoUniforms,
-        upscaled_luma: Option<&ID3D11ShaderResourceView>,
+        video_override: Option<&VideoOverride>,
         gamut_lut: Option<&ID3D11ShaderResourceView>,
         render_target: &ID3D11RenderTargetView,
         target: D3d11DrawRect,
@@ -2776,25 +3033,29 @@ impl D3d11DeviceState {
         let stride = mem::size_of::<VideoVertex>() as u32;
         let offset = 0u32;
         let vertices = video_vertices(D3d11TexRect::FULL);
-        let mut common = constants;
-        if upscaled_luma.is_some() {
-            common = common.packed_d2s_luma_input();
-        }
+        // Upscaled planes cover exactly the visible region.
+        let (luma_view, luma_scale) = match video_override {
+            Some(VideoOverride::Luma(luma)) => (luma.view.clone(), [1.0, 1.0]),
+            Some(VideoOverride::Planes(planes)) => (planes.luma.clone(), [1.0, 1.0]),
+            None => (
+                video.luma.clone(),
+                [video.tex_rect.width, video.tex_rect.height],
+            ),
+        };
+        let (chroma_view, chroma_scale) = match video_override {
+            Some(VideoOverride::Planes(planes)) => (planes.chroma.clone(), [1.0, 1.0]),
+            _ => (
+                video.chroma.clone(),
+                [video.tex_rect.width, video.tex_rect.height],
+            ),
+        };
         let constants = D3d11VideoConstants {
-            common,
+            common: constants,
             texture_scales: [
-                if upscaled_luma.is_some() {
-                    1.0
-                } else {
-                    video.tex_rect.width
-                },
-                if upscaled_luma.is_some() {
-                    1.0
-                } else {
-                    video.tex_rect.height
-                },
-                video.tex_rect.width,
-                video.tex_rect.height,
+                luma_scale[0],
+                luma_scale[1],
+                chroma_scale[0],
+                chroma_scale[1],
             ],
         };
         unsafe {
@@ -2829,11 +3090,7 @@ impl D3d11DeviceState {
             self.context.PSSetShader(&self.pixel_shader, None);
             self.context
                 .PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
-            let srvs = [
-                Some(upscaled_luma.cloned().unwrap_or_else(|| video.luma.clone())),
-                Some(video.chroma.clone()),
-                gamut_lut.cloned(),
-            ];
+            let srvs = [Some(luma_view), Some(chroma_view), gamut_lut.cloned()];
             self.context.PSSetShaderResources(0, Some(&srvs));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
@@ -3914,14 +4171,17 @@ fn trace(message: &str) {
 fn report_upscaler_failure(stage: &str, mode: LumaUpscalerMode, error: &PlayerError) {
     crate::trace::diagnostic_at(
         crate::trace::LogLevel::Warn,
-        format!("Erika D3D11 ArtCNN disabled after {stage} failure: {error}"),
+        format!(
+            "Erika D3D11 upscaler {} disabled after {stage} failure: {error}",
+            mode.label()
+        ),
     );
     crate::trace::diagnostic(
         serde_json::json!({
             "event": "luma_upscaler",
             "stage": stage,
             "renderer": "d3d11",
-            "requestedMode": format!("{mode:?}"),
+            "requestedMode": mode.label(),
             "activeBackend": "inactive",
             "reason": error.to_string(),
             "fallback": "native_luma_sampling",

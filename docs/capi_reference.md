@@ -441,6 +441,9 @@ ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rat
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
 ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *, bool muted);       // keeps the volume
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
+ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle *, const char *name,
+                                               const uint8_t *data, uintptr_t len);
+ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
 ErikaStatus erika_presenter_set_subtitle_delay(ErikaPresenterHandle *, int64_t delay_micros); // later when positive
 ErikaStatus erika_presenter_set_open_start_position(ErikaPresenterHandle *, uint64_t position_micros);
@@ -453,11 +456,29 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 is the push-model counterpart of `erika_open_with_options` and accepts the same
 `ErikaOpenOptions` (headers plus `http_read_ahead_bytes` /
 `http_back_buffer_bytes`; see
-[`erika_open_with_options`](#erikahandle--pull-model)). `set_upscaler` switches the neural
-luma upscaler at runtime (see [`erika_presenter_get_upscaler_status`](#diagnostics-and-capture));
-Metal, D3D11 feature level 11+, and compute-capable wgpu renderers execute
-ArtCNN, while backends without compute retain native luma sampling and report
-an explicit `Inactive` fallback.
+[`erika_open_with_options`](#erikahandle--pull-model)). `set_upscaler` switches the luma
+upscaler at runtime (see [`erika_presenter_get_upscaler_status`](#diagnostics-and-capture)).
+Mode values are grouped: 1-15 ArtCNN, 16-31 Anime4K, 32-47 spatial shaders
+(`Fsr1`), 48-63 platform scalers (`PlatformVideo`, `MetalFxSpatial`), 64 `Custom`.
+Network modes upscale the decoded luma plane 2x; `Fsr1` and `MetalFxSpatial`
+scale luma to the presented size; `PlatformVideo` scales the whole frame.
+Metal and D3D11 run every mode they support; the wgpu renderers (Linux,
+Android, OpenHarmony, the Windows wgpu fallback) run every network mode
+(ArtCNN 1-7, Anime4K, `Custom`) and `Fsr1`, while `PlatformVideo` and
+`MetalFxSpatial` report `Inactive` there. A mode that cannot run on the current backend keeps native luma
+sampling and reports `Inactive` with the reason in the diagnostics `upscaler`
+object. Web has no upscaler. See [Integration](integration.md#upscaler) for the
+platform matrix.
+
+`erika_presenter_load_upscaler_model` loads the network used by
+`ErikaLumaUpscalerMode_Custom` from memory (`name` is a label, `data`/`len` the
+file contents); `erika_presenter_clear_upscaler_model` drops it. Select it
+afterwards with `set_upscaler(handle, ErikaLumaUpscalerMode_Custom)`. The data
+is an Erika `.esr` network (export ArtCNN ONNX with
+`crates/erika/assets/artcnn/export_artcnn_esr.py`) or an mpv hook shader of the
+FSRCNNX or Anime4K CNN dialect. Only weights are parsed; shader code is never
+executed. liberika does not bundle FSRCNNX or RAVU/NNEDI3 (GPL/LGPL), so the host
+supplies such files.
 
 `set_subtitle_font` and `set_subtitle_style` set the subtitle *fallback* look.
 An empty family or path clears that half of the selection. Colours are
@@ -793,7 +814,7 @@ The table mirrors the C entry points — playback (`open`, `play`, `pause`,
 `setSubtitleDelay`, `subtitleDelay`, `subtitleText`, `setSubtitleFont`,
 `setSubtitleStyle`, the subtitle memory-font calls), the
 danmaku family (including `getDanmakuConfig`), output and upscaler
-(`setUpscaler`, `getUpscalerStatus`, `setOutputHeadroom`, `getOutputStatus`,
+(`setUpscaler`, `getUpscalerStatus`, `loadUpscalerModelFile`, `clearUpscalerModel`, `setOutputHeadroom`, `getOutputStatus`,
 `setDebugHudEnabled`), counters (`getPresenterStats`, `getResourceStatus`), and
 the diagnostics below (`getDiagnosticsSnapshot`, `getLogs`).
 
@@ -841,8 +862,20 @@ ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle
 ```
 
 `get_upscaler_status` reports the requested upscaler mode, the active backend
-(off / inactive / building / scalar / simdgroup-matrix), the fallback count,
-upscaled frame count, and recent encode/GPU timings in microseconds.
+(`Off`, `Inactive`, `Building`, `Scalar`, `SimdgroupMatrix`, `CooperativeMatrix`,
+`LinalgMatrix`, `VideoProcessor`, `VideoToolbox`, `MetalFx`, `TensorOps`), the
+fallback count, upscaled frame count, and recent encode/GPU timings in
+microseconds. `Inactive` means the mode cannot run here and native sampling is
+used (the reason is in diagnostics); `Building` means kernels are compiling in
+the background and native sampling is used meanwhile. `CooperativeMatrix` is
+Vulkan `VK_KHR_cooperative_matrix` next to D3D11; `LinalgMatrix` is the opt-in
+D3D12 SM 6.10 preview; `VideoProcessor` is the D3D11 video processor vendor
+extension (NVIDIA RTX Video / Intel VSR); `TensorOps` is Metal 4 tensor ops
+(M5/A19). D3D11 now also reports GPU time (timestamp queries) in
+`last_gpu_micros`.
+
+`loadUpscalerModelFile` (`{path, name?}`) and `clearUpscalerModel` are the JSON
+bridge counterparts of the load/clear functions above.
 
 `get_output_status` returns the actual negotiated output, not merely the
 request. The 13 fields are:
@@ -974,7 +1007,7 @@ handle call.
 | `output` | Requested mode, active encoding, surface format, dataspace, requested/active headroom (`null` when unknown), fallback reason label and counters. |
 | `hdr` | HDR source frames, HDR10 output frames, SDR tone-mapped frames, metadata updates/failures, output failures, `outputActive`. |
 | `resources` | Same fields as `ErikaPresenterResourceStatus`. |
-| `upscaler` | Requested mode and active backend as labels, fallbacks, upscaled frames, last encode time. |
+| `upscaler` | Requested mode and active backend as labels, `engine` (for example `scalar_compute`, `cooperative_matrix`, `linalg_matrix`, `metal4_tensor_ops`, `simdgroup_matrix`, `fsr1`, `metalfx_spatial`, `vt_low_latency_super_resolution`, `nvidia_rtx_video`, `intel_vsr`), `reason` (why the mode is `Inactive` or degraded), fallbacks, upscaled frames, last encode time, `lastGpuMs`. |
 | `audio` | Output state, configured/started, volume, pushed frames, failures, queued frames and `queuedMs`, read/written/underflow frames, ring `ringDroppedFrames`, device `recovery` state and counts. |
 | `buffers` | `playback` queue depths published by the worker (`demuxPackets`, `pendingVideoPackets`, `decodedVideoFrames`, `decodedAudioFrames`, `decodedSubtitleFrames` as `{queued, capacity}`, `demuxEof`, `updatedAgoMs`; `null` before open), presenter frame channels, `audioOutputQueuedMs`. |
 | `timing.scheduler` | `leadTimeMs`, `dropToleranceMs`, `maxConsecutiveDrops`; `presentedFrames`; `lateDroppedFrames` (discarded for being later than the drop tolerance — previously uncounted); `forcedLatePresents` (late beyond tolerance but shown because the consecutive-drop budget was spent); `maxDropBurst`, `maxDroppedLateMs`, `lastDropAgoMs`, `seekPrerollDroppedFrames`; `lateByMs` window `{samples, meanMs, p50Ms, p95Ms, maxMs}` over the last 128 presented frames; `lateHistogram` (`le10ms` … `gt120ms`). |
@@ -1061,8 +1094,8 @@ ring lives only in process memory and is read on demand.
 | `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` `LinuxExtendedLinearScRgb` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
 | `ErikaOutputFallbackReason` | `None` `DisplayHdrUnsupported` `HybridCompositionRequired` `WgpuBackendNotVulkan` `Rgba16FloatSurfaceFormatUnavailable` `NativeWindowDataSpaceApiUnavailable` `ScrgbDataSpaceVerificationFailed` `SurfaceConfigureFailed` `LegacyAppleEdrUnsupported` |
-| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` |
-| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` |
+| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` `ArtCnnC4F16Dn` `ArtCnnC4F32Ds` `ArtCnnC4F32Dn` `ArtCnnR8F64` `Anime4kS` `Anime4kM` `Anime4kL` `Anime4kVl` `Anime4kUl` `Anime4kDenoiseS` `Anime4kDenoiseM` `Anime4kDenoiseL` `Anime4kDenoiseVl` `Anime4kDenoiseUl` `Fsr1` `PlatformVideo` `MetalFxSpatial` `Custom` |
+| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` `CooperativeMatrix` `LinalgMatrix` `VideoProcessor` `VideoToolbox` `MetalFx` `TensorOps` |
 
 ## Structs
 

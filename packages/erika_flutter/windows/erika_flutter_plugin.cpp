@@ -1,6 +1,7 @@
 #include "erika_flutter_plugin.h"
 #include "erika_composition_blend_effect.h"
 #include "erika_texture_publication.h"
+#include "erika_presenter_worker.h"
 
 #include <flutter/event_channel.h>
 #include <flutter/method_channel.h>
@@ -11,6 +12,7 @@
 #include <d3d11.h>
 #include <DispatcherQueue.h>
 #include <dxgi.h>
+#include <wincodec.h>
 #include <windows.ui.composition.interop.h>
 #include <wrl/client.h>
 
@@ -27,6 +29,7 @@
 #include <cwchar>
 #include <fstream>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -46,6 +49,7 @@ constexpr wchar_t kFlutterRegularHostWindowClassName[] =
     L"FLUTTER_HOST_WINDOW";
 constexpr UINT kFrameTimerMessage = WM_APP + 1;
 constexpr UINT kSmtcMessage = WM_APP + 2;
+constexpr UINT kCompletionMessage = WM_APP + 3;
 constexpr double kFrameTimerMinFps = 1.0;
 constexpr double kFrameTimerMaxFps = 1000.0;
 constexpr double kFrameTimerDefaultFps = 60.0;
@@ -777,6 +781,8 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   using OpenWithOptionsFn = ErikaStatus (*)(ErikaPresenterHandle*, const char*, const ErikaOpenOptions*);
   using CommandFn = ErikaStatus (*)(ErikaPresenterHandle*);
   using SeekFn = ErikaStatus (*)(ErikaPresenterHandle*, uint64_t);
+  using LoadUpscalerModelFn = ErikaStatus (*)(
+      ErikaPresenterHandle*, const char*, const uint8_t*, uintptr_t);
   using SetPlaybackRateFn = ErikaStatus (*)(ErikaPresenterHandle*, double);
   using SetVolumeFn = ErikaStatus (*)(ErikaPresenterHandle*, double);
   using SetUpscalerFn = ErikaStatus (*)(ErikaPresenterHandle*, int32_t);
@@ -849,6 +855,8 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   using RenderTickFn =
       ErikaStatus (*)(ErikaPresenterHandle*, double, ErikaPresenterStats*);
   using PollEventFn = ErikaStatus (*)(ErikaPresenterHandle*, ErikaEvent*);
+  using CaptureFrameFn = ErikaStatus (*)(ErikaPresenterHandle*, uint32_t,
+                                        uint32_t, uint8_t*, uintptr_t);
   using LastErrorMessageFn = char* (*)();
   using StringFreeFn = void (*)(char*);
 
@@ -917,6 +925,8 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   SetPlaybackRateFn set_playback_rate = nullptr;
   SetVolumeFn set_volume = nullptr;
   SetUpscalerFn set_upscaler = nullptr;
+  LoadUpscalerModelFn load_upscaler_model = nullptr;
+  CommandFn clear_upscaler_model = nullptr;
   SetSubtitleScaleFn set_subtitle_scale = nullptr;
   SetSubtitleFontFn set_subtitle_font = nullptr;
   SetSubtitleStyleFn set_subtitle_style = nullptr;
@@ -962,6 +972,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   CommandFn detach_surface = nullptr;
   RenderTickFn render_tick = nullptr;
   PollEventFn poll_event = nullptr;
+  CaptureFrameFn capture_frame = nullptr;
   LastErrorMessageFn last_error_message = nullptr;
   StringFreeFn string_free = nullptr;
 
@@ -990,6 +1001,10 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
     set_volume = LoadOptional<SetVolumeFn>("erika_presenter_set_volume");
     set_upscaler =
         LoadOptional<SetUpscalerFn>("erika_presenter_set_upscaler");
+    load_upscaler_model = LoadOptional<LoadUpscalerModelFn>(
+        "erika_presenter_load_upscaler_model");
+    clear_upscaler_model = LoadOptional<CommandFn>(
+        "erika_presenter_clear_upscaler_model");
     set_subtitle_scale = LoadOptional<SetSubtitleScaleFn>(
         "erika_presenter_set_subtitle_scale");
     set_subtitle_font =
@@ -1076,6 +1091,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
         LoadRequired<CommandFn>("erika_presenter_detach_surface");
     render_tick = LoadRequired<RenderTickFn>("erika_presenter_render_tick");
     poll_event = LoadRequired<PollEventFn>("erika_presenter_poll_event");
+    capture_frame = LoadOptional<CaptureFrameFn>("erika_presenter_capture_frame_rgba");
     last_error_message =
         LoadOptional<LastErrorMessageFn>("erika_last_error_message");
     string_free = LoadOptional<StringFreeFn>("erika_string_free");
@@ -1281,7 +1297,16 @@ struct ErikaFlutterPlugin::ErikaOverlayWindow {
     const int py = client_origin.y + LogicalToPhysical(host, logical_y);
     const int pw = std::max(1, LogicalToPhysical(host, logical_width));
     const int ph = std::max(1, LogicalToPhysical(host, logical_height));
-    const HWND insert_after = host != nullptr ? host : HWND_BOTTOM;
+    // hWndInsertAfter places the popup BELOW that window. Using the Flutter
+    // host here hides opaque video behind Flutter's black background. Keep
+    // the video immediately above its host, without activating it or making
+    // it globally topmost. Preserve its separate HWND lifetime: presenters
+    // must finish using it before the platform destroys it.
+    HWND insert_after = host != nullptr ? GetWindow(host, GW_HWNDPREV) : HWND_TOP;
+    if (insert_after == hwnd) {
+      insert_after = GetWindow(hwnd, GW_HWNDPREV);
+    }
+    if (insert_after == nullptr) insert_after = HWND_TOP;
     SetWindowPos(hwnd, insert_after, px, py, pw, ph,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
   }
@@ -1555,7 +1580,7 @@ struct ErikaFlutterPlugin::ErikaFlutterTexture {
   }
 
   void MarkFrameAvailable() {
-    registrar->MarkTextureFrameAvailable(texture_id);
+    if (registrar) registrar->MarkTextureFrameAvailable(texture_id);
   }
 
   void Clear() {
@@ -1574,32 +1599,123 @@ struct ErikaFlutterPlugin::ErikaFlutterTexture {
 };
 
 struct ErikaFlutterPlugin::PlayerHost {
+  using CompletionPoster = std::function<void(std::function<void()>)>;
+  struct FrameOutput {
+    ErikaSmtcState smtc;
+    std::vector<EncodableValue> events;
+    Microsoft::WRL::ComPtr<IUnknown> texture;
+    Microsoft::WRL::ComPtr<IUnknown> swapchain;
+    uint64_t surface_epoch = 0;
+    uint64_t sink_generation = 0;
+  };
+
   PlayerHost(int64_t player_id,
              std::shared_ptr<ErikaNativeLibrary> native_library,
-             ErikaPresenterConfig config)
-      : id(player_id),
-        library(std::move(native_library)),
-        video_alpha_mode(config.video_alpha_mode) {
+             ErikaPresenterConfig config,
+             CompletionPoster poster)
+      : id(player_id), library(std::move(native_library)),
+        video_alpha_mode(config.video_alpha_mode),
+        post_completion(std::move(poster)),
+        platform_thread_id(GetCurrentThreadId()) {
     smtc_state.player_id = player_id;
-    handle = library->CreatePresenter(config);
-    if (handle == nullptr) {
-      std::string message = "erika_presenter_create returned null";
-      const auto detail = library->TakeLastError();
-      if (!detail.empty()) {
-        message += ": " + detail;
+    platform_smtc_state.player_id = player_id;
+    worker.Post([this, config] {
+      const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      com_initialized = SUCCEEDED(com);
+      try {
+        if (FAILED(com)) CheckHResult(com, "Initialize presenter worker COM");
+        handle = library->CreatePresenter(config);
+        if (!handle) {
+          throw PluginError("erika_presenter_create returned null: " +
+                            library->TakeLastError());
+        }
+        RefreshDanmakuConfigSnapshot();
+      } catch (const std::exception& error) {
+        initialization_error = SafeUtf8Message(error.what());
       }
-      DebugLog(message);
-      throw PluginError(message);
-    }
-    RefreshDanmakuConfigSnapshot();
+    });
   }
 
   ~PlayerHost() {
-    if (handle != nullptr) {
-      Detach(std::nullopt);
-      library->destroy(handle);
-      handle = nullptr;
-    }
+    DebugLog("presenter shutdown begin player=" + std::to_string(id));
+    Detach(std::nullopt);
+    worker.Stop([this] {
+      if (handle) {
+        DebugLog("presenter shutdown detach player=" + std::to_string(id));
+        library->detach_surface(handle);
+        DebugLog("presenter shutdown destroy player=" + std::to_string(id));
+        library->destroy(handle);
+        handle = nullptr;
+        DebugLog("presenter shutdown destroyed player=" + std::to_string(id));
+      }
+      if (com_initialized) CoUninitialize();
+    }, [](std::thread& thread) {
+      // DXGI CreateSwapChainForHwnd/Present may synchronously send messages to
+      // the HWND owner. Service ONLY sent messages during join, never posted
+      // method calls/completions that could re-enter and destroy this host.
+      HANDLE done = thread.native_handle();
+      while (MsgWaitForMultipleObjectsEx(1, &done, INFINITE, QS_SENDMESSAGE,
+                                         MWMO_INPUTAVAILABLE) != WAIT_OBJECT_0) {
+        MSG message;
+        PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+      }
+    });
+    DebugLog("presenter shutdown joined player=" + std::to_string(id));
+  }
+
+  void EnsureNative() const {
+    if (!initialization_error.empty()) throw PluginError(initialization_error);
+    if (!handle) throw PluginError("Presenter is unavailable.");
+  }
+
+  void Submit(std::function<EncodableValue()> work,
+              std::function<void(EncodableValue, std::string)> done) {
+    worker.Post([this, work = std::move(work), done = std::move(done)]() mutable {
+      EncodableValue value;
+      std::string error;
+      try {
+        EnsureNative();
+        value = work();
+      } catch (const std::exception& failure) {
+        error = SafeUtf8Message(failure.what());
+      }
+      auto state = smtc_state;
+      post_completion([done = std::move(done), value = std::move(value), error = std::move(error),
+                       state, publish_state = publish_state]() mutable {
+        if (publish_state) publish_state(state);
+        done(std::move(value), std::move(error));
+      });
+    });
+  }
+
+  // C API surface calls operate the renderer's D3D11 swapchain. HWND lifetime
+  // and WinRT Composition belong to the platform; workers receive only values.
+  void SurfaceCommand(std::function<void()> work, uint64_t epoch, bool report = true) {
+    worker.Post([this, work = std::move(work), epoch, report] {
+      try {
+        EnsureNative();
+        work();
+      } catch (const std::exception& error) {
+        surface_error = SafeUtf8Message(error.what());
+        native_surface_attached = false;
+        if (handle) library->detach_surface(handle);
+        const auto message = surface_error;
+        if (report) post_completion([failed = surface_failed, epoch, message] {
+          if (failed) failed(epoch, message);
+        });
+      }
+    });
+  }
+
+  void CompleteSurface(std::shared_ptr<flutter::MethodResult<EncodableValue>> result,
+                       EncodableValue value = EncodableValue()) {
+    Submit([this, value] {
+      if (!surface_error.empty()) throw PluginError(surface_error);
+      return value;
+    }, [result](EncodableValue reply, std::string error) {
+      if (error.empty()) result->Success(reply);
+      else result->Error("ERIKA_ERROR", error);
+    });
   }
 
   void CheckNative(ErikaStatus status, const char* operation) const {
@@ -1787,6 +1903,23 @@ struct ErikaFlutterPlugin::PlayerHost {
       throw PluginError("Missing Erika C ABI symbol: erika_presenter_set_upscaler");
     }
     CheckNative(library->set_upscaler(handle, mode), "set_upscaler");
+  }
+
+  void LoadUpscalerModel(const std::string& name,
+                         const std::vector<uint8_t>& data) {
+    if (library->load_upscaler_model == nullptr) {
+      throw PluginError("Missing Erika C ABI symbol: erika_presenter_load_upscaler_model");
+    }
+    CheckNative(library->load_upscaler_model(handle, name.c_str(), data.data(),
+                                             data.size()),
+                "load_upscaler_model");
+  }
+
+  void ClearUpscalerModel() {
+    if (library->clear_upscaler_model == nullptr) {
+      throw PluginError("Missing Erika C ABI symbol: erika_presenter_clear_upscaler_model");
+    }
+    CheckNative(library->clear_upscaler_model(handle), "clear_upscaler_model");
   }
 
   void SetSubtitleScale(double scale) {
@@ -2165,159 +2298,126 @@ struct ErikaFlutterPlugin::PlayerHost {
     return TrackSelectionToMap(selection);
   }
 
-  void AttachOverlay(ErikaOverlayWindow& overlay) {
-    if (surface_attached) {
-      Detach(std::nullopt);
+  std::shared_future<void> Fence() {
+    auto promise = std::make_shared<std::promise<void>>();
+    auto future = promise->get_future().share();
+    worker.Post([promise] { promise->set_value(); });
+    return future;
+  }
+
+  void AttachOverlay(ErikaOverlayWindow& overlay,
+                     std::vector<std::shared_future<void>> predecessors = {}) {
+    const bool composition = RequiresComposition(overlay);
+    if (composition && (!library->attach_wgpu_surface_with_output_capabilities ||
+                        !library->windows_composition_swapchain)) {
+      throw PluginError("The loaded runtime does not support Windows Composition.");
     }
-    const uint32_t width = overlay.PixelWidth();
-    const uint32_t height = overlay.PixelHeight();
+    Detach(std::nullopt);
+    const uint32_t width = overlay.PixelWidth(), height = overlay.PixelHeight();
     const double scale = overlay.scale;
-    const uint64_t hinstance = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
-    composition_surface = RequiresComposition(overlay);
-    try {
-      overlay.SetCompositionMode(composition_surface);
-      if (composition_surface) {
-        overlay.ClearCompositionContent();
-        ErikaSurfaceOutputCapabilities capabilities{};
-        capabilities.direct_composition = true;
-        capabilities.fallback_reason = ErikaOutputFallbackReason_None;
-        CheckNative(library->attach_wgpu_surface_with_output_capabilities(
-                        handle, ErikaWgpuSurfaceKind_WindowsHwnd,
-                        reinterpret_cast<uint64_t>(overlay.flutter), hinstance,
-                        width, height, scale, capabilities),
-                    "attach_wgpu_surface_with_output_capabilities");
-        attached_hwnd = overlay.flutter;
-        attached_overlay = &overlay;
-        RefreshCompositionContent();
-      } else {
-        CheckNative(library->attach_windows_hwnd(
-                        handle, reinterpret_cast<uint64_t>(overlay.hwnd),
-                        hinstance, width, height, scale),
-                    "attach_windows_hwnd");
-        attached_hwnd = overlay.hwnd;
-        attached_overlay = nullptr;
-      }
-    } catch (...) {
-      if (composition_surface) {
-        try {
-          overlay.ClearCompositionContent();
-        } catch (const std::exception& error) {
-          DebugLog(std::string("DirectComposition attach rollback failed: ") +
-                   error.what());
-        }
-      }
-      library->detach_surface(handle);
-      attached_hwnd = nullptr;
-      attached_overlay = nullptr;
-      attached_view_id = 0;
-      surface_attached = false;
-      composition_surface = false;
-      attached_surface_width = 0;
-      attached_surface_height = 0;
-      attached_surface_scale = 0.0;
-      if (overlay.owner_player_id == id) {
-        overlay.owner_player_id = 0;
-      }
-      throw;
-    }
+    composition_surface = composition;
+    overlay.SetCompositionMode(composition);
+    if (composition) overlay.ClearCompositionContent();
+    attached_hwnd = composition ? overlay.flutter : overlay.hwnd;
+    attached_overlay = &overlay;
     attached_view_id = kWindowOverlayViewId;
     surface_attached = true;
     attached_surface_width = width;
     attached_surface_height = height;
     attached_surface_scale = scale;
-    start_time_seconds = NowSeconds();
+    const HWND hwnd = attached_hwnd;
+    const uint64_t epoch = ++surface_epoch;
+    SurfaceCommand([this, hwnd, width, height, scale, composition, epoch,
+                    predecessors = std::move(predecessors)] {
+      // A shared HWND can have only one flip-model producer. These fences
+      // precede this command globally and never need a platform completion.
+      for (const auto& predecessor : predecessors) predecessor.wait();
+      const auto instance = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+      if (composition) {
+        ErikaSurfaceOutputCapabilities capabilities{};
+        capabilities.direct_composition = true;
+        capabilities.fallback_reason = ErikaOutputFallbackReason_None;
+        CheckNative(library->attach_wgpu_surface_with_output_capabilities(
+            handle, ErikaWgpuSurfaceKind_WindowsHwnd,
+            reinterpret_cast<uint64_t>(hwnd), instance, width, height, scale,
+            capabilities), "attach_wgpu_surface_with_output_capabilities");
+      } else {
+        CheckNative(library->attach_windows_hwnd(handle,
+            reinterpret_cast<uint64_t>(hwnd), instance, width, height, scale),
+            "attach_windows_hwnd");
+      }
+      NativeSurfaceAttached(epoch, composition, false, width, height);
+    }, epoch);
   }
 
   void AttachFlutterTexture(ErikaFlutterTexture& texture) {
-    // Optional features must not prevent native HWND/HDR playback with an
-    // older bundled runtime. Check before disturbing an existing attachment.
-    if (library->attach_flutter_texture == nullptr ||
-        library->windows_flutter_texture == nullptr) {
-      throw PluginError(
-          "Windows Flutter textures require a matching Erika native runtime. "
-          "Build with ERIKA_FORCE_SOURCE_BUILD=1 from this checkout, or install "
-          "a runtime providing erika_presenter_windows_flutter_texture_iunknown. "
-          "ErikaVideoView remains available for native HDR playback.");
+    if (!library->attach_flutter_texture || !library->windows_flutter_texture) {
+      throw PluginError("Windows Flutter textures require a matching Erika native runtime.");
     }
     if (texture.owner_player_id != 0 && texture.owner_player_id != id) {
-      throw PluginError("Erika Flutter texture " +
-                        std::to_string(texture.texture_id) +
-                        " is already attached to another player.");
+      throw PluginError("Erika Flutter texture is already attached to another player.");
     }
-    if (surface_attached) {
-      Detach(std::nullopt);
-    }
-    const auto status = library->attach_flutter_texture(
-        handle, ErikaFlutterTextureKind_WindowsTextureRegistrar,
-        texture.texture_id, texture.width, texture.height, texture.scale);
-    Check(status, "attach_flutter_texture",
-          status == ErikaStatus_Ok ? std::string{} : library->TakeLastError());
+    Detach(std::nullopt);
     texture.owner_player_id = id;
     attached_texture = &texture;
     attached_view_id = texture.texture_id;
     surface_attached = true;
-    composition_surface = false;
     attached_surface_width = texture.width;
     attached_surface_height = texture.height;
     attached_surface_scale = texture.scale;
+    const auto texture_id = texture.texture_id;
+    const auto width = texture.width, height = texture.height;
+    const auto scale = texture.scale;
+    const uint64_t epoch = ++surface_epoch;
+    SurfaceCommand([this, texture_id, width, height, scale, epoch] {
+      CheckNative(library->attach_flutter_texture(handle,
+          ErikaFlutterTextureKind_WindowsTextureRegistrar, texture_id,
+          width, height, scale), "attach_flutter_texture");
+      NativeSurfaceAttached(epoch, false, true, width, height);
+    }, epoch);
+  }
+
+  void NativeSurfaceAttached(uint64_t epoch, bool composition, bool texture,
+                             uint32_t width, uint32_t height) {
+    surface_error.clear();
+    native_surface_attached = true;
+    native_composition = composition;
+    native_texture = texture;
+    native_surface_epoch = epoch;
+    native_width = width;
+    native_height = height;
     start_time_seconds = NowSeconds();
   }
 
-  void ResizeFlutterTexture(ErikaFlutterTexture& texture,
-                            uint32_t width,
-                            uint32_t height,
-                            double scale) {
-    texture.Resize(width, height, scale);
-    if (!surface_attached || attached_texture != &texture) {
-      return;
-    }
+  void ResizeSurface(uint32_t width, uint32_t height, double scale) {
     if (width == attached_surface_width && height == attached_surface_height &&
-        std::abs(scale - attached_surface_scale) < 0.0001) {
-      return;
-    }
-    const auto status = library->resize_surface(handle, width, height, scale);
-    Check(status, "resize_surface",
-          status == ErikaStatus_Ok ? std::string{} : library->TakeLastError());
+        std::abs(scale - attached_surface_scale) < 0.0001) return;
     attached_surface_width = width;
     attached_surface_height = height;
     attached_surface_scale = scale;
+    const uint64_t epoch = ++surface_epoch;
+    SurfaceCommand([this, width, height, scale, epoch] {
+      if (!native_surface_attached)
+        throw PluginError(surface_error.empty() ? "No native surface is attached." : surface_error);
+      CheckNative(library->resize_surface(handle, width, height, scale),
+                  "resize_surface");
+      native_surface_epoch = epoch;
+      native_width = width;
+      native_height = height;
+    }, epoch);
   }
 
-  void RefreshFlutterTexture() {
-    if (attached_texture == nullptr) {
-      return;
-    }
-    void* raw_texture = nullptr;
-    const auto status =
-        library->windows_flutter_texture(handle, &raw_texture);
-    Check(status, "windows_flutter_texture_iunknown",
-          status == ErikaStatus_Ok ? std::string{} : library->TakeLastError());
-    if (attached_texture->UpdateNativeTexture(raw_texture)) {
-      attached_texture->MarkFrameAvailable();
-    }
+  void ResizeFlutterTexture(ErikaFlutterTexture& texture, uint32_t width,
+                            uint32_t height, double scale) {
+    texture.Resize(width, height, scale);
+    if (surface_attached && attached_texture == &texture)
+      ResizeSurface(width, height, scale);
   }
 
   void ResizeOverlay(ErikaOverlayWindow& overlay) {
-    const HWND expected_hwnd = composition_surface ? overlay.flutter : overlay.hwnd;
-    if (!surface_attached || attached_hwnd != expected_hwnd) {
-      return;
-    }
-    const uint32_t width = overlay.PixelWidth();
-    const uint32_t height = overlay.PixelHeight();
-    const double scale = overlay.scale;
-    if (width == attached_surface_width &&
-        height == attached_surface_height &&
-        std::abs(scale - attached_surface_scale) < 0.0001) {
-      return;
-    }
-    CheckNative(library->resize_surface(handle, width, height, scale),
-                "resize_surface");
-    attached_surface_width = width;
-    attached_surface_height = height;
-    attached_surface_scale = scale;
-    if (composition_surface) {
-      RefreshCompositionContent();
-    }
+    const HWND expected = composition_surface ? overlay.flutter : overlay.hwnd;
+    if (surface_attached && attached_hwnd == expected)
+      ResizeSurface(overlay.PixelWidth(), overlay.PixelHeight(), overlay.scale);
   }
 
   bool RequiresComposition(const ErikaOverlayWindow& overlay) const {
@@ -2325,37 +2425,19 @@ struct ErikaFlutterPlugin::PlayerHost {
            overlay.blend_mode == "overlay";
   }
 
-  void RefreshCompositionContent() {
-    if (!composition_surface || attached_overlay == nullptr) {
-      return;
-    }
-    if (library->windows_composition_swapchain == nullptr) {
-      throw PluginError(
-          "The loaded erika_capi.dll does not expose the DirectComposition "
-          "swap chain. Update the bundled Erika runtime.");
-    }
-    void* swapchain = nullptr;
-    CheckNative(library->windows_composition_swapchain(handle, &swapchain),
-                "windows_composition_swapchain_iunknown");
-    attached_overlay->SetCompositionContent(swapchain);
-  }
-
   void Detach(std::optional<int64_t> view_id) {
-    if (view_id && attached_view_id != *view_id) {
-      return;
-    }
-    if (composition_surface && attached_overlay != nullptr &&
+    if (view_id && attached_view_id != *view_id) return;
+    if (composition_surface && attached_overlay &&
         attached_overlay->owner_player_id == id) {
       try {
         attached_overlay->ClearCompositionContent();
       } catch (const std::exception& error) {
-        DebugLog(std::string("DirectComposition detach failed: ") +
-                 error.what());
+        DebugLog("DirectComposition detach failed: " + SafeUtf8Message(error.what()));
       }
     }
     attached_hwnd = nullptr;
     attached_overlay = nullptr;
-    if (attached_texture != nullptr && attached_texture->owner_player_id == id) {
+    if (attached_texture && attached_texture->owner_player_id == id) {
       attached_texture->owner_player_id = 0;
       attached_texture->Clear();
     }
@@ -2363,44 +2445,148 @@ struct ErikaFlutterPlugin::PlayerHost {
     composition_surface = false;
     attached_view_id = 0;
     surface_attached = false;
-    attached_surface_width = 0;
-    attached_surface_height = 0;
+    attached_surface_width = attached_surface_height = 0;
     attached_surface_scale = 0.0;
-    library->detach_surface(handle);
+    const uint64_t epoch = ++surface_epoch;
+    SurfaceCommand([this, epoch] {
+      CheckNative(library->detach_surface(handle), "detach_surface");
+      surface_error.clear();
+      native_surface_attached = false;
+      native_surface_epoch = epoch;
+    }, epoch, false);
   }
 
-  void RenderTick(flutter::EventSink<EncodableValue>* event_sink) {
-    if (surface_attached) {
-      ErikaPresenterStats stats{};
-      const double time_seconds = NowSeconds() - start_time_seconds;
-      const auto status = library->render_tick(handle, time_seconds, &stats);
-      if (status != ErikaStatus_Ok) {
-        DebugLog("render_tick failed with ErikaStatus_" + StatusName(status) +
-                 " (" + std::to_string(static_cast<int>(status)) + "): " +
-                 library->TakeLastError());
-      } else {
-        latest_presenter_stats = stats;
-        if (attached_texture != nullptr) {
-          try {
-            RefreshFlutterTexture();
-          } catch (const std::exception& error) {
-            DebugLog(std::string("Flutter texture publication failed: ") +
-                     error.what());
-          }
-        } else if (composition_surface) {
-          try {
-            RefreshCompositionContent();
-          } catch (const std::exception& error) {
-            DebugLog(std::string("DirectComposition swap chain rebind failed: ") +
-                     error.what());
-          }
-        }
+  void RequestTick(uint64_t sink_generation) {
+    worker.RequestFrame([this, sink_generation] {
+      const auto started = std::chrono::steady_clock::now();
+      if (FrameTraceEnabled() && !traced_thread) {
+        traced_thread = true;
+        DebugLog("presenter_worker player=" + std::to_string(id) +
+                 " platform_thread=" + std::to_string(platform_thread_id) +
+                 " render_thread=" + std::to_string(GetCurrentThreadId()) +
+                 " off_platform=" +
+                 (GetCurrentThreadId() != platform_thread_id ? "true" : "false"));
       }
-    }
-    PollEvents(event_sink);
+      try {
+        EnsureNative();
+        FrameOutput output;
+        output.surface_epoch = native_surface_epoch;
+        output.sink_generation = sink_generation;
+        try {
+          if (native_surface_attached) {
+            ErikaPresenterStats stats{};
+            CheckNative(library->render_tick(handle,
+                NowSeconds() - start_time_seconds, &stats), "render_tick");
+            latest_presenter_stats = stats;
+            if (native_texture) {
+              void* texture = nullptr;
+              CheckNative(library->windows_flutter_texture(handle, &texture),
+                          "windows_flutter_texture_iunknown");
+              output.texture.Attach(static_cast<IUnknown*>(texture));
+            } else if (native_composition) {
+              void* swapchain = nullptr;
+              CheckNative(library->windows_composition_swapchain(handle, &swapchain),
+                          "windows_composition_swapchain_iunknown");
+              output.swapchain.Attach(static_cast<IUnknown*>(swapchain));
+            }
+          }
+        } catch (const std::exception& error) {
+          // A failed render/publication must not starve playback/error events.
+          DebugLog("presenter render failed: " + SafeUtf8Message(error.what()));
+        }
+        PollEvents(output.events);
+        output.smtc = smtc_state;
+        post_completion([publish = publish_frame, output = std::move(output)] {
+          if (publish) publish(output);
+        });
+      } catch (const std::exception& error) {
+        DebugLog("presenter tick failed: " + SafeUtf8Message(error.what()));
+      }
+      if (FrameTraceEnabled()) {
+        const auto work = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+        const auto gap = std::chrono::duration<double, std::milli>(
+            started - last_tick).count();
+        if (++tick_count % 60 == 0 || work > 8.0 || gap > 24.0) {
+          DebugLog("frame_tick player=" + std::to_string(id) +
+                   " count=" + std::to_string(tick_count) +
+                   " delta_ms=" + std::to_string(gap) +
+                   " work_ms=" + std::to_string(work));
+        }
+        last_tick = started;
+      }
+    });
   }
 
-  void PollEvents(flutter::EventSink<EncodableValue>* event_sink) {
+  // Platform only. The raster callback pins its own immutable snapshot under
+  // the publication mutex; it never sees a native presenter or worker state.
+  void ApplyFrame(const FrameOutput& output) {
+    platform_smtc_state = output.smtc;
+    if (!surface_attached || surface_epoch != output.surface_epoch) return;
+    if (output.texture && attached_texture) {
+      output.texture->AddRef();  // Publication consumes this reference.
+      if (attached_texture->UpdateNativeTexture(output.texture.Get()))
+        attached_texture->MarkFrameAvailable();
+    }
+    if (output.swapchain && attached_overlay) {
+      output.swapchain->AddRef();
+      attached_overlay->SetCompositionContent(output.swapchain.Get());
+    }
+  }
+
+  EncodableValue Screenshot(const EncodableMap& args) {
+    if (!library->capture_frame) return EncodableValue();
+    const int64_t width_arg = Int64Value(FindArg(args, "width")).value_or(native_width);
+    const int64_t height_arg = Int64Value(FindArg(args, "height")).value_or(native_height);
+    if (width_arg <= 0 || height_arg <= 0 || width_arg > UINT32_MAX ||
+        height_arg > UINT32_MAX ||
+        static_cast<uint64_t>(width_arg) * height_arg > UINT32_MAX / 4) {
+      throw PluginError("Screenshot dimensions must be positive and fit an RGBA buffer.");
+    }
+    const auto width = static_cast<UINT>(width_arg);
+    const auto height = static_cast<UINT>(height_arg);
+    std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
+    const auto capture_status = library->capture_frame(
+        handle, width, height, rgba.data(), rgba.size());
+    if (capture_status != ErikaStatus_Ok) {
+      // Some runtimes export capture while their D3D11 backend has no capture
+      // implementation yet. Match the nullable screenshot contract in Dart.
+      DebugLog("screenshot unavailable: " + library->TakeLastError());
+      return EncodableValue();
+    }
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    CheckHResult(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)), "Create PNG encoder factory");
+    Microsoft::WRL::ComPtr<IStream> stream;
+    CheckHResult(CreateStreamOnHGlobal(nullptr, TRUE, &stream), "Create PNG stream");
+    Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+    CheckHResult(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder),
+                 "Create PNG encoder");
+    CheckHResult(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache), "Initialize PNG encoder");
+    Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+    CheckHResult(encoder->CreateNewFrame(&frame, nullptr), "Create PNG frame");
+    CheckHResult(frame->Initialize(nullptr), "Initialize PNG frame");
+    CheckHResult(frame->SetSize(width, height), "Set PNG size");
+    // WIC's PNG encoder accepts BGRA, whereas the C API returns RGBA.
+    for (size_t pixel = 0; pixel < rgba.size(); pixel += 4)
+      std::swap(rgba[pixel], rgba[pixel + 2]);
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    CheckHResult(frame->SetPixelFormat(&format), "Set PNG pixel format");
+    if (format != GUID_WICPixelFormat32bppBGRA) throw PluginError("PNG encoder requires BGRA.");
+    CheckHResult(frame->WritePixels(height, width * 4, static_cast<UINT>(rgba.size()),
+                                    rgba.data()), "Write PNG pixels");
+    CheckHResult(frame->Commit(), "Commit PNG frame");
+    CheckHResult(encoder->Commit(), "Commit PNG encoder");
+    STATSTG stat{};
+    CheckHResult(stream->Stat(&stat, STATFLAG_NONAME), "Get PNG size");
+    std::vector<uint8_t> png(static_cast<size_t>(stat.cbSize.QuadPart));
+    LARGE_INTEGER start{};
+    CheckHResult(stream->Seek(start, STREAM_SEEK_SET, nullptr), "Rewind PNG stream");
+    CheckHResult(stream->Read(png.data(), static_cast<ULONG>(png.size()), nullptr), "Read PNG");
+    return EncodableValue(std::move(png));
+  }
+
+  void PollEvents(std::vector<EncodableValue>& events) {
     while (true) {
       ErikaEvent event{};
       const auto status = library->poll_event(handle, &event);
@@ -2422,9 +2608,7 @@ struct ErikaFlutterPlugin::PlayerHost {
                    std::to_string(static_cast<int>(event.status)) + "): " +
                    library->TakeLastError());
         }
-        if (event_sink != nullptr) {
-          event_sink->Success(EventToMap(event));
-        }
+        events.push_back(EventToMap(event));
         continue;
       }
       if (status != ErikaStatus_NoEvent) {
@@ -2561,9 +2745,12 @@ struct ErikaFlutterPlugin::PlayerHost {
   }
 
   int64_t id = 0;
-  ErikaSmtcState smtc_state{};
+  ErikaSmtcState smtc_state{};  // Worker only.
+  ErikaSmtcState platform_smtc_state{};  // Platform only.
   std::shared_ptr<ErikaNativeLibrary> library;
-  ErikaPresenterHandle* handle = nullptr;
+  ErikaPresenterHandle* handle = nullptr;  // Worker only, including create/destroy.
+  // Platform-only attachment bookkeeping. Native work captures values and never
+  // dereferences these HWND/overlay/registrar pointers.
   HWND attached_hwnd = nullptr;
   ErikaOverlayWindow* attached_overlay = nullptr;
   ErikaFlutterTexture* attached_texture = nullptr;
@@ -2577,6 +2764,29 @@ struct ErikaFlutterPlugin::PlayerHost {
   double start_time_seconds = NowSeconds();
   ErikaDanmakuConfig current_danmaku_config = DefaultDanmakuConfig();
   ErikaPresenterStats latest_presenter_stats{};
+  CompletionPoster post_completion;
+  // Installed once on the platform before any command/tick is posted. Their
+  // copies travel through the completion queue; invocation is platform-only.
+  std::function<void(const FrameOutput&)> publish_frame;
+  std::function<void(const ErikaSmtcState&)> publish_state;
+  std::function<void(uint64_t, const std::string&)> surface_failed;
+  uint64_t surface_epoch = 0;  // Platform only.
+  // Everything below (except the worker queue) is worker-owned.
+  bool native_surface_attached = false;
+  bool native_composition = false;
+  bool native_texture = false;
+  uint64_t native_surface_epoch = 0;
+  uint32_t native_width = 0;
+  uint32_t native_height = 0;
+  bool com_initialized = false;
+  std::string initialization_error;
+  std::string surface_error;
+  const DWORD platform_thread_id;
+  bool traced_thread = false;
+  uint64_t tick_count = 0;
+  std::chrono::steady_clock::time_point last_tick = std::chrono::steady_clock::now();
+  ErikaPresenterWorker worker;  // Join before the state above is destroyed.
+
 };
 
 ErikaEventStreamHandler::ErikaEventStreamHandler(ErikaFlutterPlugin* plugin)
@@ -2597,13 +2807,14 @@ ErikaEventStreamHandler::OnCancelInternal(const EncodableValue* arguments) {
 }
 
 void ErikaFlutterPlugin::RegisterWithRegistrar(
-    flutter::PluginRegistrarWindows* registrar) {
+    flutter::PluginRegistrarWindows* registrar,
+    FlutterDesktopMessengerRef messenger) {
   auto channel =
       std::make_unique<flutter::MethodChannel<EncodableValue>>(
           registrar->messenger(), "erika_flutter/player",
           &flutter::StandardMethodCodec::GetInstance());
 
-  auto plugin = std::make_unique<ErikaFlutterPlugin>(registrar);
+  auto plugin = std::make_unique<ErikaFlutterPlugin>(registrar, messenger);
 
   channel->SetMethodCallHandler(
       [plugin_pointer = plugin.get()](const auto& call, auto result) {
@@ -2614,8 +2825,10 @@ void ErikaFlutterPlugin::RegisterWithRegistrar(
 }
 
 ErikaFlutterPlugin::ErikaFlutterPlugin(
-    flutter::PluginRegistrarWindows* registrar)
+    flutter::PluginRegistrarWindows* registrar,
+    FlutterDesktopMessengerRef messenger)
     : registrar_(registrar) {
+  native_messenger_ = FlutterDesktopMessengerAddRef(messenger);
   event_channel_ = std::make_unique<flutter::EventChannel<EncodableValue>>(
       registrar_->messenger(), "erika_flutter/events",
       &flutter::StandardMethodCodec::GetInstance());
@@ -2630,31 +2843,48 @@ ErikaFlutterPlugin::ErikaFlutterPlugin(
 }
 
 ErikaFlutterPlugin::~ErikaFlutterPlugin() {
+  ClearEventSink();
   StopFrameTimer();
   smtc_.reset();
-  DestroyFrameMessageWindow();
   if (window_proc_delegate_id_ != 0) {
     registrar_->UnregisterTopLevelWindowProcDelegate(window_proc_delegate_id_);
     window_proc_delegate_id_ = 0;
   }
-  if (event_channel_) {
+  // Engine shutdown invalidates the messenger before destroying plugins.
+  // SetStreamHandler(nullptr) calls SetCallback, which dereferences the dead
+  // engine in that state. The engine already owns/clears those handlers.
+  const bool messenger_available =
+      FlutterDesktopMessengerIsAvailable(native_messenger_);
+  if (event_channel_ && messenger_available) {
     event_channel_->SetStreamHandler(nullptr);
   }
-  while (!textures_.empty()) {
+  while (messenger_available && !textures_.empty()) {
     ReleaseTexture(textures_.begin()->first);
   }
+  if (!messenger_available) {
+    for (auto& entry : textures_) entry.second->registrar = nullptr;
+  }
+  joining_presenter_ = true;
   players_.clear();
+  // At engine shutdown the raster thread has stopped and its registrar is no
+  // longer callable. Keep publications alive through presenter detachment.
+  textures_.clear();
   overlay_window_.reset();
+  DrainCompletions();
+  DestroyFrameMessageWindow();
+  FlutterDesktopMessengerRelease(native_messenger_);
 }
 
 void ErikaFlutterPlugin::SetEventSink(
     std::unique_ptr<flutter::EventSink<EncodableValue>> sink) {
+  ++event_sink_generation_;
   event_sink_ = std::move(sink);
   StartFrameTimer();
   OnFrameTimer();
 }
 
 void ErikaFlutterPlugin::ClearEventSink() {
+  ++event_sink_generation_;
   event_sink_.reset();
 }
 
@@ -2938,6 +3168,10 @@ LRESULT CALLBACK ErikaFlutterPlugin::FrameMessageWindowProc(HWND hwnd,
     }
     return 0;
   }
+  if (message == kCompletionMessage && plugin != nullptr) {
+    plugin->DrainCompletions();
+    return 0;
+  }
   if (message == kSmtcMessage && plugin != nullptr) {
     plugin->HandleSmtcCommand(static_cast<ErikaSmtcCommand>(wparam),
                               static_cast<uint64_t>(lparam));
@@ -2953,34 +3187,35 @@ LRESULT CALLBACK ErikaFlutterPlugin::FrameMessageWindowProc(HWND hwnd,
   return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
-void ErikaFlutterPlugin::OnFrameTimer() {
-  if (in_frame_timer_) {
-    return;
+void ErikaFlutterPlugin::PostCompletion(std::function<void()> completion) {
+  std::lock_guard<std::mutex> lock(completion_mutex_);
+  completions_.push_back(std::move(completion));
+  if (!completion_message_pending_) {
+    completion_message_pending_ =
+        PostMessageW(frame_message_window_, kCompletionMessage, 0, 0) != FALSE;
   }
-  in_frame_timer_ = true;
-  static bool trace_enabled = FrameTraceEnabled();
-  static auto last_tick = std::chrono::steady_clock::now();
-  static uint64_t tick_count = 0;
-  const auto tick_started = std::chrono::steady_clock::now();
-  for (auto& entry : players_) {
-    entry.second->RenderTick(event_sink_.get());
+}
+
+void ErikaFlutterPlugin::DrainCompletions() {
+  std::deque<std::function<void()>> ready;
+  {
+    std::lock_guard<std::mutex> lock(completion_mutex_);
+    ready.swap(completions_);
+    completion_message_pending_ = false;
   }
-  RefreshSmtc();
-  if (trace_enabled) {
-    tick_count += 1;
-    const auto elapsed = std::chrono::duration<double, std::milli>(
-        tick_started - last_tick);
-    const auto work = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - tick_started);
-    if (tick_count % 60 == 0 || elapsed.count() > 24.0 || work.count() > 8.0) {
-      DebugLog("frame_tick count=" + std::to_string(tick_count) +
-               " delta_ms=" + std::to_string(elapsed.count()) +
-               " work_ms=" + std::to_string(work.count()) +
-               " players=" + std::to_string(players_.size()));
+  for (auto& completion : ready) {
+    try {
+      completion();
+    } catch (const std::exception& error) {
+      DebugLog("platform completion failed: " + SafeUtf8Message(error.what()));
     }
-    last_tick = tick_started;
   }
-  in_frame_timer_ = false;
+}
+
+void ErikaFlutterPlugin::OnFrameTimer() {
+  // A display-rate change replaces only the timer; presenter ownership and
+  // coalescing remain with the same worker throughout.
+  for (auto& entry : players_) entry.second->RequestTick(event_sink_generation_);
 }
 
 std::optional<LRESULT> ErikaFlutterPlugin::OnTopLevelWindowProc(
@@ -2988,6 +3223,7 @@ std::optional<LRESULT> ErikaFlutterPlugin::OnTopLevelWindowProc(
     UINT message,
     WPARAM wparam,
     LPARAM lparam) {
+  if (joining_presenter_) return std::nullopt;
   if (message == WM_MOVE || message == WM_MOVING || message == WM_SIZE ||
       message == WM_SIZING || message == WM_EXITSIZEMOVE ||
       message == WM_SHOWWINDOW || message == WM_DPICHANGED ||
@@ -3000,11 +3236,16 @@ std::optional<LRESULT> ErikaFlutterPlugin::OnTopLevelWindowProc(
   }
   if (message == WM_DESTROY) {
     StopFrameTimer();
+    DebugLog("window shutdown smtc");
     smtc_.reset();
-    for (auto& entry : players_) {
-      entry.second->Detach(std::nullopt);
-    }
+    DebugLog("window shutdown presenters");
+    joining_presenter_ = true;
+    players_.clear();  // Join before the owning HWND is destroyed.
+    DebugLog("window shutdown overlay");
+    joining_presenter_ = false;
     overlay_window_.reset();
+    DrainCompletions();
+    DebugLog("window shutdown complete");
   }
   return std::nullopt;
 }
@@ -3032,6 +3273,7 @@ void ErikaFlutterPlugin::RecreateOverlayWindow(
   next->ConfigureComposition(overlay ? overlay->blend_mode : "srcOver",
                              overlay ? overlay->opacity : 1.0);
   PlayerHost* owner = nullptr;
+  auto retired = std::shared_ptr<ErikaOverlayWindow>(std::move(overlay));
   for (const auto& entry : players) {
     auto& player = *entry.second;
     if (player.attached_view_id == kWindowOverlayViewId) {
@@ -3040,6 +3282,15 @@ void ErikaFlutterPlugin::RecreateOverlayWindow(
       }
       // Clear references while the old HWND/composition target is still alive.
       player.Detach(std::nullopt);
+    }
+    if (retired) {
+      // Fence EVERY worker: an earlier platform detach already cleared its
+      // bookkeeping, but its native detach/render may still be in flight.
+      // Move each retained reference into a platform completion so the last
+      // release cannot destroy the HWND/WinRT graph on a worker.
+      player.worker.Post([retired, post = player.post_completion]() mutable {
+        post([retired = std::move(retired)] {});
+      });
     }
   }
   overlay = std::move(next);
@@ -3054,14 +3305,18 @@ void ErikaFlutterPlugin::AttachOverlayPlayer(const PlayerMap& players,
                                             ErikaOverlayWindow& overlay) {
   // A shared overlay has one producer. Old widgets can still send late frame
   // or detach messages, but must not keep rendering into the new owner's HWND.
+  std::vector<std::shared_future<void>> predecessors;
   for (const auto& entry : players) {
-    if (entry.second.get() != &host &&
-        entry.second->attached_view_id == kWindowOverlayViewId) {
-      entry.second->Detach(std::nullopt);
+    if (entry.second.get() != &host) {
+      if (entry.second->attached_view_id == kWindowOverlayViewId)
+        entry.second->Detach(std::nullopt);
+      // Include a former owner whose platform bookkeeping is already detached
+      // but whose native render/detach has not finished yet.
+      predecessors.push_back(entry.second->Fence());
     }
   }
   try {
-    host.AttachOverlay(overlay);
+    host.AttachOverlay(overlay, std::move(predecessors));
     overlay.owner_player_id = host.id;
   } catch (...) {
     overlay.owner_player_id = 0;
@@ -3182,7 +3437,37 @@ int64_t ErikaFlutterPlugin::CreatePlayer(const EncodableValue* arguments) {
 
   const int64_t id = next_player_id_++;
   players_[id] = std::make_unique<PlayerHost>(
-      id, ErikaNativeLibrary::Shared(), config);
+      id, ErikaNativeLibrary::Shared(), config,
+      [this](std::function<void()> completion) {
+        PostCompletion(std::move(completion));
+      });
+  auto& host = *players_.at(id);
+  host.publish_state = [this, id](const ErikaSmtcState& state) {
+    const auto it = players_.find(id);
+    if (it == players_.end()) return;
+    it->second->platform_smtc_state = state;
+    RefreshSmtc();
+  };
+  host.surface_failed = [this, id](uint64_t epoch, const std::string& error) {
+    const auto it = players_.find(id);
+    if (it == players_.end() || it->second->surface_epoch != epoch) return;
+    DebugLog("surface command failed: " + error);
+    it->second->Detach(std::nullopt);
+    if (overlay_window_ && overlay_window_->owner_player_id == id) {
+      overlay_window_->owner_player_id = 0;
+      overlay_window_->SetFrame(0, 0, 0, 0, false, std::nullopt, std::nullopt);
+    }
+  };
+  host.publish_frame = [this, id](const PlayerHost::FrameOutput& output) {
+    const auto it = players_.find(id);
+    if (it == players_.end()) return;  // Disposed players never deliver events.
+    auto& player = *it->second;
+    player.ApplyFrame(output);
+    if (output.sink_generation == event_sink_generation_) {
+      for (const auto& event : output.events) SendEvent(event);
+    }
+    RefreshSmtc();
+  };
   StartFrameTimer();
   OnFrameTimer();
   return id;
@@ -3228,7 +3513,7 @@ void ErikaFlutterPlugin::RefreshSmtc() {
     active_player_id_ = 0;
     return;
   }
-  smtc_->Update(it->second->smtc_state);
+  smtc_->Update(it->second->platform_smtc_state);
 }
 
 void ErikaFlutterPlugin::HandleSmtcCommand(ErikaSmtcCommand command,
@@ -3237,38 +3522,32 @@ void ErikaFlutterPlugin::HandleSmtcCommand(ErikaSmtcCommand command,
   if (it == players_.end()) {
     return;
   }
-  try {
-    if (command == ErikaSmtcCommand::play) {
-      it->second->Play();
-    } else if (command == ErikaSmtcCommand::pause) {
-      it->second->Pause();
-    } else if (command == ErikaSmtcCommand::toggle) {
-      if (it->second->smtc_state.playing) {
-        it->second->Pause();
-      } else {
-        it->second->Play();
-      }
-    } else if (command == ErikaSmtcCommand::seek) {
-      it->second->Seek(position_micros);
-    } else if (command == ErikaSmtcCommand::previous ||
-               command == ErikaSmtcCommand::next) {
-      const bool enabled = command == ErikaSmtcCommand::previous
-                               ? it->second->smtc_state.previous_enabled
-                               : it->second->smtc_state.next_enabled;
-      if (enabled) {
-        SendEvent(EncodableValue(EncodableMap{
-            {EncodableValue("playerId"), EncodableValue(active_player_id_)},
-            {EncodableValue("kind"), EncodableValue(13)},
-            {EncodableValue("navigation"),
-             EncodableValue(command == ErikaSmtcCommand::previous ? "previous"
-                                                                   : "next")},
-        }));
-      }
+  auto& host = *it->second;
+  if (command == ErikaSmtcCommand::previous || command == ErikaSmtcCommand::next) {
+    const bool previous = command == ErikaSmtcCommand::previous;
+    const bool enabled = previous ? host.platform_smtc_state.previous_enabled
+                                  : host.platform_smtc_state.next_enabled;
+    if (enabled) {
+      SendEvent(EncodableValue(EncodableMap{
+          {EncodableValue("playerId"), EncodableValue(active_player_id_)},
+          {EncodableValue("kind"), EncodableValue(13)},
+          {EncodableValue("navigation"), EncodableValue(previous ? "previous" : "next")},
+      }));
     }
-    OnFrameTimer();
-  } catch (const std::exception& error) {
-    DebugLog(std::string("SMTC command failed: ") + error.what());
+    return;
   }
+  host.Submit([&host, command, position_micros] {
+    if (command == ErikaSmtcCommand::play) host.Play();
+    else if (command == ErikaSmtcCommand::pause) host.Pause();
+    else if (command == ErikaSmtcCommand::toggle) {
+      if (host.smtc_state.playing) host.Pause();
+      else host.Play();
+    } else if (command == ErikaSmtcCommand::seek) host.Seek(position_micros);
+    return EncodableValue();
+  }, [](EncodableValue, std::string error) {
+    if (!error.empty()) DebugLog("SMTC command failed: " + error);
+  });
+  OnFrameTimer();
 }
 
 void ErikaFlutterPlugin::RemovePlayer(int64_t player_id) {
@@ -3282,6 +3561,7 @@ void ErikaFlutterPlugin::RemovePlayer(int64_t player_id) {
   if (overlay_window_ && overlay_window_->owner_player_id == player_id) {
     overlay_window_->SetFrame(0.0, 0.0, 0.0, 0.0, false, std::nullopt,
                               std::nullopt);
+    it->second->Detach(std::nullopt);  // Clear Composition before releasing ownership.
     overlay_window_->owner_player_id = 0;
   }
   if (active_player_id_ == player_id) {
@@ -3290,7 +3570,9 @@ void ErikaFlutterPlugin::RemovePlayer(int64_t player_id) {
       smtc_->Clear();
     }
   }
+  joining_presenter_ = true;
   players_.erase(it);
+  joining_presenter_ = false;
 }
 
 void ErikaFlutterPlugin::SendEvent(EncodableValue event) {
@@ -3299,51 +3581,23 @@ void ErikaFlutterPlugin::SendEvent(EncodableValue event) {
   }
 }
 
-void ErikaFlutterPlugin::HandleMethodCall(
-    const flutter::MethodCall<EncodableValue>& method_call,
-    std::unique_ptr<flutter::MethodResult<EncodableValue>> result) {
-  const auto& method = method_call.method_name();
-  try {
-    if (method == "create") {
-      const int64_t player_id = CreatePlayer(method_call.arguments());
-      OnFrameTimer();
-      result->Success(EncodableValue(player_id));
-      return;
-    }
-
-    const EncodableMap& args = DictionaryArgs(method_call.arguments());
-
-    if (method == "dispose") {
-      RemovePlayer(RequiredInt64(args, "playerId"));
-      OnFrameTimer();
-      result->Success();
-    } else if (method == "createTexture") {
-      result->Success(EncodableValue(CreateTexture(args)));
-    } else if (method == "resizeTexture") {
-      auto& texture = TextureFromArgs(args);
-      const int64_t width = RequiredInt64(args, "width");
-      const int64_t height = RequiredInt64(args, "height");
-      const double scale = DoubleValue(FindArg(args, "scale")).value_or(1.0);
-      if (width <= 0 || width > UINT32_MAX || height <= 0 ||
-          height > UINT32_MAX || !std::isfinite(scale) || scale <= 0.0) {
-        throw PluginError("Flutter texture metrics must be finite and positive.");
-      }
-      const auto player = players_.find(texture.owner_player_id);
-      if (player != players_.end()) {
-        player->second->ResizeFlutterTexture(
-            texture, static_cast<uint32_t>(width),
-            static_cast<uint32_t>(height), scale);
-      } else {
-        texture.Resize(static_cast<uint32_t>(width),
-                       static_cast<uint32_t>(height), scale);
-      }
-      OnFrameTimer();
-      result->Success();
-    } else if (method == "releaseTexture") {
-      ReleaseTexture(RequiredInt64(args, "textureId"));
-      result->Success();
-    } else if (method == "open") {
-      auto& player = PlayerFromArgs(args);
+void ErikaFlutterPlugin::DispatchNativeMethod(
+    PlayerHost& host, std::string method, EncodableMap args,
+    std::shared_ptr<flutter::MethodResult<EncodableValue>> platform_result) {
+  // This is a value collector, not Flutter's MethodResult. Only the posted
+  // completion below calls Flutter, including for errors and unsupported calls.
+  struct Reply {
+    EncodableValue value;
+    bool implemented = true;
+    void Success(EncodableValue reply = EncodableValue()) { value = std::move(reply); }
+    void NotImplemented() { implemented = false; }
+  };
+  auto reply = std::make_shared<Reply>();
+  const int64_t id = host.id;
+  host.Submit([&host, method, args = std::move(args), reply] {
+    auto* result = reply.get();
+    if (method == "open") {
+      auto& player = host;
       if (const auto* value = FindArg(args, "metadata"); value != nullptr) {
         if (const auto* metadata = std::get_if<EncodableMap>(value)) {
           player.SetMediaMetadata(*metadata);
@@ -3357,34 +3611,27 @@ void ErikaFlutterPlugin::HandleMethodCall(
       }
       player.PrepareForOpen();
       player.Open(RequiredString(args, "uri"), args);
-      OnFrameTimer();
       result->Success();
     } else if (method == "play") {
-      auto& player = PlayerFromArgs(args);
+      auto& player = host;
       player.Play();
-      SetActivePlayer(player.id);
-      OnFrameTimer();
       result->Success();
     } else if (method == "pause") {
-      PlayerFromArgs(args).Pause();
-      OnFrameTimer();
+      host.Pause();
       result->Success();
     } else if (method == "stop") {
-      PlayerFromArgs(args).Stop();
-      OnFrameTimer();
+      host.Stop();
       result->Success();
     } else if (method == "close") {
-      PlayerFromArgs(args).Close();
-      OnFrameTimer();
+      host.Close();
       result->Success();
     } else if (method == "seek") {
-      PlayerFromArgs(args).Seek(
+      host.Seek(
           static_cast<uint64_t>(std::max<int64_t>(
               0, RequiredInt64(args, "positionMicros"))));
-      OnFrameTimer();
       result->Success();
     } else if (method == "setPlaybackRate") {
-      PlayerFromArgs(args).SetPlaybackRate(
+      host.SetPlaybackRate(
           DoubleValue(FindArg(args, "rate")).value_or(1.0));
       result->Success();
     } else if (method == "setMediaMetadata") {
@@ -3393,25 +3640,36 @@ void ErikaFlutterPlugin::HandleMethodCall(
       if (metadata == nullptr) {
         throw PluginError("metadata is required.");
       }
-      PlayerFromArgs(args).SetMediaMetadata(*metadata);
-      RefreshSmtc();
+      host.SetMediaMetadata(*metadata);
       result->Success();
     } else if (method == "setSystemMediaNavigation") {
-      PlayerFromArgs(args).SetSystemMediaNavigation(
+      host.SetSystemMediaNavigation(
           BoolValue(FindArg(args, "previousEnabled")).value_or(false),
           BoolValue(FindArg(args, "nextEnabled")).value_or(false));
-      RefreshSmtc();
       result->Success();
     } else if (method == "setVolume") {
-      PlayerFromArgs(args).SetVolume(
+      host.SetVolume(
           DoubleValue(FindArg(args, "volume")).value_or(1.0));
       result->Success();
     } else if (method == "setUpscaler") {
-      PlayerFromArgs(args).SetUpscaler(
+      host.SetUpscaler(
           static_cast<int32_t>(RequiredInt64(args, "mode")));
       result->Success();
+    } else if (method == "loadUpscalerModel") {
+      // `args` was moved into this closure, so the bytes are owned by the
+      // worker task for the whole native call.
+      const auto* data = std::get_if<std::vector<uint8_t>>(FindArg(args, "data"));
+      if (data == nullptr || data->empty()) {
+        throw PluginError("data is required.");
+      }
+      host.LoadUpscalerModel(
+          StringValue(FindArg(args, "name")).value_or("custom"), *data);
+      result->Success();
+    } else if (method == "clearUpscalerModel") {
+      host.ClearUpscalerModel();
+      result->Success();
     } else if (method == "setSubtitleScale") {
-      PlayerFromArgs(args).SetSubtitleScale(
+      host.SetSubtitleScale(
           DoubleValue(FindArg(args, "scale")).value_or(1.0));
       result->Success();
     } else if (method == "registerSubtitleMemoryFont") {
@@ -3420,21 +3678,20 @@ void ErikaFlutterPlugin::HandleMethodCall(
         throw PluginError("data is required.");
       }
       result->Success(EncodableValue(static_cast<int64_t>(
-          PlayerFromArgs(args).RegisterSubtitleMemoryFont(*data))));
+          host.RegisterSubtitleMemoryFont(*data))));
     } else if (method == "selectSubtitleMemoryFonts") {
       const auto* ids = std::get_if<EncodableList>(FindArg(args, "fontIds"));
       if (ids == nullptr) {
         throw PluginError("fontIds is required.");
       }
-      PlayerFromArgs(args).SelectSubtitleMemoryFonts(*ids);
+      host.SelectSubtitleMemoryFonts(*ids);
       result->Success();
     } else if (method == "clearSubtitleMemoryFonts") {
-      PlayerFromArgs(args).ClearSubtitleMemoryFonts();
+      host.ClearSubtitleMemoryFonts();
       result->Success();
     } else if (method == "getSubtitleMemoryFontStatus") {
-      result->Success(PlayerFromArgs(args).GetSubtitleMemoryFontStatus());
+      result->Success(host.GetSubtitleMemoryFontStatus());
     } else if (method == "setSubtitleStyle") {
-      auto& host = PlayerFromArgs(args);
       const bool has_style = FindArg(args, "fontFamily") != nullptr ||
                              FindArg(args, "fontFilePath") != nullptr ||
                              FindArg(args, "primaryColorRgba") != nullptr ||
@@ -3491,72 +3748,69 @@ void ErikaFlutterPlugin::HandleMethodCall(
       }
       result->Success();
     } else if (method == "getUpscalerStatus") {
-      result->Success(PlayerFromArgs(args).GetUpscalerStatus());
+      result->Success(host.GetUpscalerStatus());
     } else if (method == "getOutputStatus") {
-      result->Success(PlayerFromArgs(args).GetOutputStatus());
+      result->Success(host.GetOutputStatus());
     } else if (method == "getPresenterStats") {
-      result->Success(PlayerFromArgs(args).GetPresenterStats());
+      result->Success(host.GetPresenterStats());
     } else if (method == "getResourceStatus") {
-      result->Success(PlayerFromArgs(args).GetResourceStatus());
+      result->Success(host.GetResourceStatus());
     } else if (method == "setDebugHudEnabled") {
-      PlayerFromArgs(args).SetDebugHudEnabled(
+      host.SetDebugHudEnabled(
           BoolValue(FindArg(args, "enabled")).value_or(false));
       result->Success();
     } else if (method == "addExternalSubtitle") {
       const int64_t track_id =
-          PlayerFromArgs(args).AddExternalSubtitle(RequiredString(args, "uri"));
-      OnFrameTimer();
+          host.AddExternalSubtitle(RequiredString(args, "uri"));
       result->Success(EncodableValue(track_id));
     } else if (method == "removeSubtitleTrack") {
-      PlayerFromArgs(args).RemoveSubtitleTrack(
+      host.RemoveSubtitleTrack(
           RequiredInt64(args, "trackId"));
-      OnFrameTimer();
       result->Success();
     } else if (method == "loadDanmakuFile") {
-      PlayerFromArgs(args).LoadDanmakuFile(RequiredString(args, "uri"));
+      host.LoadDanmakuFile(RequiredString(args, "uri"));
       result->Success();
     } else if (method == "loadDanmakuJson") {
-      PlayerFromArgs(args).LoadDanmakuJson(RequiredString(args, "json"));
+      host.LoadDanmakuJson(RequiredString(args, "json"));
       result->Success();
     } else if (method == "addDanmakuTrackFile") {
       result->Success(EncodableValue(static_cast<int64_t>(
-          PlayerFromArgs(args).AddDanmakuTrackFile(
+          host.AddDanmakuTrackFile(
               RequiredString(args, "uri"), StringValue(FindArg(args, "name")),
               Int64Value(FindArg(args, "offsetMicros")).value_or(0)))));
     } else if (method == "addDanmakuTrackJson") {
       result->Success(EncodableValue(static_cast<int64_t>(
-          PlayerFromArgs(args).AddDanmakuTrackJson(
+          host.AddDanmakuTrackJson(
               RequiredString(args, "json"), StringValue(FindArg(args, "name")),
               Int64Value(FindArg(args, "offsetMicros")).value_or(0)))));
     } else if (method == "removeDanmakuTrack") {
-      PlayerFromArgs(args).RemoveDanmakuTrack(
+      host.RemoveDanmakuTrack(
           static_cast<uint64_t>(RequiredInt64(args, "trackId")));
       result->Success();
     } else if (method == "setDanmakuTrackEnabled") {
-      PlayerFromArgs(args).SetDanmakuTrackEnabled(
+      host.SetDanmakuTrackEnabled(
           static_cast<uint64_t>(RequiredInt64(args, "trackId")),
           BoolValue(FindArg(args, "enabled")).value_or(true));
       result->Success();
     } else if (method == "setDanmakuTrackOffset") {
-      PlayerFromArgs(args).SetDanmakuTrackOffset(
+      host.SetDanmakuTrackOffset(
           static_cast<uint64_t>(RequiredInt64(args, "trackId")),
           Int64Value(FindArg(args, "offsetMicros")).value_or(0));
       result->Success();
     } else if (method == "setDanmakuGlobalOffset") {
-      PlayerFromArgs(args).SetDanmakuGlobalOffset(
+      host.SetDanmakuGlobalOffset(
           Int64Value(FindArg(args, "offsetMicros")).value_or(0));
       result->Success();
     } else if (method == "danmakuTracks") {
-      result->Success(PlayerFromArgs(args).DanmakuTracks());
+      result->Success(host.DanmakuTracks());
     } else if (method == "clearDanmaku") {
-      PlayerFromArgs(args).ClearDanmaku();
+      host.ClearDanmaku();
       result->Success();
     } else if (method == "setDanmakuEnabled") {
-      PlayerFromArgs(args).SetDanmakuEnabled(
+      host.SetDanmakuEnabled(
           BoolValue(FindArg(args, "enabled")).value_or(true));
       result->Success();
     } else if (method == "setDanmakuConfig") {
-      auto& host = PlayerFromArgs(args);
       host.SetDanmakuConfig(host.DanmakuConfigFromArgs(args));
       const bool has_font = FindArg(args, "customFontFamily") != nullptr ||
                             FindArg(args, "customFontFilePath") != nullptr;
@@ -3569,17 +3823,90 @@ void ErikaFlutterPlugin::HandleMethodCall(
       }
       result->Success();
     } else if (method == "selectAudioTrack") {
-      PlayerFromArgs(args).SelectAudioTrack(OptionalTrackId(FindArg(args, "trackId")));
-      OnFrameTimer();
+      host.SelectAudioTrack(OptionalTrackId(FindArg(args, "trackId")));
       result->Success();
     } else if (method == "selectSubtitleTrack") {
-      PlayerFromArgs(args).SelectSubtitleTrack(
+      host.SelectSubtitleTrack(
           OptionalTrackId(FindArg(args, "trackId")));
-      OnFrameTimer();
       result->Success();
     } else if (method == "tracks") {
-      result->Success(PlayerFromArgs(args).Tracks());
+      result->Success(host.Tracks());
     } else if (method == "screenshot") {
+      result->Success(host.Screenshot(args));
+
+    } else {
+      result->NotImplemented();
+    }
+
+    return std::move(reply->value);
+  }, [this, id, method, reply, platform_result](
+          EncodableValue value, std::string error) {
+    if (!error.empty()) {
+      DebugLog("method " + method + " failed: " + error);
+      platform_result->Error("ERIKA_ERROR", error);
+    } else if (!reply->implemented) {
+      platform_result->NotImplemented();
+    } else {
+      if (method == "play" && players_.find(id) != players_.end())
+        SetActivePlayer(id);
+      platform_result->Success(value);
+    }
+    OnFrameTimer();
+  });
+}
+
+void ErikaFlutterPlugin::HandleMethodCall(
+    const flutter::MethodCall<EncodableValue>& method_call,
+    std::unique_ptr<flutter::MethodResult<EncodableValue>> result) {
+  const auto& method = method_call.method_name();
+  try {
+    if (method == "create") {
+      const int64_t player_id = CreatePlayer(method_call.arguments());
+      OnFrameTimer();
+      players_.at(player_id)->Submit([player_id] {
+        return EncodableValue(player_id);
+      }, [this, player_id, result = std::shared_ptr<flutter::MethodResult<EncodableValue>>(
+                              std::move(result))](EncodableValue value, std::string error) {
+        if (error.empty()) result->Success(value);
+        else {
+          RemovePlayer(player_id);
+          result->Error("ERIKA_ERROR", error);
+        }
+      });
+      return;
+    }
+
+    const EncodableMap& args = DictionaryArgs(method_call.arguments());
+
+    if (method == "dispose") {
+      RemovePlayer(RequiredInt64(args, "playerId"));
+      OnFrameTimer();
+      result->Success();
+    } else if (method == "createTexture") {
+      result->Success(EncodableValue(CreateTexture(args)));
+    } else if (method == "resizeTexture") {
+      auto& texture = TextureFromArgs(args);
+      const int64_t width = RequiredInt64(args, "width");
+      const int64_t height = RequiredInt64(args, "height");
+      const double scale = DoubleValue(FindArg(args, "scale")).value_or(1.0);
+      if (width <= 0 || width > UINT32_MAX || height <= 0 ||
+          height > UINT32_MAX || !std::isfinite(scale) || scale <= 0.0) {
+        throw PluginError("Flutter texture metrics must be finite and positive.");
+      }
+      const auto player = players_.find(texture.owner_player_id);
+      if (player != players_.end()) {
+        player->second->ResizeFlutterTexture(
+            texture, static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height), scale);
+      } else {
+        texture.Resize(static_cast<uint32_t>(width),
+                       static_cast<uint32_t>(height), scale);
+      }
+      OnFrameTimer();
+      if (player != players_.end()) player->second->CompleteSurface(std::move(result));
+      else result->Success();
+    } else if (method == "releaseTexture") {
+      ReleaseTexture(RequiredInt64(args, "textureId"));
       result->Success();
     } else if (method == "attachView") {
       auto& host = PlayerFromArgs(args);
@@ -3592,7 +3919,7 @@ void ErikaFlutterPlugin::HandleMethodCall(
         }
         host.AttachFlutterTexture(*texture->second);
         OnFrameTimer();
-        result->Success();
+        host.CompleteSurface(std::move(result));
         return;
       }
       auto& overlay = EnsureOverlayWindow();
@@ -3601,11 +3928,12 @@ void ErikaFlutterPlugin::HandleMethodCall(
           DoubleValue(FindArg(args, "opacity")).value_or(1.0));
       AttachOverlayPlayer(players_, host, overlay);
       OnFrameTimer();
-      result->Success();
+      host.CompleteSurface(std::move(result));
     } else if (method == "detachView") {
-      PlayerFromArgs(args).Detach(RequiredInt64(args, "viewId"));
+      auto& host = PlayerFromArgs(args);
+      host.Detach(RequiredInt64(args, "viewId"));
       OnFrameTimer();
-      result->Success();
+      host.CompleteSurface(std::move(result));
     } else if (method == "attachOverlay") {
       auto& host = PlayerFromArgs(args);
       UpdateOverlayTarget(args);
@@ -3615,7 +3943,7 @@ void ErikaFlutterPlugin::HandleMethodCall(
           DoubleValue(FindArg(args, "opacity")).value_or(1.0));
       AttachOverlayPlayer(players_, host, overlay);
       OnFrameTimer();
-      result->Success(EncodableValue(kWindowOverlayViewId));
+      host.CompleteSurface(std::move(result), EncodableValue(kWindowOverlayViewId));
     } else if (method == "detachOverlay") {
       auto& host = PlayerFromArgs(args);
       const auto generation = Int64Value(FindArg(args, "generation"));
@@ -3624,7 +3952,7 @@ void ErikaFlutterPlugin::HandleMethodCall(
         return;
       }
       OnFrameTimer();
-      result->Success();
+      host.CompleteSurface(std::move(result));
     } else if (method == "setOverlayFrame") {
       const bool visible =
           BoolValue(FindArg(args, "visible")).value_or(true);
@@ -3670,9 +3998,11 @@ void ErikaFlutterPlugin::HandleMethodCall(
       }
       ResizeAttachedOverlay();
       OnFrameTimer();
-      result->Success();
+      host.CompleteSurface(std::move(result));
     } else {
-      result->NotImplemented();
+      auto& host = PlayerFromArgs(args);
+      DispatchNativeMethod(host, method, args,
+          std::shared_ptr<flutter::MethodResult<EncodableValue>>(std::move(result)));
     }
   } catch (const std::exception& error) {
     const auto message = SafeUtf8Message(error.what());

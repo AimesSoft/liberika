@@ -198,6 +198,10 @@ Windows 插件在 CMake 构建中下载经校验的 `erika_capi.dll`，按生成
 
 Windows 通过 System Media Transport Controls 发布标题、作者、专辑、封面、播放状态和时间线，并支持系统播放、暂停和进度调整。需要包含 C++/WinRT 的 Windows SDK；插件会自动链接所需的 WinRT 系统库。
 
+Windows 上每个 presenter 运行在自己的原生 worker 线程上（create、命令、surface attach/resize/detach、渲染 tick、截图和 destroy），帧请求会合并。方法结果、`EventSink` 事件、SMTC 更新、texture 注册和 HWND/DirectComposition 操作仍留在平台线程。设置 `ERIKA_FLUTTER_FRAME_TRACE=1` 会为每个 presenter 记录一次 `presenter_worker`，并记录在 worker 上测得的慢 tick（`frame_tick ... work_ms=`）。
+
+Linux 采用同样的 owner 模型（16 ms 单调时钟；GTK、view 与 texture 注册留在平台线程）。OpenHarmony 为每个 presenter 提供一个 owner 线程，每个 N-API 函数还有在 ArkTS 线程 resolve promise 的 `...Async` 变体；`ErikaOhosPlayerFromId` 现在返回 null。Android 为每个 presenter 使用专用的 `HandlerThread`。在 macOS、iOS 和 tvOS 上，每个 presenter 拥有专用线程（`ErikaPresenterOwner.swift`），负责 create、命令、渲染、事件轮询、截图和 destroy；`CVDisplayLink`/`CADisplayLink` 只负责唤醒它，缓慢的 `open`、`seek` 或 `dispose` 不再阻塞 UI 线程或延迟渲染。
+
 ## Android Setup
 
 Android Gradle 构建默认为选定 ABI 下载经校验的运行时。最低 Android API 26；生成的 `jniLibs` 包含 `liberika_capi.so` 和匹配 ABI 的 NDK `libc++_shared.so`。默认选择 arm64 与 x86_64；可通过 `-PerikaAndroidAbis=arm64-v8a,x86_64` 或 `ERIKA_ANDROID_ABIS` 指定。
@@ -363,11 +367,24 @@ Windows D3D11 Flutter 路径不返回截图字节。
 
 ## Upscaler
 
-可以在创建时选择 ArtCNN，也可以在运行时切换：
+可以在创建时选择模式，也可以在运行时切换：
 
 ```dart
 final player = ErikaPlayer(upscaler: ErikaUpscalerMode.artCnnC4F16Ds);
-await player.setUpscaler(ErikaUpscalerMode.artCnnC4F16Ds);
+await player.setUpscaler(ErikaUpscalerMode.anime4kM);
 ```
 
-使用 `ErikaUpscalerMode.off` 关闭。`player.getUpscalerStatus()` 会返回请求模式、当前后端、fallback 次数、超分帧数和最近 GPU timing。Apple 使用 Metal；Android 对 planar 与 MediaCodec Surface 帧都使用 wgpu/Vulkan compute。GLES 3.0 会保持普通播放，并明确报告 `inactive` 回退。
+`ErikaUpscalerMode` 包括 ArtCNN（`artCnnC4F16`、`artCnnC4F32`、`artCnnC4F16Ds`、`artCnnC4F16Dn`、`artCnnC4F32Ds`、`artCnnC4F32Dn`、`artCnnR8F64`）、Anime4K（`anime4kS` ... `anime4kUl`、`anime4kDenoiseS` ... `anime4kDenoiseUl`）、`fsr1`（亮度上的 AMD FSR 1.0，适用于任意内容）、`platformVideo`（平台自带的视频超分）、`metalFxSpatial`（仅 Apple）和 `custom`。使用 `ErikaUpscalerMode.off` 关闭。网络类模式把亮度平面放大 2 倍；`fsr1` 与 `metalFxSpatial` 把亮度缩放到呈现尺寸，`platformVideo` 缩放整帧。
+
+`player.getUpscalerStatus()` 会返回请求模式、当前后端（`off`、`inactive`、`building`、`scalar`、`simdgroupMatrix`、`cooperativeMatrix`、`linalgMatrix`、`videoProcessor`、`videoToolbox`、`metalFx`、`tensorOps`）、fallback 次数、超分帧数和最近 GPU timing（Windows 上现在也会报告 `lastGpuDuration`）。`building` 表示 kernel 正在后台编译，期间播放使用原生采样；`inactive` 表示该模式在此平台无法运行（原因见诊断 `upscaler` 对象）。
+
+用 `await player.loadUpscalerModel(bytes, name: 'my-model')` 加载自己的网络（Erika `.esr` 文件，或 FSRCNNX / Anime4K CNN 的 mpv hook shader；因授权原因不内置 FSRCNNX），然后 `setUpscaler(ErikaUpscalerMode.custom)`；`clearUpscalerModel()` 将其卸载。Linux 上只有 JSON 文件路径方法（`loadUpscalerModelFile`）。
+
+平台说明：
+
+- Windows（D3D11）：所有网络模式（含 `custom`）、`fsr1`，以及通过 NVIDIA RTX Video Super Resolution（需要 RTX GPU，在 NVIDIA App / 控制面板中启用，仅限 SDR 视频）或 Intel VSR 实现的 `platformVideo`。`metalFxSpatial` 为 `inactive`。
+- Apple（Metal）：所有网络模式（含 `custom`）、`fsr1`、`metalFxSpatial`，以及通过 VideoToolbox 的 `platformVideo`（仅 2x，8 位 4:2:0 片源，尺寸 96x96 到 960x960，macOS/iOS/tvOS 26+；否则为 `inactive`）。
+- Linux、Android 与 OpenHarmony（wgpu/Vulkan）：支持包括 `custom` 在内的全部网络模式以及 `fsr1`；`platformVideo` 与 `metalFxSpatial` 为 `inactive`。GLES 3.0 会保持普通播放，并明确报告 `inactive` 回退。
+- Web：无超分。
+
+完整矩阵与实测耗时见 [docs/integration.zh.md](https://github.com/AimesSoft/liberika/blob/main/docs/integration.zh.md#超分)。

@@ -368,6 +368,9 @@ ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rat
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
 ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *, bool muted);       // 音量を保持
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
+ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle *, const char *name,
+                                               const uint8_t *data, uintptr_t len);
+ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
 ErikaStatus erika_presenter_set_subtitle_font(ErikaPresenterHandle *, const char *family, const char *file_path);
 ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubtitleStyle style);
@@ -377,10 +380,23 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 `set_playback_rate(1.0)` が通常速度。`erika_presenter_open_with_options` は
 `erika_open_with_options` の push モデル版で、同じ `ErikaOpenOptions`
 （header と `http_read_ahead_bytes` / `http_back_buffer_bytes`）を受け付けます
-（[`erika_open_with_options`](#erikahandle--プルモデル) 参照）。`set_upscaler` はランタイムで神経輝度アップ
+（[`erika_open_with_options`](#erikahandle--プルモデル) 参照）。`set_upscaler` はランタイムで輝度アップ
 スケーラを切り替えます（[`erika_presenter_get_upscaler_status`](#診断とスクリーンショット)
-参照）。Metal、feature level 11.0+ の D3D11、compute-capable な wgpu renderer は ArtCNN を実行し、
-それ以外の backend は native luma sampling を維持して `Inactive` fallback を明示します。
+参照）。モード値はファミリーごとにまとまっています: 1-15 が ArtCNN、16-31 が Anime4K、32-47 が空間
+shader（`Fsr1`）、48-63 がプラットフォームスケーラ（`PlatformVideo`、`MetalFxSpatial`）、64 が `Custom`。
+ネットワーク系モードはデコード済み輝度プレーンを 2 倍にし、`Fsr1` と `MetalFxSpatial` は輝度を表示サイズまで
+直接スケールし、`PlatformVideo` はフレーム全体をスケールします。Metal と D3D11 は対応する全モードを実行し、
+wgpu renderer（Linux、Android、OpenHarmony、Windows の wgpu fallback）はすべてのネットワークモード
+（ArtCNN 1-7、Anime4K、`Custom`）と `Fsr1` を実行し、`PlatformVideo` と `MetalFxSpatial` はここでは `Inactive` を報告します。現在の backend で動かせないモードは native luma sampling を維持して `Inactive` を報告し、理由は
+診断の `upscaler` オブジェクトに出ます。Web にアップスケーラはありません。プラットフォームごとの対応は
+[統合ガイド](integration.ja.md#アップスケーラ) を参照してください。
+
+`erika_presenter_load_upscaler_model` は `ErikaLumaUpscalerMode_Custom` が使うネットワークをメモリから読み込み
+（`name` はラベル、`data`/`len` はファイル内容）、`erika_presenter_clear_upscaler_model` はそれを破棄します。
+その後 `set_upscaler(handle, ErikaLumaUpscalerMode_Custom)` で選択します。データは Erika `.esr` ネットワーク
+（`crates/erika/assets/artcnn/export_artcnn_esr.py` で ArtCNN ONNX をエクスポート）、または FSRCNNX /
+Anime4K CNN 方言の mpv hook shader です。重みだけを解析し、shader コードは実行しません。liberika は FSRCNNX と
+RAVU/NNEDI3（GPL/LGPL）を同梱しないため、host がファイルを用意します。
 
 `set_subtitle_font` と `set_subtitle_style` は字幕の **fallback** の見た目を設定します。
 family や path が空ならその指定を解除します。色は `0xRRGGBBAA` で、既定は不透明な白の
@@ -701,7 +717,7 @@ char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 （`tracks`、`trackSelection`、`selectAudioTrack`、`selectSubtitleTrack`、
 `addExternalSubtitle`、`removeSubtitleTrack`、`setSubtitleScale`、`setSubtitleFont`、
 `setSubtitleStyle`、字幕メモリフォント系）、danmaku 系（`getDanmakuConfig` を含む）、
-出力とアップスケーラ（`setUpscaler`、`getUpscalerStatus`、`setOutputHeadroom`、
+出力とアップスケーラ（`setUpscaler`、`getUpscalerStatus`、`loadUpscalerModelFile`、`clearUpscalerModel`、`setOutputHeadroom`、
 `getOutputStatus`、`setDebugHudEnabled`）、カウンタ（`getPresenterStats`、
 `getResourceStatus`）、および後述の診断（`getDiagnosticsSnapshot`、`getLogs`）。
 
@@ -740,9 +756,18 @@ ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle
                                                          uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
-`get_upscaler_status` は要求アップスケーラモード、現在の backend（off / inactive /
-building / scalar / simdgroup-matrix）、フォールバック回数、アップスケール済みフレーム数、
-直近の encode/GPU 時間（マイクロ秒）を報告します。
+`get_upscaler_status` は要求アップスケーラモード、現在の backend（`Off`、`Inactive`、`Building`、
+`Scalar`、`SimdgroupMatrix`、`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx`、
+`TensorOps`）、フォールバック回数、アップスケール済みフレーム数、直近の encode/GPU 時間（マイクロ秒）を
+報告します。`Inactive` はそのモードがここでは動かせず native sampling を使うこと（理由は診断）、`Building` は
+kernel が background で compile 中で、その間は native sampling を使うことを表します。`CooperativeMatrix` は
+D3D11 と併用する Vulkan `VK_KHR_cooperative_matrix`、`LinalgMatrix` は opt-in の D3D12 SM 6.10 preview、
+`VideoProcessor` は D3D11 video processor の vendor extension（NVIDIA RTX Video / Intel VSR）、`TensorOps` は
+Metal 4 tensor ops（M5/A19）です。D3D11 も timestamp query で GPU 時間を `last_gpu_micros` に報告するように
+なりました。
+
+`loadUpscalerModelFile`（`{path, name?}`）と `clearUpscalerModel` は、上記の load/clear 関数に対応する JSON
+bridge のメソッドです。
 
 `get_output_status` は request だけでなく実際に negotiated された output を返します。
 13 field は次のとおりです。
@@ -849,7 +874,7 @@ JSON エンコード込みで中央値 約 0.3 ms）。スレッド規則は他�
 バックエンド、`hardware`、`fellBack`、`fallbackCount`、`stage`、`reason` など。初回遷移前は
 `null`）、`video`（ハードウェア/ソフトウェア/ゼロコピー各フレーム数、CPU フォールバック、
 失敗、バックプレッシャー破棄）、`presenter`（surface、各段の直近所要時間）、`output`、
-`hdr`、`resources`、`upscaler`、`audio`（キュー、アンダーフロー、リングの破棄、デバイス
+`hdr`、`resources`、`upscaler`（`engine`、`reason`、`lastGpuMs` を含む）、`audio`（キュー、アンダーフロー、リングの破棄、デバイス
 復旧）、`buffers`（再生スレッドが公開するキュー深さ `{queued, capacity}`、presenter の
 フレームチャネル）、`timing`:
 
@@ -911,8 +936,8 @@ WARNING → `warn`、libass は 0–1 → `error`、2 → `warn`。その他の�
 | `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` `LinuxExtendedLinearScRgb` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
 | `ErikaOutputFallbackReason` | `None` `DisplayHdrUnsupported` `HybridCompositionRequired` `WgpuBackendNotVulkan` `Rgba16FloatSurfaceFormatUnavailable` `NativeWindowDataSpaceApiUnavailable` `ScrgbDataSpaceVerificationFailed` `SurfaceConfigureFailed` `LegacyAppleEdrUnsupported` |
-| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` |
-| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` |
+| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` `ArtCnnC4F16Dn` `ArtCnnC4F32Ds` `ArtCnnC4F32Dn` `ArtCnnR8F64` `Anime4kS` `Anime4kM` `Anime4kL` `Anime4kVl` `Anime4kUl` `Anime4kDenoiseS` `Anime4kDenoiseM` `Anime4kDenoiseL` `Anime4kDenoiseVl` `Anime4kDenoiseUl` `Fsr1` `PlatformVideo` `MetalFxSpatial` `Custom` |
+| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` `CooperativeMatrix` `LinalgMatrix` `VideoProcessor` `VideoToolbox` `MetalFx` `TensorOps` |
 
 ## 構造体
 

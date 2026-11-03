@@ -6,6 +6,7 @@
 
 | 记录 | 范围 |
 |---|---|
+| [Vulkan 半精度空间末层优化](sr-gpu-head-2026-11-03/README.md) | 2026-11-03，RTX 5060 Ti；布局、半精度、误差验证与约 7–8% 整网收益 |
 | [PR #150–#159 的目的、取舍与运行验证](pr-150-159/review.zh.md) · [English](pr-150-159/review.en.md) · [日本語](pr-150-159/review.ja.md) | 2026-10-05 调查，10-08 鸿蒙补充，10-13 主分支集成；HTTP、媒体识别、时间戳、音频、GPU 与生命周期 |
 | [主分支集成与运行验证](pr-150-159/merge-validation.zh.md) · [English](pr-150-159/merge-validation.en.md) · [日本語](pr-150-159/merge-validation.ja.md) | 2026-10-13，PR #164 的集成与 Windows、Linux、OHOS 实测 |
 | [鸿蒙模拟器运行记录](pr-150-159/ohos-runtime.zh.md) · [English](pr-150-159/ohos-runtime.en.md) · [日本語](pr-150-159/ohos-runtime.ja.md) | 2026-10-08，完整 Rust runtime、NAPI 桥接和模拟器 |

@@ -53,17 +53,103 @@ ErikaPresenterConfig cfg = {
     .output_mode  = ErikaPresenterOutputMode_Sdr,   // AppleEdr or Android ExtendedLinear
     .edr_headroom = 1.0f,                            // requested content-headroom ceiling
     .video_alpha_mode = ErikaVideoAlphaMode_Opaque,
-    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // or ArtCnnC4F16 / C4F16Ds / C4F32
+    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // or any ErikaLumaUpscalerMode, e.g. ArtCnnC4F16
 };
 ErikaPresenterHandle *p = erika_presenter_create_with_config(cfg);
 if (!p) { /* read erika_last_error_message() */ }
 ```
 
-`erika_presenter_create()` uses defaults (SDR, no upscaler). The neural luma
-upscaler is implemented by Metal on Apple platforms, D3D11 compute on Windows,
-and wgpu compute on capable Vulkan-class adapters, including Android. Backends
-without compute (notably GLES 3.0) retain native luma sampling and report an
-explicit `Inactive` status and fallback reason.
+`erika_presenter_create()` uses defaults (SDR, no upscaler). See
+[Upscaler](#upscaler) for the available modes and what runs where.
+
+### Upscaler
+
+`set_upscaler(mode)` selects the mode (`ErikaLumaUpscalerMode`, values grouped
+by family):
+
+| Values | Family | Content |
+|---|---|---|
+| 1-7 | ArtCNN: C4F16, C4F32, C4F16 DS, C4F16 DN, C4F32 DS, C4F32 DN, R8F64 | anime; DS = denoise + sharpen (degraded sources), DN = denoise; R8F64 (~926K params) is only practical on matrix units and SD/720p sources and is bundled on desktop builds only |
+| 16-25 | Anime4K v3.2 Upscale CNN x2 (S, M, L, VL, UL) and Upscale+Denoise (21-25) | anime |
+| 32 | `Fsr1`: AMD FSR 1.0 EASU + RCAS on luma (RCAS sharpness 0.2 stops) | any |
+| 48 | `PlatformVideo`: the platform's video super resolution | live action / any |
+| 49 | `MetalFxSpatial` (Apple only) | any |
+| 64 | `Custom`: a network loaded at runtime | - |
+
+Network modes upscale the decoded luma plane 2x (chroma keeps source resolution
+and is reconstructed by the regular scaler). `Fsr1` and `MetalFxSpatial` scale
+luma straight to the presented size; `PlatformVideo` scales the whole frame.
+
+| Platform | What runs |
+|---|---|
+| Windows (D3D11) | Every network mode including `Custom` (generated compute kernels; the fastest of scalar, Vulkan cooperative matrix and D3D12 linalg is measured per network and frame size), `Fsr1`, and `PlatformVideo`: NVIDIA RTX Video Super Resolution (an RTX GPU, enabled in the NVIDIA App / Control Panel) or Intel VSR (Arc/Xe with a VSR-capable driver); SDR video only, D3D11VA-decoded NV12/P010 frames. `MetalFxSpatial` is `Inactive`. D3D12 linalg is an opt-in preview. |
+| Apple (Metal: macOS, iOS, tvOS) | Every network mode including `Custom` (Metal 4 tensor ops on M5/A19, `simdgroup_matrix` on M1-M4/A14+, scalar otherwise), `Fsr1`, `MetalFxSpatial`, and `PlatformVideo` through VideoToolbox `VTLowLatencySuperResolutionScaler`: 2x only, 8-bit 4:2:0 sources between 96x96 and 960x960, macOS/iOS/tvOS 26+; otherwise `Inactive` with the reason. |
+| wgpu renderers (Linux, Android, OpenHarmony, Windows wgpu fallback) | Every network mode including `Custom`, and `Fsr1` (generated WGSL kernels; fp16 where the adapter has `SHADER_F16`; 16x16 cooperative matrices on Vulkan adapters that expose them, such as NVIDIA; per-adapter defaults refined by timing a few kernel variants on the first frames). `PlatformVideo` and `MetalFxSpatial` are `Inactive`. Android/OpenHarmony hardware has not been benchmarked yet. |
+| Web | No upscaler. |
+
+A mode that cannot run reports the `Inactive` backend status and keeps native
+luma sampling; the reason is in the diagnostics `upscaler` object (`reason`,
+`engine`, `lastGpuMs`). On every backend the kernels compile on a background
+thread: until they are ready the status is `Building` and native sampling is
+used, so poll `get_upscaler_status` to drive any UI.
+
+Measured GPU time (2x upscale of the given source; median, GPU timestamps):
+
+| Model (1080p source) | Windows, RTX 5060 Ti (auto-selected backend) | Apple M5 Pro (Metal) | RTX 5060 Ti through wgpu/Vulkan (the Linux path) | Intel UHD 770 (D3D11) |
+|---|---|---|---|---|
+| ArtCNN C4F16 | 2.44 ms scalar (was 12.38 ms) | 2.65 ms tensor ops | 2.77 ms | 68 ms |
+| ArtCNN C4F32 | 7.29 ms cooperative matrix (scalar 9.5 ms; was 39.4 ms) | 6.35 ms | 11.4 ms | 267 ms |
+| Anime4K S / M / L / VL / UL | 0.35 / 0.78 / 0.83 / 2.07 / 4.11 ms | 1.0 / 2.8 / 2.0 / 4.96 / 7.3 ms | 0.45 / 1.04 / 1.03 / 2.85 / 5.80 ms | 8.9 / 18.7 / 22.4 / 54.5 / 173 ms |
+| ArtCNN R8F64 (720p source) | 71 ms cooperative matrix (58 ms with D3D12 linalg) | 64.6 ms | 183 ms | not for playback |
+| FSR1 (1080p to 4K) | 0.31 ms | 0.77 ms | 0.55 ms | 10 ms |
+| MetalFX (1080p to 4K) | n/a | 0.67 ms | n/a | n/a |
+
+The denoise/sharpen variants (ArtCNN DS/DN, Anime4K Denoise) cost the same as
+their base models. R8F64 is not real time on any of these GPUs.
+
+Windows accelerators, RTX 5060 Ti (1080p source unless noted; the selector
+measures the candidates on real frames and keeps the fastest, so these only
+decide the wide models):
+
+| Model | D3D11 scalar | Vulkan cooperative matrix | D3D12 linalg (opt-in) |
+|---|---|---|---|
+| ArtCNN C4F16 | 2.44 ms | 3.59 ms | 3.14 ms |
+| ArtCNN C4F32 | 9.5 ms | 7.29 ms | 6.53 ms |
+| ArtCNN C4F32, 4K source | 39.5 ms | 27.7 ms | - |
+| Anime4K UL | 4.11 ms | 7.39 ms | 20.2 ms |
+| ArtCNN R8F64, 720p source | 243 ms | 71.4 ms | 58.1 ms |
+
+Cooperative-matrix times use the default fp32 accumulation;
+`ERIKA_VK_FP16_ACCUMULATION=1` gives 6.24 ms for C4F32 and 58.7 ms for R8F64
+at a small precision cost.
+
+The Vulkan spatial head for the bundled C4F16-DN/C4F32-DN graphs now uses packed
+fp16 coefficients, shared inputs and accumulation on NVIDIA. It reduces the
+1080p full GPU handoff interval by approximately 7–8% in the paired measurements,
+with either matrix accumulation mode. Set `ERIKA_VK_FP16_HEAD=0` to retain the
+fp32 head. [Implementation and measurements](investigations/sr-gpu-head-2026-11-03/README.md).
+
+**Custom models.** `erika_presenter_load_upscaler_model(handle, name, data, len)`
+loads an Erika `.esr` network (export ArtCNN ONNX with
+`crates/erika/assets/artcnn/export_artcnn_esr.py`; for example R16F96, which is
+not bundled) or an mpv hook shader of the FSRCNNX or Anime4K CNN dialect, then
+select it with `set_upscaler(handle, ErikaLumaUpscalerMode_Custom)`;
+`erika_presenter_clear_upscaler_model` removes it. Only weights are parsed;
+shader code is never executed. FSRCNNX (GPL-3.0/LGPL-3.0) and RAVU/NNEDI3
+(LGPL-3.0) are not bundled because liberika is MPL-2.0, so the host supplies
+the file. Through the presenter JSON bridge use `loadUpscalerModelFile
+{path, name?}` and `clearUpscalerModel`.
+
+**Windows tuning (diagnostics only).**
+
+| Variable | Effect |
+|---|---|
+| `ERIKA_SR_BACKEND` | `scalar`, `coopmat` or `linalg` pins the D3D11-side executor (default: measured auto-selection). Apple: `scalar`, `matmul`, `tensor`, `legacy`, `legacy-scalar`. |
+| `ERIKA_SR_NO_SHADER_CACHE=1` | Disable the D3D11 kernel disk cache (`%LOCALAPPDATA%\liberika\sr-shader-cache`). |
+| `ERIKA_SR_TILE_BUDGET_MB` | D3D11 intermediate tensor budget (default: chosen per network, 24-192). |
+| `ERIKA_VK_FP16_ACCUMULATION=1` | fp16 accumulation in the Vulkan cooperative-matrix backend. |
+| `ERIKA_WGPU_SR_AUTOTUNE=0` | wgpu (all platforms): keep the per-adapter kernel defaults instead of timing variants on the first frames. Other `ERIKA_WGPU_SR_*` variables pin individual kernel choices; see `crates/erika/src/renderer/wgpu_sr.rs`. |
+| `ERIKA_SR_D3D12_LINALG=1` with `ERIKA_D3D12_AGILITY_SDK_PATH`, `ERIKA_D3D12_DXCOMPILER_PATH`, `ERIKA_D3D12_DXC_INCLUDE_PATH` | Opt in to the D3D12 SM 6.10 preview backend (Agility SDK 1.722-preview and the SM 6.10 preview DXC; Windows Developer Mode for experimental shader models; retail expected with Agility SDK 1.621, Dec 2026). See `crates/erika/src/renderer/d3d12_linalg/README.md`. |
 
 ### Subtitle and danmaku quality defaults
 
@@ -289,7 +375,7 @@ All of these are safe to call live, between ticks:
   `add_danmaku_track_*`), toggle (`set_danmaku_enabled`), tune via
   `set_danmaku_config`, offset tracks, set the font, set blocked words. See
   [danmaku_architecture.md](danmaku_architecture.md).
-- **Upscaler:** `set_upscaler(mode)`; inspect with `get_upscaler_status`.
+- **Upscaler:** `set_upscaler(mode)`, `load_upscaler_model` / `clear_upscaler_model` for `Custom`; inspect with `get_upscaler_status`. See [Upscaler](#upscaler).
 - **Output:** inspect the actual mode and fallback counters with
   `erika_presenter_get_output_status`; Android native hosts publish dynamic
   display ratios with `erika_presenter_set_output_headroom`. `capture_frame_rgba`

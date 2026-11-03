@@ -46,16 +46,90 @@ ErikaPresenterConfig cfg = {
     .output_mode  = ErikaPresenterOutputMode_Sdr,   // AppleEdr 或 Android ExtendedLinear
     .edr_headroom = 1.0f,                            // 请求的内容 headroom 上限
     .video_alpha_mode = ErikaVideoAlphaMode_Opaque,
-    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // 或 ArtCnnC4F16 / C4F16Ds / C4F32
+    .luma_upscaler = ErikaLumaUpscalerMode_Off,      // 或任意 ErikaLumaUpscalerMode，如 ArtCnnC4F16
 };
 ErikaPresenterHandle *p = erika_presenter_create_with_config(cfg);
 if (!p) { /* 读取 erika_last_error_message() */ }
 ```
 
-`erika_presenter_create()` 用默认值（SDR、无超分）。神经亮度超分在 Apple 平台由
-Metal 实现，在包括 Android 在内、具备 compute 能力的 Vulkan/wgpu adapter 上由
-wgpu 实现，Windows 上由 D3D11 compute 实现。无 compute 的后端（主要是 GLES 3.0）会保留原生
-luma sampling，并明确报告 `Inactive` 状态和回退原因。
+`erika_presenter_create()` 用默认值（SDR、无超分）。可用模式以及各平台实际运行的内容见[超分](#超分)。
+
+### 超分
+
+`set_upscaler(mode)` 选择模式（`ErikaLumaUpscalerMode`，数值按族分组）：
+
+| 数值 | 族 | 内容 |
+|---|---|---|
+| 1-7 | ArtCNN：C4F16、C4F32、C4F16 DS、C4F16 DN、C4F32 DS、C4F32 DN、R8F64 | 动漫；DS = 降噪 + 锐化（画质退化的片源），DN = 降噪；R8F64（约 926K 参数）只在矩阵单元和 SD/720p 片源上实用，仅桌面构建内置 |
+| 16-25 | Anime4K v3.2 Upscale CNN x2（S、M、L、VL、UL）与 Upscale+Denoise（21-25） | 动漫 |
+| 32 | `Fsr1`：亮度上的 AMD FSR 1.0 EASU + RCAS（RCAS 锐度 0.2 stops） | 任意 |
+| 48 | `PlatformVideo`：平台自带的视频超分 | 真人 / 任意 |
+| 49 | `MetalFxSpatial`（仅 Apple） | 任意 |
+| 64 | `Custom`：运行时加载的网络 | - |
+
+网络类模式把解码后的亮度平面放大 2 倍（色度保持源分辨率，由常规缩放器重建）。`Fsr1` 与
+`MetalFxSpatial` 把亮度直接缩放到呈现尺寸；`PlatformVideo` 缩放整帧。
+
+| 平台 | 运行内容 |
+|---|---|
+| Windows（D3D11） | 所有网络模式（含 `Custom`，使用生成的 compute kernel；按网络和帧尺寸实测，在标量、Vulkan cooperative matrix、D3D12 linalg 中选最快者）、`Fsr1`，以及 `PlatformVideo`：NVIDIA RTX Video Super Resolution（需要 RTX GPU，并在 NVIDIA App / 控制面板中启用）或 Intel VSR（带 VSR 驱动的 Arc/Xe）；仅限 SDR 视频、D3D11VA 解码的 NV12/P010 帧。`MetalFxSpatial` 为 `Inactive`。D3D12 linalg 是可选预览。 |
+| Apple（Metal：macOS、iOS、tvOS） | 所有网络模式（含 `Custom`；M5/A19 用 Metal 4 tensor ops，M1-M4/A14+ 用 `simdgroup_matrix`，其余为标量）、`Fsr1`、`MetalFxSpatial`，以及通过 VideoToolbox `VTLowLatencySuperResolutionScaler` 的 `PlatformVideo`：仅 2x，8 位 4:2:0 片源，尺寸 96x96 到 960x960，macOS/iOS/tvOS 26+；否则为 `Inactive` 并给出原因。 |
+| wgpu renderer（Linux、Android、OpenHarmony、Windows 的 wgpu 回退） | 所有网络模式（含 `Custom`）与 `Fsr1`（生成的 WGSL kernel；适配器支持 `SHADER_F16` 时用 fp16；在提供 16x16 cooperative matrix 的 Vulkan 适配器上（如 NVIDIA）使用矩阵单元；按适配器给出默认参数，并在最初几帧实测少量 kernel 变体后选最快者）。`PlatformVideo` 与 `MetalFxSpatial` 为 `Inactive`。Android/OpenHarmony 真机尚未实测。 |
+| Web | 无超分。 |
+
+无法运行的模式会报告 `Inactive` 后端状态并保留原生 luma sampling；原因见诊断 `upscaler` 对象
+（`reason`、`engine`、`lastGpuMs`）。所有后端的 kernel 都在后台线程编译：就绪之前状态为
+`Building`，期间使用原生采样，所以宿主应轮询 `get_upscaler_status` 来驱动 UI。
+
+实测 GPU 耗时（按所给片源放大 2 倍；中位数，GPU 时间戳）：
+
+| 模型（1080p 片源） | Windows，RTX 5060 Ti（自动选择后端） | Apple M5 Pro（Metal） | RTX 5060 Ti 走 wgpu/Vulkan（Linux 路径） | Intel UHD 770（D3D11） |
+|---|---|---|---|---|
+| ArtCNN C4F16 | 2.44 ms 标量（原 12.38 ms） | 2.65 ms tensor ops | 2.77 ms | 68 ms |
+| ArtCNN C4F32 | 7.29 ms cooperative matrix（标量 9.5 ms；原 39.4 ms） | 6.35 ms | 11.4 ms | 267 ms |
+| Anime4K S / M / L / VL / UL | 0.35 / 0.78 / 0.83 / 2.07 / 4.11 ms | 1.0 / 2.8 / 2.0 / 4.96 / 7.3 ms | 0.45 / 1.04 / 1.03 / 2.85 / 5.80 ms | 8.9 / 18.7 / 22.4 / 54.5 / 173 ms |
+| ArtCNN R8F64（720p 片源） | 71 ms cooperative matrix（D3D12 linalg 为 58 ms） | 64.6 ms | 183 ms | 不适合播放 |
+| FSR1（1080p 到 4K） | 0.31 ms | 0.77 ms | 0.55 ms | 10 ms |
+| MetalFX（1080p 到 4K） | 无 | 0.67 ms | 无 | 无 |
+
+降噪/锐化变体（ArtCNN DS/DN、Anime4K Denoise）的耗时与对应基础模型相同。R8F64 在以上 GPU 上都无法实时。
+
+Windows 加速器，RTX 5060 Ti（除注明外为 1080p 片源；选择器在真实帧上实测各候选并保留最快者，因此它们只决定宽模型）：
+
+| 模型 | D3D11 标量 | Vulkan cooperative matrix | D3D12 linalg（可选） |
+|---|---|---|---|
+| ArtCNN C4F16 | 2.44 ms | 3.59 ms | 3.14 ms |
+| ArtCNN C4F32 | 9.5 ms | 7.29 ms | 6.53 ms |
+| ArtCNN C4F32，4K 片源 | 39.5 ms | 27.7 ms | - |
+| Anime4K UL | 4.11 ms | 7.39 ms | 20.2 ms |
+| ArtCNN R8F64，720p 片源 | 243 ms | 71.4 ms | 58.1 ms |
+
+cooperative matrix 的耗时使用默认的 fp32 累加；`ERIKA_VK_FP16_ACCUMULATION=1` 时 C4F32 为 6.24 ms、R8F64 为
+58.7 ms，精度略有损失。
+
+NVIDIA 上，Vulkan 后端对内置 C4F16-DN/C4F32-DN 启用新的半精度空间末层：
+系数打包、共享输入和乘加累加使用 fp16。1080p 成对测量的完整 GPU 交接
+耗时降低约 7–8%，矩阵层使用 fp32 或 fp16 累加均有效。
+`ERIKA_VK_FP16_HEAD=0` 可恢复 fp32 末层。
+[实现原理与实测记录](investigations/sr-gpu-head-2026-11-03/README.md)。
+
+**自定义模型。** `erika_presenter_load_upscaler_model(handle, name, data, len)` 加载 Erika `.esr` 网络
+（用 `crates/erika/assets/artcnn/export_artcnn_esr.py` 导出 ArtCNN ONNX；例如未内置的 R16F96）或 FSRCNNX /
+Anime4K CNN 方言的 mpv hook shader，然后用 `set_upscaler(handle, ErikaLumaUpscalerMode_Custom)` 选用；
+`erika_presenter_clear_upscaler_model` 将其移除。只解析权重，从不执行 shader 代码。FSRCNNX
+（GPL-3.0/LGPL-3.0）与 RAVU/NNEDI3（LGPL-3.0）因 liberika 为 MPL-2.0 而不内置，需要宿主提供文件。
+通过 presenter JSON 桥使用 `loadUpscalerModelFile {path, name?}` 与 `clearUpscalerModel`。
+
+**Windows 调优（仅用于诊断）。**
+
+| 变量 | 作用 |
+|---|---|
+| `ERIKA_SR_BACKEND` | `scalar`、`coopmat` 或 `linalg` 固定 D3D11 一侧的执行器（默认：实测自动选择）。Apple：`scalar`、`matmul`、`tensor`、`legacy`、`legacy-scalar`。 |
+| `ERIKA_SR_NO_SHADER_CACHE=1` | 关闭 D3D11 kernel 磁盘缓存（`%LOCALAPPDATA%\liberika\sr-shader-cache`）。 |
+| `ERIKA_SR_TILE_BUDGET_MB` | D3D11 中间张量预算（默认按网络在 24-192 之间选择）。 |
+| `ERIKA_VK_FP16_ACCUMULATION=1` | Vulkan cooperative matrix 后端使用 fp16 累加。 |
+| `ERIKA_WGPU_SR_AUTOTUNE=0` | wgpu（所有平台）：保留按适配器给出的 kernel 默认参数，不在最初几帧实测变体。其他 `ERIKA_WGPU_SR_*` 变量可固定单项 kernel 选择，见 `crates/erika/src/renderer/wgpu_sr.rs`。 |
+| `ERIKA_SR_D3D12_LINALG=1`，配合 `ERIKA_D3D12_AGILITY_SDK_PATH`、`ERIKA_D3D12_DXCOMPILER_PATH`、`ERIKA_D3D12_DXC_INCLUDE_PATH` | 启用 D3D12 SM 6.10 预览后端（Agility SDK 1.722-preview 与 SM 6.10 预览版 DXC；实验性 shader model 需要 Windows 开发者模式；正式版预计随 Agility SDK 1.621，2026 年 12 月）。见 `crates/erika/src/renderer/d3d12_linalg/README.md`。 |
 
 ### 高清字幕与高清弹幕的默认值
 
@@ -255,7 +329,7 @@ iOS Flutter 插件将 `CADisplayLink.targetTimestamp` 经 tick mailbox 传入此
 - **弹幕:** 加载一条轨(`load_danmaku_file` / `_json` 或多轨 `add_danmaku_track_*`)、
   开关(`set_danmaku_enabled`)、用 `set_danmaku_config` 调参、偏移轨、设字体、设屏蔽词。
   见 [danmaku_architecture.md](danmaku_architecture.md)。
-- **超分:** `set_upscaler(mode)`;用 `get_upscaler_status` 检视。
+- **超分:** `set_upscaler(mode)`，`Custom` 用 `load_upscaler_model` / `clear_upscaler_model`;用 `get_upscaler_status` 检视。见[超分](#超分)。
 - **输出:** 用 `erika_presenter_get_output_status` 检视实际模式和 fallback counters。
   Android 原生宿主用 `erika_presenter_set_output_headroom` 发布动态显示 ratio。
   `capture_frame_rgba` 始终输出视频 + 字幕（不含弹幕）的 SDR RGBA8 截图，即使显示输出是

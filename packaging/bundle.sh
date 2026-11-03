@@ -59,6 +59,8 @@ cp "$ROOT/packaging/LICENSE.HarfBuzz" "$STAGE/licenses/LICENSE.HarfBuzz"
 cp "$ROOT/packaging/LICENSE.zlib" "$STAGE/licenses/LICENSE.zlib"
 cp "$ROOT/crates/erika/assets/NOTICE.md" "$STAGE/licenses/NOTICE.Droid-Sans-Fallback.md"
 cp "$ROOT/crates/erika/assets/artcnn/LICENSE.ArtCNN" "$STAGE/licenses/LICENSE.ArtCNN"
+cp "$ROOT/crates/erika/assets/anime4k/LICENSE.Anime4K" "$STAGE/licenses/LICENSE.Anime4K"
+cp "$ROOT/crates/erika/assets/fsr1/LICENSE.FSR1" "$STAGE/licenses/LICENSE.FSR1"
 
 commit="${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
 cat > "$STAGE/MANIFEST.txt" <<EOF

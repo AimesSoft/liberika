@@ -1,0 +1,197 @@
+ADAPTER NVIDIA GeForce RTX 5060 Ti
+GRAPH artcnn_c4f16_dn 0 out=16 inputs=[(0, 1, 5)]
+GRAPH artcnn_c4f16_dn 1 out=16 inputs=[(1, 16, 3)]
+GRAPH artcnn_c4f16_dn 2 out=16 inputs=[(2, 16, 3)]
+GRAPH artcnn_c4f16_dn 3 out=16 inputs=[(3, 16, 3)]
+GRAPH artcnn_c4f16_dn 4 out=4 inputs=[(4, 16, 5), (0, 1, 5)]
+RESOURCE artcnn_c4f16_dn baseline
+SHADER layer=0 executable=0 subgroup=32 Compute Shader
+STAT 0 Register Count 31
+STAT 0 Binary Size 15616
+STAT 0 Stack Size 0
+STAT 0 Local Memory Size 68719476736
+STAT 0 Shared Memory Size 1640
+SHADER layer=1 executable=0 subgroup=32 Compute Shader
+STAT 1 Register Count 80
+STAT 1 Binary Size 58880
+STAT 1 Stack Size 0
+STAT 1 Local Memory Size 68719476736
+STAT 1 Shared Memory Size 0
+SHADER layer=2 executable=0 subgroup=32 Compute Shader
+STAT 2 Register Count 80
+STAT 2 Binary Size 58368
+STAT 2 Stack Size 0
+STAT 2 Local Memory Size 68719476736
+STAT 2 Shared Memory Size 0
+SHADER layer=3 executable=0 subgroup=32 Compute Shader
+STAT 3 Register Count 80
+STAT 3 Binary Size 58880
+STAT 3 Stack Size 0
+STAT 3 Local Memory Size 68719476736
+STAT 3 Shared Memory Size 0
+SHADER layer=4 executable=0 subgroup=32 Compute Shader
+STAT 4 Register Count 25
+STAT 4 Binary Size 48384
+STAT 4 Stack Size 0
+STAT 4 Local Memory Size 68719476736
+STAT 4 Shared Memory Size 9216
+RESOURCE artcnn_c4f16_dn half
+SHADER layer=0 executable=0 subgroup=32 Compute Shader
+STAT 0 Register Count 31
+STAT 0 Binary Size 15616
+STAT 0 Stack Size 0
+STAT 0 Local Memory Size 68719476736
+STAT 0 Shared Memory Size 1640
+SHADER layer=1 executable=0 subgroup=32 Compute Shader
+STAT 1 Register Count 80
+STAT 1 Binary Size 58880
+STAT 1 Stack Size 0
+STAT 1 Local Memory Size 68719476736
+STAT 1 Shared Memory Size 0
+SHADER layer=2 executable=0 subgroup=32 Compute Shader
+STAT 2 Register Count 80
+STAT 2 Binary Size 58368
+STAT 2 Stack Size 0
+STAT 2 Local Memory Size 68719476736
+STAT 2 Shared Memory Size 0
+SHADER layer=3 executable=0 subgroup=32 Compute Shader
+STAT 3 Register Count 80
+STAT 3 Binary Size 58880
+STAT 3 Stack Size 0
+STAT 3 Local Memory Size 68719476736
+STAT 3 Shared Memory Size 0
+SHADER layer=4 executable=0 subgroup=32 Compute Shader
+STAT 4 Register Count 26
+STAT 4 Binary Size 41344
+STAT 4 Stack Size 0
+STAT 4 Local Memory Size 68719476736
+STAT 4 Shared Memory Size 9280
+RESOURCE artcnn_c4f16_dn half_shared
+SHADER layer=0 executable=0 subgroup=32 Compute Shader
+STAT 0 Register Count 31
+STAT 0 Binary Size 15616
+STAT 0 Stack Size 0
+STAT 0 Local Memory Size 68719476736
+STAT 0 Shared Memory Size 1640
+SHADER layer=1 executable=0 subgroup=32 Compute Shader
+STAT 1 Register Count 80
+STAT 1 Binary Size 58880
+STAT 1 Stack Size 0
+STAT 1 Local Memory Size 68719476736
+STAT 1 Shared Memory Size 0
+SHADER layer=2 executable=0 subgroup=32 Compute Shader
+STAT 2 Register Count 80
+STAT 2 Binary Size 58368
+STAT 2 Stack Size 0
+STAT 2 Local Memory Size 68719476736
+STAT 2 Shared Memory Size 0
+SHADER layer=3 executable=0 subgroup=32 Compute Shader
+STAT 3 Register Count 80
+STAT 3 Binary Size 58880
+STAT 3 Stack Size 0
+STAT 3 Local Memory Size 68719476736
+STAT 3 Shared Memory Size 0
+SHADER layer=4 executable=0 subgroup=32 Compute Shader
+STAT 4 Register Count 26
+STAT 4 Binary Size 34816
+STAT 4 Stack Size 0
+STAT 4 Local Memory Size 68719476736
+STAT 4 Shared Memory Size 4640
+GRAPH artcnn_c4f32_dn 0 out=32 inputs=[(0, 1, 5)]
+GRAPH artcnn_c4f32_dn 1 out=32 inputs=[(1, 32, 3)]
+GRAPH artcnn_c4f32_dn 2 out=32 inputs=[(2, 32, 3)]
+GRAPH artcnn_c4f32_dn 3 out=32 inputs=[(3, 32, 3)]
+GRAPH artcnn_c4f32_dn 4 out=4 inputs=[(4, 32, 5), (0, 1, 5)]
+RESOURCE artcnn_c4f32_dn baseline
+SHADER layer=0 executable=0 subgroup=32 Compute Shader
+STAT 0 Register Count 36
+STAT 0 Binary Size 25344
+STAT 0 Stack Size 0
+STAT 0 Local Memory Size 68719476736
+STAT 0 Shared Memory Size 1640
+SHADER layer=1 executable=0 subgroup=32 Compute Shader
+STAT 1 Register Count 80
+STAT 1 Binary Size 58624
+STAT 1 Stack Size 0
+STAT 1 Local Memory Size 68719476736
+STAT 1 Shared Memory Size 0
+SHADER layer=2 executable=0 subgroup=32 Compute Shader
+STAT 2 Register Count 80
+STAT 2 Binary Size 58240
+STAT 2 Stack Size 0
+STAT 2 Local Memory Size 68719476736
+STAT 2 Shared Memory Size 0
+SHADER layer=3 executable=0 subgroup=32 Compute Shader
+STAT 3 Register Count 80
+STAT 3 Binary Size 58624
+STAT 3 Stack Size 0
+STAT 3 Local Memory Size 68719476736
+STAT 3 Shared Memory Size 0
+SHADER layer=4 executable=0 subgroup=32 Compute Shader
+STAT 4 Register Count 28
+STAT 4 Binary Size 90112
+STAT 4 Stack Size 0
+STAT 4 Local Memory Size 68719476736
+STAT 4 Shared Memory Size 9216
+RESOURCE artcnn_c4f32_dn half
+SHADER layer=0 executable=0 subgroup=32 Compute Shader
+STAT 0 Register Count 36
+STAT 0 Binary Size 25344
+STAT 0 Stack Size 0
+STAT 0 Local Memory Size 68719476736
+STAT 0 Shared Memory Size 1640
+SHADER layer=1 executable=0 subgroup=32 Compute Shader
+STAT 1 Register Count 80
+STAT 1 Binary Size 58624
+STAT 1 Stack Size 0
+STAT 1 Local Memory Size 68719476736
+STAT 1 Shared Memory Size 0
+SHADER layer=2 executable=0 subgroup=32 Compute Shader
+STAT 2 Register Count 80
+STAT 2 Binary Size 58240
+STAT 2 Stack Size 0
+STAT 2 Local Memory Size 68719476736
+STAT 2 Shared Memory Size 0
+SHADER layer=3 executable=0 subgroup=32 Compute Shader
+STAT 3 Register Count 80
+STAT 3 Binary Size 58624
+STAT 3 Stack Size 0
+STAT 3 Local Memory Size 68719476736
+STAT 3 Shared Memory Size 0
+SHADER layer=4 executable=0 subgroup=32 Compute Shader
+STAT 4 Register Count 28
+STAT 4 Binary Size 76288
+STAT 4 Stack Size 0
+STAT 4 Local Memory Size 68719476736
+STAT 4 Shared Memory Size 9280
+RESOURCE artcnn_c4f32_dn half_shared
+SHADER layer=0 executable=0 subgroup=32 Compute Shader
+STAT 0 Register Count 36
+STAT 0 Binary Size 25344
+STAT 0 Stack Size 0
+STAT 0 Local Memory Size 68719476736
+STAT 0 Shared Memory Size 1640
+SHADER layer=1 executable=0 subgroup=32 Compute Shader
+STAT 1 Register Count 80
+STAT 1 Binary Size 58624
+STAT 1 Stack Size 0
+STAT 1 Local Memory Size 68719476736
+STAT 1 Shared Memory Size 0
+SHADER layer=2 executable=0 subgroup=32 Compute Shader
+STAT 2 Register Count 80
+STAT 2 Binary Size 58240
+STAT 2 Stack Size 0
+STAT 2 Local Memory Size 68719476736
+STAT 2 Shared Memory Size 0
+SHADER layer=3 executable=0 subgroup=32 Compute Shader
+STAT 3 Register Count 80
+STAT 3 Binary Size 58624
+STAT 3 Stack Size 0
+STAT 3 Local Memory Size 68719476736
+STAT 3 Shared Memory Size 0
+SHADER layer=4 executable=0 subgroup=32 Compute Shader
+STAT 4 Register Count 28
+STAT 4 Binary Size 63488
+STAT 4 Stack Size 0
+STAT 4 Local Memory Size 68719476736
+STAT 4 Shared Memory Size 4640

@@ -1,0 +1,305 @@
+ADAPTER NVIDIA GeForce RTX 5060 Ti
+GRAPH artcnn_c4f16_dn 0 out=16 inputs=[(0, 1, 5)]
+GRAPH artcnn_c4f16_dn 1 out=16 inputs=[(1, 16, 3)]
+GRAPH artcnn_c4f16_dn 2 out=16 inputs=[(2, 16, 3)]
+GRAPH artcnn_c4f16_dn 3 out=16 inputs=[(3, 16, 3)]
+GRAPH artcnn_c4f16_dn 4 out=4 inputs=[(4, 16, 5), (0, 1, 5)]
+FRAME artcnn_c4f16_dn baseline sample=0
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.450112 conv_ms=0.429472 correction_ms=0.020640 min_MB=74.650 effective_GBs=165.847 useful_TFLOPS=3.685 estimated_MMA_Gs=0.6193
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.384288 conv_ms=0.384096 correction_ms=0.000192 min_MB=132.710 effective_GBs=345.341 useful_TFLOPS=24.865 estimated_MMA_Gs=3.1612
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.430592 conv_ms=0.430208 correction_ms=0.000384 min_MB=132.710 effective_GBs=308.205 useful_TFLOPS=22.191 estimated_MMA_Gs=2.8172
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.379616 conv_ms=0.379296 correction_ms=0.000320 min_MB=132.710 effective_GBs=349.591 useful_TFLOPS=25.171 estimated_MMA_Gs=3.1894
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.059680 conv_ms=0.958688 correction_ms=0.100992 min_MB=87.091 effective_GBs=82.186 useful_TFLOPS=6.653 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn baseline 0 4.904287999999999
+FRAME artcnn_c4f16_dn baseline sample=1
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.448480 conv_ms=0.428288 correction_ms=0.020192 min_MB=74.650 effective_GBs=166.450 useful_TFLOPS=3.699 estimated_MMA_Gs=0.6210
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.382656 conv_ms=0.382464 correction_ms=0.000192 min_MB=132.710 effective_GBs=346.814 useful_TFLOPS=24.971 estimated_MMA_Gs=3.1747
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.430400 conv_ms=0.430016 correction_ms=0.000384 min_MB=132.710 effective_GBs=308.342 useful_TFLOPS=22.201 estimated_MMA_Gs=2.8184
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.380736 conv_ms=0.380352 correction_ms=0.000384 min_MB=132.710 effective_GBs=348.563 useful_TFLOPS=25.097 estimated_MMA_Gs=3.1806
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.351456 conv_ms=1.250272 correction_ms=0.101184 min_MB=87.091 effective_GBs=64.442 useful_TFLOPS=5.217 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn baseline 1 3.666912
+FRAME artcnn_c4f16_dn baseline sample=2
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.448544 conv_ms=0.428000 correction_ms=0.020544 min_MB=74.650 effective_GBs=166.426 useful_TFLOPS=3.698 estimated_MMA_Gs=0.6214
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.380832 conv_ms=0.380608 correction_ms=0.000224 min_MB=132.710 effective_GBs=348.475 useful_TFLOPS=25.090 estimated_MMA_Gs=3.1902
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428992 conv_ms=0.428608 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.354 useful_TFLOPS=22.273 estimated_MMA_Gs=2.8277
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.377152 conv_ms=0.376736 correction_ms=0.000416 min_MB=132.710 effective_GBs=351.875 useful_TFLOPS=25.335 estimated_MMA_Gs=3.2111
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.053760 conv_ms=0.952864 correction_ms=0.100896 min_MB=87.091 effective_GBs=82.648 useful_TFLOPS=6.691 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn baseline 2 3.3671040000000003
+FRAME artcnn_c4f16_dn baseline sample=3
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447424 conv_ms=0.426400 correction_ms=0.021024 min_MB=74.650 effective_GBs=166.843 useful_TFLOPS=3.708 estimated_MMA_Gs=0.6237
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.381056 conv_ms=0.380864 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.270 useful_TFLOPS=25.075 estimated_MMA_Gs=3.1880
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428320 conv_ms=0.427936 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.839 useful_TFLOPS=22.308 estimated_MMA_Gs=2.8321
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.377344 conv_ms=0.376960 correction_ms=0.000384 min_MB=132.710 effective_GBs=351.696 useful_TFLOPS=25.322 estimated_MMA_Gs=3.2092
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.054592 conv_ms=0.953536 correction_ms=0.101056 min_MB=87.091 effective_GBs=82.583 useful_TFLOPS=6.685 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn baseline 3 3.343136
+FRAME artcnn_c4f16_dn baseline sample=4
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447488 conv_ms=0.426688 correction_ms=0.020800 min_MB=74.650 effective_GBs=166.819 useful_TFLOPS=3.707 estimated_MMA_Gs=0.6233
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.380384 conv_ms=0.380192 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.885 useful_TFLOPS=25.120 estimated_MMA_Gs=3.1937
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428032 conv_ms=0.427616 correction_ms=0.000416 min_MB=132.710 effective_GBs=310.048 useful_TFLOPS=22.323 estimated_MMA_Gs=2.8343
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.378144 conv_ms=0.377760 correction_ms=0.000384 min_MB=132.710 effective_GBs=350.952 useful_TFLOPS=25.269 estimated_MMA_Gs=3.2024
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.056192 conv_ms=0.954432 correction_ms=0.101760 min_MB=87.091 effective_GBs=82.458 useful_TFLOPS=6.675 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn baseline 4 3.344672
+FRAME artcnn_c4f16_dn baseline sample=5
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447360 conv_ms=0.426368 correction_ms=0.020992 min_MB=74.650 effective_GBs=166.867 useful_TFLOPS=3.708 estimated_MMA_Gs=0.6238
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.381024 conv_ms=0.380832 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.299 useful_TFLOPS=25.078 estimated_MMA_Gs=3.1883
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428960 conv_ms=0.428576 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.377 useful_TFLOPS=22.275 estimated_MMA_Gs=2.8279
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.377472 conv_ms=0.377088 correction_ms=0.000384 min_MB=132.710 effective_GBs=351.577 useful_TFLOPS=25.314 estimated_MMA_Gs=3.2081
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.056256 conv_ms=0.954592 correction_ms=0.101664 min_MB=87.091 effective_GBs=82.453 useful_TFLOPS=6.675 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn baseline 5 3.350528
+FRAME artcnn_c4f16_dn baseline sample=6
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447648 conv_ms=0.426432 correction_ms=0.021216 min_MB=74.650 effective_GBs=166.760 useful_TFLOPS=3.706 estimated_MMA_Gs=0.6237
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.638624 conv_ms=0.638240 correction_ms=0.000384 min_MB=132.710 effective_GBs=207.807 useful_TFLOPS=14.962 estimated_MMA_Gs=1.9024
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.429440 conv_ms=0.429024 correction_ms=0.000416 min_MB=132.710 effective_GBs=309.031 useful_TFLOPS=22.250 estimated_MMA_Gs=2.8250
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.669248 conv_ms=0.668832 correction_ms=0.000416 min_MB=132.710 effective_GBs=198.298 useful_TFLOPS=14.277 estimated_MMA_Gs=1.8087
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.058784 conv_ms=0.956992 correction_ms=0.101792 min_MB=87.091 effective_GBs=82.256 useful_TFLOPS=6.659 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn baseline 6 3.905728
+FRAME artcnn_c4f16_dn half sample=0
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.449408 conv_ms=0.428416 correction_ms=0.020992 min_MB=74.650 effective_GBs=166.107 useful_TFLOPS=3.691 estimated_MMA_Gs=0.6208
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.383328 conv_ms=0.383136 correction_ms=0.000192 min_MB=132.710 effective_GBs=346.206 useful_TFLOPS=24.927 estimated_MMA_Gs=3.1691
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.434688 conv_ms=0.434304 correction_ms=0.000384 min_MB=132.710 effective_GBs=305.300 useful_TFLOPS=21.982 estimated_MMA_Gs=2.7906
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.379232 conv_ms=0.378880 correction_ms=0.000352 min_MB=132.710 effective_GBs=349.945 useful_TFLOPS=25.196 estimated_MMA_Gs=3.1929
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.932928 conv_ms=0.833184 correction_ms=0.099744 min_MB=87.091 effective_GBs=93.353 useful_TFLOPS=7.557 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half 0 5.14512
+FRAME artcnn_c4f16_dn half sample=1
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.773952 conv_ms=0.753216 correction_ms=0.020736 min_MB=74.650 effective_GBs=96.452 useful_TFLOPS=2.143 estimated_MMA_Gs=0.3531
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.390912 conv_ms=0.390496 correction_ms=0.000416 min_MB=132.710 effective_GBs=339.489 useful_TFLOPS=24.443 estimated_MMA_Gs=3.1094
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428832 conv_ms=0.428448 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.469 useful_TFLOPS=22.282 estimated_MMA_Gs=2.8288
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.378848 conv_ms=0.378432 correction_ms=0.000416 min_MB=132.710 effective_GBs=350.300 useful_TFLOPS=25.222 estimated_MMA_Gs=3.1967
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.933248 conv_ms=0.832960 correction_ms=0.100288 min_MB=87.091 effective_GBs=93.321 useful_TFLOPS=7.555 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half 1 3.574336
+FRAME artcnn_c4f16_dn half sample=2
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.449952 conv_ms=0.428928 correction_ms=0.021024 min_MB=74.650 effective_GBs=165.906 useful_TFLOPS=3.687 estimated_MMA_Gs=0.6201
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.386144 conv_ms=0.385920 correction_ms=0.000224 min_MB=132.710 effective_GBs=343.681 useful_TFLOPS=24.745 estimated_MMA_Gs=3.1463
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.430528 conv_ms=0.430144 correction_ms=0.000384 min_MB=132.710 effective_GBs=308.250 useful_TFLOPS=22.194 estimated_MMA_Gs=2.8176
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.379968 conv_ms=0.379552 correction_ms=0.000416 min_MB=132.710 effective_GBs=349.267 useful_TFLOPS=25.147 estimated_MMA_Gs=3.1873
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.933760 conv_ms=0.833152 correction_ms=0.100608 min_MB=87.091 effective_GBs=93.269 useful_TFLOPS=7.550 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half 2 3.274592
+FRAME artcnn_c4f16_dn half sample=3
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.448192 conv_ms=0.427584 correction_ms=0.020608 min_MB=74.650 effective_GBs=166.557 useful_TFLOPS=3.701 estimated_MMA_Gs=0.6220
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.380768 conv_ms=0.380576 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.533 useful_TFLOPS=25.094 estimated_MMA_Gs=3.1904
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.427904 conv_ms=0.427520 correction_ms=0.000384 min_MB=132.710 effective_GBs=310.141 useful_TFLOPS=22.330 estimated_MMA_Gs=2.8349
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.378496 conv_ms=0.378112 correction_ms=0.000384 min_MB=132.710 effective_GBs=350.626 useful_TFLOPS=25.245 estimated_MMA_Gs=3.1994
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.934208 conv_ms=0.834112 correction_ms=0.100096 min_MB=87.091 effective_GBs=93.225 useful_TFLOPS=7.547 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half 3 3.266368
+FRAME artcnn_c4f16_dn half sample=4
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447456 conv_ms=0.427008 correction_ms=0.020448 min_MB=74.650 effective_GBs=166.831 useful_TFLOPS=3.707 estimated_MMA_Gs=0.6228
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.381376 conv_ms=0.381184 correction_ms=0.000192 min_MB=132.710 effective_GBs=347.978 useful_TFLOPS=25.054 estimated_MMA_Gs=3.1854
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428032 conv_ms=0.427616 correction_ms=0.000416 min_MB=132.710 effective_GBs=310.048 useful_TFLOPS=22.323 estimated_MMA_Gs=2.8343
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.384032 conv_ms=0.383648 correction_ms=0.000384 min_MB=132.710 effective_GBs=345.571 useful_TFLOPS=24.881 estimated_MMA_Gs=3.1533
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.933888 conv_ms=0.833440 correction_ms=0.100448 min_MB=87.091 effective_GBs=93.257 useful_TFLOPS=7.549 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half 4 3.258144
+FRAME artcnn_c4f16_dn half sample=5
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.448928 conv_ms=0.428320 correction_ms=0.020608 min_MB=74.650 effective_GBs=166.284 useful_TFLOPS=3.695 estimated_MMA_Gs=0.6209
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.383328 conv_ms=0.382944 correction_ms=0.000384 min_MB=132.710 effective_GBs=346.206 useful_TFLOPS=24.927 estimated_MMA_Gs=3.1707
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428832 conv_ms=0.428448 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.469 useful_TFLOPS=22.282 estimated_MMA_Gs=2.8288
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.378656 conv_ms=0.378272 correction_ms=0.000384 min_MB=132.710 effective_GBs=350.477 useful_TFLOPS=25.234 estimated_MMA_Gs=3.1981
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.933248 conv_ms=0.832576 correction_ms=0.100672 min_MB=87.091 effective_GBs=93.321 useful_TFLOPS=7.555 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half 5 3.651488
+FRAME artcnn_c4f16_dn half sample=6
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447296 conv_ms=0.427232 correction_ms=0.020064 min_MB=74.650 effective_GBs=166.891 useful_TFLOPS=3.709 estimated_MMA_Gs=0.6225
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.379840 conv_ms=0.379648 correction_ms=0.000192 min_MB=132.710 effective_GBs=349.385 useful_TFLOPS=25.156 estimated_MMA_Gs=3.1982
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428928 conv_ms=0.428544 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.400 useful_TFLOPS=22.277 estimated_MMA_Gs=2.8281
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.383872 conv_ms=0.383488 correction_ms=0.000384 min_MB=132.710 effective_GBs=345.715 useful_TFLOPS=24.891 estimated_MMA_Gs=3.1546
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.933280 conv_ms=0.832768 correction_ms=0.100512 min_MB=87.091 effective_GBs=93.317 useful_TFLOPS=7.554 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half 6 3.23072
+FRAME artcnn_c4f16_dn half_shared sample=0
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.449184 conv_ms=0.428736 correction_ms=0.020448 min_MB=74.650 effective_GBs=166.189 useful_TFLOPS=3.693 estimated_MMA_Gs=0.6203
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.382816 conv_ms=0.382432 correction_ms=0.000384 min_MB=132.710 effective_GBs=346.669 useful_TFLOPS=24.960 estimated_MMA_Gs=3.1750
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.429824 conv_ms=0.429440 correction_ms=0.000384 min_MB=132.710 effective_GBs=308.755 useful_TFLOPS=22.230 estimated_MMA_Gs=2.8222
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.672832 conv_ms=0.672448 correction_ms=0.000384 min_MB=132.710 effective_GBs=197.242 useful_TFLOPS=14.201 estimated_MMA_Gs=1.7990
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.784032 conv_ms=0.683488 correction_ms=0.100544 min_MB=87.091 effective_GBs=111.081 useful_TFLOPS=8.992 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half_shared 0 5.531136
+FRAME artcnn_c4f16_dn half_shared sample=1
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447232 conv_ms=0.427072 correction_ms=0.020160 min_MB=74.650 effective_GBs=166.915 useful_TFLOPS=3.709 estimated_MMA_Gs=0.6228
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.380864 conv_ms=0.380672 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.446 useful_TFLOPS=25.088 estimated_MMA_Gs=3.1896
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.429248 conv_ms=0.428864 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.170 useful_TFLOPS=22.260 estimated_MMA_Gs=2.8260
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.378560 conv_ms=0.378176 correction_ms=0.000384 min_MB=132.710 effective_GBs=350.566 useful_TFLOPS=25.241 estimated_MMA_Gs=3.1989
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.786112 conv_ms=0.685472 correction_ms=0.100640 min_MB=87.091 effective_GBs=110.787 useful_TFLOPS=8.968 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half_shared 1 3.156416
+FRAME artcnn_c4f16_dn half_shared sample=2
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.450112 conv_ms=0.429088 correction_ms=0.021024 min_MB=74.650 effective_GBs=165.847 useful_TFLOPS=3.685 estimated_MMA_Gs=0.6198
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.383232 conv_ms=0.383008 correction_ms=0.000224 min_MB=132.710 effective_GBs=346.293 useful_TFLOPS=24.933 estimated_MMA_Gs=3.1702
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.429568 conv_ms=0.429216 correction_ms=0.000352 min_MB=132.710 effective_GBs=308.939 useful_TFLOPS=22.244 estimated_MMA_Gs=2.8237
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.379040 conv_ms=0.378656 correction_ms=0.000384 min_MB=132.710 effective_GBs=350.122 useful_TFLOPS=25.209 estimated_MMA_Gs=3.1948
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.785824 conv_ms=0.685344 correction_ms=0.100480 min_MB=87.091 effective_GBs=110.828 useful_TFLOPS=8.972 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half_shared 2 3.090144
+FRAME artcnn_c4f16_dn half_shared sample=3
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.446848 conv_ms=0.426944 correction_ms=0.019904 min_MB=74.650 effective_GBs=167.058 useful_TFLOPS=3.712 estimated_MMA_Gs=0.6229
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.381120 conv_ms=0.380928 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.212 useful_TFLOPS=25.071 estimated_MMA_Gs=3.1875
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428608 conv_ms=0.428192 correction_ms=0.000416 min_MB=132.710 effective_GBs=309.631 useful_TFLOPS=22.293 estimated_MMA_Gs=2.8304
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.378688 conv_ms=0.378304 correction_ms=0.000384 min_MB=132.710 effective_GBs=350.448 useful_TFLOPS=25.232 estimated_MMA_Gs=3.1978
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.784288 conv_ms=0.684224 correction_ms=0.100064 min_MB=87.091 effective_GBs=111.045 useful_TFLOPS=8.989 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half_shared 3 3.078528
+FRAME artcnn_c4f16_dn half_shared sample=4
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447840 conv_ms=0.427680 correction_ms=0.020160 min_MB=74.650 effective_GBs=166.688 useful_TFLOPS=3.704 estimated_MMA_Gs=0.6219
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.382912 conv_ms=0.382720 correction_ms=0.000192 min_MB=132.710 effective_GBs=346.582 useful_TFLOPS=24.954 estimated_MMA_Gs=3.1726
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428608 conv_ms=0.428224 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.631 useful_TFLOPS=22.293 estimated_MMA_Gs=2.8302
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.625504 conv_ms=0.625152 correction_ms=0.000352 min_MB=132.710 effective_GBs=212.166 useful_TFLOPS=15.276 estimated_MMA_Gs=1.9351
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.787200 conv_ms=0.686656 correction_ms=0.100544 min_MB=87.091 effective_GBs=110.634 useful_TFLOPS=8.956 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half_shared 4 3.328576
+FRAME artcnn_c4f16_dn half_shared sample=5
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.448064 conv_ms=0.427008 correction_ms=0.021056 min_MB=74.650 effective_GBs=166.605 useful_TFLOPS=3.702 estimated_MMA_Gs=0.6228
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.380160 conv_ms=0.379968 correction_ms=0.000192 min_MB=132.710 effective_GBs=349.091 useful_TFLOPS=25.135 estimated_MMA_Gs=3.1956
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428544 conv_ms=0.428160 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.677 useful_TFLOPS=22.297 estimated_MMA_Gs=2.8307
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.672320 conv_ms=0.671936 correction_ms=0.000384 min_MB=132.710 effective_GBs=197.392 useful_TFLOPS=14.212 estimated_MMA_Gs=1.8004
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.785184 conv_ms=0.685408 correction_ms=0.099776 min_MB=87.091 effective_GBs=110.918 useful_TFLOPS=8.979 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half_shared 5 3.372672
+FRAME artcnn_c4f16_dn half_shared sample=6
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447360 conv_ms=0.427072 correction_ms=0.020288 min_MB=74.650 effective_GBs=166.867 useful_TFLOPS=3.708 estimated_MMA_Gs=0.6228
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.381056 conv_ms=0.380832 correction_ms=0.000224 min_MB=132.710 effective_GBs=348.270 useful_TFLOPS=25.075 estimated_MMA_Gs=3.1883
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428640 conv_ms=0.428224 correction_ms=0.000416 min_MB=132.710 effective_GBs=309.608 useful_TFLOPS=22.292 estimated_MMA_Gs=2.8302
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.379584 conv_ms=0.379168 correction_ms=0.000416 min_MB=132.710 effective_GBs=349.621 useful_TFLOPS=25.173 estimated_MMA_Gs=3.1905
+LAYER artcnn_c4f16_dn 4 fp16 ms=0.786336 conv_ms=0.685920 correction_ms=0.100416 min_MB=87.091 effective_GBs=110.756 useful_TFLOPS=8.966 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f16_dn half_shared 6 3.08576
+GRAPH artcnn_c4f32_dn 0 out=32 inputs=[(0, 1, 5)]
+GRAPH artcnn_c4f32_dn 1 out=32 inputs=[(1, 32, 3)]
+GRAPH artcnn_c4f32_dn 2 out=32 inputs=[(2, 32, 3)]
+GRAPH artcnn_c4f32_dn 3 out=32 inputs=[(3, 32, 3)]
+GRAPH artcnn_c4f32_dn 4 out=4 inputs=[(4, 32, 5), (0, 1, 5)]
+FRAME artcnn_c4f32_dn baseline sample=0
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631104 conv_ms=0.595072 correction_ms=0.036032 min_MB=141.005 effective_GBs=223.426 useful_TFLOPS=5.257 estimated_MMA_Gs=0.9021
+LAYER artcnn_c4f32_dn 1 fp16 ms=1.094720 conv_ms=1.093920 correction_ms=0.000800 min_MB=265.421 effective_GBs=242.455 useful_TFLOPS=34.914 estimated_MMA_Gs=4.4004
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.939424 conv_ms=0.938592 correction_ms=0.000832 min_MB=265.421 effective_GBs=282.536 useful_TFLOPS=40.685 estimated_MMA_Gs=5.1098
+LAYER artcnn_c4f32_dn 3 fp16 ms=1.261536 conv_ms=1.260640 correction_ms=0.000896 min_MB=265.421 effective_GBs=210.395 useful_TFLOPS=30.297 estimated_MMA_Gs=3.7905
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.123904 conv_ms=1.838752 correction_ms=0.285152 min_MB=153.446 effective_GBs=72.247 useful_TFLOPS=6.444 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn baseline 0 9.730624
+FRAME artcnn_c4f32_dn baseline sample=1
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.629056 conv_ms=0.593856 correction_ms=0.035200 min_MB=141.005 effective_GBs=224.153 useful_TFLOPS=5.274 estimated_MMA_Gs=0.9039
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.929824 conv_ms=0.929248 correction_ms=0.000576 min_MB=265.421 effective_GBs=285.453 useful_TFLOPS=41.105 estimated_MMA_Gs=5.1801
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.925984 conv_ms=0.925248 correction_ms=0.000736 min_MB=265.421 effective_GBs=286.636 useful_TFLOPS=41.276 estimated_MMA_Gs=5.1835
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.926464 conv_ms=0.925696 correction_ms=0.000768 min_MB=265.421 effective_GBs=286.488 useful_TFLOPS=41.254 estimated_MMA_Gs=5.1621
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.113056 conv_ms=1.829536 correction_ms=0.283520 min_MB=153.446 effective_GBs=72.618 useful_TFLOPS=6.477 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn baseline 1 6.191007999999999
+FRAME artcnn_c4f32_dn baseline sample=2
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631136 conv_ms=0.594816 correction_ms=0.036320 min_MB=141.005 effective_GBs=223.414 useful_TFLOPS=5.257 estimated_MMA_Gs=0.9025
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.932384 conv_ms=0.931808 correction_ms=0.000576 min_MB=265.421 effective_GBs=284.669 useful_TFLOPS=40.992 estimated_MMA_Gs=5.1659
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.934528 conv_ms=0.933760 correction_ms=0.000768 min_MB=265.421 effective_GBs=284.016 useful_TFLOPS=40.898 estimated_MMA_Gs=5.1363
+LAYER artcnn_c4f32_dn 3 fp16 ms=1.266304 conv_ms=1.265568 correction_ms=0.000736 min_MB=265.421 effective_GBs=209.603 useful_TFLOPS=30.183 estimated_MMA_Gs=3.7758
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.120768 conv_ms=1.837152 correction_ms=0.283616 min_MB=153.446 effective_GBs=72.354 useful_TFLOPS=6.453 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn baseline 2 6.55968
+FRAME artcnn_c4f32_dn baseline sample=3
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631040 conv_ms=0.595168 correction_ms=0.035872 min_MB=141.005 effective_GBs=223.448 useful_TFLOPS=5.258 estimated_MMA_Gs=0.9019
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.932608 conv_ms=0.932000 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.601 useful_TFLOPS=40.982 estimated_MMA_Gs=5.1648
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.930304 conv_ms=0.929408 correction_ms=0.000896 min_MB=265.421 effective_GBs=285.305 useful_TFLOPS=41.084 estimated_MMA_Gs=5.1603
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.928192 conv_ms=0.927392 correction_ms=0.000800 min_MB=265.421 effective_GBs=285.955 useful_TFLOPS=41.177 estimated_MMA_Gs=5.1526
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.127744 conv_ms=1.842112 correction_ms=0.285632 min_MB=153.446 effective_GBs=72.117 useful_TFLOPS=6.432 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn baseline 3 6.26512
+FRAME artcnn_c4f32_dn baseline sample=4
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.634016 conv_ms=0.598144 correction_ms=0.035872 min_MB=141.005 effective_GBs=222.399 useful_TFLOPS=5.233 estimated_MMA_Gs=0.8974
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.933728 conv_ms=0.933152 correction_ms=0.000576 min_MB=265.421 effective_GBs=284.259 useful_TFLOPS=40.933 estimated_MMA_Gs=5.1585
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.929632 conv_ms=0.928800 correction_ms=0.000832 min_MB=265.421 effective_GBs=285.512 useful_TFLOPS=41.114 estimated_MMA_Gs=5.1637
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.929344 conv_ms=0.928608 correction_ms=0.000736 min_MB=265.421 effective_GBs=285.600 useful_TFLOPS=41.126 estimated_MMA_Gs=5.1459
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.126912 conv_ms=1.841600 correction_ms=0.285312 min_MB=153.446 effective_GBs=72.145 useful_TFLOPS=6.435 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn baseline 4 6.574336
+FRAME artcnn_c4f32_dn baseline sample=5
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631744 conv_ms=0.596160 correction_ms=0.035584 min_MB=141.005 effective_GBs=223.199 useful_TFLOPS=5.252 estimated_MMA_Gs=0.9004
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.932928 conv_ms=0.932320 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.503 useful_TFLOPS=40.968 estimated_MMA_Gs=5.1631
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.930240 conv_ms=0.929440 correction_ms=0.000800 min_MB=265.421 effective_GBs=285.325 useful_TFLOPS=41.087 estimated_MMA_Gs=5.1602
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.928320 conv_ms=0.927584 correction_ms=0.000736 min_MB=265.421 effective_GBs=285.915 useful_TFLOPS=41.172 estimated_MMA_Gs=5.1516
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.128512 conv_ms=1.843392 correction_ms=0.285120 min_MB=153.446 effective_GBs=72.091 useful_TFLOPS=6.430 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn baseline 5 6.214848
+FRAME artcnn_c4f32_dn baseline sample=6
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631264 conv_ms=0.594784 correction_ms=0.036480 min_MB=141.005 effective_GBs=223.369 useful_TFLOPS=5.256 estimated_MMA_Gs=0.9025
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.931328 conv_ms=0.930752 correction_ms=0.000576 min_MB=265.421 effective_GBs=284.992 useful_TFLOPS=41.039 estimated_MMA_Gs=5.1718
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.929664 conv_ms=0.928928 correction_ms=0.000736 min_MB=265.421 effective_GBs=285.502 useful_TFLOPS=41.112 estimated_MMA_Gs=5.1630
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.928576 conv_ms=0.927744 correction_ms=0.000832 min_MB=265.421 effective_GBs=285.836 useful_TFLOPS=41.160 estimated_MMA_Gs=5.1507
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.340704 conv_ms=2.054592 correction_ms=0.286112 min_MB=153.446 effective_GBs=65.556 useful_TFLOPS=5.847 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn baseline 6 6.5520320000000005
+FRAME artcnn_c4f32_dn half sample=0
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.629632 conv_ms=0.593760 correction_ms=0.035872 min_MB=141.005 effective_GBs=223.948 useful_TFLOPS=5.269 estimated_MMA_Gs=0.9041
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.933024 conv_ms=0.932416 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.474 useful_TFLOPS=40.964 estimated_MMA_Gs=5.1625
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.931072 conv_ms=0.930336 correction_ms=0.000736 min_MB=265.421 effective_GBs=285.070 useful_TFLOPS=41.050 estimated_MMA_Gs=5.1552
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.927200 conv_ms=0.926400 correction_ms=0.000800 min_MB=265.421 effective_GBs=286.261 useful_TFLOPS=41.222 estimated_MMA_Gs=5.1581
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.848160 conv_ms=1.563488 correction_ms=0.284672 min_MB=153.446 effective_GBs=83.027 useful_TFLOPS=7.405 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half 0 7.25072
+FRAME artcnn_c4f32_dn half sample=1
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630144 conv_ms=0.594848 correction_ms=0.035296 min_MB=141.005 effective_GBs=223.766 useful_TFLOPS=5.265 estimated_MMA_Gs=0.9024
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.928512 conv_ms=0.927904 correction_ms=0.000608 min_MB=265.421 effective_GBs=285.856 useful_TFLOPS=41.163 estimated_MMA_Gs=5.1876
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.928960 conv_ms=0.928128 correction_ms=0.000832 min_MB=265.421 effective_GBs=285.718 useful_TFLOPS=41.143 estimated_MMA_Gs=5.1675
+LAYER artcnn_c4f32_dn 3 fp16 ms=1.260992 conv_ms=1.260224 correction_ms=0.000768 min_MB=265.421 effective_GBs=210.486 useful_TFLOPS=30.310 estimated_MMA_Gs=3.7918
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.848512 conv_ms=1.564448 correction_ms=0.284064 min_MB=153.446 effective_GBs=83.011 useful_TFLOPS=7.404 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half 1 6.2624
+FRAME artcnn_c4f32_dn half sample=2
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631040 conv_ms=0.594880 correction_ms=0.036160 min_MB=141.005 effective_GBs=223.448 useful_TFLOPS=5.258 estimated_MMA_Gs=0.9024
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.930752 conv_ms=0.930144 correction_ms=0.000608 min_MB=265.421 effective_GBs=285.168 useful_TFLOPS=41.064 estimated_MMA_Gs=5.1751
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.928096 conv_ms=0.927360 correction_ms=0.000736 min_MB=265.421 effective_GBs=285.984 useful_TFLOPS=41.182 estimated_MMA_Gs=5.1717
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.927520 conv_ms=0.926720 correction_ms=0.000800 min_MB=265.421 effective_GBs=286.162 useful_TFLOPS=41.207 estimated_MMA_Gs=5.1564
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.845440 conv_ms=1.560352 correction_ms=0.285088 min_MB=153.446 effective_GBs=83.149 useful_TFLOPS=7.416 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half 2 5.958912000000001
+FRAME artcnn_c4f32_dn half sample=3
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630272 conv_ms=0.594912 correction_ms=0.035360 min_MB=141.005 effective_GBs=223.721 useful_TFLOPS=5.264 estimated_MMA_Gs=0.9023
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.931456 conv_ms=0.930848 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.953 useful_TFLOPS=41.033 estimated_MMA_Gs=5.1712
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.928928 conv_ms=0.928160 correction_ms=0.000768 min_MB=265.421 effective_GBs=285.728 useful_TFLOPS=41.145 estimated_MMA_Gs=5.1673
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.927424 conv_ms=0.926624 correction_ms=0.000800 min_MB=265.421 effective_GBs=286.191 useful_TFLOPS=41.212 estimated_MMA_Gs=5.1569
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.848544 conv_ms=1.562848 correction_ms=0.285696 min_MB=153.446 effective_GBs=83.009 useful_TFLOPS=7.404 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half 3 5.957504
+FRAME artcnn_c4f32_dn half sample=4
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.632480 conv_ms=0.596288 correction_ms=0.036192 min_MB=141.005 effective_GBs=222.940 useful_TFLOPS=5.246 estimated_MMA_Gs=0.9002
+LAYER artcnn_c4f32_dn 1 fp16 ms=1.193760 conv_ms=1.192960 correction_ms=0.000800 min_MB=265.421 effective_GBs=222.340 useful_TFLOPS=32.017 estimated_MMA_Gs=4.0350
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.932864 conv_ms=0.932096 correction_ms=0.000768 min_MB=265.421 effective_GBs=284.523 useful_TFLOPS=40.971 estimated_MMA_Gs=5.1455
+LAYER artcnn_c4f32_dn 3 fp16 ms=1.217376 conv_ms=1.216640 correction_ms=0.000736 min_MB=265.421 effective_GBs=218.027 useful_TFLOPS=31.396 estimated_MMA_Gs=3.9276
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.851552 conv_ms=1.566144 correction_ms=0.285408 min_MB=153.446 effective_GBs=82.874 useful_TFLOPS=7.392 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half 4 6.5093440000000005
+FRAME artcnn_c4f32_dn half sample=5
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.633088 conv_ms=0.597248 correction_ms=0.035840 min_MB=141.005 effective_GBs=222.725 useful_TFLOPS=5.241 estimated_MMA_Gs=0.8988
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.934240 conv_ms=0.933632 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.103 useful_TFLOPS=40.911 estimated_MMA_Gs=5.1558
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.932704 conv_ms=0.931936 correction_ms=0.000768 min_MB=265.421 effective_GBs=284.571 useful_TFLOPS=40.978 estimated_MMA_Gs=5.1463
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.928032 conv_ms=0.927264 correction_ms=0.000768 min_MB=265.421 effective_GBs=286.004 useful_TFLOPS=41.185 estimated_MMA_Gs=5.1533
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.851392 conv_ms=1.566720 correction_ms=0.284672 min_MB=153.446 effective_GBs=82.882 useful_TFLOPS=7.392 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half 5 5.93968
+FRAME artcnn_c4f32_dn half sample=6
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.633632 conv_ms=0.597888 correction_ms=0.035744 min_MB=141.005 effective_GBs=222.534 useful_TFLOPS=5.236 estimated_MMA_Gs=0.8978
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.932032 conv_ms=0.931488 correction_ms=0.000544 min_MB=265.421 effective_GBs=284.776 useful_TFLOPS=41.008 estimated_MMA_Gs=5.1677
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.932032 conv_ms=0.931296 correction_ms=0.000736 min_MB=265.421 effective_GBs=284.776 useful_TFLOPS=41.008 estimated_MMA_Gs=5.1499
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.930432 conv_ms=0.929600 correction_ms=0.000832 min_MB=265.421 effective_GBs=285.266 useful_TFLOPS=41.078 estimated_MMA_Gs=5.1404
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.137440 conv_ms=1.851232 correction_ms=0.286208 min_MB=153.446 effective_GBs=71.790 useful_TFLOPS=6.403 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half 6 6.229248
+FRAME artcnn_c4f32_dn half_shared sample=0
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630272 conv_ms=0.594464 correction_ms=0.035808 min_MB=141.005 effective_GBs=223.721 useful_TFLOPS=5.264 estimated_MMA_Gs=0.9030
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.933792 conv_ms=0.933184 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.240 useful_TFLOPS=40.931 estimated_MMA_Gs=5.1583
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.932832 conv_ms=0.932064 correction_ms=0.000768 min_MB=265.421 effective_GBs=284.532 useful_TFLOPS=40.973 estimated_MMA_Gs=5.1456
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.927104 conv_ms=0.926304 correction_ms=0.000800 min_MB=265.421 effective_GBs=286.290 useful_TFLOPS=41.226 estimated_MMA_Gs=5.1587
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.607840 conv_ms=1.320736 correction_ms=0.287104 min_MB=153.446 effective_GBs=95.436 useful_TFLOPS=8.512 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half_shared 0 7.05808
+FRAME artcnn_c4f32_dn half_shared sample=1
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630368 conv_ms=0.594720 correction_ms=0.035648 min_MB=141.005 effective_GBs=223.686 useful_TFLOPS=5.263 estimated_MMA_Gs=0.9026
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.930208 conv_ms=0.929600 correction_ms=0.000608 min_MB=265.421 effective_GBs=285.335 useful_TFLOPS=41.088 estimated_MMA_Gs=5.1782
+LAYER artcnn_c4f32_dn 2 fp16 ms=1.180736 conv_ms=1.179936 correction_ms=0.000800 min_MB=265.421 effective_GBs=224.793 useful_TFLOPS=32.370 estimated_MMA_Gs=4.0647
+LAYER artcnn_c4f32_dn 3 fp16 ms=1.211264 conv_ms=1.210528 correction_ms=0.000736 min_MB=265.421 effective_GBs=219.127 useful_TFLOPS=31.554 estimated_MMA_Gs=3.9474
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.605120 conv_ms=1.321280 correction_ms=0.283840 min_MB=153.446 effective_GBs=95.598 useful_TFLOPS=8.526 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half_shared 1 6.2248
+FRAME artcnn_c4f32_dn half_shared sample=2
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.629984 conv_ms=0.594656 correction_ms=0.035328 min_MB=141.005 effective_GBs=223.823 useful_TFLOPS=5.266 estimated_MMA_Gs=0.9027
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.930336 conv_ms=0.929728 correction_ms=0.000608 min_MB=265.421 effective_GBs=285.296 useful_TFLOPS=41.083 estimated_MMA_Gs=5.1775
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.929600 conv_ms=0.928800 correction_ms=0.000800 min_MB=265.421 effective_GBs=285.522 useful_TFLOPS=41.115 estimated_MMA_Gs=5.1637
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.926016 conv_ms=0.925248 correction_ms=0.000768 min_MB=265.421 effective_GBs=286.627 useful_TFLOPS=41.274 estimated_MMA_Gs=5.1646
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.605472 conv_ms=1.320896 correction_ms=0.284576 min_MB=153.446 effective_GBs=95.577 useful_TFLOPS=8.524 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half_shared 2 5.7168
+FRAME artcnn_c4f32_dn half_shared sample=3
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630080 conv_ms=0.594336 correction_ms=0.035744 min_MB=141.005 effective_GBs=223.789 useful_TFLOPS=5.266 estimated_MMA_Gs=0.9032
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.930304 conv_ms=0.929728 correction_ms=0.000576 min_MB=265.421 effective_GBs=285.305 useful_TFLOPS=41.084 estimated_MMA_Gs=5.1775
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.926784 conv_ms=0.926016 correction_ms=0.000768 min_MB=265.421 effective_GBs=286.389 useful_TFLOPS=41.240 estimated_MMA_Gs=5.1792
+LAYER artcnn_c4f32_dn 3 fp16 ms=1.269536 conv_ms=1.268768 correction_ms=0.000768 min_MB=265.421 effective_GBs=209.069 useful_TFLOPS=30.106 estimated_MMA_Gs=3.7662
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.605792 conv_ms=1.319584 correction_ms=0.286208 min_MB=153.446 effective_GBs=95.558 useful_TFLOPS=8.523 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half_shared 3 6.022784
+FRAME artcnn_c4f32_dn half_shared sample=4
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630112 conv_ms=0.594304 correction_ms=0.035808 min_MB=141.005 effective_GBs=223.777 useful_TFLOPS=5.265 estimated_MMA_Gs=0.9032
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.930240 conv_ms=0.929632 correction_ms=0.000608 min_MB=265.421 effective_GBs=285.325 useful_TFLOPS=41.087 estimated_MMA_Gs=5.1780
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.927200 conv_ms=0.926368 correction_ms=0.000832 min_MB=265.421 effective_GBs=286.261 useful_TFLOPS=41.222 estimated_MMA_Gs=5.1773
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.928672 conv_ms=0.927936 correction_ms=0.000736 min_MB=265.421 effective_GBs=285.807 useful_TFLOPS=41.156 estimated_MMA_Gs=5.1496
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.607904 conv_ms=1.319744 correction_ms=0.288160 min_MB=153.446 effective_GBs=95.433 useful_TFLOPS=8.512 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half_shared 4 5.699104
+FRAME artcnn_c4f32_dn half_shared sample=5
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631072 conv_ms=0.595424 correction_ms=0.035648 min_MB=141.005 effective_GBs=223.437 useful_TFLOPS=5.257 estimated_MMA_Gs=0.9015
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.931168 conv_ms=0.930592 correction_ms=0.000576 min_MB=265.421 effective_GBs=285.041 useful_TFLOPS=41.046 estimated_MMA_Gs=5.1727
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.929536 conv_ms=0.928736 correction_ms=0.000800 min_MB=265.421 effective_GBs=285.541 useful_TFLOPS=41.118 estimated_MMA_Gs=5.1641
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.929280 conv_ms=0.928544 correction_ms=0.000736 min_MB=265.421 effective_GBs=285.620 useful_TFLOPS=41.129 estimated_MMA_Gs=5.1462
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.613184 conv_ms=1.326784 correction_ms=0.286400 min_MB=153.446 effective_GBs=95.120 useful_TFLOPS=8.484 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half_shared 5 5.68912
+FRAME artcnn_c4f32_dn half_shared sample=6
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631456 conv_ms=0.595968 correction_ms=0.035488 min_MB=141.005 effective_GBs=223.301 useful_TFLOPS=5.254 estimated_MMA_Gs=0.9007
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.932160 conv_ms=0.931616 correction_ms=0.000544 min_MB=265.421 effective_GBs=284.737 useful_TFLOPS=41.002 estimated_MMA_Gs=5.1670
+LAYER artcnn_c4f32_dn 2 fp16 ms=1.270048 conv_ms=1.269248 correction_ms=0.000800 min_MB=265.421 effective_GBs=208.985 useful_TFLOPS=30.094 estimated_MMA_Gs=3.7787
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.927840 conv_ms=0.927040 correction_ms=0.000800 min_MB=265.421 effective_GBs=286.063 useful_TFLOPS=41.193 estimated_MMA_Gs=5.1546
+LAYER artcnn_c4f32_dn 4 fp16 ms=1.611136 conv_ms=1.324448 correction_ms=0.286688 min_MB=153.446 effective_GBs=95.241 useful_TFLOPS=8.494 estimated_MMA_Gs=0.0000
+PROFILE_RESULT artcnn_c4f32_dn half_shared 6 6.031263999999999

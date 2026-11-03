@@ -5,6 +5,10 @@ if(NOT EXISTS "${FLUTTER_ENGINE_DIR}/flutter_texture_registrar.h")
   message(FATAL_ERROR "Set FLUTTER_ENGINE_DIR to Flutter's cached Windows engine directory")
 endif()
 enable_testing()
+add_executable(presenter_worker_test presenter_worker_test.cpp)
+target_compile_features(presenter_worker_test PRIVATE cxx_std_17)
+add_test(NAME presenter_worker COMMAND presenter_worker_test)
+set_tests_properties(presenter_worker PROPERTIES TIMEOUT 30)
 add_executable(texture_publication_test texture_publication_test.cpp)
 target_compile_features(texture_publication_test PRIVATE cxx_std_17)
 target_compile_definitions(texture_publication_test PRIVATE NOMINMAX)
@@ -31,7 +35,7 @@ target_include_directories(plugin_build_check PRIVATE
   "${FLUTTER_ENGINE_DIR}/cpp_client_wrapper/include")
 target_link_libraries(plugin_build_check PRIVATE
   "${FLUTTER_ENGINE_DIR}/flutter_windows.dll.lib"
-  runtimeobject windowsapp CoreMessaging d3d11 dxgi shcore shlwapi)
+  runtimeobject windowsapp CoreMessaging d3d11 dxgi shcore shlwapi windowscodecs ole32)
 
 if(ERIKA_COMPAT_DLL OR ERIKA_SOURCE_DLL)
   add_executable(player_lifecycle_test player_lifecycle_test.cpp
@@ -49,7 +53,7 @@ if(ERIKA_COMPAT_DLL OR ERIKA_SOURCE_DLL)
     "${FLUTTER_ENGINE_DIR}/cpp_client_wrapper/include")
   target_link_libraries(player_lifecycle_test PRIVATE
     "${FLUTTER_ENGINE_DIR}/flutter_windows.dll.lib"
-    runtimeobject windowsapp CoreMessaging d3d11 dxgi shcore shlwapi)
+    runtimeobject windowsapp CoreMessaging d3d11 dxgi shcore shlwapi windowscodecs ole32)
   add_custom_command(TARGET player_lifecycle_test POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${FLUTTER_ENGINE_DIR}/flutter_windows.dll" "$<TARGET_FILE_DIR:player_lifecycle_test>")
   if(ERIKA_COMPAT_DLL)
@@ -60,5 +64,6 @@ if(ERIKA_COMPAT_DLL OR ERIKA_SOURCE_DLL)
   endif()
   if(ERIKA_SOURCE_DLL)
     add_test(NAME source_texture_lifecycle COMMAND player_lifecycle_test "${ERIKA_SOURCE_DLL}")
+    set_tests_properties(source_texture_lifecycle PROPERTIES TIMEOUT 45)
   endif()
 endif()

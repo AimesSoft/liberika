@@ -3,7 +3,8 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('Windows texture APIs are optional for native runtime compatibility', () {
+  test('Windows texture APIs are optional for native runtime compatibility',
+      () {
     final plugin = File('windows/erika_flutter_plugin.cpp').readAsStringSync();
     expect(plugin, contains('LoadOptional<AttachFlutterTextureFn>'));
     expect(plugin, contains('LoadOptional<GetWindowsFlutterTextureFn>'));
@@ -20,7 +21,7 @@ void main() {
     }
   });
 
-  test('macOS renders on CVDisplayLink without a per-frame GCD hop', () {
+  test('macOS renders on the presenter owner, woken by CVDisplayLink', () {
     final plugin = File(
       'macos/Classes/ErikaFlutterPlugin.swift',
     ).readAsStringSync();
@@ -28,17 +29,17 @@ void main() {
     final driverStart = plugin.indexOf(
       'private final class ErikaDisplayLinkDriver',
     );
-    final firstStruct = plugin.indexOf(
-      'private struct ErikaVideoParamsC',
-      driverStart,
-    );
+    final driverEnd = plugin.indexOf('\n}\n', driverStart);
     expect(driverStart, greaterThanOrEqualTo(0));
-    expect(firstStruct, greaterThan(driverStart));
-    final driver = plugin.substring(driverStart, firstStruct);
+    expect(driverEnd, greaterThan(driverStart));
+    final driver = plugin.substring(driverStart, driverEnd);
     expect(driver, contains('CVDisplayLinkSetOutputCallback'));
     expect(driver, contains('onTick()'));
-    expect(driver, isNot(contains('renderQueue.async')));
-    expect(driver, isNot(contains('DispatchQueue.main.async')));
+    expect(driver, isNot(contains('DispatchQueue')));
+
+    // The display link only wakes the presenter's owner; ticks coalesce there.
+    expect(plugin, contains('self.scheduleRenderTick()'));
+    expect(plugin, contains('owner.requestFrame { [weak self] in'));
   });
 
   test('macOS event polling is coalescible and stops with the last player', () {
@@ -132,12 +133,9 @@ void main() {
         '$platform/Classes/ErikaFlutterPlugin.swift',
       ).readAsStringSync();
 
-      expect(plugin, contains('private let renderQueue: DispatchQueue'));
-      expect(
-        plugin,
-        contains('private let nativeCallLock = NSRecursiveLock()'),
-      );
-      expect(plugin, contains('renderQueue.async'));
+      expect(plugin, contains('let owner: ErikaPresenterOwner'));
+      expect(plugin, contains('owner.requestFrame { [weak self] in'));
+      expect(plugin, isNot(contains('nativeCallLock')));
       expect(plugin, contains('self?.$schedulerCall'));
       expect(plugin, contains('mainThread=\\(Thread.isMainThread)'));
       expect(plugin, contains('Timer(timeInterval: 0.05'));

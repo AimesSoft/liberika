@@ -664,7 +664,7 @@ fn erika_video_fragment(in: VertexOut) -> @location(0) vec4<f32> {
     let p010_bytes = (uniforms.input_mode & 512u) != 0u;
     let y_texel = textureSample(luma_texture, video_sampler, color_coord);
     var y_sample = y_texel.r;
-    if (uniforms.is_p010 != 0u) {
+    if (uniforms.is_p010 != 0u && input_mode == 0u) {
         y_sample = sample_p010(luma_texture, color_coord, p010_bytes).x;
     }
     if (input_mode == 2u) {
@@ -677,7 +677,7 @@ fn erika_video_fragment(in: VertexOut) -> @location(0) vec4<f32> {
     }
     var rgb: vec3<f32>;
     let dovi_enabled = uniforms.dovi_flags.x != 0.0;
-    let dovi_ycbcr_input = dovi_enabled && (input_mode == 0u || input_mode == 2u);
+    let dovi_ycbcr_input = dovi_enabled && (input_mode == 0u || input_mode == 2u || input_mode == 4u);
     if (dovi_ycbcr_input) {
         // The base layer carries the raw 12-bit DV signal (10-bit container,
         // full range); range expansion and the YCbCr matrix are replaced by
@@ -689,10 +689,13 @@ fn erika_video_fragment(in: VertexOut) -> @location(0) vec4<f32> {
         rgb = dovi_signal_to_pq_rgb(sig);
     } else if (input_mode == 1u) {
         rgb = textureSample(luma_texture, video_sampler, color_coord).rgb;
-    } else if (input_mode == 3u) {
+    } else if (input_mode == 3u || input_mode == 5u) {
         let original_rgb = textureSample(chroma_texture, video_sampler, color_coord).rgb;
         let original_luma = dot(uniforms.luma_coefficients.xyz, original_rgb);
-        let enhanced_luma = sample_packed_luma(color_coord);
+        var enhanced_luma = y_texel.r;
+        if (input_mode == 3u) {
+            enhanced_luma = sample_packed_luma(color_coord);
+        }
         rgb = original_rgb + vec3<f32>(enhanced_luma - original_luma);
     } else {
         let expanded = expand_ycbcr_range(y_sample, cbcr_sample);
