@@ -4235,7 +4235,14 @@ mod tests {
             )
             .expect("create WARP device");
         }
-        let mut renderer = D3d11Renderer::new().unwrap();
+        // These tests check rendered pixels and device recovery, not real-time
+        // latency. Software rendering on a busy CI runner can exceed the
+        // production 100 ms handoff budget, especially on the first frame.
+        let mut renderer = D3d11Renderer::with_config(MetalRendererConfig {
+            compositor_handoff_timeout: Duration::from_secs(10),
+            ..MetalRendererConfig::default()
+        })
+        .unwrap();
         renderer
             .set_device(device.unwrap(), context.unwrap())
             .unwrap();

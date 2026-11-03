@@ -795,6 +795,11 @@ fn requested_device_limits(adapter_limits: wgpu::Limits, backend: wgpu::Backend)
             .min(28 * 1024);
     }
     if backend == wgpu::Backend::Gl {
+        // GLES emulators may report a nonzero dispatch limit below the portable
+        // baseline. Retain compute support without rejecting device creation.
+        limits.max_compute_workgroups_per_dimension = limits
+            .max_compute_workgroups_per_dimension
+            .min(adapter_limits.max_compute_workgroups_per_dimension);
         // Some phone emulators expose fewer varyings than the WebGL2 baseline.
         // Our presentation shaders use only a few; asking for all 15 prevents
         // device creation even when these shaders fit the adapter.
@@ -6418,6 +6423,20 @@ mod tests {
         assert_eq!(requested.max_texture_dimension_2d, 16_384);
         assert_eq!(requested.max_uniform_buffer_binding_size, 16 * 1024);
         assert!(std::mem::size_of::<VideoUniforms>() <= 16 * 1024);
+    }
+
+    #[test]
+    fn requested_limits_accept_reduced_gles_compute_dispatch_count() {
+        let adapter_limits = wgpu::Limits {
+            max_compute_workgroups_per_dimension: 33_778,
+            ..wgpu::Limits::downlevel_defaults()
+        };
+
+        let requested = requested_device_limits(adapter_limits.clone(), wgpu::Backend::Gl);
+
+        assert_eq!(requested.max_compute_workgroups_per_dimension, 33_778);
+        assert!(requested.max_compute_invocations_per_workgroup > 0);
+        assert!(requested.check_limits(&adapter_limits));
     }
 
     #[test]
