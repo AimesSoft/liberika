@@ -120,16 +120,19 @@ class ApiAlignmentTests(unittest.TestCase):
             ("packages/erika_ohos/src/main/cpp/erika_ohos.cpp",
              "packages/erika_ohos/src/main/cpp/include"),
         ]:
-            with self.subTest(path=bridge), tempfile.TemporaryDirectory() as temp:
-                module = Path(temp) / "bridge.node"
-                command = [os.environ["CXX"], "-std=c++17", "-pthread", "-fno-exceptions", "-fPIC",
-                           "-shared", "-I", str(headers), "-I", str(tests / "host_include"),
-                           "-I", str(ROOT / include), str(ROOT / bridge),
-                           str(tests / "presenter_stub.cpp"), "-o", str(module)]
-                if sys.platform == "darwin":
-                    command[1:1] = ["-undefined", "dynamic_lookup"]
-                subprocess.run(command, check=True)
-                subprocess.run([node, str(tests / "bridge_test.cjs"), str(module)], check=True)
+            for legacy in (False, True):
+                with self.subTest(path=bridge, legacy=legacy), tempfile.TemporaryDirectory() as temp:
+                    module = Path(temp) / "bridge.node"
+                    command = [os.environ["CXX"], "-std=c++17", "-pthread", "-fno-exceptions", "-fPIC",
+                               "-shared", "-I", str(headers), "-I", str(tests / "host_include"),
+                               "-I", str(ROOT / include), str(ROOT / bridge),
+                               str(tests / "presenter_stub.cpp"), "-o", str(module)]
+                    if sys.platform == "darwin":
+                        command[1:1] = ["-undefined", "dynamic_lookup"]
+                    if legacy:
+                        command.insert(1, "-DERIKA_TEST_LEGACY_RUNTIME")
+                    subprocess.run(command, check=True)
+                    subprocess.run([node, str(tests / "bridge_test.cjs"), str(module), "legacy" if legacy else "current"], check=True)
 
 if __name__ == "__main__":
     unittest.main()

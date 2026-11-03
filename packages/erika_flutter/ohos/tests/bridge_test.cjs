@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const { Worker } = require('node:worker_threads');
 const native = require(process.argv[2]);
+const legacyRuntime = process.argv[3] === 'legacy';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const keepAlive = setInterval(() => {}, 1000);
 (async () => {
@@ -25,7 +26,11 @@ const keepAlive = setInterval(() => {}, 1000);
   assert.equal(await native.nativeAttachSurfaceAsync(id, 12n, 4, 4, 1), 0);
   assert.equal(await native.nativeResizeSurfaceAsync(id, 8, 8, 1), 0);
   assert.equal(JSON.parse(await native.nativeInvokeAsync(id, 'open', '{}')).value, 17);
-  assert.equal(native.nativeLoadUpscalerModel(second, 'test', new Uint8Array([1, 2, 3])), 0);
+  const modelStatus = legacyRuntime ? 3 : 0;
+  assert.equal(native.nativeLoadUpscalerModel(second, 'test', new Uint8Array([1, 2, 3])), modelStatus);
+  if (legacyRuntime) assert.match(native.nativeLastError(), /update the native library/);
+  assert.equal(await native.nativeLoadUpscalerModelAsync(id, 'test', new Uint8Array([1, 2, 3])), modelStatus);
+  if (legacyRuntime) assert.match(native.nativeLastError(), /update the native library/);
   assert.deepEqual(native.nativeRegisterSubtitleMemoryFont(second, new Uint8Array([1, 2, 3])), [0, 42]);
   // Block the owner first: the bridge must copy input bytes before returning.
   const slow = native.nativeInvokeAsync(id, 'slow', '{}');
