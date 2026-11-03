@@ -48,25 +48,30 @@ void main() {
         '$platform/Classes/ErikaFlutterPlugin.swift',
       ).readAsStringSync();
 
-      // iOS does not wait for the player's lock on the main thread while a
-      // long call on another queue holds it: it returns the last stats.
+      // Stats are read on the presenter's owner, where the render tick
+      // stores them, so no lock or main-thread wait is involved.
       expect(
         plugin,
         contains(
-          platform == 'ios'
-              ? 'func presenterStats() -> [String: Any] {\n'
-                  '    // The last stats the render tick stored; while another queue is inside a\n'
-                  '    // long call the previous copy is returned instead of waiting for it.\n'
-                  '    tryWithNativeCall { latestPresenterStats.toFlutterMap() }\n'
-                  '      ?? latestPresenterStats.toFlutterMap()'
-              : 'func presenterStats() -> [String: Any] {\n'
-                  '    nativeCallLock.lock()\n'
-                  '    defer { nativeCallLock.unlock() }\n'
-                  '    return latestPresenterStats.toFlutterMap()',
+          'func presenterStats() -> [String: Any] {\n'
+          '    owner.assertCurrent()\n'
+          '    return latestPresenterStats.toFlutterMap()',
         ),
       );
     });
   }
+
+  test('Apple platforms ship the same presenter owner', () {
+    final canonical =
+        File('macos/Classes/ErikaPresenterOwner.swift').readAsStringSync();
+    for (final platform in <String>['ios', 'tvos']) {
+      expect(
+        File('$platform/Classes/ErikaPresenterOwner.swift').readAsStringSync(),
+        canonical,
+        reason: platform,
+      );
+    }
+  });
 
   test('Metal limits contentsFormat switching to UIKit and tvOS', () {
     final rendererFile = File('../../crates/erika/src/renderer/metal/apple.rs');

@@ -22,11 +22,8 @@ private func erikaWindowOverlayTrace(_ message: @autoclosure () -> String) {
   NSLog("[ErikaWindowOverlay] %@", message())
 }
 
-/// Drives rendering from the display's vertical refresh instead of a main-run-loop
-/// `Timer`. `CVDisplayLink` already owns a dedicated high-priority callback
-/// thread, so render directly there instead of waking a second GCD worker for
-/// every frame. The callback stays coalesced while a render is in progress so a
-/// slow `CAMetalLayer.nextDrawable()` cannot build up callbacks and replay them.
+/// Display callbacks only forward coalesced frame requests to the presenter
+/// owner. Stopping the driver never waits for native rendering or main delivery.
 private final class ErikaDisplayLinkDriver {
   private let onTick: () -> Void
   private let stateLock = NSLock()
@@ -122,6 +119,25 @@ private final class ErikaFlutterTextureSurface: NSObject, FlutterTexture {
     let metalTexture: MTLTexture
     let width: UInt32
     let height: UInt32
+  }
+
+  var ownerLease: ErikaSurfaceLease? // main only
+  var publicationAllowed: (() -> Bool)?
+  private var notificationPending = false
+
+  func invalidateFrames() {
+    lock.lock()
+    generation &+= 1
+    readyPixelBuffer = nil
+    lock.unlock()
+  }
+
+  func retire() {
+    lock.lock()
+    generation &+= 1
+    textureId = 0
+    readyPixelBuffer = nil
+    lock.unlock()
   }
 
   private let registry: FlutterTextureRegistry
@@ -230,15 +246,21 @@ private final class ErikaFlutterTextureSurface: NSObject, FlutterTexture {
 
   func publish(_ frame: PreparedFrame) {
     lock.lock()
-    guard frame.generation == generation else {
-      lock.unlock()
-      return
-    }
+    guard frame.generation == generation else { lock.unlock(); return }
     readyPixelBuffer = frame.pixelBuffer
-    let id = textureId
+    guard !notificationPending else { lock.unlock(); return }
+    notificationPending = true
     lock.unlock()
-    if id != 0 {
-      registry.textureFrameAvailable(id)
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.lock.lock()
+      self.notificationPending = false
+      let id = self.textureId
+      let current = self.readyPixelBuffer != nil
+      self.lock.unlock()
+      if id != 0 && current && self.publicationAllowed?() == true {
+        self.registry.textureFrameAvailable(id)
+      }
     }
   }
 
@@ -660,6 +682,7 @@ private final class ErikaNativeLibrary {
   typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
   typealias SetVolumeFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
   typealias SetUpscalerFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32
+  typealias LoadUpscalerModelFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<UInt8>?, UInt) -> Int32
   typealias SetSubtitleScaleFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
   typealias SetSubtitleFontFn = @convention(c) (
     UnsafeMutableRawPointer?,
@@ -778,6 +801,8 @@ private final class ErikaNativeLibrary {
   let setPlaybackRate: SetPlaybackRateFn?
   let setVolume: SetVolumeFn?
   let setUpscaler: SetUpscalerFn?
+  let loadUpscalerModel: LoadUpscalerModelFn?
+  let clearUpscalerModel: CommandFn?
   let setSubtitleScale: SetSubtitleScaleFn?
   let setSubtitleFont: SetSubtitleFontFn?
   let setSubtitleStyle: SetSubtitleStyleFn?
@@ -861,6 +886,8 @@ private final class ErikaNativeLibrary {
     setPlaybackRate = Self.loadOptional("erika_presenter_set_playback_rate", from: libraryHandle, as: SetPlaybackRateFn.self)
     setVolume = Self.loadOptional("erika_presenter_set_volume", from: libraryHandle, as: SetVolumeFn.self)
     setUpscaler = Self.loadOptional("erika_presenter_set_upscaler", from: libraryHandle, as: SetUpscalerFn.self)
+    loadUpscalerModel = Self.loadOptional("erika_presenter_load_upscaler_model", from: libraryHandle, as: LoadUpscalerModelFn.self)
+    clearUpscalerModel = Self.loadOptional("erika_presenter_clear_upscaler_model", from: libraryHandle, as: CommandFn.self)
     setSubtitleScale = Self.loadOptional("erika_presenter_set_subtitle_scale", from: libraryHandle, as: SetSubtitleScaleFn.self)
     setSubtitleFont = Self.loadOptional("erika_presenter_set_subtitle_font", from: libraryHandle, as: SetSubtitleFontFn.self)
     setSubtitleStyle = Self.loadOptional("erika_presenter_set_subtitle_style", from: libraryHandle, as: SetSubtitleStyleFn.self)
@@ -1209,9 +1236,9 @@ private final class ErikaNativeLibrary {
   }
 
   /// Whether a JSON table method takes no presenter (scope `global`), read
-  /// once from the table itself so the plugin keeps no copy of it. Such a
-  /// method is called with a NULL handle and without the player's native
-  /// call lock: a long export must not hold up rendering.
+  /// once from the table itself so the plugin keeps no copy of it. Global
+  /// methods receive a NULL handle; invocation still stays on the caller's
+  /// presenter owner so command order is preserved.
   func isGlobalJsonMethod(_ method: String) -> Bool {
     globalJsonMethodsLock.lock()
     defer { globalJsonMethodsLock.unlock() }
@@ -1326,17 +1353,28 @@ private final class ErikaNativeLibrary {
   }
 }
 
+private enum ErikaSurfaceLeaseKey { static var value: UInt8 = 0 }
+
+private extension CAMetalLayer {
+  var erikaOwnerLease: ErikaSurfaceLease? {
+    get { objc_getAssociatedObject(self, &ErikaSurfaceLeaseKey.value) as? ErikaSurfaceLease }
+    set { objc_setAssociatedObject(self, &ErikaSurfaceLeaseKey.value, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+  }
+}
+
 private final class ErikaPlayerHost {
   let id: Int64
 
-  private let library: ErikaNativeLibrary
-  private let handle: UnsafeMutableRawPointer
-  private let renderQueue: DispatchQueue
-  /// Diagnostics and JSON pass-through calls run here, never on the main
-  /// thread: they can take as long as the work they ask for (a subtitle file
-  /// parsed, a frame export decoded).
-  let jsonQueue: DispatchQueue
-  private let nativeCallLock = NSRecursiveLock()
+  private var library: ErikaNativeLibrary! // owner only
+  private var creationError: Error?
+  private var handle: UnsafeMutableRawPointer!
+  let owner: ErikaPresenterOwner
+  private var closed = false
+  private var surfaceLease: ErikaSurfaceLease? // main only
+  private var nativeLease: ErikaSurfaceLease? // owner only
+  private var nativeLayer: CAMetalLayer?
+  private var surfaceError: Error?
+  private var nativeTexture: ErikaFlutterTextureSurface?
   private weak var attachedView: ErikaMetalSurfaceView?
   private weak var attachedTexture: ErikaFlutterTextureSurface?
   private var attachedViewId: Int64?
@@ -1346,18 +1384,18 @@ private final class ErikaPlayerHost {
   private var displayTimer: Timer?
   private var displayTimerFps: Double = 0.0
   private var loggedRenderThread = false
-  private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
-  private var currentDanmakuConfig = ErikaDanmakuConfigC()
+  @ErikaSnapshot private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
+  @ErikaSnapshot private var currentDanmakuConfig = ErikaDanmakuConfigC()
   private var latestPresenterStats = ErikaPresenterStatsC()
-  private(set) var nowPlayingTitle = ""
-  private(set) var nowPlayingArtist: String?
-  private(set) var nowPlayingAlbum: String?
+  @ErikaSnapshot private(set) var nowPlayingTitle = ""
+  @ErikaSnapshot private(set) var nowPlayingArtist: String?
+  @ErikaSnapshot private(set) var nowPlayingAlbum: String?
   private(set) var nowPlayingArtwork: MPMediaItemArtwork?
-  private(set) var durationSeconds: Double?
-  private(set) var positionSeconds = 0.0
-  private(set) var playbackRate = 1.0
-  private(set) var playbackState = 0
-  private var positionUpdateTime = ProcessInfo.processInfo.systemUptime
+  @ErikaSnapshot private(set) var durationSeconds: Double?
+  @ErikaSnapshot private(set) var positionSeconds = 0.0
+  @ErikaSnapshot private(set) var playbackRate = 1.0
+  @ErikaSnapshot private(set) var playbackState = 0
+  @ErikaSnapshot private var positionUpdateTime = ProcessInfo.processInfo.systemUptime
   var onNowPlayingChanged: ((ErikaPlayerHost) -> Void)?
 
   var isPlaying: Bool { playbackState == 3 }
@@ -1370,48 +1408,150 @@ private final class ErikaPlayerHost {
       max(0, ProcessInfo.processInfo.systemUptime - positionUpdateTime) * playbackRate
   }
 
-  init(id: Int64, library: ErikaNativeLibrary, config: ErikaPresenterConfigC) throws {
+  init(id: Int64, config: ErikaPresenterConfigC) throws {
     self.id = id
-    self.library = library
-    renderQueue = DispatchQueue(
-      label: "dev.aimesoft.erika.render.\(id)",
-      qos: .userInteractive
-    )
-    jsonQueue = DispatchQueue(
-      label: "dev.aimesoft.erika.json.\(id)",
-      qos: .userInitiated
-    )
-    guard let handle = library.createPresenter(config: config) else {
-      throw ErikaPluginError.presenterCreateFailed
+    owner = ErikaPresenterOwner(id: id)
+    owner.post("create") { [self] in
+      guard let library = ErikaNativeLibrary.shared else {
+        creationError = ErikaPluginError.libraryNotFound([
+        ProcessInfo.processInfo.environment["ERIKA_CAPI_DYLIB"] ?? "",
+        ErikaNativeLibrary.sourceTreeDebugLibraryPath() ?? "",
+        "liberika_capi.dylib",
+      ].filter { !$0.isEmpty })
+        return
+      }
+      self.library = library
+      handle = library.createPresenter(config: config)
+      if handle != nil { refreshDanmakuConfigSnapshot() }
     }
-    self.handle = handle
-    refreshDanmakuConfigSnapshot()
+
   }
 
-  deinit {
+  /// Main owns driver/UI bookkeeping; native state is released only after
+  /// all accepted commands have drained. No join or main.sync is necessary.
+  func shutdown(completion: (() -> Void)? = nil) {
+    precondition(Thread.isMainThread)
+    guard !closed else { completion?(); return }
+    closed = true
     stopDisplayDriver()
     stopObservingDisplayConfigurationChanges()
-    withNativeCall {
-      _ = library.detachSurface(handle)
-      library.destroy(handle)
+    attachedTexture?.attachedPlayer = nil
+    attachedView?.attachedPlayerId = nil
+    attachedView = nil
+    surfaceLease = nil
+    onNowPlayingChanged = nil
+    nowPlayingArtwork = nil
+    owner.finish { [self] in
+      if let handle {
+        _ = library.detachSurface(handle)
+        library.destroy(handle)
+        self.handle = nil
+      }
+      nativeLease?.complete()
+      nativeLease = nil
+      let layer = nativeLayer
+      nativeLayer = nil
+      let texture = nativeTexture
+      nativeTexture = nil
+      DispatchQueue.main.async {
+        withExtendedLifetime(layer) {}
+        withExtendedLifetime(texture) {}
+        completion?()
+      }
     }
+  }
+
+  func enqueue(label: String = "command", result: @escaping FlutterResult, work: @escaping () throws -> Any?) {
+    let accepted = owner.post(label) { [self] in
+      let outcome: Any?
+      do {
+        guard handle != nil else { throw creationError ?? ErikaPluginError.presenterCreateFailed }
+        outcome = try work()
+      } catch {
+        let unsupported: Bool
+        if let pluginError = error as? ErikaPluginError, case .diagnosticsUnsupported = pluginError { unsupported = true }
+        else { unsupported = false }
+        outcome = FlutterError(code: unsupported ? "ERIKA_UNSUPPORTED" : "ERIKA_ERROR", message: String(describing: error), details: nil)
+      }
+      DispatchQueue.main.async { result(outcome) }
+    }
+    if !accepted { result(FlutterError(code: "ERIKA_ERROR", message: "Presenter disposed", details: nil)) }
+  }
+
+  func enqueue(operations: [() throws -> Any?], result: @escaping FlutterResult, label: String) {
+    enqueue(label: label, result: result) {
+      var value: Any?
+      for operation in operations { value = try operation() }
+      return value
+    }
+  }
+
+  func created(result: @escaping FlutterResult) {
+    enqueue(result: result) { [self] in id }
   }
 
   private func withNativeCall<T>(_ operation: () throws -> T) rethrows -> T {
-    nativeCallLock.lock()
-    defer { nativeCallLock.unlock() }
+    owner.assertCurrent()
     return try operation()
   }
 
-  /// Like [withNativeCall], but gives up (nil) when a call on another queue
-  /// holds the lock, instead of making the calling thread wait for it. The
-  /// timers that run on the main thread use this: a long call (a big
-  /// subtitle file parsed) must not freeze the app's interface, and what
-  /// those timers do is repeated at the next tick anyway.
-  private func tryWithNativeCall<T>(_ operation: () throws -> T) rethrows -> T? {
-    guard nativeCallLock.try() else { return nil }
-    defer { nativeCallLock.unlock() }
-    return try operation()
+  private func notifyNowPlayingChanged() {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self] in self?.notifyNowPlayingChanged() }
+      return
+    }
+    guard !closed else { return }
+    onNowPlayingChanged?(self)
+  }
+
+  private func claimSurface(previous: ErikaSurfaceLease?) -> (lease: ErikaSurfaceLease, dependency: ErikaSurfaceLease?) {
+    precondition(Thread.isMainThread)
+    if let previous, let oldHost = previous.owner as? ErikaPlayerHost,
+       oldHost !== self, oldHost.surfaceLease === previous {
+      oldHost.detach(viewId: nil)
+    }
+    let dependency = previous?.owner === self ? nil : previous
+    let lease = ErikaSurfaceLease(owner: self)
+    surfaceLease = lease
+    return (lease, dependency)
+  }
+
+  func completeSurface(result: @escaping FlutterResult, value: Any? = nil) {
+    enqueue(result: result) { [self] in
+      if let error = surfaceError { surfaceError = nil; throw error }
+      return value
+    }
+  }
+
+  /// If detach fails, destroy before releasing a surface lease. Otherwise a
+  /// new owner could attach a layer still referenced by the failed presenter.
+  private func detachNativeSurface() {
+    owner.assertCurrent()
+    guard let handle else { return }
+    let status = library.detachSurface(handle)
+    if status != 0 {
+      surfaceError = ErikaPluginError.erikaStatus("detach_surface", status)
+      library.destroy(handle)
+      self.handle = nil
+    }
+  }
+
+  private func enqueueDetach() {
+    owner.cancelFrame()
+    owner.post { [self] in
+      guard handle != nil else { return }
+      detachNativeSurface()
+      nativeLease?.complete()
+      nativeLease = nil
+      let layer = nativeLayer
+      nativeLayer = nil
+      let texture = nativeTexture
+      nativeTexture = nil
+      DispatchQueue.main.async {
+        withExtendedLifetime(layer) {}
+        withExtendedLifetime(texture) {}
+      }
+    }
   }
 
   func open(
@@ -1479,40 +1619,80 @@ private final class ErikaPlayerHost {
         }
       }
     }
-    onNowPlayingChanged?(self)
+    notifyNowPlayingChanged()
   }
 
   func play() throws {
+    if !owner.isCurrent {
+      owner.post { [self] in
+        guard handle != nil else { return }
+        do { try play() } catch { NSLog("Erika: remote play failed: \(error)") }
+      }
+      return
+    }
+
     try withNativeCall {
       try check(library.play(handle), operation: "play")
     }
   }
 
   func pause() throws {
+    if !owner.isCurrent {
+      owner.post { [self] in
+        guard handle != nil else { return }
+        do { try pause() } catch { NSLog("Erika: remote pause failed: \(error)") }
+      }
+      return
+    }
+
     try withNativeCall {
       try check(library.pause(handle), operation: "pause")
     }
   }
 
   func stop() throws {
+    if !owner.isCurrent {
+      owner.post { [self] in
+        guard handle != nil else { return }
+        do { try stop() } catch { NSLog("Erika: remote stop failed: \(error)") }
+      }
+      return
+    }
+
     try withNativeCall {
       try check(library.stop(handle), operation: "stop")
     }
   }
 
   func close() throws {
+    if !owner.isCurrent {
+      owner.post { [self] in
+        guard handle != nil else { return }
+        do { try close() } catch { NSLog("Erika: remote close failed: \(error)") }
+      }
+      return
+    }
+
     try withNativeCall {
       try check(library.close(handle), operation: "close")
     }
   }
 
   func seek(positionMicros: UInt64) throws {
+    if !owner.isCurrent {
+      owner.post { [self] in
+        guard handle != nil else { return }
+        do { try seek(positionMicros: positionMicros) } catch { NSLog("Erika: remote seek failed: \(error)") }
+      }
+      return
+    }
+
     try withNativeCall {
       try check(library.seek(handle, positionMicros), operation: "seek")
     }
     positionSeconds = Double(positionMicros) / 1_000_000
     positionUpdateTime = ProcessInfo.processInfo.systemUptime
-    onNowPlayingChanged?(self)
+    notifyNowPlayingChanged()
   }
 
   func setPlaybackRate(_ rate: Double) throws {
@@ -1525,7 +1705,7 @@ private final class ErikaPlayerHost {
     positionSeconds = nowPlayingPositionSeconds
     positionUpdateTime = ProcessInfo.processInfo.systemUptime
     playbackRate = rate
-    onNowPlayingChanged?(self)
+    notifyNowPlayingChanged()
   }
 
   func setMediaMetadata(title: String, artist: String?, album: String?, artworkData: Data?) throws {
@@ -1542,7 +1722,7 @@ private final class ErikaPlayerHost {
     nowPlayingArtist = artist
     nowPlayingAlbum = album
     nowPlayingArtwork = artwork
-    onNowPlayingChanged?(self)
+    notifyNowPlayingChanged()
   }
 
   func clearMediaMetadata() {
@@ -1550,7 +1730,7 @@ private final class ErikaPlayerHost {
     nowPlayingArtist = nil
     nowPlayingAlbum = nil
     nowPlayingArtwork = nil
-    onNowPlayingChanged?(self)
+    notifyNowPlayingChanged()
   }
 
   func setVolume(_ volume: Double) throws {
@@ -1569,6 +1749,27 @@ private final class ErikaPlayerHost {
     }
     try withNativeCall {
       try check(setUpscaler(handle, mode), operation: "set_upscaler")
+    }
+  }
+
+  func loadUpscalerModel(name: String, data: Data) throws {
+    guard let load = library.loadUpscalerModel else {
+      throw ErikaPluginError.symbolMissing("erika_presenter_load_upscaler_model")
+    }
+    let status = withNativeCall {
+      name.withCString { namePointer in
+        data.withUnsafeBytes { load(handle, namePointer, $0.bindMemory(to: UInt8.self).baseAddress, UInt(data.count)) }
+      }
+    }
+    try check(status, operation: "load_upscaler_model")
+  }
+
+  func clearUpscalerModel() throws {
+    guard let clear = library.clearUpscalerModel else {
+      throw ErikaPluginError.symbolMissing("erika_presenter_clear_upscaler_model")
+    }
+    try withNativeCall {
+      try check(clear(handle), operation: "clear_upscaler_model")
     }
   }
 
@@ -1748,8 +1949,8 @@ private final class ErikaPlayerHost {
         }
       }
     }
-    // Methods that need no presenter run without the native call lock, so a
-    // long one does not hold up the calls rendering makes under it.
+    // Global methods use a NULL presenter, but still execute on this owner
+    // to preserve method-channel command order.
     let response = library.isGlobalJsonMethod(method)
       ? call(nil)
       : withNativeCall { call(handle) }
@@ -1777,10 +1978,8 @@ private final class ErikaPlayerHost {
   }
 
   func presenterStats() -> [String: Any] {
-    // The last stats the render tick stored; while another queue is inside a
-    // long call the previous copy is returned instead of waiting for it.
-    tryWithNativeCall { latestPresenterStats.toFlutterMap() }
-      ?? latestPresenterStats.toFlutterMap()
+    owner.assertCurrent()
+    return latestPresenterStats.toFlutterMap()
   }
 
   func addExternalSubtitle(uri: String) throws -> Int64 {
@@ -2070,7 +2269,7 @@ private final class ErikaPlayerHost {
   }
 
   func captureFrameRgba(width: Int, height: Int) -> Data? {
-    guard width > 0, height > 0, let captureFrameRgba = library.captureFrameRgba else {
+    guard width > 0, height > 0, width <= 16384, height <= 16384, let captureFrameRgba = library.captureFrameRgba else {
       return nil
     }
     let byteCount = width * height * 4
@@ -2093,11 +2292,15 @@ private final class ErikaPlayerHost {
     return data
   }
 
+  func snapshotView() -> ErikaMetalSurfaceView? {
+    precondition(Thread.isMainThread)
+    return attachedView
+  }
+
   func screenshot(view: ErikaMetalSurfaceView? = nil, width: Int? = nil, height: Int? = nil) -> Data? {
-    if let width, let height, let data = captureFrameRgba(width: width, height: height) {
-      return data
-    }
-    return (view ?? attachedView)?.pngSnapshotData()
+    owner.assertCurrent()
+    if let width, let height { return captureFrameRgba(width: width, height: height) }
+    return nil
   }
 
   func attach(view: ErikaMetalSurfaceView) throws {
@@ -2107,6 +2310,7 @@ private final class ErikaPlayerHost {
     let isReattach = attachedView != nil || attachedTexture != nil
     attachedTexture?.attachedPlayer = nil
     attachedTexture = nil
+    attachedView?.attachedPlayerId = nil
     attachedView = view
     attachedViewId = view.platformViewId
     view.attachedPlayerId = id
@@ -2116,11 +2320,13 @@ private final class ErikaPlayerHost {
       "drawable=\(view.metalLayer.drawableSize) reattach=\(isReattach)"
     )
     try attachOrResize(view: view, attach: true)
+    view.attachedPlayerId = id // a transfer detached the previous owner
     observeDisplayConfigurationChanges()
     startDisplayDriverIfNeeded(resetClock: !isReattach)
   }
 
   func attach(texture: ErikaFlutterTextureSurface) throws {
+    precondition(Thread.isMainThread)
     let isReattach = attachedView != nil || attachedTexture != nil
     attachedView?.attachedPlayerId = nil
     attachedView = nil
@@ -2129,18 +2335,37 @@ private final class ErikaPlayerHost {
     attachedViewId = texture.textureId
     texture.attachedPlayer = self
     let metrics = texture.metrics()
-    try withNativeCall {
-      try check(
-        library.attachFlutterTexture(
-          handle,
-          1, // ErikaFlutterTextureKind_MacOsTextureRegistrar
-          texture.textureId,
-          metrics.width,
-          metrics.height,
-          metrics.scale
-        ),
-        operation: "attach_flutter_texture"
-      )
+    let textureId = texture.textureId
+    let claim = claimSurface(previous: texture.ownerLease)
+    texture.ownerLease = claim.lease
+    texture.attachedPlayer = self
+    texture.invalidateFrames()
+    owner.post { [self, texture] in
+      claim.dependency?.wait()
+      guard handle != nil else { claim.lease.complete(); return }
+      let previousLease = nativeLease
+      let previousLayer = nativeLayer
+      let previousTexture = nativeTexture
+      defer {
+        DispatchQueue.main.async {
+          withExtendedLifetime(previousLayer) {}
+          withExtendedLifetime(previousTexture) {}
+        }
+      }
+      do {
+        surfaceError = nil
+        try check(library.attachFlutterTexture(handle, 1, textureId, metrics.width, metrics.height, metrics.scale), operation: "attach_flutter_texture")
+        nativeTexture = texture
+        nativeLease = claim.lease
+        previousLease?.complete()
+        nativeLayer = nil
+      } catch {
+        detachNativeSurface()
+        nativeLease?.complete()
+        nativeLease = nil
+        claim.lease.complete()
+        surfaceError = error
+      }
     }
     observeDisplayConfigurationChanges()
     startDisplayDriverIfNeeded(resetClock: !isReattach)
@@ -2153,13 +2378,12 @@ private final class ErikaPlayerHost {
     attachedView?.attachedPlayerId = nil
     attachedTexture?.attachedPlayer = nil
     attachedView = nil
+    surfaceLease = nil
     attachedTexture = nil
     attachedViewId = nil
     stopDisplayDriver()
     stopObservingDisplayConfigurationChanges()
-    withNativeCall {
-      _ = library.detachSurface(handle)
-    }
+    enqueueDetach()
   }
 
   func resizeFromAttachedView() {
@@ -2175,20 +2399,21 @@ private final class ErikaPlayerHost {
   }
 
   func resizeFromAttachedTexture() {
-    guard let texture = attachedTexture else {
-      return
-    }
+    guard let texture = attachedTexture else { return }
     let metrics = texture.metrics()
-    do {
-      try withNativeCall {
-        try check(
-          library.resizeSurface(handle, metrics.width, metrics.height, metrics.scale),
-          operation: "resize_flutter_texture"
-        )
-      }
-      startDisplayDriverIfNeeded(resetClock: false)
-    } catch {
-      NSLog("ErikaFlutterPlugin: texture resize failed: \(error)")
+    owner.post { [self] in
+      guard handle != nil else { return }
+      do {
+        try check(library.resizeSurface(handle, metrics.width, metrics.height, metrics.scale), operation: "resize_flutter_texture")
+      } catch { surfaceError = error }
+    }
+    startDisplayDriverIfNeeded(resetClock: false)
+  }
+
+  private func scheduleRenderTick() {
+    owner.requestFrame { [weak self] in
+      guard let self, self.handle != nil else { return }
+      self.renderTick()
     }
   }
 
@@ -2200,14 +2425,14 @@ private final class ErikaPlayerHost {
       )
     }
     let timeSeconds = CACurrentMediaTime() - startTimeSeconds
-    let textureSurface = attachedTexture
+    let textureSurface = nativeTexture
     let preparedFrame = textureSurface?.prepareFrame()
     if textureSurface != nil && preparedFrame == nil {
       return
     }
     let previousStats = latestPresenterStats
     var stats = ErikaPresenterStatsC()
-    let tickStatus = tryWithNativeCall { () -> Int32 in
+    let status = withNativeCall { () -> Int32 in
       if let preparedFrame {
         let rawTexture = UInt64(UInt(bitPattern: Unmanaged.passUnretained(
           preparedFrame.metalTexture as AnyObject
@@ -2230,11 +2455,6 @@ private final class ErikaPlayerHost {
       }
       return status
     }
-    // Nil: another queue is inside a long call on this player; this tick is
-    // skipped and the next one renders.
-    guard let status = tickStatus else {
-      return
-    }
     if status != 0 {
       NSLog("ErikaFlutterPlugin: render_tick failed with status \(status)")
     } else if let textureSurface, let preparedFrame {
@@ -2251,10 +2471,17 @@ private final class ErikaPlayerHost {
   }
 
   func pollEvents(sendEvent: (([String: Any]) -> Void)?) {
-    // Skipped while another queue is inside a long call on this player; the
-    // events wait in the engine and the next poll takes them.
-    _ = tryWithNativeCall {
-      while true {
+    if !owner.isCurrent {
+      owner.requestMaintenance { [weak self] in
+        guard let self, self.handle != nil else { return }
+        self.pollEvents(sendEvent: sendEvent)
+      }
+      return
+    }
+
+    // Coalesced maintenance requests execute on the native owner.
+    withNativeCall {
+      for _ in 0..<256 {
         var event = ErikaEventC()
         let status = withUnsafeMutablePointer(to: &event) { pointer in
           library.pollEvent(handle, UnsafeMutableRawPointer(pointer))
@@ -2279,12 +2506,16 @@ private final class ErikaPlayerHost {
             positionUpdateTime = ProcessInfo.processInfo.systemUptime
           }
           if event.kind == 1 || event.kind == 2 || event.kind == 3 {
-            onNowPlayingChanged?(self)
+            notifyNowPlayingChanged()
           }
           let message = event.kind == 9 || event.kind == 11 || event.kind == 12
             ? library.currentEventMessage()
             : nil
-          sendEvent?(event.toFlutterMap(playerId: id, host: self, structuredMessage: message))
+          let map = event.toFlutterMap(playerId: id, host: self, structuredMessage: message)
+          DispatchQueue.main.async { [weak self] in
+            guard let self, !self.closed else { return }
+            sendEvent?(map)
+          }
           continue
         }
         if status != 5 {
@@ -2296,46 +2527,69 @@ private final class ErikaPlayerHost {
   }
 
   private func attachOrResize(view: ErikaMetalSurfaceView, attach: Bool) throws {
+    precondition(Thread.isMainThread)
     view.updateDrawableSize()
-    let width = UInt32(max(1.0, view.metalLayer.drawableSize.width).rounded())
-    let height = UInt32(max(1.0, view.metalLayer.drawableSize.height).rounded())
+    let layer = view.metalLayer
+    let width = UInt32(max(1.0, layer.drawableSize.width).rounded())
+    let height = UInt32(max(1.0, layer.drawableSize.height).rounded())
     let scale = view.currentBackingScale
-    if attach {
-      let rawLayer = UInt64(UInt(bitPattern: Unmanaged.passUnretained(view.metalLayer).toOpaque()))
-      try withNativeCall {
-        try check(
-          library.attachMetalLayer(handle, rawLayer, width, height, scale),
-          operation: "attach_metal_layer"
-        )
+    let headroom = view.displayEdrHeadroom()
+    let claim = attach ? claimSurface(previous: layer.erikaOwnerLease) : nil
+    if let claim { layer.erikaOwnerLease = claim.lease }
+    owner.post { [self, layer] in
+      claim?.dependency?.wait()
+      guard handle != nil else { claim?.lease.complete(); return }
+      let previousLease = nativeLease
+      let previousLayer = nativeLayer
+      let previousTexture = nativeTexture
+      defer {
+        DispatchQueue.main.async {
+          withExtendedLifetime(previousLayer) {}
+          withExtendedLifetime(previousTexture) {}
+        }
       }
-      reportDisplayHeadroom()
-    } else {
-      try withNativeCall {
-        try check(
-          library.resizeSurface(handle, width, height, scale),
-          operation: "resize_surface"
-        )
-      }
-      // A backing change (another screen's scale) comes as a resize; the
-      // headroom may have moved with it.
-      reportDisplayHeadroom()
+      do {
+        if attach {
+          surfaceError = nil
+          let rawLayer = UInt64(UInt(bitPattern: Unmanaged.passUnretained(layer).toOpaque()))
+          try check(library.attachMetalLayer(handle, rawLayer, width, height, scale), operation: "attach_metal_layer")
+          nativeLayer = layer
+          nativeLease = claim?.lease
+          previousLease?.complete()
+          nativeTexture = nil
+          if let setHeadroom = library.setOutputHeadroom { _ = setHeadroom(handle, headroom, true) }
+        } else {
+          try check(library.resizeSurface(handle, width, height, scale), operation: "resize_surface")
+        }
+      } catch {
+        // A failed attach cannot leave a transfer waiting for a future UI
+        // callback. Detach any partial native surface before releasing claims.
+        if attach {
+          detachNativeSurface()
+          nativeLease?.complete()
+          nativeLease = nil
+          claim?.lease.complete()
+        }
+        surfaceError = error; NSLog("Erika: surface update failed: \(error)") }
     }
+    // A backing change (another screen's scale) comes as a resize; the
+    // headroom may have moved with it.
+    if !attach { reportDisplayHeadroom() }
   }
 
   /// Publishes the presenting display's EDR headroom to the renderer.
   ///
-  /// The renderer negotiates its output mode on the render thread (the
-  /// CVDisplayLink callback), where AppKit must not be touched, so the value
+  /// The renderer negotiates its output mode on the presenter owner, where
+  /// AppKit must not be touched, so the value
   /// is resolved here and pushed through the C ABI instead. Main thread only:
   /// it reads the attached `NSView`'s screen.
   private func reportDisplayHeadroom() {
-    guard let setOutputHeadroom = library.setOutputHeadroom,
-          let view = attachedView else {
-      return
-    }
+    guard let view = attachedView else { return }
     let headroom = view.displayEdrHeadroom()
-    withNativeCall {
-      _ = setOutputHeadroom(handle, headroom, true)
+    owner.post { [self] in
+      if let handle, let setHeadroom = library.setOutputHeadroom {
+        _ = setHeadroom(handle, headroom, true)
+      }
     }
   }
 
@@ -2357,7 +2611,7 @@ private final class ErikaPlayerHost {
         guard let self else {
           return
         }
-        self.renderTick()
+        self.scheduleRenderTick()
       }
       if let driver, driver.start() {
         displayLinkDriver = driver
@@ -2438,9 +2692,7 @@ private final class ErikaPlayerHost {
       guard let self else {
         return
       }
-      self.renderQueue.async { [weak self] in
-        self?.renderTick()
-      }
+      self.scheduleRenderTick()
     }
     displayTimer = timer
     displayTimerFps = targetFps
@@ -2448,6 +2700,7 @@ private final class ErikaPlayerHost {
   }
 
   private func stopDisplayDriver() {
+    owner.cancelFrame()
     displayLinkDriver?.invalidate()
     displayLinkDriver = nil
     displayLinkDisplayID = nil
@@ -3074,12 +3327,14 @@ private final class ErikaFrameExportSessionBox {
 }
 
 public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
-  static var sharedEventSink: FlutterEventSink?
+  private var sharedEventSink: FlutterEventSink?
+  private var subscription = 0
 
   private static let playerChannelName = "erika_flutter/player"
   private static let eventsChannelName = "erika_flutter/events"
   private static let videoViewType = "erika_flutter/video_view"
 
+  private let delivery = ErikaPlatformDelivery()
   private var players: [Int64: ErikaPlayerHost] = [:]
   private var views: [Int64: WeakErikaVideoPlatformViewBox] = [:]
   private let textureRegistry: FlutterTextureRegistry
@@ -3110,14 +3365,16 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   }
 
   deinit {
+    for box in frameExportSessions.values { box.queue.async { box.close() } }
+    delivery.invalidate()
+    sharedEventSink = nil
+    pollTimer?.invalidate()
+    players.values.forEach { $0.shutdown() }
     pollTimer?.invalidate()
     clearNowPlayingInfo()
     remoteCommandTargets.forEach { command, target in
       command.isEnabled = false
       command.removeTarget(target)
-    }
-    for textureId in textures.keys {
-      textureRegistry.unregisterTexture(textureId)
     }
   }
 
@@ -3141,16 +3398,50 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     registrar.register(ErikaVideoViewFactory(plugin: instance), withId: videoViewType)
   }
 
+  #if DEBUG
+  func makeSurfaceForTesting(viewId: Int64) -> AnyObject {
+    let view = ErikaVideoPlatformView(viewId: viewId, arguments: nil, plugin: self)
+    registerView(view, viewId: viewId)
+    return view
+  }
+
+  func requestFrameForTesting(playerId: Int64) {
+    guard let host = players[playerId] else { return }
+    host.owner.requestFrame { [weak host] in
+      guard let host else { return }
+      host.renderTick()
+    }
+  }
+
+  func shutdownForTesting() {
+    delivery.invalidate()
+    sharedEventSink = nil
+    pollTimer?.invalidate()
+    players.values.forEach { $0.shutdown() }
+    players.removeAll()
+  }
+  #endif
+
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let result = delivery.reserve(
+      key: int64Value((call.arguments as? [String: Any])?["playerId"]) ?? 0, result)
     do {
       switch call.method {
       case "create":
-        result(try createPlayer(arguments: call.arguments))
+        let id = try createPlayer(arguments: call.arguments)
+        let host = players[id]!
+        host.created { [weak self] value in
+          if value is FlutterError, let self, self.players[id] === host {
+            self.players.removeValue(forKey: id)
+            host.shutdown()
+          }
+          result(value)
+        }
       case "dispose":
         let args = try dictionaryArgs(call.arguments)
         let playerId = try requiredInt64(args["playerId"], name: "playerId")
         windowOverlayPlayerIds.remove(playerId)
-        players.removeValue(forKey: playerId)
+        let retiringHost = players.removeValue(forKey: playerId)
         stopPollTimerIfIdle()
         systemMediaNavigation.removeValue(forKey: playerId)
         if activePlayerId == playerId {
@@ -3158,10 +3449,11 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           clearNowPlayingInfo()
           refreshRemoteCommands()
         }
-        result(nil)
+        if let retiringHost { retiringHost.shutdown { result(nil) } } else { result(nil) }
       case "open":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let uri = args["uri"] as? String, !uri.isEmpty else {
           throw ErikaPluginError.invalidArguments("uri is required.")
         }
@@ -3173,47 +3465,77 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         } else {
           host.clearMediaMetadata()
         }
-        try host.open(
-          uri: uri,
-          httpHeaders: headers,
-          httpReadAheadBytes: readAhead,
-          httpBackBufferBytes: backBuffer
-        )
-        result(nil)
+        operations.append {
+          [
+            host, argument1 = uri, argument2 = headers, argument3 = readAhead,
+            argument4 = backBuffer
+          ] in
+          try host.open(
+            uri: argument1, httpHeaders: argument2, httpReadAheadBytes: argument3,
+            httpBackBufferBytes: argument4);
+          return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "play":
-        let host = try playerHost(from: try dictionaryArgs(call.arguments))
-        try host.play()
-        activePlayerId = host.id
-        refreshRemoteCommands()
-        publishNowPlayingInfo(for: host)
-        result(nil)
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          try host.play(); return nil
+        }
+        let completion: FlutterResult = { [weak self] value in
+          if !(value is FlutterError), let self, self.players[host.id] === host {
+            self.activePlayerId = host.id
+            self.refreshRemoteCommands()
+            self.publishNowPlayingInfo(for: host)
+          }
+          result(value)
+        }
+        host.enqueue(operations: operations, result: completion, label: call.method)
       case "pause":
-        try playerHost(from: try dictionaryArgs(call.arguments)).pause()
-        result(nil)
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          try host.pause(); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "stop":
-        try playerHost(from: try dictionaryArgs(call.arguments)).stop()
-        result(nil)
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          try host.stop(); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "close":
-        try playerHost(from: try dictionaryArgs(call.arguments)).close()
-        result(nil)
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          try host.close(); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "createTexture":
         let args = try dictionaryArgs(call.arguments)
         let width = UInt32(clamping: max(1, int64Value(args["width"]) ?? 1))
         let height = UInt32(clamping: max(1, int64Value(args["height"]) ?? 1))
         let scale = max(0.1, doubleValue(args["scale"]) ?? 1.0)
         guard width <= 16384, height <= 16384,
-              let texture = ErikaFlutterTextureSurface(
-                registry: textureRegistry,
-                width: width,
-                height: height,
-                scale: scale
-              ) else {
+          let texture = ErikaFlutterTextureSurface(
+            registry: textureRegistry,
+            width: width,
+            height: height,
+            scale: scale
+          )
+        else {
           throw ErikaPluginError.invalidArguments("Unable to create Flutter texture surface.")
         }
         let textureId = texture.register()
         guard textureId != 0 else {
           throw ErikaPluginError.invalidArguments("Flutter rejected the texture surface.")
         }
+        texture.publicationAllowed = { [weak self] in self?.delivery.valid == true }
         textures[textureId] = texture
         result(textureId)
       case "resizeTexture":
@@ -3226,33 +3548,52 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let height = UInt32(clamping: max(1, int64Value(args["height"]) ?? 1))
         let scale = max(0.1, doubleValue(args["scale"]) ?? 1.0)
         guard width <= 16384, height <= 16384,
-              texture.resize(width: width, height: height, scale: scale) else {
+          texture.resize(width: width, height: height, scale: scale)
+        else {
           throw ErikaPluginError.invalidArguments("Unable to resize Flutter texture surface.")
         }
         texture.attachedPlayer?.resizeFromAttachedTexture()
-        result(nil)
+        if let host = texture.attachedPlayer {
+          host.completeSurface(result: result)
+        } else {
+          result(nil)
+        }
       case "releaseTexture":
         let args = try dictionaryArgs(call.arguments)
         let textureId = try requiredInt64(args["textureId"], name: "textureId")
         if let texture = textures.removeValue(forKey: textureId) {
-          texture.attachedPlayer?.detach(viewId: textureId)
-          textureRegistry.unregisterTexture(textureId)
+          let host = texture.attachedPlayer
+          host?.detach(viewId: textureId)
+          texture.retire()
+          let release = { [weak self, texture] (_: Any?) in
+            if let self, self.delivery.valid { self.textureRegistry.unregisterTexture(textureId) }
+            withExtendedLifetime(texture) {}
+            result(nil)
+          }
+          if let host { host.completeSurface(result: release) } else { release(nil) }
+          return
         }
         result(nil)
       case "seek":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         let positionMicros = try requiredUInt64(args["positionMicros"], name: "positionMicros")
-        try host.seek(positionMicros: positionMicros)
-        result(nil)
+        operations.append { [host, argument1 = positionMicros] in
+          try host.seek(positionMicros: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setPlaybackRate":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let rate = doubleValue(args["rate"]) else {
           throw ErikaPluginError.invalidArguments("rate is required.")
         }
-        try host.setPlaybackRate(rate)
-        result(nil)
+        operations.append { [host, argument1 = rate] in
+          try host.setPlaybackRate(argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setMediaMetadata":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
@@ -3276,50 +3617,104 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case "setVolume":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let volume = doubleValue(args["volume"]) else {
           throw ErikaPluginError.invalidArguments("volume is required.")
         }
-        try host.setVolume(volume)
-        result(nil)
+        operations.append { [host, argument1 = volume] in
+          try host.setVolume(argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setUpscaler":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let mode = int32Value(args["mode"]) else {
           throw ErikaPluginError.invalidArguments("mode is required.")
         }
-        try host.setUpscaler(mode: mode)
-        result(nil)
+        operations.append { [host, argument1 = mode] in
+          try host.setUpscaler(mode: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
+      case "loadUpscalerModel":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        guard let data = args["data"] as? FlutterStandardTypedData, !data.data.isEmpty else {
+          throw ErikaPluginError.invalidArguments("data is required.")
+        }
+        operations.append {
+          [host, argument1 = args["name"] as? String ?? "custom", argument2 = data.data] in
+          try host.loadUpscalerModel(name: argument1, data: argument2); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
+      case "clearUpscalerModel":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          try host.clearUpscalerModel(); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setSubtitleScale":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let scale = doubleValue(args["scale"]) else {
           throw ErikaPluginError.invalidArguments("scale is required.")
         }
-        try host.setSubtitleScale(scale)
-        result(nil)
+        operations.append { [host, argument1 = scale] in
+          try host.setSubtitleScale(argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "registerSubtitleMemoryFont":
         let args = try dictionaryArgs(call.arguments)
-        guard let data = args["data"] as? FlutterStandardTypedData else { throw ErikaPluginError.invalidArguments("data is required.") }
-        result(Int64(clamping: try playerHost(from: args).registerSubtitleMemoryFont(data.data)))
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        guard let data = args["data"] as? FlutterStandardTypedData else {
+          throw ErikaPluginError.invalidArguments("data is required.")
+        }
+        operations.append { [host, argument1 = data.data] in
+          return Int64(clamping: try host.registerSubtitleMemoryFont(argument1))
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "selectSubtitleMemoryFonts":
         let args = try dictionaryArgs(call.arguments)
-        try playerHost(from: args).selectSubtitleMemoryFonts((args["fontIds"] as? [NSNumber] ?? []).map { $0.uint64Value })
-        result(nil)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append {
+          [host, argument1 = (args["fontIds"] as? [NSNumber] ?? []).map { $0.uint64Value }] in
+          try host.selectSubtitleMemoryFonts(argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "clearSubtitleMemoryFonts":
         let args = try dictionaryArgs(call.arguments)
-        try playerHost(from: args).clearSubtitleMemoryFonts()
-        result(nil)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          try host.clearSubtitleMemoryFonts(); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "getSubtitleMemoryFontStatus":
         let args = try dictionaryArgs(call.arguments)
-        result(try playerHost(from: args).subtitleMemoryFontStatus())
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return try host.subtitleMemoryFontStatus()
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setSubtitleStyle":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         if args.keys.contains("fontFamily") || args.keys.contains("fontFilePath") {
-          try host.setSubtitleFont(
-            family: args["fontFamily"] as? String,
-            filePath: args["fontFilePath"] as? String
-          )
+          operations.append {
+            [
+              host, argument1 = args["fontFamily"] as? String,
+              argument2 = args["fontFilePath"] as? String
+            ] in
+            try host.setSubtitleFont(family: argument1, filePath: argument2); return nil
+          }
         }
         if args.keys.contains("primaryColorRgba") || args.keys.contains("outlineColorRgba")
           || args.keys.contains("fontSize") || args.keys.contains("outlineWidth")
@@ -3334,48 +3729,78 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         {
           let primary = int64Value(args["primaryColorRgba"]) ?? 0xFFFF_FFFF
           let outline = int64Value(args["outlineColorRgba"]) ?? 0x0000_007F
-          try host.setSubtitleStyle(
-            fontFamily: args["fontFamily"] as? String,
-            fontFilePath: args["fontFilePath"] as? String,
-            primaryRgba: UInt32(truncatingIfNeeded: primary),
-            outlineRgba: UInt32(truncatingIfNeeded: outline),
-            fontSize: doubleValue(args["fontSize"]) ?? 48.0,
-            outlineWidth: doubleValue(args["outlineWidth"]) ?? 2.0,
-            bold: boolValue(args["bold"]) ?? false,
-            italic: boolValue(args["italic"]) ?? false,
-            underline: boolValue(args["underline"]) ?? false,
-            strikeOut: boolValue(args["strikeOut"]) ?? false,
-            spacing: doubleValue(args["spacing"]) ?? 0.0,
-            scaleXPercent: doubleValue(args["scaleXPercent"]) ?? 100.0,
-            scaleYPercent: doubleValue(args["scaleYPercent"]) ?? 100.0,
-            borderStyle: int32Value(args["borderStyle"]) ?? 1,
-            shadowDepth: doubleValue(args["shadowDepth"]) ?? 0.0,
-            blur: doubleValue(args["blur"]) ?? 0.0,
-            alignment: int32Value(args["alignment"]) ?? 2,
-            marginLeft: int32Value(args["marginLeft"]) ?? 48,
-            marginRight: int32Value(args["marginRight"]) ?? 48,
-            marginVertical: int32Value(args["marginVertical"]) ?? 54,
-            overrideMask: UInt32(truncatingIfNeeded: int64Value(args["overrideMask"]) ?? 0)
-          )
+          operations.append {
+            [
+              host, argument1 = args["fontFamily"] as? String,
+              argument2 = args["fontFilePath"] as? String,
+              argument3 = UInt32(truncatingIfNeeded: primary),
+              argument4 = UInt32(truncatingIfNeeded: outline),
+              argument5 = doubleValue(args["fontSize"]) ?? 48.0,
+              argument6 = doubleValue(args["outlineWidth"]) ?? 2.0,
+              argument7 = boolValue(args["bold"]) ?? false,
+              argument8 = boolValue(args["italic"]) ?? false,
+              argument9 = boolValue(args["underline"]) ?? false,
+              argument10 = boolValue(args["strikeOut"]) ?? false,
+              argument11 = doubleValue(args["spacing"]) ?? 0.0,
+              argument12 = doubleValue(args["scaleXPercent"]) ?? 100.0,
+              argument13 = doubleValue(args["scaleYPercent"]) ?? 100.0,
+              argument14 = int32Value(args["borderStyle"]) ?? 1,
+              argument15 = doubleValue(args["shadowDepth"]) ?? 0.0,
+              argument16 = doubleValue(args["blur"]) ?? 0.0,
+              argument17 = int32Value(args["alignment"]) ?? 2,
+              argument18 = int32Value(args["marginLeft"]) ?? 48,
+              argument19 = int32Value(args["marginRight"]) ?? 48,
+              argument20 = int32Value(args["marginVertical"]) ?? 54,
+              argument21 = UInt32(truncatingIfNeeded: int64Value(args["overrideMask"]) ?? 0)
+            ] in
+            try host.setSubtitleStyle(
+              fontFamily: argument1, fontFilePath: argument2, primaryRgba: argument3,
+              outlineRgba: argument4, fontSize: argument5, outlineWidth: argument6, bold: argument7,
+              italic: argument8, underline: argument9, strikeOut: argument10, spacing: argument11,
+              scaleXPercent: argument12, scaleYPercent: argument13, borderStyle: argument14,
+              shadowDepth: argument15, blur: argument16, alignment: argument17,
+              marginLeft: argument18, marginRight: argument19, marginVertical: argument20,
+              overrideMask: argument21);
+            return nil
+          }
         }
-        result(nil)
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "getUpscalerStatus":
         let args = try dictionaryArgs(call.arguments)
-        result(try playerHost(from: args).upscalerStatus())
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return try host.upscalerStatus()
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "getOutputStatus":
         let args = try dictionaryArgs(call.arguments)
-        result(try playerHost(from: args).outputStatus())
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return try host.outputStatus()
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "getResourceStatus":
         let args = try dictionaryArgs(call.arguments)
-        result(try playerHost(from: args).resourceStatus())
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return try host.resourceStatus()
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "getDiagnosticsSnapshot":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        respondOffMain(queue: host.jsonQueue, keeping: host, result: result) {
-          try host.diagnosticsSnapshotJson()
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return try host.diagnosticsSnapshotJson()
         }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "invokeJson":
         let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let method = args["method"] as? String, !method.isEmpty else {
           throw ErikaPluginError.invalidArguments("method is required.")
         }
@@ -3393,10 +3818,10 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
         let data = try JSONSerialization.data(withJSONObject: arguments)
         let argumentsJson = String(decoding: data, as: UTF8.self)
-        let host = try playerHost(from: args)
-        respondOffMain(queue: host.jsonQueue, keeping: host, result: result) {
-          try host.invokeJson(method: method, argumentsJson: argumentsJson)
+        operations.append { [host, argument1 = method, argument2 = argumentsJson] in
+          return try host.invokeJson(method: argument1, argumentsJson: argument2)
         }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "getLogs":
         // The log ring is process-wide; playerId is accepted but not needed.
         let args = try dictionaryArgs(call.arguments)
@@ -3415,141 +3840,215 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
       case "getPresenterStats":
         let args = try dictionaryArgs(call.arguments)
-        result(try playerHost(from: args).presenterStats())
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return host.presenterStats()
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setDebugHudEnabled":
         let args = try dictionaryArgs(call.arguments)
-        try playerHost(from: args).setDebugHudEnabled(boolValue(args["enabled"]) ?? false)
-        result(nil)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host, argument1 = boolValue(args["enabled"]) ?? false] in
+          try host.setDebugHudEnabled(argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "addExternalSubtitle":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let uri = args["uri"] as? String, !uri.isEmpty else {
           throw ErikaPluginError.invalidArguments("uri is required.")
         }
-        result(try host.addExternalSubtitle(uri: uri))
+        operations.append { [host, argument1 = uri] in
+          return try host.addExternalSubtitle(uri: argument1)
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "removeSubtitleTrack":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         let trackId = try requiredInt64(args["trackId"], name: "trackId")
-        try host.removeSubtitleTrack(trackId: trackId)
-        result(nil)
+        operations.append { [host, argument1 = trackId] in
+          try host.removeSubtitleTrack(trackId: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "loadDanmakuFile":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let uri = args["uri"] as? String, !uri.isEmpty else {
           throw ErikaPluginError.invalidArguments("uri is required.")
         }
-        try host.loadDanmakuFile(uri: uri)
-        result(nil)
+        operations.append { [host, argument1 = uri] in
+          try host.loadDanmakuFile(uri: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "loadDanmakuJson":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let json = args["json"] as? String, !json.isEmpty else {
           throw ErikaPluginError.invalidArguments("json is required.")
         }
-        try host.loadDanmakuJson(json)
-        result(nil)
+        operations.append { [host, argument1 = json] in
+          try host.loadDanmakuJson(argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "addDanmakuTrackFile":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let uri = args["uri"] as? String, !uri.isEmpty else {
           throw ErikaPluginError.invalidArguments("uri is required.")
         }
         let offsetMicros = int64Value(args["offsetMicros"]) ?? 0
-        result(Int64(clamping: try host.addDanmakuTrackFile(
-          uri: uri,
-          name: args["name"] as? String,
-          offsetMicros: offsetMicros
-        )))
+        operations.append {
+          [host, argument1 = uri, argument2 = args["name"] as? String, argument3 = offsetMicros] in
+          return Int64(
+            clamping: try host.addDanmakuTrackFile(
+              uri: argument1, name: argument2, offsetMicros: argument3))
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "addDanmakuTrackJson":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
         guard let json = args["json"] as? String, !json.isEmpty else {
           throw ErikaPluginError.invalidArguments("json is required.")
         }
         let offsetMicros = int64Value(args["offsetMicros"]) ?? 0
-        result(Int64(clamping: try host.addDanmakuTrackJson(
-          json,
-          name: args["name"] as? String,
-          offsetMicros: offsetMicros
-        )))
+        operations.append {
+          [host, argument1 = json, argument2 = args["name"] as? String, argument3 = offsetMicros] in
+          return Int64(
+            clamping: try host.addDanmakuTrackJson(
+              argument1, name: argument2, offsetMicros: argument3))
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "removeDanmakuTrack":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.removeDanmakuTrack(trackId: try requiredUInt64(args["trackId"], name: "trackId"))
-        result(nil)
+        var operations: [() throws -> Any?] = []
+        operations.append {
+          [host, argument1 = try requiredUInt64(args["trackId"], name: "trackId")] in
+          try host.removeDanmakuTrack(trackId: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setDanmakuTrackEnabled":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.setDanmakuTrackEnabled(
-          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
-          enabled: boolValue(args["enabled"]) ?? true
-        )
-        result(nil)
+        var operations: [() throws -> Any?] = []
+        operations.append {
+          [
+            host, argument1 = try requiredUInt64(args["trackId"], name: "trackId"),
+            argument2 = boolValue(args["enabled"]) ?? true
+          ] in
+          try host.setDanmakuTrackEnabled(trackId: argument1, enabled: argument2); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setDanmakuTrackOffset":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.setDanmakuTrackOffset(
-          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
-          offsetMicros: int64Value(args["offsetMicros"]) ?? 0
-        )
-        result(nil)
+        var operations: [() throws -> Any?] = []
+        operations.append {
+          [
+            host, argument1 = try requiredUInt64(args["trackId"], name: "trackId"),
+            argument2 = int64Value(args["offsetMicros"]) ?? 0
+          ] in
+          try host.setDanmakuTrackOffset(trackId: argument1, offsetMicros: argument2); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setDanmakuGlobalOffset":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.setDanmakuGlobalOffset(offsetMicros: int64Value(args["offsetMicros"]) ?? 0)
-        result(nil)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host, argument1 = int64Value(args["offsetMicros"]) ?? 0] in
+          try host.setDanmakuGlobalOffset(offsetMicros: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "danmakuTracks":
-        let host = try playerHost(from: try dictionaryArgs(call.arguments))
-        result(try host.danmakuTracks())
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return try host.danmakuTracks()
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "clearDanmaku":
-        let host = try playerHost(from: try dictionaryArgs(call.arguments))
-        try host.clearDanmaku()
-        result(nil)
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          try host.clearDanmaku(); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setDanmakuEnabled":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.setDanmakuEnabled(boolValue(args["enabled"]) ?? true)
-        result(nil)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host, argument1 = boolValue(args["enabled"]) ?? true] in
+          try host.setDanmakuEnabled(argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "setDanmakuConfig":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.setDanmakuConfig(
-          danmakuConfig(from: args, base: host.danmakuConfigSnapshot())
-        )
+        var operations: [() throws -> Any?] = []
+        operations.append { [host, patch = danmakuConfigPatch(from: args)] in
+          try host.setDanmakuConfig(patch(host.danmakuConfigSnapshot())); return nil
+        }
         if args.keys.contains("customFontFamily") || args.keys.contains("customFontFilePath") {
-          try host.setDanmakuFont(
-            family: args["customFontFamily"] as? String,
-            filePath: args["customFontFilePath"] as? String
-          )
+          operations.append {
+            [
+              host, argument1 = args["customFontFamily"] as? String,
+              argument2 = args["customFontFilePath"] as? String
+            ] in
+            try host.setDanmakuFont(family: argument1, filePath: argument2); return nil
+          }
         }
         if let blockWordsJson = args["blockWordsJson"] as? String {
-          try host.setDanmakuBlockWordsJson(blockWordsJson)
+          operations.append { [host, argument1 = blockWordsJson] in
+            try host.setDanmakuBlockWordsJson(argument1); return nil
+          }
         }
-        result(nil)
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "selectAudioTrack":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.selectAudioTrack(trackId: optionalTrackId(args["trackId"]))
-        result(nil)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host, argument1 = try optionalTrackId(args["trackId"])] in
+          try host.selectAudioTrack(trackId: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "selectSubtitleTrack":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.selectSubtitleTrack(trackId: optionalTrackId(args["trackId"]))
-        result(nil)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host, argument1 = try optionalTrackId(args["trackId"])] in
+          try host.selectSubtitleTrack(trackId: argument1); return nil
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "tracks":
-        let host = try playerHost(from: try dictionaryArgs(call.arguments))
-        result(try host.tracks())
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        var operations: [() throws -> Any?] = []
+        operations.append { [host] in
+          return try host.tracks()
+        }
+        host.enqueue(operations: operations, result: result, label: call.method)
       case "screenshot":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
         let view = try optionalVideoView(from: args, host: host)
         let width = int64Value(args["width"]).map(Int.init)
         let height = int64Value(args["height"]).map(Int.init)
-        if let data = host.screenshot(view: view, width: width, height: height) {
-          result(FlutterStandardTypedData(bytes: data))
-        } else {
-          result(nil)
+        host.enqueue(result: { [weak host, weak view] value in
+          if let error = value as? FlutterError { result(error); return }
+          let bytes = value as? Data ?? (view ?? host?.snapshotView())?.pngSnapshotData()
+          result(bytes.map { FlutterStandardTypedData(bytes: $0) })
+        }) {
+          host.screenshot(width: width, height: height)
         }
       case "exportGif":
         let args = try dictionaryArgs(call.arguments)
@@ -3561,14 +4060,16 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
         let startMillis = try requiredUInt64(args["startMillis"], name: "startMillis")
         let endMillis = try requiredUInt64(args["endMillis"], name: "endMillis")
-        let framesPerSecondValue = try requiredUInt64(args["framesPerSecond"], name: "framesPerSecond")
+        let framesPerSecondValue = try requiredUInt64(
+          args["framesPerSecond"], name: "framesPerSecond")
         let outputWidthValue = try requiredUInt64(args["outputWidth"], name: "outputWidth")
         let outputHeightValue = try requiredUInt64(args["outputHeight"], name: "outputHeight")
         guard let framesPerSecond = UInt32(exactly: framesPerSecondValue),
-              let outputWidth = UInt32(exactly: outputWidthValue),
-              let outputHeight = UInt32(exactly: outputHeightValue),
-              let quality = Int32(exactly: int64Value(args["quality"]) ?? 0),
-              let loopCount = Int32(exactly: int64Value(args["loopCount"]) ?? 0) else {
+          let outputWidth = UInt32(exactly: outputWidthValue),
+          let outputHeight = UInt32(exactly: outputHeightValue),
+          let quality = Int32(exactly: int64Value(args["quality"]) ?? 0),
+          let loopCount = Int32(exactly: int64Value(args["loopCount"]) ?? 0)
+        else {
           throw ErikaPluginError.invalidArguments("GIF export numeric arguments are out of range.")
         }
         let overwrite = (args["overwrite"] as? Bool) ?? true
@@ -3603,7 +4104,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
               ])
             }
           } catch {
-            DispatchQueue.main.async { result(self.flutterError(error)) }
+            DispatchQueue.main.async { result(Self.flutterError(error)) }
           }
         }
       case "exportFrame":
@@ -3613,9 +4114,11 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
         let positionMillis = try requiredUInt64(args["positionMillis"], name: "positionMillis")
         guard let maxWidth = UInt32(exactly: int64Value(args["width"]) ?? 0),
-              let maxHeight = UInt32(exactly: int64Value(args["height"]) ?? 0),
-              let format = Int32(exactly: int64Value(args["format"]) ?? 1) else {
-          throw ErikaPluginError.invalidArguments("Frame export numeric arguments are out of range.")
+          let maxHeight = UInt32(exactly: int64Value(args["height"]) ?? 0),
+          let format = Int32(exactly: int64Value(args["format"]) ?? 1)
+        else {
+          throw ErikaPluginError.invalidArguments(
+            "Frame export numeric arguments are out of range.")
         }
         let httpHeaders = (args["httpHeaders"] as? [String: String]) ?? [:]
         let httpReadAheadBytes = try optionalReadAheadBytes(args["httpReadAheadBytes"])
@@ -3637,7 +4140,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
             )
             DispatchQueue.main.async { result(exported) }
           } catch {
-            DispatchQueue.main.async { result(self.flutterError(error)) }
+            DispatchQueue.main.async { result(Self.flutterError(error)) }
           }
         }
       case "openFrameExportSession":
@@ -3652,7 +4155,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let box = ErikaFrameExportSessionBox(id: sessionId)
         // Opening reads the container header, which for a network source takes
         // a round trip: off the main thread.
-        box.queue.async {
+        box.queue.async { [weak self] in
           do {
             guard let library = ErikaNativeLibrary.shared else {
               throw ErikaPluginError.libraryNotFound([])
@@ -3663,12 +4166,16 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
               httpHeaders: httpHeaders,
               httpReadAheadBytes: httpReadAheadBytes
             )
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+              guard let self, self.delivery.valid else {
+                box.queue.async { box.close() }
+                return
+              }
               self.frameExportSessions[sessionId] = box
               result(sessionId)
             }
           } catch {
-            DispatchQueue.main.async { result(self.flutterError(error)) }
+            DispatchQueue.main.async { result(Self.flutterError(error)) }
           }
         }
       case "exportSessionFrame":
@@ -3679,9 +4186,11 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
         let positionMillis = try requiredUInt64(args["positionMillis"], name: "positionMillis")
         guard let maxWidth = UInt32(exactly: int64Value(args["width"]) ?? 0),
-              let maxHeight = UInt32(exactly: int64Value(args["height"]) ?? 0),
-              let format = Int32(exactly: int64Value(args["format"]) ?? 1) else {
-          throw ErikaPluginError.invalidArguments("Frame export numeric arguments are out of range.")
+          let maxHeight = UInt32(exactly: int64Value(args["height"]) ?? 0),
+          let format = Int32(exactly: int64Value(args["format"]) ?? 1)
+        else {
+          throw ErikaPluginError.invalidArguments(
+            "Frame export numeric arguments are out of range.")
         }
         respondOffMain(queue: box.queue, keeping: box, result: result) {
           try box.frame(
@@ -3713,7 +4222,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         } else {
           throw ErikaPluginError.viewNotFound(viewId)
         }
-        result(nil)
+        host.completeSurface(result: result, value: nil)
       case "detachView":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
@@ -3722,20 +4231,20 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         if viewId == erikaWindowHostedVideoSurfaceId {
           windowOverlayPlayerIds.remove(host.id)
         }
-        result(nil)
+        host.completeSurface(result: result, value: nil)
       case "attachOverlay":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
         updateRequestedFlutterView(from: args)
         let installation = try ensureWindowOverlayInstalled()
         erikaWindowOverlayTrace(
-          "attach request player=\(host.id) flutterView=\(requestedFlutterViewIdentifier ?? -1) " +
-          "secondary=\(requestedSecondaryWindow) targetWindow=\(installation.hostWindow.windowNumber)"
+          "attach request player=\(host.id) flutterView=\(requestedFlutterViewIdentifier ?? -1) "
+            + "secondary=\(requestedSecondaryWindow) targetWindow=\(installation.hostWindow.windowNumber)"
         )
         let overlay = installation.overlay
         try host.attach(view: overlay)
         windowOverlayPlayerIds.insert(host.id)
-        result(erikaWindowHostedVideoSurfaceId)
+        host.completeSurface(result: result, value: erikaWindowHostedVideoSurfaceId)
       case "detachOverlay":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
@@ -3746,23 +4255,25 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         // the stale detach cannot stop the live surface's display link and
         // leave a frozen, non-rendering overlay on screen.
         if let generation,
-           let activeGeneration = overlay?.activeGeneration,
-           generation != activeGeneration {
+          let activeGeneration = overlay?.activeGeneration,
+          generation != activeGeneration
+        {
           result(nil)
           return
         }
         host.detach(viewId: erikaWindowHostedVideoSurfaceId)
         windowOverlayPlayerIds.remove(host.id)
         overlay?.updateOverlayFrame(nil, visible: false, debugLabel: nil, generation: generation)
-        result(nil)
+        host.completeSurface(result: result, value: nil)
       case "setOverlayFrame":
         let args = try dictionaryArgs(call.arguments)
         let visible = boolValue(args["visible"]) ?? true
         let generation = int64Value(args["generation"])
         if !visible,
-           let generation,
-           let activeGeneration = resolveWindowOverlay()?.activeGeneration,
-           generation != activeGeneration {
+          let generation,
+          let activeGeneration = resolveWindowOverlay()?.activeGeneration,
+          generation != activeGeneration
+        {
           result(nil)
           return
         }
@@ -3796,18 +4307,20 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         result(FlutterMethodNotImplemented)
       }
     } catch {
-      result(flutterError(error))
+      result(Self.flutterError(error))
     }
   }
 
   public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-    Self.sharedEventSink = events
+    subscription += 1
+    sharedEventSink = events
     startPollTimerIfNeeded()
     return nil
   }
 
   public func onCancel(withArguments arguments: Any?) -> FlutterError? {
-    Self.sharedEventSink = nil
+    subscription += 1
+    sharedEventSink = nil
     return nil
   }
 
@@ -4028,18 +4541,10 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   }
 
   private func createPlayer(arguments: Any?) throws -> Int64 {
-    guard let library = ErikaNativeLibrary.shared else {
-      throw ErikaPluginError.libraryNotFound([
-        ProcessInfo.processInfo.environment["ERIKA_CAPI_DYLIB"] ?? "",
-        ErikaNativeLibrary.sourceTreeDebugLibraryPath() ?? "",
-        "liberika_capi.dylib",
-      ].filter { !$0.isEmpty })
-    }
     let id = nextPlayerId
     nextPlayerId += 1
     let host = try ErikaPlayerHost(
       id: id,
-      library: library,
       config: presenterConfigForNewPlayer(arguments: arguments)
     )
     host.onNowPlayingChanged = { [weak self] changedHost in
@@ -4153,8 +4658,8 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   private func performRemoteCommand(
     _ command: @escaping (ErikaPlayerHost) throws -> Void
   ) -> MPRemoteCommandHandlerStatus {
-    performOnMain {
-      guard let host = self.activePlayer() else { return .noSuchContent }
+    performOnMain { [weak self] in
+      guard let self, self.delivery.valid, let host = self.activePlayer() else { return .noSuchContent }
       do {
         try command(host)
         return .success
@@ -4174,15 +4679,15 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
   }
 
   private func emitSystemMediaNavigation(_ navigation: String) -> MPRemoteCommandHandlerStatus {
-    performOnMain {
-      guard let playerId = self.activePlayerId,
+    performOnMain { [weak self] in
+      guard let self, self.delivery.valid, let playerId = self.activePlayerId,
             self.players[playerId] != nil,
             let capabilities = self.systemMediaNavigation[playerId] else { return .noSuchContent }
       let enabled = navigation == "previous"
         ? capabilities.previousEnabled
         : capabilities.nextEnabled
       guard enabled else { return .noSuchContent }
-      Self.sharedEventSink?([
+      self.sharedEventSink?([
         "playerId": playerId,
         "kind": 13,
         "navigation": navigation,
@@ -4197,7 +4702,8 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     if Thread.isMainThread {
       return work()
     }
-    return DispatchQueue.main.sync(execute: work)
+    DispatchQueue.main.async { _ = work() }
+    return .success
   }
 
   private func refreshRemoteCommands() {
@@ -4398,69 +4904,49 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     return number.uint64Value
   }
 
-  private func danmakuConfig(
-    from args: [String: Any],
-    base: ErikaDanmakuConfigC
-  ) -> ErikaDanmakuConfigC {
-    var config = base
-    if let value = boolValue(args["enabled"]) {
-      config.enabled = value ? 1 : 0
+  private func danmakuConfigPatch(from args: [String: Any]) -> (ErikaDanmakuConfigC) -> ErikaDanmakuConfigC {
+    let enabled = boolValue(args["enabled"])
+    let fontSize = doubleValue(args["fontSize"])
+    let opacity = doubleValue(args["opacity"])
+    let displayArea = doubleValue(args["displayArea"])
+    let scrollDurationSeconds = doubleValue(args["scrollDurationSeconds"])
+    let scrollSpeedFactor = doubleValue(args["scrollSpeedFactor"])
+    let trackGapRatio = doubleValue(args["trackGapRatio"])
+    let outlineWidth = doubleValue(args["outlineWidth"])
+    let shadowOffsetX = doubleValue(args["shadowOffsetX"])
+    let shadowOffsetY = doubleValue(args["shadowOffsetY"])
+    let mergeDuplicates = boolValue(args["mergeDuplicates"])
+    let allowStacking = boolValue(args["allowStacking"])
+    let allowScrollOverwrite = boolValue(args["allowScrollOverwrite"])
+    let maxQuantity = int64Value(args["maxQuantity"])
+    let maxLinesPerMode = int64Value(args["maxLinesPerMode"])
+    let blockTop = boolValue(args["blockTop"])
+    let blockBottom = boolValue(args["blockBottom"])
+    let blockScroll = boolValue(args["blockScroll"])
+    let shadowStyle = int64Value(args["shadowStyle"])
+    return { base in
+      var config = base
+      if let value = enabled { config.enabled = value ? 1 : 0 }
+      if let value = fontSize { config.fontSize = Float(value) }
+      if let value = opacity { config.opacity = Float(value) }
+      if let value = displayArea { config.displayArea = Float(value) }
+      if let value = scrollDurationSeconds { config.scrollDurationSeconds = Float(value) }
+      if let value = scrollSpeedFactor { config.scrollSpeedFactor = Float(value) }
+      if let value = trackGapRatio { config.trackGapRatio = Float(value) }
+      if let value = outlineWidth { config.outlineWidth = Float(value) }
+      if let value = shadowOffsetX { config.shadowOffsetX = Float(value) }
+      if let value = shadowOffsetY { config.shadowOffsetY = Float(value) }
+      if let value = mergeDuplicates { config.mergeDuplicates = value ? 1 : 0 }
+      if let value = allowStacking { config.allowStacking = value ? 1 : 0 }
+      if let value = allowScrollOverwrite { config.allowScrollOverwrite = value ? 1 : 0 }
+      if let value = maxQuantity, value > 0 { config.maxQuantity = UInt32(clamping: value) }
+      if let value = maxLinesPerMode, value > 0 { config.maxLinesPerMode = UInt32(clamping: value) }
+      if let value = blockTop { config.blockTop = value ? 1 : 0 }
+      if let value = blockBottom { config.blockBottom = value ? 1 : 0 }
+      if let value = blockScroll { config.blockScroll = value ? 1 : 0 }
+      if let value = shadowStyle { config.shadowStyle = Int32(clamping: value) }
+      return config
     }
-    if let value = doubleValue(args["fontSize"]) {
-      config.fontSize = Float(value)
-    }
-    if let value = doubleValue(args["opacity"]) {
-      config.opacity = Float(value)
-    }
-    if let value = doubleValue(args["displayArea"]) {
-      config.displayArea = Float(value)
-    }
-    if let value = doubleValue(args["scrollDurationSeconds"]) {
-      config.scrollDurationSeconds = Float(value)
-    }
-    if let value = doubleValue(args["scrollSpeedFactor"]) {
-      config.scrollSpeedFactor = Float(value)
-    }
-    if let value = doubleValue(args["trackGapRatio"]) {
-      config.trackGapRatio = Float(value)
-    }
-    if let value = doubleValue(args["outlineWidth"]) {
-      config.outlineWidth = Float(value)
-    }
-    if let value = doubleValue(args["shadowOffsetX"]) {
-      config.shadowOffsetX = Float(value)
-    }
-    if let value = doubleValue(args["shadowOffsetY"]) {
-      config.shadowOffsetY = Float(value)
-    }
-    if let value = boolValue(args["mergeDuplicates"]) {
-      config.mergeDuplicates = value ? 1 : 0
-    }
-    if let value = boolValue(args["allowStacking"]) {
-      config.allowStacking = value ? 1 : 0
-    }
-    if let value = boolValue(args["allowScrollOverwrite"]) {
-      config.allowScrollOverwrite = value ? 1 : 0
-    }
-    if let value = int64Value(args["maxQuantity"]), value > 0 {
-      config.maxQuantity = UInt32(clamping: value)
-    }
-    if let value = int64Value(args["maxLinesPerMode"]), value > 0 {
-      config.maxLinesPerMode = UInt32(clamping: value)
-    }
-    if let value = boolValue(args["blockTop"]) {
-      config.blockTop = value ? 1 : 0
-    }
-    if let value = boolValue(args["blockBottom"]) {
-      config.blockBottom = value ? 1 : 0
-    }
-    if let value = boolValue(args["blockScroll"]) {
-      config.blockScroll = value ? 1 : 0
-    }
-    if let value = int64Value(args["shadowStyle"]) {
-      config.shadowStyle = Int32(clamping: value)
-    }
-    return config
   }
 
   private func startPollTimerIfNeeded() {
@@ -4471,7 +4957,11 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       guard let self else {
         return
       }
-      let sink = Self.sharedEventSink
+      let generation = self.subscription
+      let sink: ([String: Any]) -> Void = { [weak self] event in
+        guard let self, self.delivery.valid, self.subscription == generation else { return }
+        self.sharedEventSink?(event)
+      }
       for host in self.players.values {
         host.pollEvents(sendEvent: sink)
       }
@@ -4591,7 +5081,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         case .success(let value):
           result(value)
         case .failure(let error):
-          result(self.flutterError(error))
+          result(Self.flutterError(error))
         }
       }
     }
@@ -4623,7 +5113,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     throw ErikaPluginError.invalidArguments("minLevel must be one of \(names.joined(separator: ", ")).")
   }
 
-  private func flutterError(_ error: Error) -> FlutterError {
+  private static func flutterError(_ error: Error) -> FlutterError {
     if let pluginError = error as? ErikaPluginError,
        case .diagnosticsUnsupported = pluginError {
       return FlutterError(code: "ERIKA_UNSUPPORTED", message: String(describing: error), details: nil)

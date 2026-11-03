@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Linux and OpenHarmony presenters now own native work on one worker per player,
+  with native frame clocks, coalesced ticks and platform-thread result/event
+  delivery. Surface retirement and disposal drain and join native work (#93/#94).
+- Added `ErikaPlayer.loadUpscalerModel` / `clearUpscalerModel` to load a custom
+  super-resolution network (Erika `.esr` or an FSRCNNX / Anime4K CNN mpv hook
+  shader, supplied by the host) and select it with `ErikaUpscalerMode.custom`.
+  Requires a native library that exports `erika_presenter_load_upscaler_model`.
+- Windows presenters now create, render, process commands and capture frames
+  on a dedicated worker per player. Frame requests coalesce while busy; Flutter
+  results, events, textures and composition updates return to the platform thread
+  (#93). Windows screenshots now return PNG bytes when supported by the runtime.
+- macOS, iOS and tvOS presenters now create, run every native command, render,
+  poll and dispose on a dedicated thread per player; the display link only wakes
+  it and the main thread delivers results and events in order. A slow `open`,
+  `seek` or `dispose` no longer blocks the UI thread (#93).
+- Windows: the window overlay is placed above the host window again, so video
+  is no longer hidden behind it, and closing the app no longer crashes when an
+  event channel is torn down after its messenger.
+
 ## 0.3.3 - 2026-11-01
 
 - `setMuted(bool)` silences the output without losing the volume, and

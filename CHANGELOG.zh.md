@@ -15,6 +15,17 @@
 - D3D11 与 Metal 上的超分亮度输出为普通 2x `R16_FLOAT` 纹理；GPU 耗时报告在 `lastGpuMicros`，诊断 `upscaler` 对象新增 `engine`、`reason` 与 `lastGpuMs`。
 - 新的后端状态说明模式的运行方式：`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx` 与 `TensorOps`。无法运行某模式的后端保持原生采样并报告 `Inactive`。
 
+### Flutter 插件：每个 presenter 一个 owner 线程（#93）
+
+- Windows：每个 presenter 拥有一个原生工作线程，负责创建、命令、surface 变更、渲染、截图与销毁。帧请求会合并，平台线程只负责交付方法结果、事件、SMTC 更新与窗口/合成操作。
+- Linux 与 OpenHarmony 使用同一种 owner，渲染与原生命令不再占用平台线程。OpenHarmony 的 N-API 函数新增 `...Async` 变体；旧的 C 辅助函数 `ErikaOhosPlayerFromId` 现在返回 null。
+- macOS、iOS 与 tvOS：创建、所有原生命令、渲染、轮询、截图与销毁都在 presenter 自己的线程上执行；display link 只负责唤醒它。耗时的 `open`、`seek` 或 `dispose` 不再卡住 UI 线程，也不再推迟画面。
+- `ERIKA_FLUTTER_FRAME_TRACE=1` 会记录每个 tick 与命令在哪个线程上执行。
+
+### 修复
+
+- Windows Flutter 插件：窗口 overlay 重新放在宿主窗口之上，视频不再被遮住；event channel 在 messenger 之后销毁时，关闭应用不再崩溃。
+
 ## 0.3.3 - 2026-11-01
 
 - 新增保留音量的静音：`PresenterRuntime::set_muted`、C `erika_presenter_set_muted`、JSON `setMuted` 与 `volume`（`{volume, muted}`）、Flutter `ErikaPlayer.setMuted` 与 `getVolume`。静音期间设置的音量在取消静音时生效；`volume()` 始终报告宿主选择的音量。

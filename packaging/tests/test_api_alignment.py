@@ -2,7 +2,9 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -56,7 +58,7 @@ class ApiAlignmentTests(unittest.TestCase):
     def test_ohos_alpha_reaches_native_call(self):
         flutter = read("packages/erika_flutter/ohos/src/main/ets/components/plugin/ErikaFlutterPlugin.ets")
         self.assertIn("this.numberArg(args, 'videoAlphaMode', 0)", flutter)
-        self.assertIn("nativeCreate(outputMode, headroom, upscaler, videoAlphaMode)", flutter)
+        self.assertIn("nativeCreateAsync(outputMode, headroom, upscaler, videoAlphaMode)", flutter)
         sdk = read("packages/erika_ohos/src/main/ets/ErikaPlayer.ets")
         self.assertIn("config.videoAlphaMode ?? 0", sdk)
         self.assertIn("nativeCreate(outputMode, edrHeadroom, upscaler, videoAlphaMode)", sdk)
@@ -100,90 +102,34 @@ class ApiAlignmentTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("CXX"), "Set CXX to a C++ compiler to execute NativeCreate with a fake N-API host")
     def test_native_create_preserves_config_and_legacy_default(self):
-        # Execute the actual bridge function with a fake N-API argument source
-        # and capture what reaches the presenter. No OHOS SDK/device is needed.
-        for path in ["packages/erika_flutter/ohos/src/main/cpp/erika_flutter_plugin.cpp",
-                     "packages/erika_ohos/src/main/cpp/erika_ohos.cpp"]:
-            with self.subTest(path=path), tempfile.TemporaryDirectory() as temp:
-                source = read(path)
-                start = source.index("napi_value NativeCreate(")
-                end = source.index("\nnapi_value NativeLastError", start)
-                harness = r'''
-#include <cassert>
-#include <cstdint>
-#include <map>
-#include <atomic>
-#include "erika.h"
-using napi_env = void*;
-using napi_callback_info = void*;
-using napi_value = double;
-size_t supplied;
-double values[] = {2, 4.0, 3, 1};
-void napi_get_cb_info(napi_env, napi_callback_info, size_t* n, napi_value* args, void*, void*) {
-  *n = supplied < *n ? supplied : *n;
-  for (size_t i = 0; i < *n; ++i) args[i] = values[i];
-}
-int GetInt32(napi_env, napi_value v) { return static_cast<int>(v); }
-double GetDouble(napi_env, napi_value v) { return v; }
-int64_t GetInt64(napi_env, napi_value v) { return static_cast<int64_t>(v); }
-napi_value Null(napi_env) { return 0; }
-napi_value Int64(napi_env, int64_t v) { return static_cast<double>(v); }
-struct OhosPlayer { ErikaPresenterHandle* presenter; void* window; };
-std::map<int64_t, OhosPlayer> g_players;
-std::atomic<int64_t> g_next_player_id{1};
-void ReleaseWindow(OhosPlayer&) {}
-ErikaPresenterConfig captured;
-int creates = 0;
-int destroys = 0;
-extern "C" void erika_presenter_destroy(ErikaPresenterHandle*) { ++destroys; }
-extern "C" ErikaPresenterHandle* erika_presenter_create_with_config(ErikaPresenterConfig c) {
-  captured = c; ++creates;
-  return reinterpret_cast<ErikaPresenterHandle*>(16);
-}
-'''
-                harness += source[start:end]
-                find_start = source.index("OhosPlayer* FindPlayer(")
-                find_end = source.index("\nvoid ReleaseWindow", find_start)
-                destroy_start = source.index("napi_value NativeDestroy(")
-                destroy_end = source.index("\nnapi_value NativeInvoke", destroy_start)
-                harness += source[find_start:find_end]
-                harness += source[destroy_start:destroy_end]
-                harness += r'''
-int main() {
-  int64_t stale_id = 0;
-  for (size_t count : {size_t(3), size_t(4)}) {
-    values[0] = 2;
-    supplied = count;
-    const int64_t player_id = NativeCreate(nullptr, nullptr);
-    assert(player_id > 0);
-    assert(player_id != stale_id && "reusing a presenter address must not reuse its player ID");
-    assert(g_players.size() == 1 && FindPlayer(player_id) != nullptr);
-    assert(FindPlayer(player_id)->presenter == reinterpret_cast<ErikaPresenterHandle*>(16));
-    if (stale_id != 0) {
-      assert(FindPlayer(stale_id) == nullptr);
-      supplied = 1; values[0] = static_cast<double>(stale_id);
-      NativeDestroy(nullptr, nullptr);
-      assert(g_players.size() == 1 && destroys == 1);
-    }
-    assert(captured.output_mode == 2 && captured.edr_headroom == 4.0f);
-    assert(captured.luma_upscaler == 3);
-    assert(captured.video_alpha_mode == (count == 4 ? 1 : 0));
-    supplied = 1; values[0] = static_cast<double>(player_id);
-    NativeDestroy(nullptr, nullptr);
-    assert(g_players.empty());
-    stale_id = player_id;
-  }
-  supplied = 2;
-  assert(NativeCreate(nullptr, nullptr) == 0);
-  assert(creates == 2 && destroys == 2);
-}
-'''
-                cpp = Path(temp) / "bridge.cpp"
-                cpp.write_text(harness, encoding="utf-8")
-                exe = Path(temp) / ("bridge.exe" if os.name == "nt" else "bridge")
-                subprocess.run([os.environ["CXX"], "-std=c++17", "-I", str(ROOT / "crates/erika_capi/include"), str(cpp), "-o", str(exe)], check=True)
-                subprocess.run([str(exe)], check=True)
-
+        # Load each package's actual N-API bridge into Node with an owner-checking
+        # C API double (packages/erika_flutter/ohos/tests). Among the ownership
+        # checks, the harness verifies that the whole config reaches the presenter,
+        # that a 3-argument call keeps the opaque alpha default, and that a shorter
+        # call creates nothing. No OHOS SDK/device is needed.
+        if "CXX" not in os.environ:
+            self.skipTest("Set CXX to a C++ compiler to run the OHOS bridges under Node")
+        node = shutil.which("node")
+        headers = Path(node).resolve().parents[1] / "include" / "node" if node else None
+        if not headers or not (headers / "node_api.h").exists():
+            self.skipTest("Node.js with its N-API headers is required for the OHOS bridge test")
+        tests = ROOT / "packages/erika_flutter/ohos/tests"
+        for bridge, include in [
+            ("packages/erika_flutter/ohos/src/main/cpp/erika_flutter_plugin.cpp",
+             "packages/erika_flutter/native/include"),
+            ("packages/erika_ohos/src/main/cpp/erika_ohos.cpp",
+             "packages/erika_ohos/src/main/cpp/include"),
+        ]:
+            with self.subTest(path=bridge), tempfile.TemporaryDirectory() as temp:
+                module = Path(temp) / "bridge.node"
+                command = [os.environ["CXX"], "-std=c++17", "-pthread", "-fno-exceptions", "-fPIC",
+                           "-shared", "-I", str(headers), "-I", str(tests / "host_include"),
+                           "-I", str(ROOT / include), str(ROOT / bridge),
+                           str(tests / "presenter_stub.cpp"), "-o", str(module)]
+                if sys.platform == "darwin":
+                    command[1:1] = ["-undefined", "dynamic_lookup"]
+                subprocess.run(command, check=True)
+                subprocess.run([node, str(tests / "bridge_test.cjs"), str(module)], check=True)
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,17 @@
 - D3D11 と Metal の超解像輝度出力は通常の 2x `R16_FLOAT` テクスチャになりました。GPU 時間は `lastGpuMicros` に報告され、診断の `upscaler` オブジェクトに `engine`、`reason`、`lastGpuMs` が加わりました。
 - 新しいバックエンド状態がモードの実行方法を示します：`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx`、`TensorOps`。モードを実行できないバックエンドはネイティブのサンプリングを保ち、`Inactive` を報告します。
 
+### Flutter プラグイン：presenter ごとの owner スレッド（#93）
+
+- Windows：各 presenter が生成、コマンド、surface の変更、描画、キャプチャ、破棄を担うネイティブのワーカースレッドを持ちます。フレーム要求はまとめられ、プラットフォームスレッドはメソッドの結果、イベント、SMTC の更新、ウィンドウ/合成の操作だけを届けます。
+- Linux と OpenHarmony も同じ owner を使い、描画とネイティブコマンドがプラットフォームスレッドで動かなくなりました。OpenHarmony の N-API 関数に `...Async` 版が加わり、従来の C ヘルパー `ErikaOhosPlayerFromId` は null を返すようになりました。
+- macOS、iOS、tvOS：生成、すべてのネイティブコマンド、描画、ポーリング、キャプチャ、破棄が presenter 専用のスレッドで実行され、display link はそれを起こすだけです。時間のかかる `open`、`seek`、`dispose` が UI スレッドを止めたり、フレームを遅らせたりしなくなりました。
+- `ERIKA_FLUTTER_FRAME_TRACE=1` で、各 tick とコマンドを実行したスレッドを記録します。
+
+### 修正
+
+- Windows Flutter プラグイン：ウィンドウ overlay を再びホストウィンドウの上に置くため、映像が隠れなくなりました。event channel が messenger より後に破棄されても、アプリ終了時にクラッシュしなくなりました。
+
 ## 0.3.3 - 2026-11-01
 
 - 音量を保持するミュートを追加しました：`PresenterRuntime::set_muted`、C `erika_presenter_set_muted`、JSON `setMuted` と `volume`（`{volume, muted}`）、Flutter `ErikaPlayer.setMuted` と `getVolume`。ミュート中に設定した音量はミュート解除時に適用され、`volume()` は常にホストが選んだ音量を返します。

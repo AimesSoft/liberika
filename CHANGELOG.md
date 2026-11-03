@@ -53,6 +53,28 @@
   `TensorOps`. Backends that cannot run a mode keep native sampling and report
   `Inactive`.
 
+### Flutter plugins: one owner thread per presenter (#93)
+
+- Windows: each presenter now owns a native worker thread for creation,
+  commands, surface changes, rendering, capture and destruction. Frame
+  requests are coalesced, and the platform thread only delivers method
+  results, events, SMTC updates and window/composition operations.
+- Linux and OpenHarmony use the same owner, so rendering and native commands
+  no longer run on the platform thread. OpenHarmony's N-API functions gain
+  `...Async` variants; the legacy `ErikaOhosPlayerFromId` C helper now
+  returns null.
+- macOS, iOS and tvOS: create, every native command, rendering, polling,
+  capture and destroy run on the presenter's own thread; the display link
+  only wakes it. A slow `open`, `seek` or `dispose` no longer blocks the UI
+  thread or delays frames.
+- `ERIKA_FLUTTER_FRAME_TRACE=1` logs which thread ran each tick and command.
+
+### Fixes
+
+- Windows Flutter plugin: the window overlay is placed above the host window
+  again, so video is no longer hidden behind it, and closing the app no
+  longer crashes when an event channel is torn down after its messenger.
+
 ## 0.3.3 - 2026-11-01
 
 - Added mute that keeps the volume: `PresenterRuntime::set_muted`, C

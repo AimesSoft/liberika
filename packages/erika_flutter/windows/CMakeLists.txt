@@ -22,6 +22,7 @@ endif()
 list(APPEND PLUGIN_SOURCES
   "erika_composition_blend_effect.h"
   "erika_texture_publication.h"
+  "erika_presenter_worker.h"
   "erika_flutter_plugin.cpp"
   "erika_flutter_plugin.h"
   "erika_windows_smtc.cpp"
@@ -52,7 +53,7 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 target_include_directories(${PLUGIN_NAME} PRIVATE
   "${ERIKA_NATIVE_HEADER_DIR}")
 target_link_libraries(${PLUGIN_NAME} PRIVATE
-  flutter flutter_wrapper_plugin runtimeobject windowsapp CoreMessaging d3d11 dxgi shcore shlwapi)
+  flutter flutter_wrapper_plugin runtimeobject windowsapp CoreMessaging d3d11 dxgi shcore shlwapi windowscodecs ole32)
 
 set(ERIKA_WINDOWS_ARCH "" CACHE STRING
   "Erika Windows architecture: x64, x86_64, arm64, or aarch64")
