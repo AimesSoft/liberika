@@ -37,6 +37,8 @@ Future<void> smoke() async {
     if (bytes?.length != 24) throw StateError('capture size');
     final font = await player.invokeMethod<int>('registerSubtitleMemoryFont', {'playerId': id, 'data': Uint8List.fromList([1, 2, 3])});
     if (font != 42) throw StateError('font bytes');
+    await player.invokeMethod('loadUpscalerModel', {'playerId': id, 'name': 'smoke', 'data': Uint8List.fromList([1, 2, 3])});
+    await player.invokeMethod('clearUpscalerModel', {'playerId': id});
     await player.invokeMethod('detachView', {'playerId': id, 'viewId': texture});
     await player.invokeMethod('attachView', {'playerId': id, 'viewId': texture});
     if (Platform.environment['ERIKA_TEST_WAYLAND_OVERLAY'] == '1') {
@@ -69,7 +71,7 @@ Future<void> smoke() async {
     await Future<void>.delayed(const Duration(milliseconds: 80));
     if (events.length != atDispose) throw StateError('stale event after dispose');
     await subscription.cancel();
-    stdout.writeln('LINUX_STUB_SMOKE passed open/play/pause/seek/resize/capture/font/detach/reattach/pending-result dispose; overlay=${Platform.environment['ERIKA_TEST_WAYLAND_OVERLAY']}; events=${events.length}');
+    stdout.writeln('LINUX_STUB_SMOKE passed open/play/pause/seek/resize/capture/font/model/detach/reattach/pending-result dispose; overlay=${Platform.environment['ERIKA_TEST_WAYLAND_OVERLAY']}; events=${events.length}');
     exit(0);
   } catch (error, stack) {
     stderr.writeln('LINUX_STUB_SMOKE failed $error\n$stack'); exit(1);

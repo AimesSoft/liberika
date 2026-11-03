@@ -60,6 +60,7 @@ ErikaStatus erika_presenter_register_subtitle_memory_font(ErikaPresenterHandle* 
 ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle* p, const char*, const uint8_t* bytes, size_t size) {
   Owner(p); assert(size == 3 && bytes[0] == 1 && bytes[2] == 3); return ErikaStatus_Ok;
 }
+ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle* p) { Owner(p); return ErikaStatus_Ok; }
 ErikaStatus erika_presenter_attach_wgpu_surface(ErikaPresenterHandle* p, ErikaWgpuSurfaceKind, uint64_t, uint64_t, uint32_t w, uint32_t h, double) {
   Owner(p); p->attached = true; p->width = w; p->height = h; return ErikaStatus_Ok;
 }

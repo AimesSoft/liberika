@@ -456,22 +456,30 @@ static void method_call(FlMethodChannel*, FlMethodCall* call, gpointer data) {
       // Desktop MPRIS is optional; these hints do not change playback.
       success(call); return;
     }
-    std::vector<uint8_t> font;
-    if (method == "registerSubtitleMemoryFont") {
+    // Byte arguments are copied here for the owner; the JSON hop below cannot
+    // carry them.
+    const bool binary = method == "registerSubtitleMemoryFont" || method == "loadUpscalerModel";
+    std::vector<uint8_t> payload;
+    std::string payload_name;
+    if (binary) {
       auto* bytes = arg(args, "data");
       if (!bytes || fl_value_get_type(bytes) != FL_VALUE_TYPE_UINT8_LIST)
-        throw std::runtime_error("Expected font bytes");
-      font.assign(fl_value_get_uint8_list(bytes), fl_value_get_uint8_list(bytes) + fl_value_get_length(bytes));
+        throw std::runtime_error(method == "loadUpscalerModel" ? "Expected model bytes" : "Expected font bytes");
+      payload.assign(fl_value_get_uint8_list(bytes), fl_value_get_uint8_list(bytes) + fl_value_get_length(bytes));
+      const char* name = string_arg(args, "name");
+      payload_name = name && *name ? name : "custom";
     }
+    if (method == "loadUpscalerModel" && payload.empty()) throw std::runtime_error("Expected model bytes");
     g_autoptr(FlJsonMessageCodec) codec = fl_json_message_codec_new();
     g_autoptr(GError) error = nullptr;
     g_autoptr(GBytes) bytes = fl_message_codec_encode_message(FL_MESSAGE_CODEC(codec),
-      method == "registerSubtitleMemoryFont" ? nullptr : args, &error);
+      binary ? nullptr : args, &error);
     if (!bytes) throw std::runtime_error(error->message);
     gsize size; const auto* encoded = static_cast<const char*>(g_bytes_get_data(bytes, &size));
     std::string json(encoded, size);
     auto* owner = &player;
-    queue_method(plugin, owner, call, [owner, method, json, font = std::move(font)]() -> FlValue* {
+    queue_method(plugin, owner, call, [owner, method, json, payload = std::move(payload),
+                                       payload_name = std::move(payload_name)]() -> FlValue* {
       g_autoptr(FlJsonMessageCodec) codec = fl_json_message_codec_new();
       g_autoptr(GBytes) bytes = g_bytes_new(json.data(), json.size());
       g_autoptr(GError) error = nullptr;
@@ -481,8 +489,16 @@ static void method_call(FlMethodChannel*, FlMethodCall* call, gpointer data) {
       if (!player.handle) throw std::runtime_error("Presenter creation failed");
     if (method == "registerSubtitleMemoryFont") {
       uint64_t font_id = 0;
-      check(erika_presenter_register_subtitle_memory_font(player.handle, font.data(), font.size(), &font_id));
+      check(erika_presenter_register_subtitle_memory_font(player.handle, payload.data(), payload.size(), &font_id));
       return fl_value_new_int(font_id);
+    }
+    if (method == "loadUpscalerModel") {
+      check(erika_presenter_load_upscaler_model(player.handle, payload_name.c_str(), payload.data(), payload.size()));
+      return nullptr;
+    }
+    if (method == "clearUpscalerModel") {
+      check(erika_presenter_clear_upscaler_model(player.handle));
+      return nullptr;
     }
     if (method == "setSubtitleStyle") {
       ErikaSubtitleStyle style{};
