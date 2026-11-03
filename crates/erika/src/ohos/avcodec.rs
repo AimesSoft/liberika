@@ -1,3 +1,4 @@
+use super::pixel_layout::VideoPixelFormat;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void};
 use std::ptr::{self, NonNull};
@@ -142,6 +143,7 @@ unsafe extern "C" {
     ) -> i32;
     fn OH_AVBuffer_GetAddr(buffer: *mut OH_AVBuffer) -> *mut u8;
     fn OH_AVBuffer_GetCapacity(buffer: *mut OH_AVBuffer) -> i32;
+    fn OH_AVBuffer_GetNativeBuffer(buffer: *mut OH_AVBuffer) -> *mut OH_NativeBuffer;
 }
 
 #[link(name = "native_image")]
@@ -178,6 +180,7 @@ unsafe extern "C" {
         buffer: *mut *mut OH_NativeBuffer,
     ) -> i32;
     fn OH_NativeBuffer_GetConfig(buffer: *mut OH_NativeBuffer, config: *mut OhosNativeBufferConfig);
+    fn OH_NativeBuffer_Unreference(buffer: *mut OH_NativeBuffer) -> i32;
 }
 
 #[link(name = "native_window")]
@@ -221,7 +224,8 @@ impl OhosVideoCodec {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct DecodedNv12FrameView<'a> {
+pub struct DecodedVideoFrameView<'a> {
+    pub pixel_format: VideoPixelFormat,
     pub luma: &'a [u8],
     pub chroma: &'a [u8],
     pub luma_stride: usize,
@@ -737,6 +741,7 @@ pub struct OhosVideoDecoder {
     parameter_sets_sent: bool,
     surface: Option<Arc<OhosAvCodecSurface>>,
     started: bool,
+    last_output_pixel_format: Option<VideoPixelFormat>,
 }
 
 unsafe impl Send for OhosVideoDecoder {}
@@ -786,6 +791,7 @@ impl OhosVideoDecoder {
             parameter_sets_sent: false,
             surface,
             started: false,
+            last_output_pixel_format: None,
         };
         decoder.initialize(width, height, &codec_config)?;
         Ok(decoder)
@@ -975,7 +981,7 @@ impl OhosVideoDecoder {
 
     pub fn receive_frame<T, F>(&mut self, consume: F) -> Result<OhosDecoderOutput<T>, String>
     where
-        F: for<'buffer> FnOnce(DecodedNv12FrameView<'buffer>) -> Result<T, String>,
+        F: for<'buffer> FnOnce(DecodedVideoFrameView<'buffer>) -> Result<T, String>,
     {
         self.check_callback_error()?;
         let (output, layout) = {
@@ -1000,7 +1006,23 @@ impl OhosVideoDecoder {
         // SAFETY: AVCodec owns the output storage and guarantees that it stays
         // valid until OH_VideoDecoder_FreeOutputBuffer below. The higher-ranked
         // callback bound prevents a borrowed view from escaping `consume`.
-        let consume_result = unsafe { nv12_output_view(output, layout) }.and_then(consume);
+        let consume_result = unsafe { output_frame_view(output, layout) }.and_then(|decoded| {
+            if self.last_output_pixel_format != Some(decoded.pixel_format) {
+                crate::trace::diagnostic(
+                    serde_json::json!({
+                        "event": "ohos_avcodec_output_layout",
+                        "pixelFormat": decoded.pixel_format.as_str(),
+                        "bytesPerSample": decoded.pixel_format.bytes_per_sample(),
+                        "width": decoded.width,
+                        "height": decoded.height,
+                        "stride": decoded.luma_stride,
+                    })
+                    .to_string(),
+                );
+                self.last_output_pixel_format = Some(decoded.pixel_format);
+            }
+            consume(decoded)
+        });
         let release_result = check_avcodec(
             unsafe { OH_VideoDecoder_FreeOutputBuffer(self.codec, output.index) },
             "OH_VideoDecoder_FreeOutputBuffer",
@@ -1247,44 +1269,55 @@ fn is_annex_b(data: &[u8]) -> bool {
     data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
 }
 
-unsafe fn nv12_output_view<'a>(
+unsafe fn output_frame_view<'a>(
     output: OutputBuffer,
     layout: OutputLayout,
-) -> Result<DecodedNv12FrameView<'a>, String> {
-    if layout.pixel_format != AV_PIXEL_FORMAT_NV12 {
-        return Err(format!(
-            "AVCodec returned unsupported pixel format {} instead of NV12",
-            layout.pixel_format
-        ));
-    }
+) -> Result<DecodedVideoFrameView<'a>, String> {
+    let buffer = output.buffer as *mut OH_AVBuffer;
+    let native = unsafe { OH_AVBuffer_GetNativeBuffer(buffer) };
+    let mut config = OhosNativeBufferConfig::default();
+    let native_format = if native.is_null() {
+        None
+    } else {
+        unsafe { OH_NativeBuffer_GetConfig(native, &mut config) };
+        unsafe { OH_NativeBuffer_Unreference(native) };
+        Some(config.format)
+    };
+    // AVCodec may label a P010 buffer as pixel_format=NV12. The native
+    // buffer's real format distinguishes 8-bit bytes from 10-bit words.
+    let pixel_format = VideoPixelFormat::from_native_buffer(layout.pixel_format, native_format)?;
+    let stride = if config.stride > 0 {
+        config.stride as usize
+    } else {
+        layout.stride
+    };
     let width = layout.width as usize;
     let height = layout.height as usize;
-    let chroma_width = width.div_ceil(2) * 2;
+    let luma_row_bytes = pixel_format.luma_row_bytes(width)?;
+    let chroma_row_bytes = pixel_format.chroma_row_bytes(width)?;
     let chroma_rows = height.div_ceil(2);
     if layout.width == 0
         || layout.height == 0
-        || layout.stride < width
-        || layout.stride < chroma_width
+        || stride < luma_row_bytes
+        || stride < chroma_row_bytes
         || layout.slice_height < height
     {
-        return Err(format!("invalid AVCodec output layout {layout:?}"));
+        return Err(format!(
+            "invalid AVCodec output layout {layout:?}, format={pixel_format:?}, stride={stride}"
+        ));
     }
-    let buffer = output.buffer as *mut OH_AVBuffer;
     let capacity = unsafe { OH_AVBuffer_GetCapacity(buffer) };
     if capacity < 0 {
         return Err("OH_AVBuffer output capacity is unavailable".to_string());
     }
     let offset = output.attr.offset.max(0) as usize;
-    let luma_storage_size = layout
-        .stride
+    let luma_storage_size = stride
         .checked_mul(layout.slice_height)
         .ok_or_else(|| "AVCodec luma layout size overflowed".to_string())?;
-    let visible_luma_size = layout
-        .stride
+    let visible_luma_size = stride
         .checked_mul(height)
         .ok_or_else(|| "AVCodec visible luma size overflowed".to_string())?;
-    let chroma_size = layout
-        .stride
+    let chroma_size = stride
         .checked_mul(chroma_rows)
         .ok_or_else(|| "AVCodec chroma layout size overflowed".to_string())?;
     let required = luma_storage_size
@@ -1301,12 +1334,13 @@ unsafe fn nv12_output_view<'a>(
         return Err("OH_AVBuffer output address is unavailable".to_string());
     }
     let source = unsafe { address.add(offset) };
-    let source_chroma = unsafe { source.add(layout.stride * layout.slice_height) };
-    Ok(DecodedNv12FrameView {
+    let source_chroma = unsafe { source.add(luma_storage_size) };
+    Ok(DecodedVideoFrameView {
+        pixel_format,
         luma: unsafe { slice::from_raw_parts(source, visible_luma_size) },
         chroma: unsafe { slice::from_raw_parts(source_chroma, chroma_size) },
-        luma_stride: layout.stride,
-        chroma_stride: layout.stride,
+        luma_stride: stride,
+        chroma_stride: stride,
         width: layout.width,
         height: layout.height,
         pts_micros: output.attr.pts,

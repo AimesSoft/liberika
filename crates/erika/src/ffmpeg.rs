@@ -34,7 +34,7 @@ use crate::android::mediacodec::{
 };
 #[cfg(target_env = "ohos")]
 use crate::ohos::avcodec::{
-    DecodedNv12FrameView, DecodedSurfaceFrame, OhosDecoderOutput, OhosNativeBufferImage,
+    DecodedSurfaceFrame, DecodedVideoFrameView, OhosDecoderOutput, OhosNativeBufferImage,
     OhosVideoCodec, OhosVideoDecoder,
 };
 
@@ -1650,7 +1650,7 @@ impl Decoder {
             }
             return match decoder
                 .receive_frame(|decoded| {
-                    Frame::from_ohos_nv12(decoded, time_base, color)
+                    Frame::from_ohos_video_frame(decoded, time_base, color)
                         .map_err(|error| error.to_string())
                 })
                 .map_err(FfmpegError::OhosAvCodec)?
@@ -1744,7 +1744,7 @@ impl Decoder {
         let output_mode = if ohos_decoder.uses_surface() {
             "surface_native_buffer"
         } else {
-            "buffer_nv12_direct_frame_copy"
+            "buffer_planar_direct_frame_copy"
         };
         crate::trace::diagnostic(
             serde_json::json!({
@@ -2433,8 +2433,8 @@ impl Frame {
     }
 
     #[cfg(target_env = "ohos")]
-    fn from_ohos_nv12(
-        decoded: DecodedNv12FrameView<'_>,
+    fn from_ohos_video_frame(
+        decoded: DecodedVideoFrameView<'_>,
         time_base: TimeBase,
         color: OhosFrameColorProperties,
     ) -> Result<Self> {
@@ -2445,31 +2445,40 @@ impl Frame {
             || decoded.height > i32::MAX as u32
         {
             return Err(FfmpegError::OhosAvCodec(format!(
-                "invalid decoded NV12 dimensions {}x{}",
+                "invalid decoded OHOS video dimensions {}x{}",
                 decoded.width, decoded.height
             )));
         }
         let width = decoded.width as usize;
         let height = decoded.height as usize;
-        let chroma_width = width.div_ceil(2) * 2;
+        let luma_row_bytes = decoded
+            .pixel_format
+            .luma_row_bytes(width)
+            .map_err(FfmpegError::OhosAvCodec)?;
+        let chroma_width = decoded
+            .pixel_format
+            .chroma_row_bytes(width)
+            .map_err(FfmpegError::OhosAvCodec)?;
         let chroma_rows = height.div_ceil(2);
         let expected_luma_size = decoded.luma_stride.checked_mul(height).ok_or_else(|| {
-            FfmpegError::OhosAvCodec("decoded NV12 luma size overflowed".to_string())
+            FfmpegError::OhosAvCodec("decoded OHOS video luma size overflowed".to_string())
         })?;
         let expected_chroma_size =
             decoded
                 .chroma_stride
                 .checked_mul(chroma_rows)
                 .ok_or_else(|| {
-                    FfmpegError::OhosAvCodec("decoded NV12 chroma size overflowed".to_string())
+                    FfmpegError::OhosAvCodec(
+                        "decoded OHOS video chroma size overflowed".to_string(),
+                    )
                 })?;
-        if decoded.luma_stride < width
+        if decoded.luma_stride < luma_row_bytes
             || decoded.chroma_stride < chroma_width
             || decoded.luma.len() < expected_luma_size
             || decoded.chroma.len() < expected_chroma_size
         {
             return Err(FfmpegError::OhosAvCodec(format!(
-                "decoded NV12 frame has invalid source layout: luma {}/{expected_luma_size} bytes (stride {}), chroma {}/{expected_chroma_size} bytes (stride {})",
+                "decoded OHOS video frame has invalid source layout: luma {}/{expected_luma_size} bytes (stride {}), chroma {}/{expected_chroma_size} bytes (stride {})",
                 decoded.luma.len(),
                 decoded.luma_stride,
                 decoded.chroma.len(),
@@ -2478,7 +2487,11 @@ impl Frame {
         }
 
         unsafe {
-            (*frame.ptr).format = sys::AVPixelFormat_AV_PIX_FMT_NV12 as i32;
+            (*frame.ptr).format = if decoded.pixel_format.bytes_per_sample() == 2 {
+                sys::AVPixelFormat_AV_PIX_FMT_P010LE as i32
+            } else {
+                sys::AVPixelFormat_AV_PIX_FMT_NV12 as i32
+            };
             (*frame.ptr).width = decoded.width as i32;
             (*frame.ptr).height = decoded.height as i32;
             (*frame.ptr).pts = rescale_microseconds_to_time_base(decoded.pts_micros, time_base);
@@ -2490,7 +2503,7 @@ impl Frame {
         }
         check(
             unsafe { sys::av_frame_get_buffer(frame.ptr, 32) },
-            "av_frame_get_buffer(OHOS NV12)",
+            "av_frame_get_buffer(OHOS video)",
         )?;
 
         let source_luma = decoded.luma.as_ptr();
@@ -2502,18 +2515,18 @@ impl Frame {
             let destination_chroma_stride = (*frame.ptr).linesize[1].max(0) as usize;
             if destination_luma.is_null()
                 || destination_chroma.is_null()
-                || destination_luma_stride < width
+                || destination_luma_stride < luma_row_bytes
                 || destination_chroma_stride < chroma_width
             {
                 return Err(FfmpegError::OhosAvCodec(
-                    "FFmpeg allocated an invalid NV12 frame layout".to_string(),
+                    "FFmpeg allocated an invalid OHOS video frame layout".to_string(),
                 ));
             }
             for row in 0..height {
                 ptr::copy_nonoverlapping(
                     source_luma.add(row * decoded.luma_stride),
                     destination_luma.add(row * destination_luma_stride),
-                    width,
+                    luma_row_bytes,
                 );
             }
             for row in 0..chroma_rows {
