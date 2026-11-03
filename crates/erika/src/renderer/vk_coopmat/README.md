@@ -14,7 +14,7 @@ for shader in conv resident; do
     glslc --target-env=vulkan1.3 -O -DDIRECT_LOAD -DELEMENT_EPILOGUE "$shader.comp" -o "${shader}_elements.spv"
     glslc --target-env=vulkan1.3 -O -DDIRECT_LOAD -DELEMENT_EPILOGUE -DHALF_ACCUM "$shader.comp" -o "${shader}_elements_half.spv"
 done
-for shader in input border border_specialized pad head head_point head_spatial peak fused bandwidth; do
+for shader in input border border_specialized pad head head_point head_spatial head_spatial_half peak fused bandwidth; do
     glslc --target-env=vulkan1.3 -O "$shader.comp" -o "$shader.spv"
 done
 glslc --target-env=vulkan1.3 -O -DHALF_ACCUM peak.comp -o peak_half.spv
@@ -41,8 +41,15 @@ and their barrier. This is selected for graphs up to 32 channels. Wider
 graphs retain the previous kernel choices. Both variants fuse bias,
 residual and activation. Heads fuse depth-to-space, base reconstruction,
 normalization inversion and clamp. Small heads use vector ALUs with a
-16 KiB fp32 coefficient buffer and specialized descriptors; 1x1 heads avoid
-shared staging entirely. Larger heads use matrices. Folded border classes
+16 KiB coefficient buffer and specialized descriptors; 1x1 heads avoid
+shared staging entirely. NVIDIA defaults to the packed fp16 spatial head for
+the exact bundled C4F16-DN/C4F32-DN graphs. It loads contiguous input channels
+into a padded fp16 shared tile and uses four-channel fp16 FMA before the fp32
+epilogue. Each coefficient quartet retains its 16-byte slot, with four halves
+packed into the first two words. Selection compares the complete graph and
+weights, so a custom model's name alone does not change its precision policy.
+Other vector heads use fp32 coefficients/accumulators. Larger heads use
+matrices. Folded border classes
 are corrected before consumers; narrow graphs use specialized OIHW loops.
 
 Binding 0: feature arena; 1: fp16 weights; 2: u32 metadata (all storage
@@ -62,8 +69,8 @@ epilogues. Specialized heads instead use IDs32..95 for up to 16 input
 descriptors (feature base, transform, actual channels, coefficient base).
 The experimental fused shader defines its own IDs32..50 in `fused.comp`.
 
-Fp16 operands/features are used with both accumulation variants. Default
-accumulation remains fp32. `ERIKA_VK_FP16_ACCUMULATION=1` selects fp16 when
+Fp16 operands/features are used with both matrix accumulation variants. Default
+matrix accumulation remains fp32. `ERIKA_VK_FP16_ACCUMULATION=1` selects fp16 when
 supported. Tuning flags below are read during construction/prepare and
 are diagnostics, not additional renderer-facing API:
 
@@ -74,6 +81,9 @@ are diagnostics, not additional renderer-facing API:
 - `ERIKA_VK_TENSOR_HEAD=1`: force matrix heads; `0`: request vector heads
   where coefficient/shared-memory limits permit.
 - `ERIKA_VK_POINT_HEAD=0`, `ERIKA_VK_SPATIAL_HEAD=0`: old generic vector head.
+- `ERIKA_VK_FP16_HEAD=0`: retain the fp32 spatial head. `1` also permits the
+  validated packed-head path on other vendors; graph/capability checks still
+  apply. This is independent of matrix accumulation precision.
 - `ERIKA_VK_BORDER=0`: old scalar ring loop; `1`: specialized loop for all
   widths (default specializes only graphs up to 32 channels).
 - `ERIKA_VK_BAND_MIB=N`: horizontal bands bounded by the requested working

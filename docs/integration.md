@@ -123,6 +123,12 @@ Cooperative-matrix times use the default fp32 accumulation;
 `ERIKA_VK_FP16_ACCUMULATION=1` gives 6.24 ms for C4F32 and 58.7 ms for R8F64
 at a small precision cost.
 
+The Vulkan spatial head for the bundled C4F16-DN/C4F32-DN graphs now uses packed
+fp16 coefficients, shared inputs and accumulation on NVIDIA. It reduces the
+1080p full GPU handoff interval by approximately 7–8% in the paired measurements,
+with either matrix accumulation mode. Set `ERIKA_VK_FP16_HEAD=0` to retain the
+fp32 head. [Implementation and measurements](investigations/sr-gpu-head-2026-11-03/README.md).
+
 **Custom models.** `erika_presenter_load_upscaler_model(handle, name, data, len)`
 loads an Erika `.esr` network (export ArtCNN ONNX with
 `crates/erika/assets/artcnn/export_artcnn_esr.py`; for example R16F96, which is

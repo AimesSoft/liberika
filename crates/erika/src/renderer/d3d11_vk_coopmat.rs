@@ -164,6 +164,55 @@ fn vector_head(gpu: &Gpu, model: &SrModel) -> bool {
         && 16 * (8 + kernel - 1).pow(2) * 4 <= gpu.limits.max_compute_shared_memory_size
 }
 
+/// The half-precision spatial head is calibrated against these exact bundled
+/// graphs. Comparing the graph, not just its name, also handles custom models
+/// that reuse a bundled name without changing their numerical policy.
+fn validated_half_head_model(model: &SrModel) -> bool {
+    use crate::renderer::pipeline::LumaUpscalerMode;
+    use crate::renderer::sr::catalog;
+
+    let mode = match model.name.as_str() {
+        "artcnn_c4f16_dn" => LumaUpscalerMode::ArtCnnC4F16Dn,
+        "artcnn_c4f32_dn" => LumaUpscalerMode::ArtCnnC4F32Dn,
+        _ => return false,
+    };
+    catalog::execution_model(mode).is_ok_and(|known| model == known.as_ref())
+}
+
+fn half_spatial_head(gpu: &Gpu, model: &SrModel) -> bool {
+    let choice = std::env::var("ERIKA_VK_FP16_HEAD");
+    if choice.as_deref() == Ok("0")
+        || (gpu.vendor_id != 0x10de && choice.as_deref() != Ok("1"))
+        || !gpu.half_supported
+        || !vector_head(gpu, model)
+        || std::env::var("ERIKA_VK_SPATIAL_HEAD").as_deref() == Ok("0")
+    {
+        return false;
+    }
+    let head = model.layers.last().expect("validated graph has a head");
+    let kernel = head.inputs[0].kernel;
+    head.inputs.len() <= 16
+        && (2..=5).contains(&kernel)
+        && head.inputs.iter().all(|input| input.kernel == kernel)
+        && validated_half_head_model(model)
+}
+
+/// Keep each coefficient quartet in its original 16-byte uniform slot. The
+/// shader bitcasts the first two words to four halves; the last two are unused.
+fn pack_half_head_weights(weights: &[f32]) -> Vec<[u32; 4]> {
+    weights
+        .chunks_exact(4)
+        .map(|v| {
+            [
+                u32::from(f32_to_f16(v[0])) | (u32::from(f32_to_f16(v[1])) << 16),
+                u32::from(f32_to_f16(v[2])) | (u32::from(f32_to_f16(v[3])) << 16),
+                0,
+                0,
+            ]
+        })
+        .collect()
+}
+
 fn layer_tile(
     gpu: &Gpu,
     model: &SrModel,
@@ -282,6 +331,7 @@ struct Gpu {
     family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
     limits: vk::PhysicalDeviceLimits,
+    vendor_id: u32,
     timestamp_bits: u32,
     shape: [u32; 4],
     half_supported: bool,
@@ -365,6 +415,7 @@ impl Gpu {
                 .0
                 .get_physical_device_properties2(physical, &mut properties);
             let limits = properties.properties.limits;
+            let vendor_id = properties.properties.vendor_id;
             if properties.properties.api_version < vk::API_VERSION_1_3 {
                 return Err(error("Vulkan 1.3 is required"));
             }
@@ -509,6 +560,7 @@ impl Gpu {
                 family,
                 memory,
                 limits,
+                vendor_id,
                 timestamp_bits,
                 shape,
                 half_supported,
@@ -818,6 +870,7 @@ impl Pipelines {
     fn new(
         gpu: &Arc<Gpu>,
         half: bool,
+        half_head: bool,
         model: &SrModel,
         packed: &PackedModel,
         groups: u32,
@@ -981,6 +1034,8 @@ impl Pipelines {
                 out.conv.push(out.compile(
                     if point_head {
                         include_bytes!("vk_coopmat/head_point.spv")
+                    } else if spatial_head && half_head {
+                        include_bytes!("vk_coopmat/head_spatial_half.spv")
                     } else if spatial_head {
                         include_bytes!("vk_coopmat/head_spatial.spv")
                     } else if layer.output == model.head.tensor && out.vector_head {
@@ -1853,7 +1908,13 @@ impl VkCoopMatUpscaler {
             (packed.metadata.len() * 4) as u64,
             Some(bytes(&packed.metadata)),
         )?;
-        let head_weights = Buffer::new(&self.gpu, 16384, Some(bytes(&packed.head_weights)))?;
+        let half_head = half_spatial_head(&self.gpu, &model);
+        let head_weights = if half_head {
+            let coefficients = pack_half_head_weights(&packed.head_weights);
+            Buffer::new(&self.gpu, 16384, Some(bytes(&coefficients)))?
+        } else {
+            Buffer::new(&self.gpu, 16384, Some(bytes(&packed.head_weights)))?
+        };
         if model
             .layers
             .iter()
@@ -1864,6 +1925,7 @@ impl VkCoopMatUpscaler {
         let pipelines = Pipelines::new(
             &self.gpu,
             self.half_accumulation,
+            half_head,
             &model,
             &packed,
             groups,
@@ -2544,6 +2606,30 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_SRV_DIMENSION_TEXTURE2DARRAY,
     };
+
+    #[test]
+    fn vk_half_head_requires_the_validated_weights() {
+        for mode in [
+            LumaUpscalerMode::ArtCnnC4F16Dn,
+            LumaUpscalerMode::ArtCnnC4F32Dn,
+        ] {
+            let model = catalog::execution_model(mode).unwrap();
+            assert!(validated_half_head_model(&model));
+            let mut custom = (*model).clone();
+            custom.layers.last_mut().unwrap().inputs[0].weights[0] += 0.125;
+            assert!(!validated_half_head_model(&custom));
+        }
+        let original = catalog::source_model(LumaUpscalerMode::ArtCnnC4F16Dn).unwrap();
+        assert!(!validated_half_head_model(&original));
+    }
+
+    #[test]
+    fn vk_half_head_uniform_layout() {
+        let packed = pack_half_head_weights(&[1.0, -2.0, 0.5, 0.0, -0.0, 4.0, -8.0, 0.25]);
+        assert_eq!(std::mem::size_of_val(packed.as_slice()), 32);
+        assert_eq!(packed[0], [0xc0003c00, 0x00003800, 0, 0]);
+        assert_eq!(packed[1], [0x44008000, 0x3400c800, 0, 0]);
+    }
 
     fn hardware() -> (ID3D11Device, ID3D11DeviceContext) {
         let mut device = None;

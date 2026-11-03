@@ -107,6 +107,12 @@ Windows 加速器，RTX 5060 Ti（除注明外为 1080p 片源；选择器在真
 cooperative matrix 的耗时使用默认的 fp32 累加；`ERIKA_VK_FP16_ACCUMULATION=1` 时 C4F32 为 6.24 ms、R8F64 为
 58.7 ms，精度略有损失。
 
+NVIDIA 上，Vulkan 后端对内置 C4F16-DN/C4F32-DN 启用新的半精度空间末层：
+系数打包、共享输入和乘加累加使用 fp16。1080p 成对测量的完整 GPU 交接
+耗时降低约 7–8%，矩阵层使用 fp32 或 fp16 累加均有效。
+`ERIKA_VK_FP16_HEAD=0` 可恢复 fp32 末层。
+[实现原理与实测记录](investigations/sr-gpu-head-2026-11-03/README.md)。
+
 **自定义模型。** `erika_presenter_load_upscaler_model(handle, name, data, len)` 加载 Erika `.esr` 网络
 （用 `crates/erika/assets/artcnn/export_artcnn_esr.py` 导出 ArtCNN ONNX；例如未内置的 R16F96）或 FSRCNNX /
 Anime4K CNN 方言的 mpv hook shader，然后用 `set_upscaler(handle, ErikaLumaUpscalerMode_Custom)` 选用；

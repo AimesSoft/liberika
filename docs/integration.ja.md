@@ -116,6 +116,12 @@ Windows アクセラレータ、RTX 5060 Ti（特記なしは 1080p ソース。
 cooperative matrix の時間は既定の fp32 累積です。`ERIKA_VK_FP16_ACCUMULATION=1` では C4F32 が 6.24 ms、
 R8F64 が 58.7 ms になり、精度はわずかに下がります。
 
+NVIDIA では、内蔵 C4F16-DN/C4F32-DN の Vulkan 空間ヘッドに、fp16 係数の
+パック、fp16 共有入力と積和演算を使用します。1080p の比較では、行列側の
+累積精度が fp32/fp16 のどちらでも GPU ハンドオフ全体の時間が約 7–8%
+短縮しました。`ERIKA_VK_FP16_HEAD=0` で fp32 ヘッドに戻せます。
+[実装と測定記録（中文）](investigations/sr-gpu-head-2026-11-03/README.md)。
+
 **カスタムモデル。** `erika_presenter_load_upscaler_model(handle, name, data, len)` は Erika `.esr` ネットワーク
 （`crates/erika/assets/artcnn/export_artcnn_esr.py` で ArtCNN ONNX をエクスポート。たとえば同梱されない R16F96）
 または FSRCNNX / Anime4K CNN 方言の mpv hook shader を読み込みます。その後

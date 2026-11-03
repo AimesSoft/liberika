@@ -1,0 +1,207 @@
+ADAPTER NVIDIA GeForce RTX 5060 Ti
+GRAPH artcnn_c4f16_dn 0 out=16 inputs=[(0, 1, 5)]
+GRAPH artcnn_c4f16_dn 1 out=16 inputs=[(1, 16, 3)]
+GRAPH artcnn_c4f16_dn 2 out=16 inputs=[(2, 16, 3)]
+GRAPH artcnn_c4f16_dn 3 out=16 inputs=[(3, 16, 3)]
+GRAPH artcnn_c4f16_dn 4 out=4 inputs=[(4, 16, 5), (0, 1, 5)]
+FRAME artcnn_c4f16_dn fp32 sample=0
+LAYER artcnn_c4f16_dn 0 fp32 ms=0.453120 conv_ms=0.432640 correction_ms=0.020480 min_MB=74.650 effective_GBs=164.746 useful_TFLOPS=3.661 estimated_MMA_Gs=0.6147
+LAYER artcnn_c4f16_dn 1 fp32 ms=0.490688 conv_ms=0.490496 correction_ms=0.000192 min_MB=132.710 effective_GBs=270.458 useful_TFLOPS=19.473 estimated_MMA_Gs=2.4755
+LAYER artcnn_c4f16_dn 2 fp32 ms=0.429824 conv_ms=0.429440 correction_ms=0.000384 min_MB=132.710 effective_GBs=308.755 useful_TFLOPS=22.230 estimated_MMA_Gs=2.8222
+LAYER artcnn_c4f16_dn 3 fp32 ms=0.645984 conv_ms=0.645632 correction_ms=0.000352 min_MB=132.710 effective_GBs=205.439 useful_TFLOPS=14.792 estimated_MMA_Gs=1.8737
+LAYER artcnn_c4f16_dn 4 fp32 ms=1.052992 conv_ms=0.952256 correction_ms=0.100736 min_MB=87.091 effective_GBs=82.708 useful_TFLOPS=6.695 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":5.061567999999999,"model":"artcnn_c4f16_dn","sample":0,"vulkan_ms":3.517152,"warmup":true}
+FRAME artcnn_c4f16_dn fp32 sample=1
+LAYER artcnn_c4f16_dn 0 fp32 ms=0.453600 conv_ms=0.431712 correction_ms=0.021888 min_MB=74.650 effective_GBs=164.571 useful_TFLOPS=3.657 estimated_MMA_Gs=0.6161
+LAYER artcnn_c4f16_dn 1 fp32 ms=0.490560 conv_ms=0.490336 correction_ms=0.000224 min_MB=132.710 effective_GBs=270.528 useful_TFLOPS=19.478 estimated_MMA_Gs=2.4763
+LAYER artcnn_c4f16_dn 2 fp32 ms=0.429440 conv_ms=0.429056 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.031 useful_TFLOPS=22.250 estimated_MMA_Gs=2.8248
+LAYER artcnn_c4f16_dn 3 fp32 ms=0.491104 conv_ms=0.490720 correction_ms=0.000384 min_MB=132.710 effective_GBs=270.229 useful_TFLOPS=19.456 estimated_MMA_Gs=2.4652
+LAYER artcnn_c4f16_dn 4 fp32 ms=1.050720 conv_ms=0.949888 correction_ms=0.100832 min_MB=87.091 effective_GBs=82.887 useful_TFLOPS=6.710 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":3.6351999999999998,"model":"artcnn_c4f16_dn","sample":1,"vulkan_ms":3.363168,"warmup":true}
+FRAME artcnn_c4f16_dn fp32 sample=2
+LAYER artcnn_c4f16_dn 0 fp32 ms=0.451744 conv_ms=0.430752 correction_ms=0.020992 min_MB=74.650 effective_GBs=165.248 useful_TFLOPS=3.672 estimated_MMA_Gs=0.6174
+LAYER artcnn_c4f16_dn 1 fp32 ms=0.489344 conv_ms=0.489152 correction_ms=0.000192 min_MB=132.710 effective_GBs=271.201 useful_TFLOPS=19.526 estimated_MMA_Gs=2.4823
+LAYER artcnn_c4f16_dn 2 fp32 ms=0.429216 conv_ms=0.428800 correction_ms=0.000416 min_MB=132.710 effective_GBs=309.193 useful_TFLOPS=22.262 estimated_MMA_Gs=2.8264
+LAYER artcnn_c4f16_dn 3 fp32 ms=0.491328 conv_ms=0.490944 correction_ms=0.000384 min_MB=132.710 effective_GBs=270.106 useful_TFLOPS=19.448 estimated_MMA_Gs=2.4641
+LAYER artcnn_c4f16_dn 4 fp32 ms=1.053472 conv_ms=0.952192 correction_ms=0.101280 min_MB=87.091 effective_GBs=82.671 useful_TFLOPS=6.692 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":3.6068480000000003,"model":"artcnn_c4f16_dn","sample":2,"vulkan_ms":3.361568,"warmup":false}
+FRAME artcnn_c4f16_dn fp32 sample=3
+LAYER artcnn_c4f16_dn 0 fp32 ms=0.450624 conv_ms=0.430720 correction_ms=0.019904 min_MB=74.650 effective_GBs=165.658 useful_TFLOPS=3.681 estimated_MMA_Gs=0.6175
+LAYER artcnn_c4f16_dn 1 fp32 ms=0.488736 conv_ms=0.488544 correction_ms=0.000192 min_MB=132.710 effective_GBs=271.538 useful_TFLOPS=19.551 estimated_MMA_Gs=2.4854
+LAYER artcnn_c4f16_dn 2 fp32 ms=0.427712 conv_ms=0.427232 correction_ms=0.000480 min_MB=132.710 effective_GBs=310.280 useful_TFLOPS=22.340 estimated_MMA_Gs=2.8368
+LAYER artcnn_c4f16_dn 3 fp32 ms=0.491392 conv_ms=0.491008 correction_ms=0.000384 min_MB=132.710 effective_GBs=270.070 useful_TFLOPS=19.445 estimated_MMA_Gs=2.4638
+LAYER artcnn_c4f16_dn 4 fp32 ms=1.053056 conv_ms=0.952128 correction_ms=0.100928 min_MB=87.091 effective_GBs=82.703 useful_TFLOPS=6.695 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":3.600256,"model":"artcnn_c4f16_dn","sample":3,"vulkan_ms":3.358656,"warmup":false}
+FRAME artcnn_c4f16_dn fp32 sample=4
+LAYER artcnn_c4f16_dn 0 fp32 ms=0.451072 conv_ms=0.431072 correction_ms=0.020000 min_MB=74.650 effective_GBs=165.494 useful_TFLOPS=3.678 estimated_MMA_Gs=0.6170
+LAYER artcnn_c4f16_dn 1 fp32 ms=0.488896 conv_ms=0.488672 correction_ms=0.000224 min_MB=132.710 effective_GBs=271.449 useful_TFLOPS=19.544 estimated_MMA_Gs=2.4847
+LAYER artcnn_c4f16_dn 2 fp32 ms=0.763488 conv_ms=0.763104 correction_ms=0.000384 min_MB=132.710 effective_GBs=173.821 useful_TFLOPS=12.515 estimated_MMA_Gs=1.5882
+LAYER artcnn_c4f16_dn 3 fp32 ms=0.491616 conv_ms=0.491200 correction_ms=0.000416 min_MB=132.710 effective_GBs=269.947 useful_TFLOPS=19.436 estimated_MMA_Gs=2.4628
+LAYER artcnn_c4f16_dn 4 fp32 ms=1.056512 conv_ms=0.954752 correction_ms=0.101760 min_MB=87.091 effective_GBs=82.433 useful_TFLOPS=6.673 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":3.94032,"model":"artcnn_c4f16_dn","sample":4,"vulkan_ms":3.697152,"warmup":false}
+FRAME artcnn_c4f16_dn fp32 sample=5
+LAYER artcnn_c4f16_dn 0 fp32 ms=0.451648 conv_ms=0.430880 correction_ms=0.020768 min_MB=74.650 effective_GBs=165.283 useful_TFLOPS=3.673 estimated_MMA_Gs=0.6172
+LAYER artcnn_c4f16_dn 1 fp32 ms=0.489056 conv_ms=0.488864 correction_ms=0.000192 min_MB=132.710 effective_GBs=271.360 useful_TFLOPS=19.538 estimated_MMA_Gs=2.4837
+LAYER artcnn_c4f16_dn 2 fp32 ms=0.429184 conv_ms=0.428672 correction_ms=0.000512 min_MB=132.710 effective_GBs=309.216 useful_TFLOPS=22.264 estimated_MMA_Gs=2.8273
+LAYER artcnn_c4f16_dn 3 fp32 ms=0.490944 conv_ms=0.490560 correction_ms=0.000384 min_MB=132.710 effective_GBs=270.317 useful_TFLOPS=19.463 estimated_MMA_Gs=2.4660
+LAYER artcnn_c4f16_dn 4 fp32 ms=1.053824 conv_ms=0.952480 correction_ms=0.101344 min_MB=87.091 effective_GBs=82.643 useful_TFLOPS=6.690 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":3.6,"model":"artcnn_c4f16_dn","sample":5,"vulkan_ms":3.361088,"warmup":false}
+FRAME artcnn_c4f16_dn fp32 sample=6
+LAYER artcnn_c4f16_dn 0 fp32 ms=0.450848 conv_ms=0.430400 correction_ms=0.020448 min_MB=74.650 effective_GBs=165.576 useful_TFLOPS=3.679 estimated_MMA_Gs=0.6179
+LAYER artcnn_c4f16_dn 1 fp32 ms=0.488448 conv_ms=0.488256 correction_ms=0.000192 min_MB=132.710 effective_GBs=271.698 useful_TFLOPS=19.562 estimated_MMA_Gs=2.4868
+LAYER artcnn_c4f16_dn 2 fp32 ms=0.429120 conv_ms=0.428736 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.262 useful_TFLOPS=22.267 estimated_MMA_Gs=2.8269
+LAYER artcnn_c4f16_dn 3 fp32 ms=0.491168 conv_ms=0.490752 correction_ms=0.000416 min_MB=132.710 effective_GBs=270.193 useful_TFLOPS=19.454 estimated_MMA_Gs=2.4651
+LAYER artcnn_c4f16_dn 4 fp32 ms=1.051136 conv_ms=0.950368 correction_ms=0.100768 min_MB=87.091 effective_GBs=82.854 useful_TFLOPS=6.707 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":3.591552,"model":"artcnn_c4f16_dn","sample":6,"vulkan_ms":3.356384,"warmup":false}
+FRAME artcnn_c4f16_dn fp16 sample=0
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.449600 conv_ms=0.429152 correction_ms=0.020448 min_MB=74.650 effective_GBs=166.036 useful_TFLOPS=3.690 estimated_MMA_Gs=0.6197
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.384928 conv_ms=0.384544 correction_ms=0.000384 min_MB=132.710 effective_GBs=344.767 useful_TFLOPS=24.823 estimated_MMA_Gs=3.1575
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428896 conv_ms=0.428512 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.423 useful_TFLOPS=22.278 estimated_MMA_Gs=2.8283
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.676320 conv_ms=0.676000 correction_ms=0.000320 min_MB=132.710 effective_GBs=196.224 useful_TFLOPS=14.128 estimated_MMA_Gs=1.7896
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.053344 conv_ms=0.950880 correction_ms=0.102464 min_MB=87.091 effective_GBs=82.681 useful_TFLOPS=6.693 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":5.2633280000000005,"model":"artcnn_c4f16_dn","sample":0,"vulkan_ms":3.671072,"warmup":true}
+FRAME artcnn_c4f16_dn fp16 sample=1
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447616 conv_ms=0.427040 correction_ms=0.020576 min_MB=74.650 effective_GBs=166.772 useful_TFLOPS=3.706 estimated_MMA_Gs=0.6228
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.380352 conv_ms=0.380160 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.915 useful_TFLOPS=25.122 estimated_MMA_Gs=3.1939
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.426912 conv_ms=0.426528 correction_ms=0.000384 min_MB=132.710 effective_GBs=310.861 useful_TFLOPS=22.382 estimated_MMA_Gs=2.8415
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.376576 conv_ms=0.376192 correction_ms=0.000384 min_MB=132.710 effective_GBs=352.413 useful_TFLOPS=25.374 estimated_MMA_Gs=3.2158
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.053824 conv_ms=0.952288 correction_ms=0.101536 min_MB=87.091 effective_GBs=82.643 useful_TFLOPS=6.690 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":3.377024,"model":"artcnn_c4f16_dn","sample":1,"vulkan_ms":3.1316479999999998,"warmup":true}
+FRAME artcnn_c4f16_dn fp16 sample=2
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447072 conv_ms=0.427616 correction_ms=0.019456 min_MB=74.650 effective_GBs=166.974 useful_TFLOPS=3.711 estimated_MMA_Gs=0.6220
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.381664 conv_ms=0.381472 correction_ms=0.000192 min_MB=132.710 effective_GBs=347.715 useful_TFLOPS=25.035 estimated_MMA_Gs=3.1830
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428384 conv_ms=0.427840 correction_ms=0.000544 min_MB=132.710 effective_GBs=309.793 useful_TFLOPS=22.305 estimated_MMA_Gs=2.8328
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.377120 conv_ms=0.376736 correction_ms=0.000384 min_MB=132.710 effective_GBs=351.905 useful_TFLOPS=25.337 estimated_MMA_Gs=3.2111
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.055936 conv_ms=0.953248 correction_ms=0.102688 min_MB=87.091 effective_GBs=82.478 useful_TFLOPS=6.677 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":3.38128,"model":"artcnn_c4f16_dn","sample":2,"vulkan_ms":3.136384,"warmup":false}
+FRAME artcnn_c4f16_dn fp16 sample=3
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447264 conv_ms=0.426496 correction_ms=0.020768 min_MB=74.650 effective_GBs=166.903 useful_TFLOPS=3.709 estimated_MMA_Gs=0.6236
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.383136 conv_ms=0.382912 correction_ms=0.000224 min_MB=132.710 effective_GBs=346.379 useful_TFLOPS=24.939 estimated_MMA_Gs=3.1710
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.430016 conv_ms=0.429632 correction_ms=0.000384 min_MB=132.710 effective_GBs=308.617 useful_TFLOPS=22.220 estimated_MMA_Gs=2.8210
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.376896 conv_ms=0.376512 correction_ms=0.000384 min_MB=132.710 effective_GBs=352.114 useful_TFLOPS=25.352 estimated_MMA_Gs=3.2130
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.054560 conv_ms=0.953248 correction_ms=0.101312 min_MB=87.091 effective_GBs=82.585 useful_TFLOPS=6.685 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":3.349024,"model":"artcnn_c4f16_dn","sample":3,"vulkan_ms":3.135776,"warmup":false}
+FRAME artcnn_c4f16_dn fp16 sample=4
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447456 conv_ms=0.426976 correction_ms=0.020480 min_MB=74.650 effective_GBs=166.831 useful_TFLOPS=3.707 estimated_MMA_Gs=0.6229
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.382368 conv_ms=0.382176 correction_ms=0.000192 min_MB=132.710 effective_GBs=347.075 useful_TFLOPS=24.989 estimated_MMA_Gs=3.1771
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428576 conv_ms=0.428192 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.654 useful_TFLOPS=22.295 estimated_MMA_Gs=2.8304
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.377632 conv_ms=0.377248 correction_ms=0.000384 min_MB=132.710 effective_GBs=351.428 useful_TFLOPS=25.303 estimated_MMA_Gs=3.2068
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.347424 conv_ms=1.245888 correction_ms=0.101536 min_MB=87.091 effective_GBs=64.635 useful_TFLOPS=5.232 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":3.641504,"model":"artcnn_c4f16_dn","sample":4,"vulkan_ms":3.427392,"warmup":false}
+FRAME artcnn_c4f16_dn fp16 sample=5
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.447488 conv_ms=0.426784 correction_ms=0.020704 min_MB=74.650 effective_GBs=166.819 useful_TFLOPS=3.707 estimated_MMA_Gs=0.6232
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.381344 conv_ms=0.381152 correction_ms=0.000192 min_MB=132.710 effective_GBs=348.007 useful_TFLOPS=25.057 estimated_MMA_Gs=3.1856
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428576 conv_ms=0.428192 correction_ms=0.000384 min_MB=132.710 effective_GBs=309.654 useful_TFLOPS=22.295 estimated_MMA_Gs=2.8304
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.390240 conv_ms=0.389856 correction_ms=0.000384 min_MB=132.710 effective_GBs=340.074 useful_TFLOPS=24.485 estimated_MMA_Gs=3.1031
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.054720 conv_ms=0.952032 correction_ms=0.102688 min_MB=87.091 effective_GBs=82.573 useful_TFLOPS=6.684 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":3.3762879999999997,"model":"artcnn_c4f16_dn","sample":5,"vulkan_ms":3.1484799999999997,"warmup":false}
+FRAME artcnn_c4f16_dn fp16 sample=6
+LAYER artcnn_c4f16_dn 0 fp16 ms=0.448032 conv_ms=0.427200 correction_ms=0.020832 min_MB=74.650 effective_GBs=166.617 useful_TFLOPS=3.703 estimated_MMA_Gs=0.6226
+LAYER artcnn_c4f16_dn 1 fp16 ms=0.380096 conv_ms=0.379872 correction_ms=0.000224 min_MB=132.710 effective_GBs=349.150 useful_TFLOPS=25.139 estimated_MMA_Gs=3.1964
+LAYER artcnn_c4f16_dn 2 fp16 ms=0.428160 conv_ms=0.427808 correction_ms=0.000352 min_MB=132.710 effective_GBs=309.955 useful_TFLOPS=22.317 estimated_MMA_Gs=2.8330
+LAYER artcnn_c4f16_dn 3 fp16 ms=0.376832 conv_ms=0.376512 correction_ms=0.000320 min_MB=132.710 effective_GBs=352.174 useful_TFLOPS=25.357 estimated_MMA_Gs=3.2130
+LAYER artcnn_c4f16_dn 4 fp16 ms=1.057600 conv_ms=0.954784 correction_ms=0.102816 min_MB=87.091 effective_GBs=82.348 useful_TFLOPS=6.666 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":3.3585279999999997,"model":"artcnn_c4f16_dn","sample":6,"vulkan_ms":3.1363519999999996,"warmup":false}
+GRAPH artcnn_c4f32_dn 0 out=32 inputs=[(0, 1, 5)]
+GRAPH artcnn_c4f32_dn 1 out=32 inputs=[(1, 32, 3)]
+GRAPH artcnn_c4f32_dn 2 out=32 inputs=[(2, 32, 3)]
+GRAPH artcnn_c4f32_dn 3 out=32 inputs=[(3, 32, 3)]
+GRAPH artcnn_c4f32_dn 4 out=4 inputs=[(4, 32, 5), (0, 1, 5)]
+FRAME artcnn_c4f32_dn fp32 sample=0
+LAYER artcnn_c4f32_dn 0 fp32 ms=0.635744 conv_ms=0.600096 correction_ms=0.035648 min_MB=141.005 effective_GBs=221.795 useful_TFLOPS=5.219 estimated_MMA_Gs=0.8945
+LAYER artcnn_c4f32_dn 1 fp32 ms=1.191328 conv_ms=1.190752 correction_ms=0.000576 min_MB=265.421 effective_GBs=222.794 useful_TFLOPS=32.082 estimated_MMA_Gs=4.1088
+LAYER artcnn_c4f32_dn 2 fp32 ms=1.204800 conv_ms=1.204032 correction_ms=0.000768 min_MB=265.421 effective_GBs=220.303 useful_TFLOPS=31.724 estimated_MMA_Gs=4.0486
+LAYER artcnn_c4f32_dn 3 fp32 ms=1.172320 conv_ms=1.171552 correction_ms=0.000768 min_MB=265.421 effective_GBs=226.406 useful_TFLOPS=32.603 estimated_MMA_Gs=4.1456
+LAYER artcnn_c4f32_dn 4 fp32 ms=2.125312 conv_ms=1.835744 correction_ms=0.289568 min_MB=153.446 effective_GBs=72.199 useful_TFLOPS=6.439 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":10.146880000000001,"model":"artcnn_c4f32_dn","sample":0,"vulkan_ms":6.77744,"warmup":true}
+FRAME artcnn_c4f32_dn fp32 sample=1
+LAYER artcnn_c4f32_dn 0 fp32 ms=0.637472 conv_ms=0.601376 correction_ms=0.036096 min_MB=141.005 effective_GBs=221.194 useful_TFLOPS=5.205 estimated_MMA_Gs=0.8926
+LAYER artcnn_c4f32_dn 1 fp32 ms=1.188096 conv_ms=1.187264 correction_ms=0.000832 min_MB=265.421 effective_GBs=223.400 useful_TFLOPS=32.170 estimated_MMA_Gs=4.1209
+LAYER artcnn_c4f32_dn 2 fp32 ms=1.198656 conv_ms=1.197888 correction_ms=0.000768 min_MB=265.421 effective_GBs=221.432 useful_TFLOPS=31.886 estimated_MMA_Gs=4.0694
+LAYER artcnn_c4f32_dn 3 fp32 ms=1.475104 conv_ms=1.474336 correction_ms=0.000768 min_MB=265.421 effective_GBs=179.934 useful_TFLOPS=25.910 estimated_MMA_Gs=3.2943
+LAYER artcnn_c4f32_dn 4 fp32 ms=2.125376 conv_ms=1.835008 correction_ms=0.290368 min_MB=153.446 effective_GBs=72.197 useful_TFLOPS=6.439 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":7.55824,"model":"artcnn_c4f32_dn","sample":1,"vulkan_ms":7.304032,"warmup":true}
+FRAME artcnn_c4f32_dn fp32 sample=2
+LAYER artcnn_c4f32_dn 0 fp32 ms=0.636864 conv_ms=0.600960 correction_ms=0.035904 min_MB=141.005 effective_GBs=221.405 useful_TFLOPS=5.210 estimated_MMA_Gs=0.8932
+LAYER artcnn_c4f32_dn 1 fp32 ms=1.185632 conv_ms=1.185024 correction_ms=0.000608 min_MB=265.421 effective_GBs=223.864 useful_TFLOPS=32.236 estimated_MMA_Gs=4.1286
+LAYER artcnn_c4f32_dn 2 fp32 ms=1.196864 conv_ms=1.196064 correction_ms=0.000800 min_MB=265.421 effective_GBs=221.764 useful_TFLOPS=31.934 estimated_MMA_Gs=4.0756
+LAYER artcnn_c4f32_dn 3 fp32 ms=1.168928 conv_ms=1.168064 correction_ms=0.000864 min_MB=265.421 effective_GBs=227.063 useful_TFLOPS=32.697 estimated_MMA_Gs=4.1580
+LAYER artcnn_c4f32_dn 4 fp32 ms=2.324064 conv_ms=2.032864 correction_ms=0.291200 min_MB=153.446 effective_GBs=66.025 useful_TFLOPS=5.889 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":7.176832,"model":"artcnn_c4f32_dn","sample":2,"vulkan_ms":6.96464,"warmup":false}
+FRAME artcnn_c4f32_dn fp32 sample=3
+LAYER artcnn_c4f32_dn 0 fp32 ms=0.634720 conv_ms=0.599328 correction_ms=0.035392 min_MB=141.005 effective_GBs=222.153 useful_TFLOPS=5.227 estimated_MMA_Gs=0.8957
+LAYER artcnn_c4f32_dn 1 fp32 ms=1.185952 conv_ms=1.185376 correction_ms=0.000576 min_MB=265.421 effective_GBs=223.804 useful_TFLOPS=32.228 estimated_MMA_Gs=4.1274
+LAYER artcnn_c4f32_dn 2 fp32 ms=1.196032 conv_ms=1.195232 correction_ms=0.000800 min_MB=265.421 effective_GBs=221.918 useful_TFLOPS=31.956 estimated_MMA_Gs=4.0784
+LAYER artcnn_c4f32_dn 3 fp32 ms=1.167168 conv_ms=1.166368 correction_ms=0.000800 min_MB=265.421 effective_GBs=227.406 useful_TFLOPS=32.746 estimated_MMA_Gs=4.1641
+LAYER artcnn_c4f32_dn 4 fp32 ms=2.125376 conv_ms=1.834880 correction_ms=0.290496 min_MB=153.446 effective_GBs=72.197 useful_TFLOPS=6.439 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":6.984319999999999,"model":"artcnn_c4f32_dn","sample":3,"vulkan_ms":6.761536,"warmup":false}
+FRAME artcnn_c4f32_dn fp32 sample=4
+LAYER artcnn_c4f32_dn 0 fp32 ms=0.634784 conv_ms=0.599456 correction_ms=0.035328 min_MB=141.005 effective_GBs=222.130 useful_TFLOPS=5.227 estimated_MMA_Gs=0.8955
+LAYER artcnn_c4f32_dn 1 fp32 ms=1.184096 conv_ms=1.183488 correction_ms=0.000608 min_MB=265.421 effective_GBs=224.155 useful_TFLOPS=32.278 estimated_MMA_Gs=4.1340
+LAYER artcnn_c4f32_dn 2 fp32 ms=1.199776 conv_ms=1.199008 correction_ms=0.000768 min_MB=265.421 effective_GBs=221.225 useful_TFLOPS=31.856 estimated_MMA_Gs=4.0656
+LAYER artcnn_c4f32_dn 3 fp32 ms=1.168160 conv_ms=1.167360 correction_ms=0.000800 min_MB=265.421 effective_GBs=227.213 useful_TFLOPS=32.719 estimated_MMA_Gs=4.1605
+LAYER artcnn_c4f32_dn 4 fp32 ms=2.124832 conv_ms=1.834464 correction_ms=0.290368 min_MB=153.446 effective_GBs=72.216 useful_TFLOPS=6.441 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":7.012672,"model":"artcnn_c4f32_dn","sample":4,"vulkan_ms":6.76208,"warmup":false}
+FRAME artcnn_c4f32_dn fp32 sample=5
+LAYER artcnn_c4f32_dn 0 fp32 ms=0.877984 conv_ms=0.842400 correction_ms=0.035584 min_MB=141.005 effective_GBs=160.601 useful_TFLOPS=3.779 estimated_MMA_Gs=0.6372
+LAYER artcnn_c4f32_dn 1 fp32 ms=1.194752 conv_ms=1.194048 correction_ms=0.000704 min_MB=265.421 effective_GBs=222.156 useful_TFLOPS=31.990 estimated_MMA_Gs=4.0974
+LAYER artcnn_c4f32_dn 2 fp32 ms=1.201216 conv_ms=1.200480 correction_ms=0.000736 min_MB=265.421 effective_GBs=220.960 useful_TFLOPS=31.818 estimated_MMA_Gs=4.0606
+LAYER artcnn_c4f32_dn 3 fp32 ms=1.171392 conv_ms=1.170528 correction_ms=0.000864 min_MB=265.421 effective_GBs=226.586 useful_TFLOPS=32.628 estimated_MMA_Gs=4.1493
+LAYER artcnn_c4f32_dn 4 fp32 ms=2.127520 conv_ms=1.836672 correction_ms=0.290848 min_MB=153.446 effective_GBs=72.125 useful_TFLOPS=6.433 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":7.266368,"model":"artcnn_c4f32_dn","sample":5,"vulkan_ms":7.024448,"warmup":false}
+FRAME artcnn_c4f32_dn fp32 sample=6
+LAYER artcnn_c4f32_dn 0 fp32 ms=0.637792 conv_ms=0.602368 correction_ms=0.035424 min_MB=141.005 effective_GBs=221.083 useful_TFLOPS=5.202 estimated_MMA_Gs=0.8911
+LAYER artcnn_c4f32_dn 1 fp32 ms=1.187936 conv_ms=1.187328 correction_ms=0.000608 min_MB=265.421 effective_GBs=223.430 useful_TFLOPS=32.174 estimated_MMA_Gs=4.1206
+LAYER artcnn_c4f32_dn 2 fp32 ms=1.203424 conv_ms=1.202528 correction_ms=0.000896 min_MB=265.421 effective_GBs=220.555 useful_TFLOPS=31.760 estimated_MMA_Gs=4.0537
+LAYER artcnn_c4f32_dn 3 fp32 ms=1.423744 conv_ms=1.422944 correction_ms=0.000800 min_MB=265.421 effective_GBs=186.425 useful_TFLOPS=26.845 estimated_MMA_Gs=3.4132
+LAYER artcnn_c4f32_dn 4 fp32 ms=2.388352 conv_ms=2.095904 correction_ms=0.292448 min_MB=153.446 effective_GBs=64.248 useful_TFLOPS=5.730 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":32,"handoff_ms":7.638464,"model":"artcnn_c4f32_dn","sample":6,"vulkan_ms":7.293504,"warmup":false}
+FRAME artcnn_c4f32_dn fp16 sample=0
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.629728 conv_ms=0.593792 correction_ms=0.035936 min_MB=141.005 effective_GBs=223.914 useful_TFLOPS=5.269 estimated_MMA_Gs=0.9040
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.935008 conv_ms=0.934400 correction_ms=0.000608 min_MB=265.421 effective_GBs=283.870 useful_TFLOPS=40.877 estimated_MMA_Gs=5.1516
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.937632 conv_ms=0.936864 correction_ms=0.000768 min_MB=265.421 effective_GBs=283.076 useful_TFLOPS=40.763 estimated_MMA_Gs=5.1193
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.930016 conv_ms=0.929216 correction_ms=0.000800 min_MB=265.421 effective_GBs=285.394 useful_TFLOPS=41.097 estimated_MMA_Gs=5.1425
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.128960 conv_ms=1.842240 correction_ms=0.286720 min_MB=153.446 effective_GBs=72.076 useful_TFLOPS=6.428 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":7.47088,"model":"artcnn_c4f32_dn","sample":0,"vulkan_ms":6.0030719999999995,"warmup":true}
+FRAME artcnn_c4f32_dn fp16 sample=1
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630464 conv_ms=0.594944 correction_ms=0.035520 min_MB=141.005 effective_GBs=223.652 useful_TFLOPS=5.262 estimated_MMA_Gs=0.9023
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.931008 conv_ms=0.930464 correction_ms=0.000544 min_MB=265.421 effective_GBs=285.090 useful_TFLOPS=41.053 estimated_MMA_Gs=5.1734
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.927648 conv_ms=0.926912 correction_ms=0.000736 min_MB=265.421 effective_GBs=286.122 useful_TFLOPS=41.202 estimated_MMA_Gs=5.1742
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.924064 conv_ms=0.923232 correction_ms=0.000832 min_MB=265.421 effective_GBs=287.232 useful_TFLOPS=41.361 estimated_MMA_Gs=5.1758
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.333664 conv_ms=1.836928 correction_ms=0.496736 min_MB=153.446 effective_GBs=65.753 useful_TFLOPS=5.864 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":6.498592,"model":"artcnn_c4f32_dn","sample":1,"vulkan_ms":6.193856,"warmup":true}
+FRAME artcnn_c4f32_dn fp16 sample=2
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.630368 conv_ms=0.594400 correction_ms=0.035968 min_MB=141.005 effective_GBs=223.686 useful_TFLOPS=5.263 estimated_MMA_Gs=0.9031
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.932160 conv_ms=0.931552 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.737 useful_TFLOPS=41.002 estimated_MMA_Gs=5.1673
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.927200 conv_ms=0.926464 correction_ms=0.000736 min_MB=265.421 effective_GBs=286.261 useful_TFLOPS=41.222 estimated_MMA_Gs=5.1767
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.923040 conv_ms=0.922144 correction_ms=0.000896 min_MB=265.421 effective_GBs=287.551 useful_TFLOPS=41.407 estimated_MMA_Gs=5.1819
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.122464 conv_ms=1.838560 correction_ms=0.283904 min_MB=153.446 effective_GBs=72.296 useful_TFLOPS=6.448 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":6.249280000000001,"model":"artcnn_c4f32_dn","sample":2,"vulkan_ms":5.982048,"warmup":false}
+FRAME artcnn_c4f32_dn fp16 sample=3
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.632160 conv_ms=0.596096 correction_ms=0.036064 min_MB=141.005 effective_GBs=223.052 useful_TFLOPS=5.248 estimated_MMA_Gs=0.9005
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.932192 conv_ms=0.931616 correction_ms=0.000576 min_MB=265.421 effective_GBs=284.728 useful_TFLOPS=41.001 estimated_MMA_Gs=5.1670
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.930336 conv_ms=0.929440 correction_ms=0.000896 min_MB=265.421 effective_GBs=285.296 useful_TFLOPS=41.083 estimated_MMA_Gs=5.1602
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.925120 conv_ms=0.924352 correction_ms=0.000768 min_MB=265.421 effective_GBs=286.904 useful_TFLOPS=41.314 estimated_MMA_Gs=5.1696
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.423136 conv_ms=2.137248 correction_ms=0.285888 min_MB=153.446 effective_GBs=63.326 useful_TFLOPS=5.648 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":6.501151999999999,"model":"artcnn_c4f32_dn","sample":3,"vulkan_ms":6.290719999999999,"warmup":false}
+FRAME artcnn_c4f32_dn fp16 sample=4
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.632032 conv_ms=0.596288 correction_ms=0.035744 min_MB=141.005 effective_GBs=223.098 useful_TFLOPS=5.249 estimated_MMA_Gs=0.9002
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.931776 conv_ms=0.931168 correction_ms=0.000608 min_MB=265.421 effective_GBs=284.855 useful_TFLOPS=41.019 estimated_MMA_Gs=5.1695
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.930720 conv_ms=0.929920 correction_ms=0.000800 min_MB=265.421 effective_GBs=285.178 useful_TFLOPS=41.066 estimated_MMA_Gs=5.1575
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.926720 conv_ms=0.925984 correction_ms=0.000736 min_MB=265.421 effective_GBs=286.409 useful_TFLOPS=41.243 estimated_MMA_Gs=5.1605
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.128768 conv_ms=1.839968 correction_ms=0.288800 min_MB=153.446 effective_GBs=72.082 useful_TFLOPS=6.429 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":6.243552,"model":"artcnn_c4f32_dn","sample":4,"vulkan_ms":5.998336,"warmup":false}
+FRAME artcnn_c4f32_dn fp16 sample=5
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.632256 conv_ms=0.596832 correction_ms=0.035424 min_MB=141.005 effective_GBs=223.019 useful_TFLOPS=5.247 estimated_MMA_Gs=0.8994
+LAYER artcnn_c4f32_dn 1 fp16 ms=0.934048 conv_ms=0.933408 correction_ms=0.000640 min_MB=265.421 effective_GBs=284.162 useful_TFLOPS=40.919 estimated_MMA_Gs=5.1571
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.928992 conv_ms=0.928192 correction_ms=0.000800 min_MB=265.421 effective_GBs=285.708 useful_TFLOPS=41.142 estimated_MMA_Gs=5.1671
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.925952 conv_ms=0.925216 correction_ms=0.000736 min_MB=265.421 effective_GBs=286.646 useful_TFLOPS=41.277 estimated_MMA_Gs=5.1647
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.125248 conv_ms=1.839744 correction_ms=0.285504 min_MB=153.446 effective_GBs=72.202 useful_TFLOPS=6.440 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":6.226688,"model":"artcnn_c4f32_dn","sample":5,"vulkan_ms":5.993888,"warmup":false}
+FRAME artcnn_c4f32_dn fp16 sample=6
+LAYER artcnn_c4f32_dn 0 fp16 ms=0.631680 conv_ms=0.595456 correction_ms=0.036224 min_MB=141.005 effective_GBs=223.222 useful_TFLOPS=5.252 estimated_MMA_Gs=0.9015
+LAYER artcnn_c4f32_dn 1 fp16 ms=1.284384 conv_ms=1.283616 correction_ms=0.000768 min_MB=265.421 effective_GBs=206.652 useful_TFLOPS=29.758 estimated_MMA_Gs=3.7501
+LAYER artcnn_c4f32_dn 2 fp16 ms=0.934112 conv_ms=0.933344 correction_ms=0.000768 min_MB=265.421 effective_GBs=284.142 useful_TFLOPS=40.917 estimated_MMA_Gs=5.1386
+LAYER artcnn_c4f32_dn 3 fp16 ms=0.927104 conv_ms=0.926176 correction_ms=0.000928 min_MB=265.421 effective_GBs=286.290 useful_TFLOPS=41.226 estimated_MMA_Gs=5.1594
+LAYER artcnn_c4f32_dn 4 fp16 ms=2.125760 conv_ms=1.839648 correction_ms=0.286112 min_MB=153.446 effective_GBs=72.184 useful_TFLOPS=6.438 estimated_MMA_Gs=0.0000
+RESULT {"acc_bits":16,"handoff_ms":6.56416,"model":"artcnn_c4f32_dn","sample":6,"vulkan_ms":6.351871999999999,"warmup":false}

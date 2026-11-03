@@ -1,0 +1,344 @@
+[
+  {
+    "acc_bits": 16,
+    "median_ms": 3.37472,
+    "model": "artcnn_c4f16_dn",
+    "round": 0,
+    "samples_ms": [
+      3.36192,
+      3.3910720000000003,
+      3.582144,
+      3.37472,
+      3.346336,
+      3.351136,
+      3.348384,
+      3.383968,
+      3.9428479999999997
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.4167680000000002,
+    "model": "artcnn_c4f16_dn",
+    "round": 0,
+    "samples_ms": [
+      3.8578240000000004,
+      3.357728,
+      3.667168,
+      3.3887359999999997,
+      3.38464,
+      3.747168,
+      3.74544,
+      3.4167680000000002,
+      3.364576
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows2"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.38336,
+    "model": "artcnn_c4f16_dn",
+    "round": 0,
+    "samples_ms": [
+      4.1024,
+      3.35392,
+      3.359072,
+      3.3608000000000002,
+      3.638528,
+      3.3642239999999997,
+      3.38336,
+      3.386368,
+      3.413696
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows4"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.390816,
+    "model": "artcnn_c4f16_dn",
+    "round": 1,
+    "samples_ms": [
+      3.641792,
+      3.385376,
+      3.3784319999999997,
+      3.38208,
+      3.4163520000000003,
+      3.734592,
+      3.739296,
+      3.390816,
+      3.369504
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.387424,
+    "model": "artcnn_c4f16_dn",
+    "round": 1,
+    "samples_ms": [
+      3.3584,
+      3.383136,
+      3.393568,
+      3.9305920000000003,
+      3.389952,
+      3.391872,
+      3.387424,
+      3.361344,
+      3.370464
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows2"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.424736,
+    "model": "artcnn_c4f16_dn",
+    "round": 1,
+    "samples_ms": [
+      3.368192,
+      3.685024,
+      3.404608,
+      3.438304,
+      3.424736,
+      3.397344,
+      3.464192,
+      3.840512,
+      3.40384
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows4"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.401664,
+    "model": "artcnn_c4f16_dn",
+    "round": 2,
+    "samples_ms": [
+      3.401664,
+      3.929312,
+      3.36352,
+      3.35968,
+      3.358368,
+      3.374464,
+      3.949184,
+      3.741984,
+      3.413728
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.409824,
+    "model": "artcnn_c4f16_dn",
+    "round": 2,
+    "samples_ms": [
+      3.6824000000000003,
+      3.394688,
+      3.3794239999999998,
+      3.4023679999999996,
+      3.378368,
+      3.409824,
+      3.4132160000000002,
+      3.430272,
+      3.4252480000000003
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows2"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 3.4023679999999996,
+    "model": "artcnn_c4f16_dn",
+    "round": 2,
+    "samples_ms": [
+      3.43376,
+      3.401056,
+      3.3999360000000003,
+      3.715008,
+      3.947296,
+      3.377376,
+      3.436384,
+      3.3981440000000003,
+      3.4023679999999996
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows4"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.277856,
+    "model": "artcnn_c4f32_dn",
+    "round": 0,
+    "samples_ms": [
+      6.201216,
+      6.24144,
+      6.193376,
+      6.551424,
+      6.26736,
+      6.431616,
+      6.663008,
+      6.277856,
+      6.582432
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 8.169984,
+    "model": "artcnn_c4f32_dn",
+    "round": 0,
+    "samples_ms": [
+      8.003487999999999,
+      7.9968,
+      8.465983999999999,
+      8.2272,
+      8.048992,
+      8.742528,
+      8.169984,
+      8.059296,
+      8.333984
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows2"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 8.983903999999999,
+    "model": "artcnn_c4f32_dn",
+    "round": 0,
+    "samples_ms": [
+      8.983903999999999,
+      9.227936000000001,
+      8.780543999999999,
+      9.17216,
+      9.485439999999999,
+      8.936639999999999,
+      9.103776,
+      8.960544,
+      8.7568
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows4"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.507296,
+    "model": "artcnn_c4f32_dn",
+    "round": 1,
+    "samples_ms": [
+      6.275104,
+      6.706208,
+      6.325024,
+      6.507296,
+      6.257984,
+      6.605568,
+      6.230912,
+      6.80464,
+      6.642048
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 8.284576,
+    "model": "artcnn_c4f32_dn",
+    "round": 1,
+    "samples_ms": [
+      8.42176,
+      8.545216,
+      8.284576,
+      8.0648,
+      8.5288,
+      8.025664,
+      8.296608,
+      8.013504,
+      8.076928
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows2"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 9.12432,
+    "model": "artcnn_c4f32_dn",
+    "round": 1,
+    "samples_ms": [
+      9.163839999999999,
+      8.787424,
+      9.319744,
+      9.111872,
+      8.775936,
+      9.156384,
+      9.035584,
+      9.341216,
+      9.12432
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows4"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 6.242496,
+    "model": "artcnn_c4f32_dn",
+    "round": 2,
+    "samples_ms": [
+      6.267072000000001,
+      6.2792639999999995,
+      6.951456,
+      6.23776,
+      6.720575999999999,
+      6.2411840000000005,
+      6.236992,
+      6.242496,
+      6.236192
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "baseline"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 8.108832,
+    "model": "artcnn_c4f32_dn",
+    "round": 2,
+    "samples_ms": [
+      8.079936,
+      8.230624,
+      8.041504,
+      8.678144,
+      7.983776,
+      8.357856,
+      8.608448,
+      8.108832,
+      7.994655999999999
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows2"
+  },
+  {
+    "acc_bits": 16,
+    "median_ms": 9.19824,
+    "model": "artcnn_c4f32_dn",
+    "round": 2,
+    "samples_ms": [
+      9.33408,
+      9.19824,
+      9.224224,
+      8.845952,
+      9.33696,
+      8.844064000000001,
+      9.285824,
+      8.981504,
+      8.766016
+    ],
+    "timing": "D3D11 full handoff GPU interval",
+    "variant": "rows4"
+  }
+]
