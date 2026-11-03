@@ -13,6 +13,9 @@
 #include <unordered_map>
 #include <vector>
 
+// Released runtimes before custom-model support must still load this bridge.
+#pragma weak erika_presenter_load_upscaler_model
+
 namespace erika_ohos {
 using Task = std::function<void(napi_env)>;
 inline std::string Take(char* value) {
@@ -163,6 +166,11 @@ inline Reply Execute(Player& p, const Request& r) {
     uint64_t font = 0; reply.kind = Reply::Font;
     reply.number = erika_presenter_register_subtitle_memory_font(p.presenter, r.bytes.data(), r.bytes.size(), &font); reply.font = font;
   } else if (r.op == Op::Model) {
+    if (!erika_presenter_load_upscaler_model) {
+      reply.number = ErikaStatus_PlayerError;
+      reply.error = "The Erika runtime does not support custom upscaler models; update the native library";
+      return reply;
+    }
     reply.number = erika_presenter_load_upscaler_model(p.presenter, r.method.c_str(), r.bytes.data(), r.bytes.size());
   } else if (r.op == Op::Attach) {
     p.Detach();
