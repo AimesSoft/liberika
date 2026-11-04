@@ -1021,6 +1021,7 @@ struct LibassRuntime {
     /// rarely the font selector is rebuilt.
     fonts_generation: u64,
     custom_font_loads: u64,
+    log_style_state: Option<(bool, i32)>,
     _log_context: Box<LibassLogContext>,
     _log_bridge: Box<libass_ffi::ErikaAssLogBridge>,
 }
@@ -1089,6 +1090,7 @@ impl LibassRuntime {
                 custom_font_loads: 0,
                 _log_context: log_context,
                 _log_bridge: log_bridge,
+                log_style_state: None,
             }
         };
         runtime.configure_style(style, memory_fonts, 1.0, 288);
@@ -1112,6 +1114,11 @@ impl LibassRuntime {
     ) {
         let fonts_changed = self.configure_fonts(style, memory_fonts);
         let override_bits = self.configure_style_override(style, font_scale, play_res_height);
+        let state = (fonts_changed, override_bits);
+        if self.log_style_state == Some(state) {
+            return;
+        }
+        self.log_style_state = Some(state);
         crate::trace::diagnostic(
             serde_json::json!({
                 "event": "subtitle_font_fallback",
@@ -3996,6 +4003,55 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,中文字幕 fallback
                 .to_ascii_lowercase()
                 .contains("failed to find any fallback")),
             "libass reported no usable fallback font: {seen:?}"
+        );
+    }
+    /// `set_play_res_height` runs from the render path, and a host that only
+    /// exports textures alternates between two viewports on every frame. That
+    /// must not re-emit the `subtitle_font_fallback` diagnostic while nothing
+    /// it reports actually changed.
+    #[cfg(feature = "libass")]
+    #[test]
+    fn metrics_only_reconfiguration_does_not_repeat_the_configured_diagnostic() {
+        use crate::trace::{LogQuery, export_logs};
+
+        const TRACK_ID: i64 = 987_654_321;
+
+        let style = SubtitleStyleConfig::default();
+        let mut runtime =
+            LibassRuntime::new(TRACK_ID, &[], &[], LibassRenderConfig::default(), &style)
+                .expect("libass runtime");
+
+        runtime.configure_style(&style, &[], 1.0, 1080);
+        let seq = export_logs(&LogQuery {
+            limit: 0,
+            min_level: None,
+            since_seq: 0,
+        })["nextSeq"]
+            .as_u64()
+            .expect("nextSeq");
+
+        for height in [1080, 360, 1080, 360] {
+            runtime.configure_style(&style, &[], 1.0, height);
+        }
+
+        let exported = export_logs(&LogQuery {
+            limit: 0,
+            min_level: None,
+            since_seq: seq,
+        });
+        let repeated = exported["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|entry| {
+                entry["data"]["event"] == "subtitle_font_fallback"
+                    && entry["data"]["stage"] == "configured"
+                    && entry["data"]["trackId"] == TRACK_ID
+            })
+            .count();
+        assert_eq!(
+            repeated, 0,
+            "only the viewport changed; the diagnostic must not repeat"
         );
     }
 }
