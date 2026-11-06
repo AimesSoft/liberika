@@ -4,7 +4,7 @@
 
 liberika のブラウザービルドには、既存の Rust 弾幕エンジン、リポジトリでパッチを適用した libass と FreeType/HarfBuzz/FriBidi、コンテナーのデマルチプレックス用に絞った FFmpeg が含まれます。`Player` がパイプライン全体を管理し、アプリは Canvas とメディアソースを渡します。別の字幕・弾幕ライブラリは不要です。
 
-このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.3 の `liberika-web-0.3.3.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別で、npm では未公開です。ソースからのビルドも可能です。
+このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.4 の `liberika-web-0.3.4.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別で、npm では未公開です。ソースからのビルドも可能です。
 
 ## MKV 字幕と添付フォント
 
@@ -24,11 +24,11 @@ liberika のブラウザービルドには、既存の Rust 弾幕エンジン�
 
 ## ビルド
 
-必要なもの：Rust（workspace の rust-version を参照）、Node、Python 3、CMake、Meson、Ninja、make、pkg-config、Emscripten **4.0.23**、wasm-bindgen-cli **0.2.126**。
+必要なもの：Rust（workspace の rust-version を参照）、Node、Python 3、CMake、Meson、Ninja、make、pkg-config、Emscripten **4.0.23**、wasm-bindgen-cli **0.2.130**。
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.126 --locked
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
 # ローカルにインストール。シェルの起動ファイルは変更しません。
 git clone https://github.com/emscripten-core/emsdk.git target/web-tools/emsdk
 target/web-tools/emsdk/emsdk install 4.0.23

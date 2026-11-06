@@ -1,6 +1,10 @@
-# erika
+# liberika ArkTS SDK
 
-Native ArkTS/HarmonyOS SDK powered by Erika. This package is independent of
+[English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
+
+The OHPM package remains `erika`; imports and `Erika*` API names are unchanged.
+
+Native ArkTS/HarmonyOS SDK powered by liberika. This package is independent of
 Flutter and exposes the liberika presenter through an ArkTS-friendly API.
 
 The first package target is OpenHarmony arm64. The package contains the native
@@ -14,8 +18,10 @@ provides an `XComponent` surface id through `attachSurface()` and drives
 ohpm install erika
 ```
 
-As of 2026-10-31, OHPM lists 0.3.0 as the latest public version; 0.3.3 awaits review after upload.
-This checkout documents the 0.3.3 SDK.
+As of 2026-11-06, OHPM lists 0.3.4 as the latest public version.
+This checkout documents the 0.3.4 SDK.
+
+Native presenter operations are serialized on a dedicated owner thread. The ArkTS wrapper shown below retains synchronous method signatures; the native bridge also provides async entry points. `ErikaOhosPlayerFromId` returns null in 0.3.4; use the bridge instead of retaining a raw native player pointer.
 
 ## Player configuration
 
