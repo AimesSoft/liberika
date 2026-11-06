@@ -1297,16 +1297,11 @@ struct ErikaFlutterPlugin::ErikaOverlayWindow {
     const int py = client_origin.y + LogicalToPhysical(host, logical_y);
     const int pw = std::max(1, LogicalToPhysical(host, logical_width));
     const int ph = std::max(1, LogicalToPhysical(host, logical_height));
-    // hWndInsertAfter places the popup BELOW that window. Using the Flutter
-    // host here hides opaque video behind Flutter's black background. Keep
-    // the video immediately above its host, without activating it or making
-    // it globally topmost. Preserve its separate HWND lifetime: presenters
-    // must finish using it before the platform destroys it.
-    HWND insert_after = host != nullptr ? GetWindow(host, GW_HWNDPREV) : HWND_TOP;
-    if (insert_after == hwnd) {
-      insert_after = GetWindow(hwnd, GW_HWNDPREV);
-    }
-    if (insert_after == nullptr) insert_after = HWND_TOP;
+    // Native video is an underlay: the host supplies a transparent video
+    // region and paints Flutter controls above it. hWndInsertAfter places this
+    // popup BELOW the host. Raising it above the host hides those controls,
+    // even without WS_EX_TOPMOST (input transparency does not affect pixels).
+    const HWND insert_after = host != nullptr ? host : HWND_BOTTOM;
     SetWindowPos(hwnd, insert_after, px, py, pw, ph,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
   }

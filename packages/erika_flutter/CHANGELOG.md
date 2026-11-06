@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix the Windows native video window covering Flutter playback controls. Restore
+  its position below the transparent host window; keep the native HDR swapchain
+  and presenter worker lifecycle unchanged. This corrects the 0.3.4 stacking change.
+
 ## 0.3.4 - 2026-11-06
 
 - Linux and OpenHarmony presenters now own native work on one worker per player,
