@@ -361,17 +361,15 @@ class ErikaFlutterPluginTestPeer {
       Require(first_parent.hwnd && second_parent.hwnd);
       auto overlay = std::make_unique<ErikaFlutterPlugin::ErikaOverlayWindow>(
           first_parent.hwnd);
-      // SetWindowPos's insert-after HWND is above the positioned window.
-      // A video popup below its opaque Flutter host renders successfully but
-      // remains invisible. Check the real OS stacking order, including a
-      // second update when the popup already immediately precedes its host.
+      // The transparent Flutter host must stay above the native video so
+      // playback controls remain visible. Check repeated frame updates too.
       for (int i = 0; i < 2; ++i) {
         overlay->SetFrame(0, 0, 8, 8, true, std::nullopt, std::nullopt);
-        Require(GetWindow(first_parent.hwnd, GW_HWNDPREV) == overlay->hwnd);
+        Require(GetWindow(first_parent.hwnd, GW_HWNDNEXT) == overlay->hwnd);
         Require((GetWindowLongPtrW(overlay->hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0);
       }
       overlay->SetFrame(0, 0, 0, 0, false, std::nullopt, std::nullopt);
-      std::cout << "opaque overlay stays above Flutter host without topmost passed\n";
+      std::cout << "video underlay stays below Flutter controls without topmost passed\n";
       ErikaFlutterPlugin::PlayerMap players;
       for (int64_t id : {11, 22, 33}) {
         players.emplace(id, std::make_unique<ErikaFlutterPlugin::PlayerHost>(

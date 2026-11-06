@@ -45,6 +45,8 @@ macOS 上当 `blendMode` 不是 `srcOver` 时，widget 会改走 native platform
 
 Windows 上 `ErikaVideoView` 默认继续使用原生 HWND/swapchain，保留普通视频的 HDR10 输出；不会根据当前片源或 `outputMode` 自动切入 Flutter Texture。显式使用 `ErikaTextureVideoView` 才启用 SDR BGRA8 texture；`srcOver` 支持 Flutter 的透明度、裁剪、变换和颜色滤镜，`overlay` 转入原生 Windows Composition，其余混合模式明确报错。
 
+Windows 原生 HWND 视频层位于 Flutter 宿主窗口下方，宿主必须将视频区域及窗口合成背景设为透明，控件仍由上方的 Flutter 绘制。不能通过把视频 HWND 提到宿主上方解决黑底，否则视频会遮住播放控件；`WS_EX_TRANSPARENT` 和不使用 `WS_EX_TOPMOST` 都不能保证视觉层级正确。不提供透明宿主的应用可显式选择 SDR 的 `ErikaTextureVideoView`。
+
 Windows texture 每次画面内容变化后通过 GPU copy 发布完成且不可变的快照，无 CPU 像素回读；复制完成前不会交给 Flutter。暂停且字幕/弹幕/HUD 未变化时复用已发布快照，不重复通知 Flutter。尺寸变化、seek、字幕、弹幕和 HUD 更新均会使输出失效。Flutter 打开共享句柄不等于 GPU 采样结束，因此已发布快照永不被再次写入。插件仅保留最新和正在被 raster callback 读取的快照，未消费的中间 resize 快照可立即回收。
 
 此能力需要匹配的 v0.1.8 或更新版本 native runtime。Flutter package 在 `native_artifacts.properties` 中固定原生版本和校验值。旧 runtime 缺少 texture 符号时，仅显式 texture 绑定报错，不影响原生播放器创建。
