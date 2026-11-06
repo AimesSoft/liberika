@@ -5780,14 +5780,18 @@ mod tests {
         let tracks = player.tracks();
 
         // Plain source text is readable but cannot be opened as a subtitle.
-        assert!(player
-            .add_external_subtitle(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
-            .is_err());
+        assert!(
+            player
+                .add_external_subtitle(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .is_err()
+        );
         assert_eq!(player.state(), PlayerState::Ready);
         assert_eq!(player.tracks(), tracks);
-        assert!(!events
-            .try_iter()
-            .any(|event| matches!(event, PlayerEvent::Error(_))));
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, PlayerEvent::Error(_)))
+        );
 
         player
             .add_external_subtitle(root.join("track-a.srt").to_string_lossy())

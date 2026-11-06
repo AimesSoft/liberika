@@ -55,8 +55,7 @@ pub fn inspect(bytes: &[u8]) -> CharsetInspection {
         }
         return CharsetInspection {
             detected: "UTF-8 (BOM)",
-            utf8: (start > UTF8_BOM.len())
-                .then(|| bytes[start - UTF8_BOM.len()..].to_vec()),
+            utf8: (start > UTF8_BOM.len()).then(|| bytes[start - UTF8_BOM.len()..].to_vec()),
         };
     }
     if bytes.starts_with(&UTF16_LE_BOM) || bytes.starts_with(&UTF16_BE_BOM) {
