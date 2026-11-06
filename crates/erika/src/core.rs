@@ -3139,12 +3139,10 @@ fn handle_playback_command(
                     let _ = reply.send(Ok(track));
                 }
                 Err(error) => {
-                    let message = error.to_string();
-                    emit_from_worker(
-                        inner,
-                        PlayerEvent::Error(PlayerError::Playback(message.clone())),
-                    );
-                    let _ = reply.send(Err(message));
+                    // The media is still open. Report this command's failure
+                    // to its caller without turning a bad sidecar into a
+                    // fatal playback event for every embedding application.
+                    let _ = reply.send(Err(error.to_string()));
                 }
             }
         }
@@ -5767,6 +5765,36 @@ mod tests {
             events.recv().unwrap(),
             PlayerEvent::Error(PlayerError::Playback(_))
         ));
+    }
+
+    #[test]
+    fn invalid_external_subtitle_is_nonfatal_and_allows_replacement() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback");
+        let player = Player::new(PlayerConfig::default());
+        player
+            .open(MediaRequest::new(
+                root.join("playback-fixture.mkv").to_string_lossy(),
+            ))
+            .unwrap();
+        let events = player.subscribe();
+        let tracks = player.tracks();
+
+        // Plain source text is readable but cannot be opened as a subtitle.
+        assert!(player
+            .add_external_subtitle(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .is_err());
+        assert_eq!(player.state(), PlayerState::Ready);
+        assert_eq!(player.tracks(), tracks);
+        assert!(!events
+            .try_iter()
+            .any(|event| matches!(event, PlayerEvent::Error(_))));
+
+        player
+            .add_external_subtitle(root.join("track-a.srt").to_string_lossy())
+            .unwrap();
+        assert_eq!(player.state(), PlayerState::Ready);
+        assert_eq!(player.tracks().len(), tracks.len() + 1);
+        player.close().unwrap();
     }
 
     #[test]
