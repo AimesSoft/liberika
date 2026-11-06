@@ -49,6 +49,9 @@ pub mod iosaudio {
     const NO_ERR: OSStatus = 0;
     const BUFFER_COUNT: usize = 3;
     const BUFFER_MILLIS: u32 = 20;
+    // One callback fills one ~BUFFER_MILLIS buffer; a 100 ms drain bound is
+    // generous and only ever paid when dispose races a live callback.
+    const IOS_DISPOSE_CALLBACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
     const K_AUDIO_FORMAT_LINEAR_PCM: UInt32 = 0x6c70_636d;
     const K_AUDIO_FORMAT_FLAG_IS_FLOAT: UInt32 = 1 << 0;
     const K_AUDIO_FORMAT_FLAG_IS_PACKED: UInt32 = 1 << 3;
@@ -153,6 +156,11 @@ pub mod iosaudio {
         // them to the platform. The presenter includes their duration in a
         // playback-rate transition bridge.
         in_flight_buffers: AtomicU32,
+        // Callbacks currently executing on the AudioQueue's internal thread.
+        // AudioQueueDispose does not guarantee an in-flight callback has
+        // finished when it returns; the dispose path waits on this counter
+        // before freeing the state.
+        active_callbacks: AtomicU32,
         buffer_duration: Duration,
         channels: usize,
     }
@@ -190,6 +198,7 @@ pub mod iosaudio {
                 volume: Arc::clone(&self.volume),
                 last_applied_volume: AtomicU32::new(self.volume.load(Ordering::Relaxed)),
                 in_flight_buffers: AtomicU32::new(0),
+                active_callbacks: AtomicU32::new(0),
                 buffer_duration: Duration::from_secs_f64(
                     buffer_frames as f64 / format.sample_rate.max(1) as f64,
                 ),
@@ -331,7 +340,26 @@ pub mod iosaudio {
                 let status = unsafe { AudioQueueDispose(queue, immediate as Boolean) };
                 self.buffers.clear();
                 if let Some(state) = self.callback_state.take() {
-                    unsafe { drop(Box::from_raw(state.as_ptr())) };
+                    // AudioQueueDispose does not guarantee that an in-flight
+                    // callback has finished when it returns. Wait (bounded) for
+                    // the callback to leave the state before freeing it; if the
+                    // wait times out, deliberately leak one callback state --
+                    // that beats a use-after-free on the queue's thread.
+                    let deadline = std::time::Instant::now() + IOS_DISPOSE_CALLBACK_DRAIN_TIMEOUT;
+                    let mut still_active =
+                        unsafe { state.as_ref().active_callbacks.load(Ordering::Acquire) } > 0;
+                    while still_active && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        still_active =
+                            unsafe { state.as_ref().active_callbacks.load(Ordering::Acquire) } > 0;
+                    }
+                    let boxed = unsafe { Box::from_raw(state.as_ptr()) };
+                    if still_active {
+                        std::mem::forget(boxed);
+                        crate::trace::log(
+                            "[erika-audio-trace] stage=ios_audioqueue_state_leaked reason=dispose_callback_drain_timeout",
+                        );
+                    }
                 }
                 check_status(status, "AudioQueueDispose")?;
             }
@@ -417,6 +445,10 @@ pub mod iosaudio {
             return;
         }
         let state = unsafe { &*(user_data as *const CallbackState) };
+        // Marked before any early return below so the dispose path can wait
+        // for this callback to leave the state before freeing it.
+        state.active_callbacks.fetch_add(1, Ordering::AcqRel);
+        let _active_guard = CallbackActiveGuard(&state.active_callbacks);
         let _ =
             state
                 .in_flight_buffers
@@ -424,6 +456,14 @@ pub mod iosaudio {
                     count.checked_sub(1)
                 });
         let _ = fill_audio_queue_buffer(queue, audio_buffer, state);
+    }
+
+    struct CallbackActiveGuard<'a>(&'a AtomicU32);
+
+    impl Drop for CallbackActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     fn fill_audio_queue_buffer(
