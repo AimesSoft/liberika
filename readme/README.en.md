@@ -13,7 +13,7 @@
 
 The host application provides a rendering surface and sends playback commands — decoding, timing, video rendering, subtitles, danmaku, and audio output are handled entirely inside Erika. Native video surfaces present directly; Flutter textures can participate in host composition.
 
-Current release: **0.3.3**. Start with the [documentation index](../docs/README.en.md).
+Current release: **0.3.4**. Start with the [documentation index](../docs/README.en.md).
 
 **Play MKV in the browser with its ASS subtitles and attached fonts.** The current
 source includes a [Web / WASM backend](../docs/web.md), integrated into Erika Web.
@@ -26,7 +26,7 @@ the server.
 ## Features
 
 - Hardware decoding with software fallback: VideoToolbox, D3D11VA, MediaCodec, AVCodec, and experimental Linux NVDEC / VA-API.
-- Metal, D3D11 and wgpu rendering with subtitles and danmaku, HDR/EDR, Dolby Vision mapping and ArtCNN luma upscaling.
+- Metal, D3D11 and wgpu rendering with subtitles and danmaku, HDR/EDR, Dolby Vision mapping, and ArtCNN, Anime4K, FSR1 and platform upscaling where supported.
 - Local files and HTTP(S), custom headers, background read-ahead and a bounded rewind cache.
 - Audio-master synchronization, pause, seek, playback rate, media tracks and external subtitles.
 - Rust, C ABI, Flutter, SwiftPM and native OpenHarmony ArkTS integration.
@@ -36,16 +36,16 @@ the server.
 
 | Host | Install / entry point | Guide |
 |---|---|---|
-| Browser / JavaScript / TypeScript | Download `liberika-web-0.3.3.zip` or build from source | [Web integration and deployment](../docs/web.md) |
-| Flutter | `flutter pub add erika_flutter` (0.3.3) | [Plugin guide](../packages/erika_flutter/README.md) |
-| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode; latest public SDK is 0.3.0 as of 2026-10-31 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| Browser / JavaScript / TypeScript | Download `liberika-web-0.3.4.zip` or build from source | [Web integration and deployment](../docs/web.md) |
+| Flutter | `flutter pub add erika_flutter` (0.3.4) | [Plugin guide](../packages/erika_flutter/README.md) |
+| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode; latest public SDK is 0.3.4 as of 2026-11-06 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | Matching C ABI bundle and `erika.h` | [Native integration](../docs/integration.md) |
-| Rust | Git dependency pinned to `v0.3.3` | [Build guide](../docs/building.md) |
+| Rust | Git dependency pinned to `v0.3.4` | [Build guide](../docs/building.md) |
 | Linux | System FFmpeg 8 and patched libass; source build | [Linux guide](../docs/linux.md) |
 
-As of 2026-10-31, OHPM lists 0.3.0 as the latest public version; 0.3.3 awaits review after upload.
-Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.3).
+As of 2026-11-06, OHPM lists 0.3.4 as the latest public version.
+Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.4).
 
 ### Browser
 
@@ -57,7 +57,7 @@ python3 scripts/serve_web.py
 
 Open `http://127.0.0.1:18765` for the demo. Deploy the runtime from `target/web/`
 and use `Player.create({ canvas })` and `player.open(fileOrURL)` in your own UI.
-The Release includes `liberika-web-0.3.3.zip` with a demo `index.html`.
+The Release includes `liberika-web-0.3.4.zip` with a demo `index.html`.
 Extract the whole archive and serve it over HTTPS or localhost; source builds
 are also available. The Web package has not been published to npm.
 Audio/video codecs depend on browser WebCodecs support. See the [browser guide](../docs/web.md)
@@ -84,7 +84,7 @@ platform-specific choices and lifecycle.
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.3" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.4" }
 ```
 
 ```rust

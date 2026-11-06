@@ -23,7 +23,7 @@ The plugin keeps Dart out of the hot path:
 
 ## Start position, playback completion and subtitles
 
-With the 0.3.1 plugin and matching native runtime, `open(startPosition:)` asks
+With the 0.3.1 or later plugin and matching native runtime, `open(startPosition:)` asks
 the engine to seek before presenting the first frame. It returns `false` when
 an older native runtime cannot accept the position; the media still opens at
 the beginning, so the host can seek afterward. A missing or non-positive start
