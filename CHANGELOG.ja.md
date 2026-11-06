@@ -2,7 +2,7 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
-## Unreleased
+## 0.3.4 - 2026-11-06
 
 ### 超解像（#193、#194）
 

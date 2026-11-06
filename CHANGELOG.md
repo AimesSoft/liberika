@@ -2,7 +2,7 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
-## Unreleased
+## 0.3.4 - 2026-11-06
 
 ### Super resolution (#193, #194)
 

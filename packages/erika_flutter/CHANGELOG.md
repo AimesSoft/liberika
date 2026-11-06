@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.4 - 2026-11-06
 
 - Linux and OpenHarmony presenters now own native work on one worker per player,
   with native frame clocks, coalesced ticks and platform-thread result/event

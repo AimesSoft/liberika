@@ -2,7 +2,7 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
-## Unreleased
+## 0.3.4 - 2026-11-06
 
 ### 超分（#193、#194）
 

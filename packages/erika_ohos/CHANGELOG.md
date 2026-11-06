@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.4 - 2026-11-06
 
 - Presenter operations now run on a serialized native owner. Existing synchronous
   APIs, including `renderTick()`, remain available; `startRendering()` enables a
