@@ -523,6 +523,7 @@ impl D3d11Upscaler {
                 "height": key.2,
                 "candidates": summary,
                 "selected": label(self.choice),
+                "unavailable": self.unavailable,
             })
             .to_string(),
         );

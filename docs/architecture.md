@@ -335,6 +335,13 @@ Direct3D 11 (`renderer/d3d11_sr.rs` and neighbours):
   matrix) and `d3d11_d3d12_linalg.rs` with `d3d12_linalg/` (opt-in D3D12 SM 6.10
   preview).
 
+The Windows Vulkan sidecar loads `vulkan-1.dll` by its absolute system-directory
+path, independent of DLLs bundled by the host application. A missing runtime or
+unsupported device uses the existing scalar D3D11 compute path. The
+`luma_upscaler_vulkan_init` diagnostics identify the loader path and adapter/driver;
+`luma_upscaler_backend_selection` includes unavailable-accelerator reasons alongside
+the measured candidates. Acceleration remains capability-based across GPU vendors.
+
 Metal (`renderer/metal/`): `upscaler_network.rs` is the generic network engine
 (Metal 4 tensor ops on M5/A19, `simdgroup_matrix`, or scalar), with
 `upscaler_fsr.rs`, `upscaler_metalfx.rs` and `upscaler_vt.rs` for FSR1, MetalFX

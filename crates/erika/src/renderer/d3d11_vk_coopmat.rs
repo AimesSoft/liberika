@@ -5,8 +5,10 @@
 //! completion value. No CPU fence wait is used by an ordinary encode.
 
 use std::collections::VecDeque;
-use std::ffi::CStr;
+use std::ffi::{CStr, OsString};
 use std::mem;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +20,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::{
     DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIDevice, IDXGIResource1,
 };
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::core::{Interface, PCSTR, PCWSTR};
 
 use crate::core::{PlayerError, Result};
@@ -348,6 +351,34 @@ impl Drop for Gpu {
     }
 }
 
+fn load_vulkan_entry() -> Result<Entry> {
+    // App-local loaders can mishandle newer physical-device extension calls,
+    // including vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. Use the
+    // system Vulkan runtime; loading errors follow the existing scalar fallback.
+    let capacity = unsafe { GetSystemDirectoryW(None) };
+    if capacity == 0 {
+        return Err(error(std::io::Error::last_os_error()));
+    }
+    let mut directory = vec![0; capacity as usize];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) };
+    if length == 0 {
+        return Err(error(std::io::Error::last_os_error()));
+    }
+    directory.truncate(length as usize);
+    let path = PathBuf::from(OsString::from_wide(&directory)).join("vulkan-1.dll");
+    let entry = unsafe { Entry::load_from(&path) }
+        .map_err(|cause| error(format!("cannot load {}: {cause}", path.display())))?;
+    crate::trace::diagnostic(
+        serde_json::json!({
+            "event": "luma_upscaler_vulkan_init",
+            "stage": "loader",
+            "path": path,
+        })
+        .to_string(),
+    );
+    Ok(entry)
+}
+
 impl Gpu {
     fn new(d3d: &ID3D11Device) -> Result<Arc<Self>> {
         unsafe {
@@ -356,7 +387,7 @@ impl Gpu {
             let mut luid = [0u8; 8];
             luid[..4].copy_from_slice(&adapter.AdapterLuid.LowPart.to_le_bytes());
             luid[4..].copy_from_slice(&adapter.AdapterLuid.HighPart.to_le_bytes());
-            let entry = Entry::load().map_err(error)?;
+            let entry = load_vulkan_entry()?;
             let app = vk::ApplicationInfo::default()
                 .application_name(c"Erika SR")
                 .api_version(vk::API_VERSION_1_3);
@@ -416,6 +447,18 @@ impl Gpu {
                 .get_physical_device_properties2(physical, &mut properties);
             let limits = properties.properties.limits;
             let vendor_id = properties.properties.vendor_id;
+            crate::trace::diagnostic(
+                serde_json::json!({
+                    "event": "luma_upscaler_vulkan_init",
+                    "stage": "adapter",
+                    "device": CStr::from_ptr(properties.properties.device_name.as_ptr()).to_string_lossy(),
+                    "vendor_id": vendor_id,
+                    "device_id": properties.properties.device_id,
+                    "api_version": properties.properties.api_version,
+                    "driver_version": properties.properties.driver_version,
+                })
+                .to_string(),
+            );
             if properties.properties.api_version < vk::API_VERSION_1_3 {
                 return Err(error("Vulkan 1.3 is required"));
             }
