@@ -2,6 +2,10 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
+## 0.3.5 - 2026-11-07
+
+- Fix the Windows native video window covering Flutter playback controls in 0.3.4. Restore video below the transparent Flutter host while preserving native HDR output. Flutter applications must update the plugin and rebuild; replacing only the native DLL does not apply this fix.
+
 ## 0.3.4 - 2026-11-06
 
 ### Super resolution (#193, #194)
