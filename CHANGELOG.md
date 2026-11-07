@@ -2,13 +2,7 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
-## 0.3.5 - 2026-11-07
-
-- Fix the Windows native video window covering Flutter playback controls in 0.3.4. Restore video below the transparent Flutter host while preserving native HDR output. Flutter applications must update the plugin and rebuild; replacing only the native DLL does not apply this fix.
-- Load the system Vulkan runtime on Windows for cooperative-matrix super resolution, avoiding incompatible app-local Vulkan loaders. Add loader and adapter diagnostics; unavailable acceleration keeps the existing scalar fallback.
-- Normalize repeated leading UTF-8 BOMs in external subtitles so ASS and other text formats can be probed correctly. Subtitle-add failures return to the caller without emitting a global playback error; the open video remains usable.
-
-## 0.3.4 - 2026-11-06
+## 0.3.6 - 2026-11-07
 
 ### Release packages
 
@@ -55,6 +49,14 @@
 - `xtask deps build --ffmpeg` picks what of FFmpeg a build carries: `full` by
   default, `slim` for the smallest, `common` or `slim` with groups in between.
   `ERIKA_FFMPEG_SET` makes Cargo link that build.
+
+## 0.3.5 - 2026-11-07
+
+- Fix the Windows native video window covering Flutter playback controls in 0.3.4. Restore video below the transparent Flutter host while preserving native HDR output. Flutter applications must update the plugin and rebuild; replacing only the native DLL does not apply this fix.
+- Load the system Vulkan runtime on Windows for cooperative-matrix super resolution, avoiding incompatible app-local Vulkan loaders. Add loader and adapter diagnostics; unavailable acceleration keeps the existing scalar fallback.
+- Normalize repeated leading UTF-8 BOMs in external subtitles so ASS and other text formats can be probed correctly. Subtitle-add failures return to the caller without emitting a global playback error; the open video remains usable.
+
+## 0.3.4 - 2026-11-06
 
 ### Super resolution (#193, #194)
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6 - 2026-11-07
+
+- Danmaku draw emoji in their own colors, and subtitles and danmaku take missing
+  glyphs from the system's fonts first. See the core changelog.
+- The native libraries are much smaller: static libraries no longer carry debug info.
+
 ## 0.3.5 - 2026-11-07
 
 - Fix the Windows native video window covering Flutter playback controls. Restore
