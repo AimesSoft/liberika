@@ -108,6 +108,7 @@ libass，因此需要 `--all`，仅构建基础集不够。
 | 标志 | 取值 | 默认 | 含义 |
 |------|------|------|------|
 | `--profile` | `lgpl`、`gpl-full` | `lgpl` | FFmpeg 许可证 profile(见下)。 |
+| `--ffmpeg` | `full`、`common`、`slim`、`slim,<分组>…` | `full` | FFmpeg 带上哪些格式(见[按需编译](#按需编译))。 |
 | `--target` | 见目标表 | `host` | 交叉编译目标。 |
 | `--all` | — | 关 | 同时构建 libass + FreeType + HarfBuzz + FriBidi(字幕渲染)。所有目标的基础集都是 zlib + FFmpeg + dav1d。 |
 | `--force` | — | 关 | 即使已是最新标记也重建。 |
@@ -222,6 +223,62 @@ cargo build -p erika_capi --release --target x86_64-linux-android `
 Cargo 会在 `target/x86_64-linux-android/release` 下同时生成
 `liberika_capi.so` 和 `liberika_capi.a`。Flutter Android Gradle 任务直接打包
 cdylib 与匹配 ABI 的 NDK `libc++_shared.so`。
+
+## 按需编译
+
+默认构建什么都带。下面的开关互相独立，全部关掉就是最小状态。
+
+### Cargo feature
+
+| Feature | 默认 | 关掉后 |
+|---|---|---|
+| `embedded-fallback-font` | 开 | 不带 Droid Sans Fallback，约小 6 MB。系统字体读不了时没有回退，见[平台矩阵](platform_matrix.zh.md#回退字体) |
+| `artcnn-r8f64` | 开 | 不带最大的超分网络 R8F64，约小 1.8 MB |
+| `libass` | 开 | 不渲染 ASS 字幕，也没有 HarfBuzz，组合表情逐个画出 |
+| `wgpu` | `erika_capi` 开 | 不带 wgpu 渲染。Android、OpenHarmony、Linux 需要它 |
+
+### FFmpeg
+
+`xtask deps build --ffmpeg` 决定 FFmpeg 带上哪些格式，`ERIKA_FFMPEG_SET` 让 Cargo 链接同一份构建：
+
+```bash
+cargo run -p xtask -- deps build --all --ffmpeg common
+ERIKA_FFMPEG_SET=common cargo build -p erika_capi --release \
+  --no-default-features --features libass,wgpu,artcnn-r8f64
+```
+
+| 取值 | 解码器 | 解封装器 | 内容 |
+|---|---|---|---|
+| `full`（默认） | 503 | 354 | FFmpeg 的全部解码器和解封装器 |
+| `common` | 204 | 77 | `slim` 加下面全部分组 |
+| `slim` | 44 | 27 | 主流视频、音频、容器和字幕 |
+
+`slim` 后面可以跟分组，按下表顺序写，例如 `slim,images,streaming`：
+
+| 分组 | 内容 |
+|---|---|
+| `legacy-video` | RealVideo、H.263、VP3/VP5/VP6、Indeo、Cinepak 等；RM、Bink、SWF |
+| `pro-video` | ProRes、DNxHD、FFV1、UtVideo；MXF、NUT、DV |
+| `images` | PNG、GIF、WebP、BMP、TIFF |
+| `legacy-audio` | MP1/MP2、RealAudio、AMR、ADPCM 等；CAF、AIFF、Musepack |
+| `lossless-audio` | ALAC、APE、WavPack、TAK、TTA、DSD、全部 PCM |
+| `subtitles` | SAMI、MicroDVD、VobSub、LRC 等文字和外挂字幕 |
+| `streaming` | HLS、concat |
+
+### 体积
+
+macOS arm64 的 `liberika_capi.dylib`，已 strip：
+
+| 构建 | 大小 | `xz -9e` 后 |
+|---|---|---|
+| 默认 | 36.84 MB | 13.76 MB |
+| `common`，不带字体 | 23.16 MB | 8.88 MB |
+| `slim`，不带字体 | 21.52 MB | 8.23 MB |
+| 再去掉 R8F64 | 19.72 MB | 6.62 MB |
+| 再去掉 wgpu | 16.39 MB | 5.63 MB |
+
+Web：`web build --without-fallback-font` 让 wasm 从 7.66 MB 降到 1.59 MB，字体改由
+`Player.create({ fallbackFont })` 传入。
 
 ## 许可证 profile
 

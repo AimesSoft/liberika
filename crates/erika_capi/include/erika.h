@@ -37,6 +37,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -581,6 +582,11 @@ ErikaHandle *erika_create(void);
 void erika_destroy(ErikaHandle *handle);
 char *erika_last_error_message(void);
 void erika_string_free(char *value);
+
+/* The font built into this library and its length, or NULL without one. The bytes
+ * live as long as the process and are not freed. A host serving a browser page
+ * can pass them to it, so that the page needs no font of its own. */
+const uint8_t *erika_embedded_fallback_font(size_t *out_length);
 
 ErikaStatus erika_export_gif(
     const ErikaGifExportOptions *options,

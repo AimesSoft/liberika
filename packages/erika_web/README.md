@@ -17,7 +17,10 @@ Web Audio supplies audio output and the clock; WebGL2 composites video,
 subtitles and danmaku into one canvas. Embedded ASS fonts load automatically,
 and subtitle/danmaku supersampling is independent of the video resolution.
 The complete fallback font is embedded once in the Rust WASM and supplied to
-libass by the worker; no standalone font download is required.
+libass by the worker; no standalone font download is required. The
+`liberika-web-nofont` package, or a build with `web build --without-fallback-font`,
+takes one instead:
+`Player.create({ canvas, fallbackFont: { data, index } })`.
 
 ```js
 import { AudioSession, Player } from './liberika/index.js';

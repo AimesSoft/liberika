@@ -72,6 +72,8 @@ export class Player extends EventTarget {
     canvas: HTMLCanvasElement;
     volume?: number;
     audioSession?: AudioSession;
+    /** Stands in for text no font covers, in a package built without its own. */
+    fallbackFont?: { data: ArrayBuffer | Uint8Array; index?: number };
   }): Promise<Player>;
   private constructor();
   readonly currentTime: number;

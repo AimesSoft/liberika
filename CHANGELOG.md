@@ -10,6 +10,52 @@
 
 ## 0.3.4 - 2026-11-06
 
+### Release packages
+
+- Static libraries no longer carry debug info, which makes release packages much
+  smaller: macOS arm64 goes from about 122 MB to about 47 MB. Crashes still show
+  function names, but not files and lines.
+
+### Colour emoji
+
+- Danmaku draw emoji in their own colours, not as boxes and not tinted with the
+  comment's colour. `sbix` and `CBDT` bitmaps and `COLR` vectors are all read.
+- Flags, skin tones, families and keycaps are composed into one glyph by
+  HarfBuzz, and drawn one by one when the font has no composed glyph. A build
+  without `libass` has no HarfBuzz, so it draws them one by one too.
+- Emoji sit centred on the line, with the same outline and shadow as the text.
+- Emoji in subtitles stay monochrome: libass only produces alpha bitmaps.
+- `DanmakuRenderPlan` gains `color_atlas` and `color_glyphs`. Embedders drawing
+  danmaku themselves must draw this layer too, or emoji stay invisible. Web:
+  the browser's fonts draw them, and `Player` needs no change.
+
+### Fallback font
+
+- Subtitles and danmaku try the system's fonts for missing text, and use the embedded
+  Droid Sans Fallback when those cannot be read. Android reads the face for each
+  language from `fonts.xml`, and fonts stay memory-mapped. From iOS 18 on, and on tvOS,
+  Chinese still relies on the embedded font: PingFang keeps its outlines in Apple's
+  `hvgl` table, which FreeType cannot read.
+- `system_font::fallback()` names the face a device offers. Nothing is copied: only
+  the face in use is mapped.
+- `font::embedded_fallback_font()` and `erika_embedded_fallback_font()` give the
+  embedded font, so a host can pass it to its own page and carry one copy.
+- Web: the new `liberika-web-nofont` package has no font and takes one through
+  `Player.create({ fallbackFont })`.
+
+### Build what you need
+
+- Release packages stay as they are. The switches below make a smaller build from
+  source; with all of them off it is the smallest (see
+  [Building](docs/building.md#build-what-you-need)).
+- `embedded-fallback-font`, on by default, is about 6 MB. Without it nothing is left
+  when the system's fonts cannot be read.
+- `artcnn-r8f64`, on by default, carries R8F64, the largest super resolution
+  network, about 1.8 MB.
+- `xtask deps build --ffmpeg` picks what of FFmpeg a build carries: `full` by
+  default, `slim` for the smallest, `common` or `slim` with groups in between.
+  `ERIKA_FFMPEG_SET` makes Cargo link that build.
+
 ### Super resolution (#193, #194)
 
 - Super resolution is rebuilt around one backend-neutral network description

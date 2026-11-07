@@ -104,6 +104,7 @@ workspace テストは libass を有効にするため、基本セットだけ�
 | フラグ | 値 | 既定 | 意味 |
 |--------|----|------|------|
 | `--profile` | `lgpl`、`gpl-full` | `lgpl` | FFmpeg ライセンス profile（下記）。 |
+| `--ffmpeg` | `full`、`common`、`slim`、`slim,<グループ>…` | `full` | FFmpeg に含める形式（[必要な分だけビルド](#必要な分だけビルド)を参照）。 |
 | `--target` | ターゲット表参照 | `host` | クロスコンパイル先。 |
 | `--all` | — | off | libass + FreeType + HarfBuzz + FriBidi（字幕描画）も。全ターゲットの基本セットは zlib + FFmpeg + dav1d。 |
 | `--force` | — | off | 最新マーカーがあっても再ビルド。 |
@@ -183,6 +184,63 @@ Windows の native library は既定で C runtime の DLL（`/MD`）を link し
 ```powershell
 cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
 ```
+
+## 必要な分だけビルド
+
+既定のビルドはすべてを含みます。以下のスイッチは互いに独立で、すべて切ると最小になります。
+
+### Cargo feature
+
+| Feature | 既定 | 無効時 |
+|---|---|---|
+| `embedded-fallback-font` | 有効 | Droid Sans Fallback を含めず、約 6 MB 小さくなります。システムフォントを読めないと代わりがありません。[プラットフォーム一覧](platform_matrix.ja.md#フォールバックフォント)を参照 |
+| `artcnn-r8f64` | 有効 | 最大の超解像ネットワーク R8F64 を含めず、約 1.8 MB 小さくなります |
+| `libass` | 有効 | ASS を描画せず、HarfBuzz もないため、組み合わせ絵文字は 1 つずつ描きます |
+| `wgpu` | `erika_capi` で有効 | wgpu レンダラーを含めません。Android、OpenHarmony、Linux には必要です |
+
+### FFmpeg
+
+`xtask deps build --ffmpeg` で FFmpeg に含める形式を選び、`ERIKA_FFMPEG_SET` で Cargo が
+同じビルドをリンクします。
+
+```bash
+cargo run -p xtask -- deps build --all --ffmpeg common
+ERIKA_FFMPEG_SET=common cargo build -p erika_capi --release \
+  --no-default-features --features libass,wgpu,artcnn-r8f64
+```
+
+| 値 | デコーダ | デマルチプレクサ | 内容 |
+|---|---|---|---|
+| `full`（既定） | 503 | 354 | FFmpeg のすべてのデコーダとデマルチプレクサ |
+| `common` | 204 | 77 | `slim` と下記の全グループ |
+| `slim` | 44 | 27 | 主流の映像、音声、コンテナ、字幕 |
+
+`slim` の後ろにはグループを下表の順で続けられます。例: `slim,images,streaming`
+
+| グループ | 内容 |
+|---|---|
+| `legacy-video` | RealVideo、H.263、VP3/VP5/VP6、Indeo、Cinepak など。RM、Bink、SWF |
+| `pro-video` | ProRes、DNxHD、FFV1、UtVideo。MXF、NUT、DV |
+| `images` | PNG、GIF、WebP、BMP、TIFF |
+| `legacy-audio` | MP1/MP2、RealAudio、AMR、ADPCM など。CAF、AIFF、Musepack |
+| `lossless-audio` | ALAC、APE、WavPack、TAK、TTA、DSD、すべての PCM |
+| `subtitles` | SAMI、MicroDVD、VobSub、LRC などのテキスト字幕と外部字幕 |
+| `streaming` | HLS、concat |
+
+### サイズ
+
+macOS arm64 の `liberika_capi.dylib`（strip 済み）:
+
+| ビルド | サイズ | `xz -9e` 後 |
+|---|---|---|
+| 既定 | 36.84 MB | 13.76 MB |
+| `common`、フォントなし | 23.16 MB | 8.88 MB |
+| `slim`、フォントなし | 21.52 MB | 8.23 MB |
+| さらに R8F64 なし | 19.72 MB | 6.62 MB |
+| さらに wgpu なし | 16.39 MB | 5.63 MB |
+
+Web: `web build --without-fallback-font` で wasm は 7.66 MB から 1.59 MB になり、フォントは
+`Player.create({ fallbackFont })` で渡します。
 
 ## ライセンス profile
 

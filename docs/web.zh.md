@@ -60,6 +60,8 @@ python3 scripts/serve_web.py
 修改 shell 启动配置。可以用 `EMSDK` 指定现有 SDK。
 
 发布时保留整个产物目录中的 JS、WASM、Worker 与许可证；回退字体已内嵌在 Rust WASM 中。
+页面由自带字体的设备提供时，可用 `liberika-web-nofont` 包或 `web build
+--without-fallback-font` 省去约 6 MB，再把字体传给 `Player.create({ canvas, fallbackFont: { data, index } })`。
 浏览器需要 HTTPS 或 localhost；本实现不依赖 SharedArrayBuffer 或跨源隔离。
 `build-manifest.json` 记录产物的 SHA-256。示例支持 `?src=URL` 打开远程媒体。
 

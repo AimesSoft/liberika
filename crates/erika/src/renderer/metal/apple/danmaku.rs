@@ -232,6 +232,8 @@ mod gpu_tests {
                 shadow_rgba: [0.0, 0.0, 0.0, opacity * 0.55],
                 shadow_offset: [1.0, 1.0],
             }],
+            color_atlas: None,
+            color_glyphs: Vec::new(),
             frame_stats: DanmakuFrameStats::default(),
         }
     }

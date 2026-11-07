@@ -39,6 +39,8 @@ def meson(name, source, options):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--skip-native', action='store_true', help='reuse previously built Web C libraries')
+    parser.add_argument('--without-fallback-font', action='store_true',
+                        help='leave the font out; the page gives Player.create a fallbackFont of its own')
     args = parser.parse_args()
     sdk = Path(ENV.get('EMSDK', ROOT / 'target/web-tools/emsdk'))
     emdir = sdk / 'upstream/emscripten'
@@ -79,11 +81,12 @@ def main():
         run(['make', '-j', JOBS], ffbuild)
         run(['make', 'install'], ffbuild)
     native = ROOT / 'crates/erika/src/web/media.c'
-    exports = ['malloc','free','erika_open','erika_close','erika_info','erika_read','erika_packet_data','erika_packet_size','erika_packet_stream','erika_packet_time','erika_packet_duration','erika_packet_key','erika_seek','erika_error','erika_subtitle_select','erika_subtitle_load','erika_subtitle_render','erika_subtitle_changed','erika_image_next','erika_image_data','erika_image_width','erika_image_height','erika_image_stride','erika_image_x','erika_image_y','erika_image_color','erika_add_font']
+    exports = ['malloc','free','erika_set_default_family','erika_open','erika_close','erika_info','erika_read','erika_packet_data','erika_packet_size','erika_packet_stream','erika_packet_time','erika_packet_duration','erika_packet_key','erika_seek','erika_error','erika_subtitle_select','erika_subtitle_load','erika_subtitle_render','erika_subtitle_changed','erika_image_next','erika_image_data','erika_image_width','erika_image_height','erika_image_stride','erika_image_x','erika_image_y','erika_image_color','erika_add_font']
     run(['emcc', native, '-O3', '-I'+str(PREFIX/'include'), '-L'+str(PREFIX/'lib'), '-lavformat', '-lavcodec', '-lavutil', '-lass', '-lharfbuzz', '-lfribidi', '-lfreetype', '-lc++',
          '-sMODULARIZE=1', '-sEXPORT_ES6=1', '-sENVIRONMENT=worker', '-sALLOW_MEMORY_GROWTH=1', '-sMAXIMUM_MEMORY=536870912', '-sSTACK_SIZE=1048576', '-sASYNCIFY=1',
          '-sFILESYSTEM=0', '-sEXPORTED_FUNCTIONS='+json.dumps(['_'+s for s in exports]), '-sEXPORTED_RUNTIME_METHODS=["ccall","UTF8ToString","HEAPU8"]', '-o', OUT/'media.js'])
-    run(['cargo', 'build', '-p', 'erika', '--lib', '--release', '--target', 'wasm32-unknown-unknown'])
+    features = ['--no-default-features', '--features', 'libass'] if args.without_fallback_font else []
+    run(['cargo', 'build', '-p', 'erika', '--lib', '--release', '--target', 'wasm32-unknown-unknown', *features])
     run(['wasm-bindgen', ROOT/'target/wasm32-unknown-unknown/release/erika.wasm', '--target', 'web', '--out-dir', OUT, '--out-name', 'erika_core'])
     for file in (ROOT/'packages/erika_web').glob('*'):
         if file.is_file() and file.suffix in ['.js','.json','.ts','.md']: shutil.copy2(file, OUT/file.name)

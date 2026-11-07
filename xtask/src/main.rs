@@ -43,10 +43,12 @@ const LIBASS_URLS: &[&str] = &[
     "https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.xz",
     "https://codeload.github.com/libass/libass/tar.gz/refs/tags/0.17.5",
 ];
-const LIBASS_PATCHSET_VERSION: &str = "erika-ordered-font-fallback-v1";
-const LIBASS_BUILD_VERSION: &str = "0.17.5+erika-ordered-font-fallback-v1";
-const LIBASS_PATCHES: &[&str] =
-    &["third_party/patches/libass-0.17.5/0001-erika-ordered-default-font-families.patch"];
+const LIBASS_PATCHSET_VERSION: &str = "erika-ordered-font-fallback-v2";
+const LIBASS_BUILD_VERSION: &str = "0.17.5+erika-ordered-font-fallback-v2";
+const LIBASS_PATCHES: &[&str] = &[
+    "third_party/patches/libass-0.17.5/0001-erika-ordered-default-font-families.patch",
+    "third_party/patches/libass-0.17.5/0002-erika-default-font-face.patch",
+];
 
 const HARFBUZZ_ARCHIVE: &str = "harfbuzz-14.2.1.tar.xz";
 const HARFBUZZ_DIR: &str = "harfbuzz-14.2.1";
@@ -82,7 +84,9 @@ fn main() -> Result<()> {
         "deps" => deps(args),
         "web" => {
             if args.first().map(String::as_str) != Some("build") {
-                bail!("usage: cargo run -p xtask -- web build [--skip-native]");
+                bail!(
+                    "usage: cargo run -p xtask -- web build [--skip-native] [--without-fallback-font]"
+                );
             }
             let root = workspace_root()?;
             run(Command::new("python3")
@@ -201,12 +205,13 @@ fn deps(mut args: Vec<String>) -> Result<()> {
     let options = DepsOptions::parse(&args)?;
     match subcommand.as_str() {
         "plan" => {
-            print_dependency_plan(options.profile, options.target, options.crt);
+            print_dependency_plan(options);
             Ok(())
         }
         "fetch" => {
-            print_dependency_plan(options.profile, options.target, options.crt);
-            let layout = workspace_layout(options.profile, options.target, options.crt)?;
+            print_dependency_plan(options);
+            let layout =
+                workspace_layout(options.profile, options.target, options.crt, options.ffmpeg)?;
             fetch_dependency_sources(&layout, options.all)?;
             write_profile_metadata(&layout, options.profile, options.target)
         }
@@ -214,10 +219,11 @@ fn deps(mut args: Vec<String>) -> Result<()> {
             options.profile,
             options.target,
             options.crt,
+            options.ffmpeg,
         )?),
         "smoke-ffmpeg-make" => smoke_ffmpeg_make(options),
         "build" => {
-            print_dependency_plan(options.profile, options.target, options.crt);
+            print_dependency_plan(options);
             build_dependencies(options)
         }
         other => bail!("unknown deps subcommand: {other}"),
@@ -267,6 +273,7 @@ impl NativeDependencyProfile {
                 "--disable-shared",
                 "--disable-programs",
                 "--disable-doc",
+                "--disable-debug",
                 "--disable-network",
                 "--disable-autodetect",
                 "--enable-zlib",
@@ -286,6 +293,7 @@ impl NativeDependencyProfile {
                 "--disable-shared",
                 "--disable-programs",
                 "--disable-doc",
+                "--disable-debug",
                 "--disable-network",
                 "--disable-autodetect",
                 "--enable-zlib",
@@ -303,13 +311,14 @@ impl NativeDependencyProfile {
 
     #[cfg(test)]
     fn ffmpeg_configure_flags_for_target(self, target: NativeTarget) -> Vec<&'static str> {
-        self.ffmpeg_configure_flags_for(target, WindowsCrt::Dynamic)
+        self.ffmpeg_configure_flags_for(target, WindowsCrt::Dynamic, FfmpegSet::Full)
     }
 
     fn ffmpeg_configure_flags_for(
         self,
         target: NativeTarget,
         crt: WindowsCrt,
+        set: FfmpegSet,
     ) -> Vec<&'static str> {
         let mut flags = self.ffmpeg_configure_flags().to_vec();
         if target.is_windows() {
@@ -337,6 +346,7 @@ impl NativeDependencyProfile {
         if target.is_android() {
             assert_android_software_decoder_fallbacks(&flags);
         }
+        set.apply(target, &mut flags);
         flags
     }
 }
@@ -623,11 +633,144 @@ impl NativeTarget {
     }
 }
 
+/// A group of formats `--ffmpeg slim` leaves out and can bring back.
+struct FfmpegGroup {
+    name: &'static str,
+    flags: &'static [&'static str],
+}
+
+const FFMPEG_GROUPS: &[FfmpegGroup] = &[
+    FfmpegGroup {
+        name: "legacy-video",
+        flags: &[
+            "--enable-decoder=h261,h263,h263p,msmpeg4v1,msmpeg4v2,msmpeg4v3,rv10,rv20,rv30,rv40,vp3,vp5,vp6,vp6a,vp6f,cinepak,indeo3,indeo4,indeo5,svq1,svq3,mjpegb,bink,binkaudio_dct,binkaudio_rdft,smacker,smackaud,flic",
+            "--enable-demuxer=rm,nsv,bink,smacker,swf,flic,m4v,h261,h263",
+            "--enable-parser=h261,h263,vp3,rv34",
+        ],
+    },
+    FfmpegGroup {
+        name: "pro-video",
+        flags: &[
+            "--enable-decoder=prores,dnxhd,ffv1,huffyuv,ffvhuff,utvideo,rawvideo,dvvideo,dvaudio",
+            "--enable-demuxer=mxf,nut,rawvideo,dv",
+            "--enable-parser=dvaudio",
+        ],
+    },
+    FfmpegGroup {
+        name: "images",
+        flags: &[
+            "--enable-decoder=png,apng,bmp,gif,tiff,webp",
+            "--enable-demuxer=image2,gif,apng,mpjpeg",
+            "--enable-parser=png,bmp,webp,jpeg2000",
+        ],
+    },
+    FfmpegGroup {
+        name: "legacy-audio",
+        flags: &[
+            "--enable-decoder=mp1,mp2,mp1float,mp2float,mp3float,mp3adu,aac_latm,aac_fixed,cook,sipr,atrac3,atrac3p,ra_144,ra_288,amrnb,amrwb,wmavoice,nellymoser,gsm,gsm_ms,qdm2,mpc7,mpc8,ws_snd1,adpcm_*",
+            "--enable-demuxer=amr,amrnb,amrwb,caf,aiff,au,voc,gsm,mpc,mpc8,wsaud,xwma,w64",
+            "--enable-parser=cook,gsm,sipr,xma,amr",
+        ],
+    },
+    FfmpegGroup {
+        name: "lossless-audio",
+        flags: &[
+            "--enable-decoder=alac,ape,wavpack,tak,tta,sonic,dsd_lsbf,dsd_msbf,dsd_lsbf_planar,dsd_msbf_planar,dst,pcm_*",
+            "--enable-demuxer=ape,wv,tak,tta,dsf,iff,pcm_s16le,pcm_s24le",
+            "--enable-parser=tak",
+        ],
+    },
+    FfmpegGroup {
+        name: "subtitles",
+        flags: &[
+            "--enable-decoder=text,hdmv_text_subtitle,dvb_teletext,microdvd,sami,subviewer,vplayer,mpl2,jacosub,pjs,realtext,stl,xsub",
+            "--enable-demuxer=sami,microdvd,subviewer,vplayer,mpl2,jacosub,pjs,realtext,stl,lrc,vobsub,sup",
+        ],
+    },
+    FfmpegGroup {
+        name: "streaming",
+        flags: &["--enable-demuxer=hls,concat"],
+    },
+];
+
+/// What of FFmpeg a build carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfmpegSet {
+    /// Everything FFmpeg offers.
+    Full,
+    /// The formats the profile lists, plus the [`FFMPEG_GROUPS`] of this mask.
+    Slim(u16),
+}
+
+impl FfmpegSet {
+    const COMMON: Self = Self::Slim((1 << FFMPEG_GROUPS.len()) - 1);
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "full" => return Ok(Self::Full),
+            "common" => return Ok(Self::COMMON),
+            _ => {}
+        }
+        let mut names = value.split(',');
+        if names.next() != Some("slim") {
+            bail!("unknown FFmpeg set: {value} (full, common, or slim with groups after a comma)");
+        }
+        let mut mask = 0;
+        for name in names {
+            let group = FFMPEG_GROUPS
+                .iter()
+                .position(|group| group.name == name)
+                .with_context(|| format!("unknown FFmpeg group: {name}"))?;
+            mask |= 1 << group;
+        }
+        Ok(Self::Slim(mask))
+    }
+
+    /// Follows `ffmpeg` in the folders of a set, as `ERIKA_FFMPEG_SET` finds them.
+    fn suffix(self) -> String {
+        match self {
+            Self::Full => String::new(),
+            Self::COMMON => "-common".to_string(),
+            Self::Slim(mask) => {
+                let mut suffix = "-slim".to_string();
+                for (index, group) in FFMPEG_GROUPS.iter().enumerate() {
+                    if mask & (1 << index) != 0 {
+                        suffix.push('-');
+                        suffix.push_str(group.name);
+                    }
+                }
+                suffix
+            }
+        }
+    }
+
+    fn apply(self, target: NativeTarget, flags: &mut Vec<&'static str>) {
+        let Self::Slim(mask) = self else {
+            return;
+        };
+        // Everything the profile enables after this stays; what it never
+        // named is gone, hardware decoding too.
+        flags.insert(0, "--disable-everything");
+        flags.push("--enable-decoder=subrip,ssa,movtext");
+        if target.is_apple() {
+            flags.push("--enable-hwaccel=*_videotoolbox");
+        } else if target.is_windows() {
+            flags.push("--enable-hwaccel=*_d3d11va,*_d3d11va2,*_dxva2");
+        }
+        for (index, group) in FFMPEG_GROUPS.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                flags.extend(group.flags);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DepsOptions {
     profile: NativeDependencyProfile,
     target: NativeTarget,
     crt: WindowsCrt,
+    ffmpeg: FfmpegSet,
     force: bool,
     all: bool,
     jobs: Option<usize>,
@@ -639,6 +782,7 @@ impl DepsOptions {
             profile: NativeDependencyProfile::Lgpl,
             target: NativeTarget::Host,
             crt: WindowsCrt::Dynamic,
+            ffmpeg: FfmpegSet::Full,
             force: false,
             all: false,
             jobs: None,
@@ -667,6 +811,11 @@ impl DepsOptions {
                         "static" => WindowsCrt::Static,
                         other => bail!("unknown C runtime: {other} (dynamic or static)"),
                     };
+                    index += 2;
+                }
+                "--ffmpeg" => {
+                    let value = args.get(index + 1).context("--ffmpeg requires a value")?;
+                    options.ffmpeg = FfmpegSet::parse(value)?;
                     index += 2;
                 }
                 "--force" => {
@@ -736,6 +885,7 @@ fn workspace_layout(
     profile: NativeDependencyProfile,
     target: NativeTarget,
     crt: WindowsCrt,
+    ffmpeg: FfmpegSet,
 ) -> Result<WorkspaceLayout> {
     let root = workspace_root()?;
     let cache_dir = root.join("third_party/cache");
@@ -757,9 +907,10 @@ fn workspace_layout(
         )
     };
     let ffmpeg_source_dir = source_dir.join(FFMPEG_DIR);
-    let ffmpeg_build_dir = build_dir.join("ffmpeg");
+    let ffmpeg_folder = format!("ffmpeg{}", ffmpeg.suffix());
+    let ffmpeg_build_dir = build_dir.join(&ffmpeg_folder);
     let ffmpeg_build_marker = ffmpeg_build_dir.join("ffmpeg-built.txt");
-    let ffmpeg_prefix = dist_dir.join("ffmpeg");
+    let ffmpeg_prefix = dist_dir.join(&ffmpeg_folder);
     let dav1d_source_dir = source_dir.join(DAV1D_DIR);
     let dav1d_build_dir = build_dir.join("dav1d");
     let dav1d_build_marker = dav1d_build_dir.join("dav1d-built.txt");
@@ -824,7 +975,14 @@ fn workspace_layout(
     })
 }
 
-fn print_dependency_plan(profile: NativeDependencyProfile, target: NativeTarget, crt: WindowsCrt) {
+fn print_dependency_plan(options: DepsOptions) {
+    let DepsOptions {
+        profile,
+        target,
+        crt,
+        ffmpeg,
+        ..
+    } = options;
     println!("Erika native dependency plan");
     println!("profile: {}", profile_name(profile));
     println!("target: {}", target.triple().unwrap_or("host"));
@@ -846,7 +1004,7 @@ fn print_dependency_plan(profile: NativeDependencyProfile, target: NativeTarget,
     println!("fribidi: {FRIBIDI_VERSION} ({})", FRIBIDI_URLS[0]);
     println!("zlib: {ZLIB_VERSION} ({})", ZLIB_URLS[0]);
     println!("ffmpeg configure flags:");
-    for flag in profile.ffmpeg_configure_flags_for(target, crt) {
+    for flag in profile.ffmpeg_configure_flags_for(target, crt, ffmpeg) {
         println!("  {flag}");
     }
     println!(
@@ -885,7 +1043,7 @@ fn fetch_dependency_sources(layout: &WorkspaceLayout, all: bool) -> Result<()> {
 }
 
 fn build_dependencies(options: DepsOptions) -> Result<()> {
-    let layout = workspace_layout(options.profile, options.target, options.crt)?;
+    let layout = workspace_layout(options.profile, options.target, options.crt, options.ffmpeg)?;
     ensure_required_tools(options, &layout)?;
     prepare_dependency_dirs(&layout)?;
     fetch_dependency_sources(&layout, options.all)?;
@@ -2929,9 +3087,10 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     if !extra_ldflags.is_empty() {
         configure.arg(format!("--extra-ldflags={}", extra_ldflags.join(" ")));
     }
-    for flag in options
-        .profile
-        .ffmpeg_configure_flags_for(options.target, options.crt)
+    for flag in
+        options
+            .profile
+            .ffmpeg_configure_flags_for(options.target, options.crt, options.ffmpeg)
     {
         configure.arg(flag);
     }
@@ -3016,7 +3175,7 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             layout.ffmpeg_prefix.display(),
             options
                 .profile
-                .ffmpeg_configure_flags_for(options.target, options.crt)
+                .ffmpeg_configure_flags_for(options.target, options.crt, options.ffmpeg)
                 .join(" ")
         ),
     )
@@ -3505,6 +3664,7 @@ fn ffmpeg_build_marker_is_current(layout: &WorkspaceLayout, options: DepsOptions
             options.profile,
             options.target,
             options.crt,
+            options.ffmpeg,
         )
         && patchset_is_current
         && android_api_is_current
@@ -3576,8 +3736,11 @@ fn ffmpeg_build_marker_has_current_flags(
     profile: NativeDependencyProfile,
     target: NativeTarget,
     crt: WindowsCrt,
+    set: FfmpegSet,
 ) -> bool {
-    let expected = profile.ffmpeg_configure_flags_for(target, crt).join(" ");
+    let expected = profile
+        .ffmpeg_configure_flags_for(target, crt, set)
+        .join(" ");
     marker
         .lines()
         .find_map(|line| line.strip_prefix("flags="))
@@ -4921,6 +5084,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ffmpeg_sets_keep_the_default_and_shrink_on_request() {
+        let target = NativeTarget::Aarch64Macos;
+        let flags = |set| {
+            NativeDependencyProfile::Lgpl.ffmpeg_configure_flags_for(
+                target,
+                WindowsCrt::Dynamic,
+                set,
+            )
+        };
+        let full = flags(FfmpegSet::Full);
+        assert!(!full.contains(&"--disable-everything"));
+
+        let slim = flags(FfmpegSet::parse("slim").unwrap());
+        assert_eq!(slim[0], "--disable-everything");
+        assert!(slim.contains(&"--enable-hwaccel=*_videotoolbox"));
+        assert!(slim.iter().any(|flag| flag.contains("=libdav1d")));
+
+        let picked = FfmpegSet::parse("slim,lossless-audio").unwrap();
+        assert!(
+            flags(picked)
+                .iter()
+                .any(|flag| flag.contains("ape,wavpack"))
+        );
+        assert!(!flags(picked).iter().any(|flag| flag.contains("rv40")));
+
+        let common = flags(FfmpegSet::COMMON);
+        for group in FFMPEG_GROUPS {
+            assert!(common.contains(&group.flags[0]), "{}", group.name);
+        }
+    }
+
+    #[test]
+    fn ffmpeg_sets_build_in_folders_of_their_own() {
+        assert_eq!(FfmpegSet::Full.suffix(), "");
+        assert_eq!(FfmpegSet::parse("slim").unwrap().suffix(), "-slim");
+        assert_eq!(
+            FfmpegSet::parse("slim,images,streaming").unwrap().suffix(),
+            "-slim-images-streaming"
+        );
+        assert_eq!(FfmpegSet::parse("common").unwrap().suffix(), "-common");
+        assert!(FfmpegSet::parse("slim,nothing").is_err());
+        assert!(FfmpegSet::parse("small").is_err());
+    }
+
+    #[test]
     fn apple_child_commands_remove_inherited_deployment_targets() {
         let mut command = Command::new("tool");
         command
@@ -5374,21 +5582,24 @@ mod tests {
                     &current,
                     profile,
                     target,
-                    WindowsCrt::Dynamic
+                    WindowsCrt::Dynamic,
+                    FfmpegSet::Full
                 ));
                 let stale = current.replace(" --extra-cflags=-MD", "");
                 assert!(!ffmpeg_build_marker_has_current_flags(
                     &stale,
                     profile,
                     target,
-                    WindowsCrt::Dynamic
+                    WindowsCrt::Dynamic,
+                    FfmpegSet::Full
                 ));
                 // A static runtime build is a different build.
                 assert!(!ffmpeg_build_marker_has_current_flags(
                     &current,
                     profile,
                     target,
-                    WindowsCrt::Static
+                    WindowsCrt::Static,
+                    FfmpegSet::Full
                 ));
             }
         }
@@ -5397,12 +5608,20 @@ mod tests {
     #[test]
     fn windows_static_crt_builds_ffmpeg_with_mt_in_its_own_directory() {
         let target = NativeTarget::X86_64WindowsMsvc;
-        let flags =
-            NativeDependencyProfile::Lgpl.ffmpeg_configure_flags_for(target, WindowsCrt::Static);
+        let flags = NativeDependencyProfile::Lgpl.ffmpeg_configure_flags_for(
+            target,
+            WindowsCrt::Static,
+            FfmpegSet::Full,
+        );
         assert!(flags.contains(&"--extra-cflags=-MT"));
         assert!(!flags.contains(&"--extra-cflags=-MD"));
-        let layout =
-            workspace_layout(NativeDependencyProfile::Lgpl, target, WindowsCrt::Static).unwrap();
+        let layout = workspace_layout(
+            NativeDependencyProfile::Lgpl,
+            target,
+            WindowsCrt::Static,
+            FfmpegSet::Full,
+        )
+        .unwrap();
         assert!(
             layout
                 .dist_dir
@@ -5439,7 +5658,8 @@ mod tests {
             &current,
             profile,
             target,
-            WindowsCrt::Dynamic
+            WindowsCrt::Dynamic,
+            FfmpegSet::Full
         ));
 
         let stale = current.replace(",vp8,vp9", ",vp9");
@@ -5447,7 +5667,8 @@ mod tests {
             &stale,
             profile,
             target,
-            WindowsCrt::Dynamic
+            WindowsCrt::Dynamic,
+            FfmpegSet::Full
         ));
     }
 
@@ -5584,9 +5805,10 @@ mod tests {
 
 fn print_help() {
     println!("Erika xtask");
-    println!("  cargo run -p xtask -- web build [--skip-native]");
+    println!("  cargo run -p xtask -- web build [--skip-native] [--without-fallback-font]");
     println!("  cargo run -p xtask -- deps plan --profile lgpl");
     println!("  cargo run -p xtask -- deps fetch --profile lgpl [--all]");
+    println!("  deps build also takes --ffmpeg full|common|slim[,group...], full by default");
     println!("  cargo run -p xtask -- deps status --profile lgpl");
     println!(
         "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios|aarch64-apple-tvos|aarch64-apple-tvos-sim|x86_64-apple-tvos|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android|i686-linux-android|aarch64-unknown-linux-ohos|x86_64-unknown-linux-ohos] [--force] [--jobs N]"

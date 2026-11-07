@@ -158,6 +158,13 @@ accepts `NULL`; no call on the session may be running or follow it.
 
 ## Conventions
 
+### Embedded font
+
+`erika_embedded_fallback_font(size_t *out_length)` returns the font built into the
+library and its length, or `NULL` without one. The bytes live as long as the process
+and are not freed. A host serving a browser page can pass them to it, so that the
+page needs no font of its own.
+
 ### Status codes
 
 Every fallible call returns `ErikaStatus`:

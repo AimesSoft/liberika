@@ -10,6 +10,42 @@
 
 ## 0.3.4 - 2026-11-06
 
+### 发布包
+
+- 静态库不再带调试信息，发布包小很多：macOS arm64 从约 122 MB 降到约 47 MB。崩溃时仍能看到
+  函数名，看不到文件和行号。
+
+### 彩色表情
+
+- 弹幕里的表情用自己的颜色画，不再是方块，也不再染成弹幕色。字体里的 `sbix`、`CBDT`
+  位图和 `COLR` 矢量都能读。
+- 国旗、肤色、家庭、键帽这类组合表情由 HarfBuzz 合成一个字形，字体没有合成字形时逐个
+  画出。关掉 `libass` 的构建没有 HarfBuzz，组合表情也逐个画出。
+- 表情在行内居中，和文字一样带描边和阴影。
+- 字幕里的表情仍是单色：libass 只输出 alpha 位图。
+- `DanmakuRenderPlan` 新增 `color_atlas` 和 `color_glyphs`。自己绘制弹幕的接入方要多画
+  这一层，否则看不到表情。Web：表情由浏览器的字体画出，`Player` 不用改。
+
+### 回退字体
+
+- 字幕和弹幕缺字时先用系统字体，读不了才用内嵌的 Droid Sans Fallback。Android 从
+  `fonts.xml` 读取各语言对应的字面，字体文件以内存映射方式读取。iOS 18 起和 tvOS 的中文
+  仍靠内嵌字体：PingFang 的轮廓在苹果的 `hvgl` 表里，FreeType 读不了。
+- `system_font::fallback()` 给出设备提供的字面。不拷贝字体，只映射正在使用的那个字面。
+- `font::embedded_fallback_font()` 和 `erika_embedded_fallback_font()` 给出内嵌字体，主机
+  可以把它传给自己的页面，这样只需要一份字体。
+- Web：新增 `liberika-web-nofont` 包，不带字体，由 `Player.create({ fallbackFont })` 传入。
+
+### 按需编译
+
+- 发布包不变。下面的开关用来从源码做更小的构建，全部关掉就是最小状态（见
+  [构建](docs/building.zh.md#按需编译)）。
+- `embedded-fallback-font` 默认打开，约 6 MB。关掉后系统字体读不了时没有回退。
+- `artcnn-r8f64` 默认打开，关掉后不带最大的超分网络 R8F64，约小 1.8 MB。
+- `xtask deps build --ffmpeg` 选择构建带上 FFmpeg 的哪些部分：默认 `full`，`slim`
+  最小，`common` 或 `slim` 加分组介于两者之间。`ERIKA_FFMPEG_SET` 让 Cargo 链接对应
+  的构建。
+
 ### 超分（#193、#194）
 
 - 超分改为围绕一份与后端无关的网络描述（`renderer/sr/`）重建：ArtCNN、Anime4K 与运行时加载的网络都转换到这份描述；线性层被精确合并进相邻层（ArtCNN 少 26-33% 的乘加；图像边缘一圈像素使用专用权重，输出与原网络一致），每个 GPU 后端都与 CPU 参考实现比对。

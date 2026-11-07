@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
 
-#[cfg(feature = "libass")]
+#[cfg(all(feature = "libass", any(test, feature = "embedded-fallback-font")))]
 use crate::NIPAPLAY_FALLBACK_FONT;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -1063,6 +1063,7 @@ impl LibassRuntime {
             });
             libass_ffi::erika_ass_install_log_bridge(library.as_ptr(), &mut *log_bridge);
             libass_ffi::ass_set_extract_fonts(library.as_ptr(), 1);
+            #[cfg(any(test, feature = "embedded-fallback-font"))]
             add_bundled_ass_fallback_font(library.as_ptr(), track_id);
             add_attached_ass_fonts(library.as_ptr(), track_id, memory_fonts);
             add_attached_ass_fonts(library.as_ptr(), track_id, fonts);
@@ -1156,17 +1157,34 @@ impl LibassRuntime {
         for font in memory_fonts {
             fallback_families.extend(font.families.iter().cloned());
         }
-        fallback_families.push(BUNDLED_ASS_FALLBACK_FONT_FAMILY.to_string());
+        let custom_font = style
+            .font_file_path()
+            .filter(|path| self.custom_font_file_is_current(path))
+            .and_then(|path| CString::new(path).ok());
+        let system_font = custom_font
+            .is_none()
+            .then(system_ass_default_font)
+            .flatten();
+        // What the system offers goes first. A named family wins over the default
+        // file, so the built-in family stays out when that file is the system's.
+        if !cfg!(test) {
+            fallback_families.extend(
+                crate::system_font::PREFERRED_FAMILIES
+                    .iter()
+                    .map(|family| family.to_string()),
+            );
+        }
+        #[cfg(any(test, feature = "embedded-fallback-font"))]
+        if system_font.is_none() {
+            fallback_families.push(BUNDLED_ASS_FALLBACK_FONT_FAMILY.to_string());
+        }
         let mut seen = HashSet::new();
         fallback_families.retain(|family| !family.is_empty() && seen.insert(family.clone()));
         let family = CString::new(fallback_families.join("\u{1f}"))
             .unwrap_or_else(|_| default_ass_font_family_cstr().to_owned());
         let selection = LibassFontSelection {
             family,
-            default_font: style
-                .font_file_path()
-                .filter(|path| self.custom_font_file_is_current(path))
-                .and_then(|path| CString::new(path).ok()),
+            default_font: custom_font.or(system_font),
         };
         if self.fonts.as_ref() == Some(&selection) {
             return false;
@@ -2384,23 +2402,32 @@ const MAX_ASS_FONT_SIZE: f64 = 400.0;
 const MAX_ASS_OUTLINE: f64 = 32.0;
 
 /// Attachment name liberika registers the bundled `assets/subfont.ttf` under.
+#[cfg(any(test, feature = "embedded-fallback-font"))]
 const BUNDLED_ASS_FALLBACK_FONT_NAME: &str = "subfont.ttf";
 /// Family name carried by the bundled fallback face. Keep in sync with the
 /// asset itself; `bundled_ass_fallback_family_matches_asset` locks the two.
+#[cfg(any(test, feature = "embedded-fallback-font"))]
 const BUNDLED_ASS_FALLBACK_FONT_FAMILY: &str = "Droid Sans Fallback";
 
 #[cfg(target_os = "macos")]
 const DEFAULT_ASS_FONT_FAMILY: &str = "PingFang SC";
 #[cfg(target_os = "windows")]
 const DEFAULT_ASS_FONT_FAMILY: &str = "Arial";
-// Every other target renders without a system font provider (mobile selects
-// `ASS_FONTPROVIDER_NONE`, and the vendored libass build has fontconfig
-// disabled), so the bundled fallback family is the only one libass resolves.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "windows")),
+    any(test, feature = "embedded-fallback-font")
+))]
 const DEFAULT_ASS_FONT_FAMILY: &str = BUNDLED_ASS_FALLBACK_FONT_FAMILY;
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "windows")),
+    not(any(test, feature = "embedded-fallback-font"))
+))]
+const DEFAULT_ASS_FONT_FAMILY: &str = "sans-serif";
 
 #[cfg(feature = "libass")]
 fn default_ass_font_provider() -> libc::c_int {
+    // On iOS and tvOS CoreText would offer PingFang, which FreeType cannot read:
+    // its outlines are in Apple's `hvgl` table.
     if cfg!(any(
         target_os = "ios",
         target_os = "tvos",
@@ -2414,14 +2441,28 @@ fn default_ass_font_provider() -> libc::c_int {
     }
 }
 
+/// libass has no font provider on Android and OpenHarmony, so it opens the
+/// system's fallback face itself. The face of a collection follows an ASCII
+/// unit separator, as liberika's libass patch reads it.
+#[cfg(feature = "libass")]
+fn system_ass_default_font() -> Option<CString> {
+    if !cfg!(any(target_os = "android", target_env = "ohos")) || cfg!(test) {
+        return None;
+    }
+    let font = crate::system_font::fallback()?;
+    CString::new(format!("{}\u{1f}{}", font.path.display(), font.index)).ok()
+}
+
 #[cfg(feature = "libass")]
 fn default_ass_font_family_cstr() -> &'static CStr {
-    if cfg!(target_os = "macos") {
-        c"Droid Sans Fallback"
-    } else if cfg!(target_os = "windows") {
+    if cfg!(target_os = "windows") {
         c"Arial"
-    } else {
+    } else if cfg!(any(test, feature = "embedded-fallback-font")) {
         c"Droid Sans Fallback"
+    } else if cfg!(target_os = "macos") {
+        c"PingFang SC"
+    } else {
+        c"sans-serif"
     }
 }
 
@@ -2544,7 +2585,7 @@ unsafe fn add_attached_ass_fonts(
 /// requested family, but a script that names a font nobody has - or one that
 /// covers none of the codepoints in the line - falls back here instead of
 /// rendering nothing.
-#[cfg(feature = "libass")]
+#[cfg(all(feature = "libass", any(test, feature = "embedded-fallback-font")))]
 unsafe fn add_bundled_ass_fallback_font(library: *mut libass_ffi::AssLibrary, track_id: i64) {
     let Ok(data_size) = libc::c_int::try_from(NIPAPLAY_FALLBACK_FONT.len()) else {
         crate::trace::diagnostic(

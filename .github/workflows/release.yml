@@ -98,6 +98,7 @@ jobs:
           mkdir -p "out/${{ matrix.arch }}"
           cp "target/${{ matrix.target }}/release/liberika_capi.dylib" "out/${{ matrix.arch }}/"
           cp "target/${{ matrix.target }}/release/liberika_capi.a" "out/${{ matrix.arch }}/"
+          strip -S "out/${{ matrix.arch }}/liberika_capi.a"
           install_name_tool -id @rpath/liberika_capi.dylib "out/${{ matrix.arch }}/liberika_capi.dylib"
       - name: Package
         run: |
@@ -191,7 +192,8 @@ jobs:
           ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
             cargo rustc --locked \
               -p erika_capi --lib --release --target "$T" \
-              --no-default-features --features libass --crate-type staticlib
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
+          strip -S "target/$T/release/liberika_capi.a"
       - uses: actions/upload-artifact@v4
         with:
           name: native-ios-${{ matrix.target }}
@@ -280,7 +282,8 @@ jobs:
           ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
             cargo +nightly rustc -Z build-std=std,panic_abort --locked \
               -p erika_capi --lib --release --target "$T" \
-              --no-default-features --features libass --crate-type staticlib
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
+          strip -S "target/$T/release/liberika_capi.a"
       - uses: actions/upload-artifact@v4
         with:
           name: native-tvos-${{ matrix.target }}
@@ -484,9 +487,10 @@ jobs:
           cargo run --locked -p xtask -- deps build --all --profile "$PROFILE" --target "$T"
           ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
             cargo build --locked -p erika_capi --release --target "$T" \
-              --no-default-features --features libass,wgpu
+              --no-default-features --features libass,wgpu,embedded-fallback-font,artcnn-r8f64
           mkdir -p "out/android/${{ matrix.abi }}"
           cp "target/$T/release/liberika_capi.a" "out/android/${{ matrix.abi }}/liberika_capi.a"
+          "$PREBUILT/bin/llvm-strip" --strip-debug "out/android/${{ matrix.abi }}/liberika_capi.a"
           cp "target/$T/release/liberika_capi.so" "out/android/${{ matrix.abi }}/liberika_capi.so"
           cp "$PREBUILT/sysroot/usr/lib/${{ matrix.cxx_runtime_target }}/libc++_shared.so" \
             "out/android/${{ matrix.abi }}/libc++_shared.so"
@@ -612,7 +616,7 @@ jobs:
         run: >-
           cargo build --locked -p erika_capi --release
           --target "$ERIKA_NATIVE_TARGET"
-          --no-default-features --features libass,wgpu
+          --no-default-features --features libass,wgpu,embedded-fallback-font,artcnn-r8f64
       - name: Build OpenHarmony Flutter native bridge
         run: |
           set -euo pipefail
@@ -697,6 +701,16 @@ jobs:
           mkdir -p dist
           cd target/web
           zip -r "$GITHUB_WORKSPACE/dist/liberika-web-${VERSION}.zip" .
+      - name: Build browser package without the fallback font
+        run: cargo run --locked -p xtask -- web build --skip-native --without-fallback-font
+      - name: Package it
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f target/web/erika_core_bg.wasm
+          cd target/web
+          zip -r "$GITHUB_WORKSPACE/dist/liberika-web-nofont-${VERSION}.zip" .
       - uses: actions/upload-artifact@v4
         with:
           name: liberika-web
@@ -748,6 +762,8 @@ jobs:
             release records the digest of every archive, including the separate
             `liberika-web-X.Y.Z.zip` browser runtime and demo. Serve the complete
             Web archive over HTTPS or localhost, preserving its relative paths.
+            `liberika-web-nofont-X.Y.Z.zip` is the same runtime without the
+            fallback font, for a page whose host passes one in.
             See [docs/web.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/web.md)
             for browser requirements and integration. See
             [docs/capi_reference.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/capi_reference.md)

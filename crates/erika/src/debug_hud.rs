@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use ab_glyph::{Font, FontArc, Glyph, PxScale, ScaleFont, point};
 
-use crate::NIPAPLAY_FALLBACK_FONT;
 use crate::subtitle::SubtitleBitmapPlane;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -76,7 +75,7 @@ impl DebugHud {
     pub fn new() -> Self {
         Self {
             enabled: false,
-            font: FontArc::try_from_slice(NIPAPLAY_FALLBACK_FONT).ok(),
+            font: crate::danmaku::load_default_font(),
             last_refresh: None,
             previous_sample: None,
             plane: None,

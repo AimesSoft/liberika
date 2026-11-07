@@ -118,6 +118,12 @@ void erika_frame_export_session_close(ErikaFrameExportSession *session);
 
 ## 規約
 
+### 内蔵フォント
+
+`erika_embedded_fallback_font(size_t *out_length)` はライブラリの内蔵フォントと長さを返し、
+内蔵していなければ `NULL` を返します。このメモリはプロセスの間有効で、解放は不要です。ブラウザの
+ページを配信するホストはこれをページに渡せるので、ページ側にフォントは要りません。
+
 ### ステータスコード
 
 失敗しうる呼び出しはすべて `ErikaStatus` を返します。

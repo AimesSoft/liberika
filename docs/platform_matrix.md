@@ -37,6 +37,36 @@ Android scRGB and Linux HDR require a surface that supports the respective encod
 
 Linux VA-API → Vulkan direct import and the WSL GPU-copy path are experimental. Texture composition, hardware decode and zero-copy decoded frames are distinct paths; see the [Linux guide](linux.md) for selection.
 
+## Fallback font
+
+Subtitles and danmaku try the system's fonts for text the requested font lacks, and
+use the embedded Droid Sans Fallback when those cannot be read.
+
+| Platform | System fonts |
+|---|---|
+| macOS, Windows, Linux | Read directly |
+| Android | Chosen from the language list in `fonts.xml` |
+| OpenHarmony | Read directly |
+| iOS, tvOS | Embedded font. From iOS 18 on, and on tvOS, the system's Chinese font `PingFangUI.ttc` keeps its outlines in the `hvgl` table, which FreeType cannot read |
+| Browser | Out of reach: the font in the wasm, or one passed as `fallbackFont` |
+
+Without `embedded-fallback-font` there is no embedded font: Chinese does not show on
+iOS and tvOS, and a browser page must be given a font.
+
+## Colour emoji
+
+Danmaku draw emoji in the font's own colours. Subtitles draw them in one colour,
+since libass only produces alpha bitmaps.
+
+| Platform | Emoji font |
+|---|---|
+| macOS, iOS, tvOS | Apple Color Emoji |
+| Windows | Segoe UI Emoji |
+| Linux | A colour font on the system, such as Noto Color Emoji; monochrome without one |
+| Android | Noto Color Emoji, with flags in `NotoColorEmojiFlags` |
+| OpenHarmony | The system's colour font |
+| Browser | The browser's own fonts |
+
 ## CI and validation
 
 Native builds cover six prebuilt platforms; the Linux native workflow runs source playback checks using Xvfb, Mesa and PulseAudio. The Flutter consumer workflow checks six prebuilt platforms. Device experiments for HDR output and platform lifecycle are in the [validation archive](investigations/README.md).

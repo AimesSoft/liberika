@@ -64,7 +64,10 @@ fn bundled_asset(mode: LumaUpscalerMode) -> Option<&'static [u8]> {
         LumaUpscalerMode::ArtCnnC4F32Dn => {
             include_bytes!("../../../assets/artcnn/artcnn_c4f32_dn.esr")
         }
-        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        #[cfg(all(
+            feature = "artcnn-r8f64",
+            any(target_os = "windows", target_os = "macos", target_os = "linux")
+        ))]
         LumaUpscalerMode::ArtCnnR8F64 => include_bytes!("../../../assets/artcnn/artcnn_r8f64.esr"),
         LumaUpscalerMode::Anime4kS => {
             include_bytes!("../../../assets/anime4k/anime4k_upscale_s.esr")

@@ -647,6 +647,7 @@ name = "erika"
 version = "0.3.5"
 dependencies = [
  "ab_glyph",
+ "ab_glyph_rasterizer",
  "aho-corasick",
  "ash",
  "bytemuck",
@@ -661,6 +662,7 @@ dependencies = [
  "glow",
  "js-sys",
  "libc",
+ "memmap2",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -681,6 +683,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "ttf-parser",
  "wasm-bindgen",
  "wgpu",
  "windows",

@@ -54,7 +54,7 @@ A complete release contains 15 ZIPs plus `SHA256SUMS`:
 | Android | `erika-capi-android.zip` | 1 |
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
-| Web / WASM | `liberika-web-X.Y.Z.zip` | 1 |
+| Web / WASM | `liberika-web-X.Y.Z.zip`, `liberika-web-nofont-X.Y.Z.zip` | 2 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI bundles include the library, `include/erika.h`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, dependency license texts, and a `MANIFEST.txt` with the tag/commit. iOS/tvOS contain device + simulator XCFramework slices. The combined Android bundle contains static/shared libraries and matching `libc++_shared.so` for four ABIs. Flutter Android bundles contain one ABI's shared runtime each.
