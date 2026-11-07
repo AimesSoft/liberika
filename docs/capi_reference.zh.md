@@ -138,7 +138,7 @@ if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
 
 ### 内嵌字体
 
-`erika_embedded_fallback_font(size_t *out_length)` 返回库内嵌的字体和长度，没有内嵌时返回
+`erika_embedded_fallback_font(uintptr_t *out_length)` 返回库内嵌的字体和长度，没有内嵌时返回
 `NULL`。这段内存随进程存在，不用释放。主机为浏览器页面提供服务时可以把它传给页面，页面就不用
 自带字体。
 
