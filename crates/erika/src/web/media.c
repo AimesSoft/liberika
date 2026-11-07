@@ -24,6 +24,7 @@ static char error_text[256];
 static char *info;
 static int renderer_width, renderer_height, subtitle_changed;
 static size_t font_bytes;
+static char default_family[1024] = "Droid Sans Fallback";
 
 EM_ASYNC_JS(int, source_read, (double offset, int destination, int length), {
     try { return await Module.readSource(offset, destination, length); }
@@ -92,7 +93,7 @@ int erika_open(double size, const char *name) {
     renderer = ass_renderer_init(library);
     if (!renderer) return fail(AVERROR(ENOMEM));
     ass_set_cache_limits(renderer, 2048, 64);
-    ass_set_fonts(renderer, NULL, "Droid Sans Fallback", ASS_FONTPROVIDER_NONE, NULL, 1);
+    ass_set_fonts(renderer, NULL, default_family, ASS_FONTPROVIDER_NONE, NULL, 1);
     for (unsigned i = 0; i < format->nb_streams; ++i) {
         AVStream *s = format->streams[i]; AVCodecParameters *p = s->codecpar;
         if (p->codec_type == AVMEDIA_TYPE_ATTACHMENT && p->extradata_size > 0 && p->extradata_size <= 32*1024*1024 && font_bytes + p->extradata_size <= 128*1024*1024) {
@@ -100,7 +101,7 @@ int erika_open(double size, const char *name) {
             font_bytes += p->extradata_size;
         }
     }
-    ass_set_fonts(renderer, NULL, "Droid Sans Fallback", ASS_FONTPROVIDER_NONE, NULL, 1);
+    ass_set_fonts(renderer, NULL, default_family, ASS_FONTPROVIDER_NONE, NULL, 1);
     return 0;
 }
 const char *erika_info(void) {
@@ -149,10 +150,14 @@ int erika_subtitle_load(char *data, int length) {
     subtitles=ass_read_memory(library,data,length,NULL); subtitle_stream=-1;
     return subtitles ? 0 : fail(AVERROR_INVALIDDATA);
 }
+int erika_set_default_family(const char *family) {
+    snprintf(default_family, sizeof default_family, "%s", family);
+    return 0;
+}
 int erika_add_font(char *name, char *data, int length) {
     if (!library || length<1 || length>32*1024*1024 || font_bytes + length > 128*1024*1024) return fail(AVERROR(EINVAL));
     ass_add_font(library,name,data,length); font_bytes += length;
-    ass_set_fonts(renderer,NULL,"Droid Sans Fallback",ASS_FONTPROVIDER_NONE,NULL,1); return 0;
+    ass_set_fonts(renderer,NULL,default_family,ASS_FONTPROVIDER_NONE,NULL,1); return 0;
 }
 int erika_read(void) {
     av_packet_unref(packet);

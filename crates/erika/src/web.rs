@@ -1,19 +1,82 @@
 //! Browser bindings. The Web package owns WebCodecs, libass and the GPU surface;
 //! text layout and rasterization use the same implementation as native players.
+use crate::color_glyph::ColorBitmap;
 use crate::danmaku::{
     DanmakuColor, DanmakuFontSelection, DanmakuItem, DanmakuLayoutConfig, DanmakuMode,
     DanmakuTimeline, DanmakuViewport, DfmLayoutEngine, DfmPreparedLayout,
 };
-use crate::font::SubtitleFontAttachment;
+use crate::font::{FallbackFont, SubtitleFontAttachment};
 use js_sys::{Float32Array, Object, Reflect, Uint8Array};
 use std::{sync::Arc, time::Duration};
 use wasm_bindgen::prelude::*;
 
-/// Share the font already embedded for danmaku with the libass WASM module.
-/// Return an owned JS array so later Rust memory growth cannot invalidate it.
+thread_local! {
+    static EMOJI_PAINTER: std::cell::RefCell<Option<js_sys::Function>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Lets the page draw emoji: only the browser reaches the system's color fonts.
+/// `painter(text, height)` answers `{ width, height, rgba }`, with premultiplied
+/// pixels and the emoji in the middle, or nothing.
+#[wasm_bindgen(js_name = setEmojiPainter)]
+pub fn set_emoji_painter(painter: js_sys::Function) {
+    EMOJI_PAINTER.with(|slot| *slot.borrow_mut() = Some(painter));
+    crate::color_glyph::set_browser_painter(paint_emoji);
+}
+
+fn paint_emoji(text: &str, em: u32) -> Option<ColorBitmap> {
+    let picture = EMOJI_PAINTER.with(|slot| {
+        slot.borrow()
+            .as_ref()?
+            .call2(&JsValue::NULL, &text.into(), &em.into())
+            .ok()
+    })?;
+    if picture.is_null() || picture.is_undefined() {
+        return None;
+    }
+    let number = |key: &str| Reflect::get(&picture, &key.into()).ok()?.as_f64();
+    let (width, height) = (number("width")? as u32, number("height")? as u32);
+    let rgba = Uint8Array::new(&Reflect::get(&picture, &"rgba".into()).ok()?).to_vec();
+    if width == 0 || height == 0 || rgba.len() != (width * height * 4) as usize {
+        return None;
+    }
+    let em = em.max(1) as f32;
+    Some(ColorBitmap {
+        width,
+        height,
+        rgba,
+        left: 0.0,
+        em_width: width as f32 / em,
+        em_height: height as f32 / em,
+        advance: width as f32 / em,
+    })
+}
+
+/// Share the fallback face danmaku use with the libass WASM module; empty when
+/// this package carries none and the page was given none. Return an owned JS
+/// array so later Rust memory growth cannot invalidate it.
 #[wasm_bindgen(js_name = fallbackFont)]
 pub fn fallback_font() -> Uint8Array {
-    Uint8Array::from(crate::NIPAPLAY_FALLBACK_FONT)
+    match crate::font::fallback_font() {
+        Some(font) => Uint8Array::from(&*font.data),
+        None => Uint8Array::new_with_length(0),
+    }
+}
+
+/// Give the player the fallback face of the device serving this page, and
+/// answer the families libass finds it under; empty when the bytes hold no such
+/// face, which leaves the player as it was.
+#[wasm_bindgen(js_name = setFallbackFont)]
+pub fn set_fallback_font(data: Vec<u8>, index: u32) -> String {
+    let font = FallbackFont {
+        data: Arc::from(data),
+        index,
+    };
+    let Some(families) = font.families() else {
+        return String::new();
+    };
+    crate::font::set_fallback_font(Some(font));
+    families
 }
 
 #[wasm_bindgen]
@@ -27,6 +90,7 @@ pub struct WebDanmaku {
     pending_size_at: Option<f64>,
     atlas_version: u64,
     atlas_size: (u32, u32, usize),
+    picture_version: u64,
     size_deadline: Option<f64>,
     fonts: Vec<SubtitleFontAttachment>,
     font_generation: u64,
@@ -51,6 +115,7 @@ impl WebDanmaku {
             pending_size_at: None,
             atlas_version: 0,
             atlas_size: (0, 0, 0),
+            picture_version: 0,
             size_deadline: None,
             fonts: Vec::new(),
             font_generation: 0,
@@ -274,6 +339,29 @@ impl WebDanmaku {
             "groups",
             Float32Array::from(groups.as_slice()).into(),
         )?;
+        let mut pictures = Vec::<f32>::with_capacity(plan.color_glyphs.len() * 9);
+        for glyph in &plan.color_glyphs {
+            pictures.extend_from_slice(&glyph.rect);
+            pictures.extend_from_slice(&glyph.tex_rect);
+            pictures.push(glyph.opacity);
+        }
+        set(
+            &result,
+            "pictures",
+            Float32Array::from(pictures.as_slice()).into(),
+        )?;
+        if let Some(atlas) = &plan.color_atlas
+            && atlas.version != self.picture_version
+        {
+            set(&result, "pictureWidth", atlas.width.into())?;
+            set(&result, "pictureHeight", atlas.height.into())?;
+            set(
+                &result,
+                "pictureAtlas",
+                Uint8Array::from(atlas.rgba.as_slice()).into(),
+            )?;
+            self.picture_version = atlas.version;
+        }
         if let Some(atlas) = plan.atlas {
             if atlas.version != self.atlas_version {
                 if let Some(update) = atlas.incremental_update_from(

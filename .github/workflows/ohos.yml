@@ -113,7 +113,7 @@ jobs:
         run: >-
           cargo build --locked -p erika_capi --release
           --target "$ERIKA_NATIVE_TARGET"
-          --no-default-features --features libass,wgpu
+          --no-default-features --features libass,wgpu,embedded-fallback-font,artcnn-r8f64
       - name: Build OpenHarmony Flutter native bridge
         run: |
           set -euo pipefail

@@ -35,7 +35,8 @@ use crate::core::{
     RendererBackend, RendererRuntimeStats, Result, SurfaceOutputCapabilities, WgpuSurfaceHandle,
 };
 use crate::danmaku::{
-    DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan,
+    DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuGlyphInstance,
+    DanmakuRenderPlan,
 };
 use crate::ffmpeg::{DecoderBackend, PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
@@ -279,6 +280,24 @@ impl OverlayUniforms {
         }
     }
 
+    /// An emoji from the premultiplied picture atlas, at `opacity`.
+    fn picture_rect(
+        opacity: f32,
+        rect: [f32; 4],
+        tex_rect: [f32; 4],
+        viewport_w: u32,
+        viewport_h: u32,
+    ) -> Self {
+        Self {
+            rect,
+            tex_rect,
+            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+            overlay_mode: 2,
+            output_encoding: 0,
+            color: [1.0, 1.0, 1.0, opacity],
+        }
+    }
+
     fn for_output(mut self, output: OutputDescription) -> Self {
         self.output_encoding = u32::from(output.extended_linear);
         self
@@ -348,6 +367,7 @@ struct OverlayDraw {
 enum DanmakuAtlasTexture {
     Fill,
     Outline,
+    Picture,
 }
 
 struct WgpuDanmakuAtlasCache {
@@ -588,6 +608,7 @@ pub struct WgpuRenderer {
     current_video_visible: bool,
     upload_serial: u64,
     danmaku_atlas_cache: Option<WgpuDanmakuAtlasCache>,
+    danmaku_picture_cache: Option<(u64, wgpu::Texture)>,
     supports_16bit_norm: bool,
     output_mode: OutputMode,
     video_alpha_mode: VideoAlphaMode,
@@ -1750,6 +1771,7 @@ impl WgpuRenderer {
             current_video_visible: false,
             upload_serial: 0,
             danmaku_atlas_cache: None,
+            danmaku_picture_cache: None,
             supports_16bit_norm: context.supports_16bit_norm,
             output_mode,
             video_alpha_mode,
@@ -3463,7 +3485,49 @@ impl WgpuRenderer {
         for item in &plan.items {
             self.append_danmaku_glyph_uniforms(item, viewport_w, viewport_h, output, &mut uniforms);
         }
-        self.make_batched_danmaku_draws(&fill_texture, &outline_texture, &uniforms)
+        // Emoji go over the text of their comment, in their own colors.
+        let picture_texture = plan
+            .color_atlas
+            .as_ref()
+            .filter(|_| !plan.color_glyphs.is_empty())
+            .map(|atlas| self.prepare_danmaku_picture_texture(atlas));
+        if picture_texture.is_some() {
+            for glyph in &plan.color_glyphs {
+                let uniform = OverlayUniforms::picture_rect(
+                    glyph.opacity,
+                    glyph.rect,
+                    glyph.tex_rect,
+                    viewport_w,
+                    viewport_h,
+                )
+                .for_output(output);
+                uniforms.push((DanmakuAtlasTexture::Picture, uniform));
+            }
+        }
+        self.make_batched_danmaku_draws(
+            &fill_texture,
+            &outline_texture,
+            picture_texture.as_ref(),
+            &uniforms,
+        )
+    }
+
+    fn prepare_danmaku_picture_texture(&mut self, atlas: &DanmakuColorAtlas) -> wgpu::Texture {
+        if let Some((version, texture)) = &self.danmaku_picture_cache
+            && *version == atlas.version
+        {
+            return texture.clone();
+        }
+        let texture = self.create_plane_texture(
+            "erika-wgpu-danmaku-picture-atlas",
+            atlas.width,
+            atlas.height,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &atlas.rgba,
+            atlas.width * 4,
+        );
+        self.danmaku_picture_cache = Some((atlas.version, texture.clone()));
+        texture
     }
 
     fn prepare_danmaku_atlas_textures(
@@ -3607,6 +3671,7 @@ impl WgpuRenderer {
         &self,
         fill_texture: &wgpu::Texture,
         outline_texture: &wgpu::Texture,
+        picture_texture: Option<&wgpu::Texture>,
         uniforms: &[(DanmakuAtlasTexture, OverlayUniforms)],
     ) -> Result<Vec<OverlayDraw>> {
         if uniforms.is_empty() {
@@ -3669,6 +3734,12 @@ impl WgpuRenderer {
         let fill_bind_group = make_bind_group("erika-wgpu-danmaku-fill-bind-group", fill_texture);
         let outline_bind_group =
             make_bind_group("erika-wgpu-danmaku-outline-bind-group", outline_texture);
+        let picture = picture_texture.map(|texture| {
+            (
+                make_bind_group("erika-wgpu-danmaku-picture-bind-group", texture),
+                texture.clone(),
+            )
+        });
         uniforms
             .iter()
             .enumerate()
@@ -3685,6 +3756,9 @@ impl WgpuRenderer {
                     DanmakuAtlasTexture::Fill => (fill_bind_group.clone(), fill_texture.clone()),
                     DanmakuAtlasTexture::Outline => {
                         (outline_bind_group.clone(), outline_texture.clone())
+                    }
+                    DanmakuAtlasTexture::Picture => {
+                        picture.clone().expect("a picture draw has its atlas")
                     }
                 };
                 Ok(OverlayDraw {
@@ -6949,6 +7023,8 @@ mod tests {
                 shadow_rgba: [0.0, 0.0, 0.0, 0.0],
                 shadow_offset: [1.0, 1.0],
             }],
+            color_atlas: None,
+            color_glyphs: Vec::new(),
             frame_stats: DanmakuFrameStats::default(),
         };
 

@@ -4,8 +4,11 @@ pub mod android;
 pub mod apple;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod audio;
+mod color_glyph;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod core;
+#[cfg(target_vendor = "apple")]
+mod coretext;
 pub mod danmaku;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod debug_hud;
@@ -41,6 +44,7 @@ pub mod source;
 pub mod subtitle;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod subtitle_charset;
+pub mod system_font;
 pub mod text;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
@@ -49,7 +53,9 @@ pub mod windows;
 
 mod trace;
 
-pub(crate) const NIPAPLAY_FALLBACK_FONT: &[u8] = include_bytes!("../assets/subfont.ttf");
+#[cfg(any(test, feature = "embedded-fallback-font"))]
+// A static: a const would be copied into every crate and module that uses it.
+pub(crate) static NIPAPLAY_FALLBACK_FONT: &[u8] = include_bytes!("../assets/subfont.ttf");
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use core::*;

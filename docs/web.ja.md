@@ -123,6 +123,7 @@ await player.configureSubtitles({ scale: 1, supersampling: true });
 2026-10-22 のリリースビルドでは再生ランタイムがファイル合計 **10.93 MiB**、各ファイルを gzip レベル 9 で圧縮した合計が **4.56 MiB** でした。両 WASM モジュール、JavaScript ランタイム、完全な組み込みフォールバックフォントを含み、ホスト UI、デモ、ドキュメント、メディアは含みません。重複したフォントコピーを削除する前はそれぞれ 17.00 MiB、7.30 MiB でした。サーバーが gzip を有効にすると転送量は圧縮サイズに近づきます。これらはパッケージサイズであり、実行時メモリ使用量ではありません。
 
 - HTTPS または localhost で配信し、JavaScript モジュールの MIME type と `.wasm` 用の `application/wasm` を設定します。JS、両 WASM モジュール、Worker、`licenses/` を一緒に配置します。生成された `index.html` は任意のデモです。
+- 独自のフォントを持つ端末が配信するページでは、`liberika-web-nofont` パッケージか `web build --without-fallback-font` で約 6 MB 削り、`Player.create({ canvas, fallbackFont: { data, index } })` でフォントを渡せます。
 - Canvas にゼロでない CSS 幅と高さを指定します。`Player` はサイズを監視し描画面を自動更新します。
 - リモートメディアはブラウザーからのリクエストを許可する必要があります。8 MiB を超えるファイルには、総サイズが既知の有効な HTTP `206` バイト範囲応答が必要です。クロスオリジンサーバーは `Access-Control-Expose-Headers` で `Content-Range` を公開します。`scripts/serve_web.py` はローカルテスト用に Range をサポートします。
 - ランタイムをバージョン付きディレクトリにデプロイするか、エントリーポイントとリソースをまとめて再検証し、キャッシュされた JS が別ビルドの WASM を読み込まないようにします。

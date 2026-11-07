@@ -1,9 +1,39 @@
-import init, { WebDanmaku, fallbackFont } from "./erika_core.js";
+import init, {
+  WebDanmaku,
+  fallbackFont,
+  setEmojiPainter,
+  setFallbackFont,
+} from "./erika_core.js";
 import createMedia from "./media.js";
 import { Renderer } from "./renderer.js";
 import { Source } from "./source.js";
 import { supportedAudio, supportedVideo, videoPacketGate } from "./codecs.js";
 
+let fallbackFamily = "";
+let emojiCanvas;
+
+/** Only the browser reaches the system's color fonts. */
+function paintEmoji(text, em) {
+  emojiCanvas ??= new OffscreenCanvas(1, 1);
+  const context = emojiCanvas.getContext("2d", { willReadFrequently: true });
+  const font = `${em}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
+  context.font = font;
+  const width = Math.ceil(context.measureText(text).width);
+  if (!width) return null;
+  const height = Math.ceil(em * 1.25);
+  emojiCanvas.width = width;
+  emojiCanvas.height = height;
+  context.font = font;
+  context.fillText(text, 0, em);
+  const rgba = context.getImageData(0, 0, width, height).data;
+  for (let i = 0; i < rgba.length; i += 4) {
+    const alpha = rgba[i + 3] / 255;
+    rgba[i] *= alpha;
+    rgba[i + 1] *= alpha;
+    rgba[i + 2] *= alpha;
+  }
+  return { width, height, rgba };
+}
 let media,
   source,
   renderer,
@@ -337,8 +367,12 @@ function draw(t) {
   schedulePump();
 }
 const methods = {
-  async init({ canvas, width, height, scale }) {
+  async init({ canvas, width, height, scale, font }) {
     await init();
+    setEmojiPainter(paintEmoji);
+    if (font) {
+      fallbackFamily = setFallbackFont(new Uint8Array(font.data), font.index ?? 0);
+    }
     media = await createMedia({
       printErr: (message) => send("log", { message }),
       readSource: (offset, dest, length) =>
@@ -369,9 +403,15 @@ const methods = {
       delete track.extraPtr;
       delete track.extraSize;
     }
-    // Reuse the font embedded in Rust; each media open creates a new libass
+    // Reuse the fallback face Rust holds; each media open creates a new libass
     // library, so register it again without fetching a second packaged copy.
-    bytesCall("erika_add_font", fallbackFont(), "subfont.ttf");
+    const fallback = fallbackFont();
+    if (fallback.length) {
+      if (fallbackFamily) {
+        media.ccall("erika_set_default_family", "number", ["string"], [fallbackFamily]);
+      }
+      bytesCall("erika_add_font", fallback, "fallback");
+    }
     await selectTracks();
     makeDecoders();
     const sub = info.tracks.find(

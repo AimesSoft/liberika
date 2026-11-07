@@ -78,6 +78,10 @@ included localhost server supports Range requests. The generated directory is
 a deployable package, not an npm publication; keep JS, WASM, workers and
 license notices together. `build-manifest.json` records output SHA-256 hashes.
 
+A page served by a device with fonts of its own can drop about 6 MB with
+the `liberika-web-nofont` package or `web build --without-fallback-font`, and hand the font over with
+`Player.create({ canvas, fallbackFont: { data, index } })`.
+
 ## Embed
 
 Copy the generated runtime into your site's `liberika/` directory, preserving

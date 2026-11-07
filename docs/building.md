@@ -121,6 +121,7 @@ Subcommands: `plan` (print the plan), `fetch` (download sources only),
 | Flag | Values | Default | Meaning |
 |------|--------|---------|---------|
 | `--profile` | `lgpl`, `gpl-full` | `lgpl` | FFmpeg license profile (see below). |
+| `--ffmpeg` | `full`, `common`, `slim`, `slim,<group>…` | `full` | Which formats FFmpeg carries (see [Build what you need](#build-what-you-need)). |
 | `--target` | see targets table | `host` | Cross-compile target. |
 | `--all` | — | off | Also build libass + FreeType + HarfBuzz + FriBidi (subtitle rendering). The baseline is zlib + FFmpeg + dav1d on every target. |
 | `--force` | — | off | Rebuild even if up-to-date markers exist. |
@@ -252,6 +253,65 @@ cargo build -p erika_capi --release --target x86_64-linux-android `
 Cargo produces both `liberika_capi.so` and `liberika_capi.a` under
 `target/x86_64-linux-android/release`. The Flutter Android Gradle task packages
 the cdylib directly together with the matching NDK `libc++_shared.so`.
+
+## Build what you need
+
+A default build carries everything. The switches below are independent, and with
+all of them off the build is at its smallest.
+
+### Cargo features
+
+| Feature | Default | When off |
+|---|---|---|
+| `embedded-fallback-font` | on | No Droid Sans Fallback, about 6 MB less. Nothing is left when the system's fonts cannot be read; see the [platform matrix](platform_matrix.md#fallback-font) |
+| `artcnn-r8f64` | on | No R8F64, the largest super resolution network, about 1.8 MB less |
+| `libass` | on | No ASS rendering, and no HarfBuzz, so composed emoji are drawn one by one |
+| `wgpu` | on in `erika_capi` | No wgpu renderer. Android, OpenHarmony and Linux need it |
+
+### FFmpeg
+
+`xtask deps build --ffmpeg` picks the formats FFmpeg carries, and
+`ERIKA_FFMPEG_SET` makes Cargo link that build:
+
+```bash
+cargo run -p xtask -- deps build --all --ffmpeg common
+ERIKA_FFMPEG_SET=common cargo build -p erika_capi --release \
+  --no-default-features --features libass,wgpu,artcnn-r8f64
+```
+
+| Value | Decoders | Demuxers | Contents |
+|---|---|---|---|
+| `full` (default) | 503 | 354 | All of FFmpeg's decoders and demuxers |
+| `common` | 204 | 77 | `slim` plus every group below |
+| `slim` | 44 | 27 | Mainstream video, audio, containers and subtitles |
+
+`slim` can take groups after it, in the order of this table, such as
+`slim,images,streaming`:
+
+| Group | Contents |
+|---|---|
+| `legacy-video` | RealVideo, H.263, VP3/VP5/VP6, Indeo, Cinepak and more; RM, Bink, SWF |
+| `pro-video` | ProRes, DNxHD, FFV1, UtVideo; MXF, NUT, DV |
+| `images` | PNG, GIF, WebP, BMP, TIFF |
+| `legacy-audio` | MP1/MP2, RealAudio, AMR, ADPCM and more; CAF, AIFF, Musepack |
+| `lossless-audio` | ALAC, APE, WavPack, TAK, TTA, DSD, all PCM |
+| `subtitles` | SAMI, MicroDVD, VobSub, LRC and other text and external subtitles |
+| `streaming` | HLS, concat |
+
+### Size
+
+`liberika_capi.dylib` on macOS arm64, stripped:
+
+| Build | Size | After `xz -9e` |
+|---|---|---|
+| Default | 36.84 MB | 13.76 MB |
+| `common`, no font | 23.16 MB | 8.88 MB |
+| `slim`, no font | 21.52 MB | 8.23 MB |
+| Also without R8F64 | 19.72 MB | 6.62 MB |
+| Also without wgpu | 16.39 MB | 5.63 MB |
+
+Web: `web build --without-fallback-font` takes the wasm from 7.66 MB to 1.59 MB,
+and `Player.create({ fallbackFont })` passes the font in instead.
 
 ## License profiles
 

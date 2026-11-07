@@ -11,9 +11,16 @@ build = "build.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["libass"]
+default = ["libass", "embedded-fallback-font", "artcnn-r8f64"]
 libass = []
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Carries Droid Sans Fallback, about 6 MB. Without it subtitles and danmaku use
+# the device's fonts: fine on macOS, Windows, Linux, Android and OpenHarmony. From
+# iOS 18 on, and on tvOS, nothing here can read the system's Chinese font, and a
+# browser page must be given one.
+embedded-fallback-font = []
+# The largest super resolution network, about 1.8 MB, desktop only.
+artcnn-r8f64 = []
 
 [dependencies]
 ab_glyph.workspace = true
@@ -29,9 +36,12 @@ serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+ttf-parser = "0.25"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 crossbeam-channel.workspace = true
+memmap2 = "0.9"
+ab_glyph_rasterizer = "0.1"
 erika_ffmpeg_sys = { path = "../erika_ffmpeg_sys" }
 png.workspace = true
 reqwest.workspace = true

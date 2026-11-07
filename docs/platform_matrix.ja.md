@@ -37,6 +37,36 @@ Android scRGB と Linux HDR には、それぞれのエンコーディングを�
 
 Linux VA-API → Vulkan の直接インポートと WSL GPU コピーパスは実験的です。テクスチャ合成、ハードウェアデコード、デコードフレームのゼロコピーは別のパスです。選択方法は [Linux ガイド](linux.ja.md) を参照してください。
 
+## フォールバックフォント
+
+字幕と弾幕は足りない文字にまずシステムフォントを使い、読めないときに内蔵の Droid Sans
+Fallback を使います。
+
+| プラットフォーム | システムフォント |
+|---|---|
+| macOS、Windows、Linux | そのまま読みます |
+| Android | `fonts.xml` の言語一覧から選びます |
+| OpenHarmony | そのまま読みます |
+| iOS、tvOS | 内蔵フォントを使います。iOS 18 以降と tvOS の中国語フォント `PingFangUI.ttc` のアウトラインは `hvgl` テーブルにあり、FreeType では読めません |
+| ブラウザ | 読めません。wasm の内蔵フォントか、`fallbackFont` で渡したものを使います |
+
+`embedded-fallback-font` を無効にすると内蔵フォントはなくなります。iOS と tvOS では中国語が
+表示されず、ブラウザのページにはフォントを渡す必要があります。
+
+## カラー絵文字
+
+弾幕の絵文字はフォント自身の色で描きます。字幕は単色です（libass はアルファビットマップ
+しか出力しません）。
+
+| プラットフォーム | 絵文字フォント |
+|---|---|
+| macOS、iOS、tvOS | Apple Color Emoji |
+| Windows | Segoe UI Emoji |
+| Linux | Noto Color Emoji などシステムのカラーフォント。なければ単色 |
+| Android | Noto Color Emoji。国旗は `NotoColorEmojiFlags` |
+| OpenHarmony | システムのカラーフォント |
+| ブラウザ | ブラウザ自身のフォント |
+
 ## CI と検証
 
 ネイティブビルドはビルド済み配布のある 6 プラットフォームを対象とします。Linux native workflow は Xvfb、Mesa、PulseAudio を使ってソースから再生を検証します。Flutter consumer workflow はビルド済み配布のある 6 プラットフォームを確認します。HDR 出力とプラットフォームのライフサイクルに関する実機検証は [検証記録](investigations/README.md) にあります。

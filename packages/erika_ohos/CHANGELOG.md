@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.6 - 2026-11-07
+
+- Align with the 0.3.6 release: color emoji in danmaku, and system fonts first for
+  missing glyphs. See the core changelog.
+
 ## 0.3.5 - 2026-11-07
 
 - Align with the 0.3.5 patch release. No OpenHarmony behavior changes.

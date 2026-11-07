@@ -107,7 +107,7 @@ jobs:
           cargo run -p xtask -- deps build --all --profile "$ERIKA_NATIVE_PROFILE" --target "$T"
           ERIKA_NATIVE_TARGET="$T" \
             cargo build -p erika_capi --release --target "$T" \
-              --no-default-features --features libass,wgpu
+              --no-default-features --features libass,wgpu,embedded-fallback-font,artcnn-r8f64
           mkdir -p "out/android/${{ matrix.abi }}"
           cp "target/$T/release/liberika_capi.a" "out/android/${{ matrix.abi }}/liberika_capi.a"
           cp "target/$T/release/liberika_capi.so" "out/android/${{ matrix.abi }}/liberika_capi.so"

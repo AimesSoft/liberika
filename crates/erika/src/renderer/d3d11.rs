@@ -47,7 +47,8 @@ use crate::core::{
     RendererRuntimeStats, Result, SurfaceMetrics, TransferFunction, WgpuSurfaceKind,
 };
 use crate::danmaku::{
-    DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan,
+    DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuGlyphInstance,
+    DanmakuRenderPlan,
 };
 use crate::ffmpeg::{Frame, PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
@@ -812,6 +813,11 @@ float4 overlay_ps_main(VsOut input) : SV_Target {
         float3 rgb = sdr_ui_color_to_target_output(color.rgb);
         return float4(rgb, color.a * sampled.r);
     }
+    if (overlay_mode == 2u) {
+        // Premultiplied, so the filter does not darken an emoji's edges.
+        float3 rgb = sdr_ui_color_to_target_output(sampled.rgb / max(sampled.a, 0.0001));
+        return float4(rgb, color.a * sampled.a);
+    }
     sampled.rgb = sdr_ui_color_to_target_output(sampled.rgb);
     return sampled;
 }
@@ -926,6 +932,28 @@ impl OverlayUniforms {
             overlay_mode: 1,
             reserved0: 0,
             color,
+            ui_nits: overlay_ui_nits(target),
+        }
+    }
+}
+
+impl OverlayUniforms {
+    /// An emoji from the premultiplied picture atlas, at `opacity`.
+    fn picture_rect(
+        opacity: f32,
+        rect: [f32; 4],
+        tex_rect: [f32; 4],
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+    ) -> Self {
+        Self {
+            rect,
+            tex_rect,
+            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+            overlay_mode: 2,
+            reserved0: 0,
+            color: [1.0, 1.0, 1.0, opacity],
             ui_nits: overlay_ui_nits(target),
         }
     }
@@ -1230,6 +1258,7 @@ pub struct D3d11Renderer {
     handoff_timeout: Duration,
     flutter_scene: Option<FlutterTextureScene>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
+    danmaku_picture_cache: Option<(u64, D3d11OverlayTexture)>,
     requested_output_mode: crate::renderer::output::OutputMode,
     video_alpha_mode: VideoAlphaMode,
     upscaler_mode: LumaUpscalerMode,
@@ -1300,6 +1329,7 @@ impl D3d11Renderer {
             handoff_timeout: config.compositor_handoff_timeout,
             flutter_scene: None,
             danmaku_atlas_cache: None,
+            danmaku_picture_cache: None,
             requested_output_mode: config.output_mode,
             video_alpha_mode: config.video_alpha_mode,
             upscaler_mode: config.luma_upscaler,
@@ -1385,6 +1415,7 @@ impl D3d11Renderer {
             .map_err(|error| d3d_error("ID3D11Device::GetImmediateContext", error))?;
         self.retire_current_video()?;
         self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
         self.set_device(frame_device, context)
     }
 
@@ -1412,6 +1443,7 @@ impl D3d11Renderer {
         self.current_video = None;
         self.current_video_fence = None;
         self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
         self.flutter_scene = None;
         self.state = None;
     }
@@ -2071,7 +2103,52 @@ impl D3d11Renderer {
                 item, &fill, &outline, viewport_w, viewport_h, target, &mut draws,
             );
         }
+        // Emoji go over the text of their comment, in their own colors.
+        if let Some(atlas) = plan
+            .color_atlas
+            .as_ref()
+            .filter(|_| !plan.color_glyphs.is_empty())
+        {
+            let texture = self.prepare_danmaku_picture_texture(atlas)?;
+            for glyph in &plan.color_glyphs {
+                draws.push(D3d11OverlayDraw {
+                    texture: texture.clone(),
+                    constants: OverlayUniforms::picture_rect(
+                        glyph.opacity,
+                        glyph.rect,
+                        glyph.tex_rect,
+                        viewport_w,
+                        viewport_h,
+                        target,
+                    ),
+                });
+            }
+        }
         Ok(draws)
+    }
+
+    fn prepare_danmaku_picture_texture(
+        &mut self,
+        atlas: &DanmakuColorAtlas,
+    ) -> Result<D3d11OverlayTexture> {
+        if let Some((version, texture)) = &self.danmaku_picture_cache
+            && *version == atlas.version
+        {
+            return Ok(texture.clone());
+        }
+        let texture = {
+            let state = self.state.as_ref().expect("device ensured");
+            create_cpu_texture(
+                state,
+                atlas.width,
+                atlas.height,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                &atlas.rgba,
+                atlas.width * 4,
+            )?
+        };
+        self.danmaku_picture_cache = Some((atlas.version, texture.clone()));
+        Ok(texture)
     }
 
     fn prepare_danmaku_atlas_textures(
@@ -2695,6 +2772,7 @@ impl RendererBackend for D3d11Renderer {
         self.retire_current_video()?;
         self.surface = None;
         self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
         self.stats.attached = false;
         self.stats.surface_width = 0;
         self.stats.surface_height = 0;
@@ -2748,6 +2826,7 @@ impl RendererBackend for D3d11Renderer {
     fn clear_current_frame(&mut self) -> Result<()> {
         self.retire_current_video()?;
         self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
         if self.surface.is_some() {
             self.render_clear(0.0)?;
         }

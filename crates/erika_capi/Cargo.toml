@@ -11,8 +11,10 @@ build = "build.rs"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["libass", "wgpu"]
+default = ["libass", "wgpu", "embedded-fallback-font", "artcnn-r8f64"]
 libass = ["erika/libass"]
+embedded-fallback-font = ["erika/embedded-fallback-font"]
+artcnn-r8f64 = ["erika/artcnn-r8f64"]
 wgpu = ["erika/wgpu"]
 
 [dependencies]

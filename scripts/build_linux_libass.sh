@@ -14,7 +14,8 @@ ARCHIVE="$ROOT/third_party/cache/libass-$VERSION.tar.xz"
 SOURCE="$ROOT/third_party/src/linux-libass-$VERSION"
 BUILD="$ROOT/third_party/build/$TARGET/system/libass"
 PREFIX="$ROOT/third_party/dist/$TARGET/system/libass"
-PATCH="$ROOT/third_party/patches/libass-$VERSION/0001-erika-ordered-default-font-families.patch"
+# Every patch of this version, in order, as `xtask` applies them elsewhere.
+PATCHES=("$ROOT/third_party/patches/libass-$VERSION/"*.patch)
 
 for tool in curl sha256sum tar patch meson ninja pkg-config; do
   command -v "$tool" >/dev/null || { echo "Required tool missing: $tool" >&2; exit 1; }
@@ -28,10 +29,14 @@ if [[ ! -f "$ARCHIVE" ]]; then
   mv "$ARCHIVE.download" "$ARCHIVE"
 fi
 printf '%s  %s\n' "$SHA256" "$ARCHIVE" | sha256sum --check --status
-PATCH_HASH="$(sha256sum "$PATCH" | cut -d ' ' -f 1)"
+PATCH_HASH="$(cat "${PATCHES[@]}" | sha256sum | cut -d ' ' -f 1)"
 if [[ ! -f "$SOURCE/.erika-patch" ]] || [[ "$(cat "$SOURCE/.erika-patch")" != "$PATCH_HASH" ]]; then
+  rm -rf "$SOURCE"
+  mkdir -p "$SOURCE"
   tar -xJf "$ARCHIVE" -C "$SOURCE" --strip-components=1
-  patch --directory="$SOURCE" --strip=1 --input="$PATCH"
+  for patch in "${PATCHES[@]}"; do
+    patch --directory="$SOURCE" --strip=1 --input="$patch"
+  done
   printf '%s\n' "$PATCH_HASH" > "$SOURCE/.erika-patch"
 fi
 SETUP=()

@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_PROFILE");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_TARGET");
     println!("cargo:rerun-if-env-changed=ERIKA_FFMPEG_DIR");
+    println!("cargo:rerun-if-env-changed=ERIKA_FFMPEG_SET");
     println!("cargo:rerun-if-env-changed=ERIKA_LIBASS_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_FREETYPE_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_HARFBUZZ_DIR");
@@ -385,6 +386,17 @@ fn enforce_bundled_ffmpeg_version(version_major: Option<u32>) {
     );
 }
 
+/// `ffmpeg`, or the folder of the smaller set `ERIKA_FFMPEG_SET` names, as
+/// `xtask deps build --ffmpeg` builds it.
+fn ffmpeg_dir_name() -> String {
+    match env::var("ERIKA_FFMPEG_SET") {
+        Ok(set) if !set.is_empty() && set != "full" => {
+            format!("ffmpeg-{}", set.replace(',', "-"))
+        }
+        _ => "ffmpeg".to_string(),
+    }
+}
+
 fn ffmpeg_dist_dir() -> PathBuf {
     if let Ok(path) = env::var("ERIKA_FFMPEG_DIR") {
         return PathBuf::from(path);
@@ -394,9 +406,11 @@ fn ffmpeg_dist_dir() -> PathBuf {
             .join("third_party/dist")
             .join(target)
             .join(native_profile_dir())
-            .join("ffmpeg");
+            .join(ffmpeg_dir_name());
     }
-    native_dist_root().join(native_profile_dir()).join("ffmpeg")
+    native_dist_root()
+        .join(native_profile_dir())
+        .join(ffmpeg_dir_name())
 }
 
 fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {

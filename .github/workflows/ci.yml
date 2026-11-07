@@ -234,7 +234,7 @@ jobs:
           ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="aarch64-apple-ios" \
           cargo rustc --locked -p erika_capi --lib --release \
               --target aarch64-apple-ios \
-              --no-default-features --features libass --crate-type staticlib
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
 
   tvos:
     name: tvOS simulator staticlib
@@ -271,7 +271,7 @@ jobs:
           cargo +nightly rustc -Z build-std=std,panic_abort --locked \
               -p erika_capi --lib --release \
               --target aarch64-apple-tvos-sim \
-              --no-default-features --features libass --crate-type staticlib
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
 
   windows:
     name: Windows ${{ matrix.arch }} build

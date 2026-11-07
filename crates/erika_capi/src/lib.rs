@@ -1006,6 +1006,18 @@ pub extern "C" fn erika_last_error_message() -> *mut c_char {
     LAST_ERROR.with(|slot| option_string_to_c(slot.borrow().as_deref()))
 }
 
+/// The font built into this library and its length, or NULL without one. The
+/// bytes live as long as the process and are not freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_embedded_fallback_font(out_length: *mut usize) -> *const u8 {
+    let font = erika::font::embedded_fallback_font();
+    if !out_length.is_null() {
+        // SAFETY: the caller passes NULL or a place for the length.
+        unsafe { *out_length = font.map_or(0, <[u8]>::len) };
+    }
+    font.map_or(std::ptr::null(), <[u8]>::as_ptr)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn erika_string_free(value: *mut c_char) {
     if value.is_null() {

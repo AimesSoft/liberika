@@ -52,7 +52,9 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use objc2_quartz_core::{kCAContentsFormatRGBA8Uint, kCAContentsFormatRGBA16Float};
 
 use crate::core::{ColorPrimaries, RendererResourceStats, SurfaceMetrics, TransferFunction};
-use crate::danmaku::{DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuRenderPlan};
+use crate::danmaku::{
+    DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuColorGlyph, DanmakuGlyphAtlas, DanmakuRenderPlan,
+};
 use crate::overlay::OverlayViewport;
 use crate::renderer::gamut::{
     GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
@@ -186,6 +188,7 @@ pub struct MetalRendererImpl {
     video_sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
     overlay_alpha_atlas_cache: Option<OverlayAlphaAtlasCache>,
     danmaku_alpha_atlas_cache: Option<DanmakuAlphaAtlasCache>,
+    danmaku_color_atlas_cache: Option<(u64, Retained<ProtocolObject<dyn MTLTexture>>)>,
     danmaku_vertex_buffers: Vec<DanmakuVertexBufferSlot>,
     danmaku_vertex_buffer_cursor: usize,
     danmaku_vertex_buffer_acquisitions: u64,
@@ -283,6 +286,7 @@ impl MetalRendererImpl {
             video_sampler: None,
             overlay_alpha_atlas_cache: None,
             danmaku_alpha_atlas_cache: None,
+            danmaku_color_atlas_cache: None,
             danmaku_vertex_buffers: Vec::new(),
             danmaku_vertex_buffer_cursor: 0,
             danmaku_vertex_buffer_acquisitions: 0,
@@ -1735,7 +1739,68 @@ impl MetalRendererImpl {
             layout,
             target,
         )?;
+        self.draw_danmaku_pictures(encoder, plan, layout, target)
+    }
+
+    /// Emoji go over the text of their comment, in their own colors.
+    fn draw_danmaku_pictures(
+        &mut self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        plan: &DanmakuRenderPlan,
+        layout: VideoPresentationLayout,
+        target: TargetColorState,
+    ) -> Result<()> {
+        let Some(atlas) = plan.color_atlas.as_ref() else {
+            return Ok(());
+        };
+        if plan.color_glyphs.is_empty() {
+            return Ok(());
+        }
+        let texture = self.prepare_danmaku_color_atlas(atlas)?;
+        let pipeline = self.overlay_pipeline_state()?;
+        let sampler = self.video_sampler_state()?;
+        let edr = self.output_mode.is_edr();
+        unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
+            encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+        }
+        for glyph in &plan.color_glyphs {
+            let uniforms = OverlayUniforms::from_danmaku_picture(glyph, layout, target, edr);
+            unsafe {
+                encoder.setVertexBytes_length_atIndex(
+                    overlay_uniform_pointer(&uniforms),
+                    mem::size_of::<OverlayUniforms>(),
+                    0,
+                );
+                encoder.setFragmentBytes_length_atIndex(
+                    overlay_uniform_pointer(&uniforms),
+                    mem::size_of::<OverlayUniforms>(),
+                    0,
+                );
+                encoder.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                );
+            }
+        }
         Ok(())
+    }
+
+    fn prepare_danmaku_color_atlas(
+        &mut self,
+        atlas: &DanmakuColorAtlas,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        if let Some((version, texture)) = &self.danmaku_color_atlas_cache
+            && *version == atlas.version
+        {
+            return Ok(texture.clone());
+        }
+        let texture =
+            self.create_overlay_texture(atlas.width as usize, atlas.height as usize, &atlas.rgba)?;
+        self.danmaku_color_atlas_cache = Some((atlas.version, texture.clone()));
+        Ok(texture)
     }
 
     fn prepare_danmaku_alpha_atlas(
@@ -2763,6 +2828,24 @@ impl OverlayUniforms {
             overlay_mode: 0,
             target_transfer: transfer_code(target.transfer),
             color: [1.0, 1.0, 1.0, 1.0],
+            ui_nits: ui_output_nits(target, edr_output),
+        }
+    }
+
+    /// Danmaku rectangles are in the overlay's own pixels already.
+    fn from_danmaku_picture(
+        glyph: &DanmakuColorGlyph,
+        layout: VideoPresentationLayout,
+        target: TargetColorState,
+        edr_output: bool,
+    ) -> Self {
+        Self {
+            rect: glyph.rect,
+            tex_rect: glyph.tex_rect,
+            viewport: layout.overlay_viewport(),
+            overlay_mode: 2,
+            target_transfer: transfer_code(target.transfer),
+            color: [1.0, 1.0, 1.0, glyph.opacity],
             ui_nits: ui_output_nits(target, edr_output),
         }
     }
@@ -3889,6 +3972,15 @@ fragment float4 erika_overlay_fragment(
             uniforms.ui_nits
         );
         return float4(rgb, uniforms.color.a * sampled.r);
+    }
+    if (uniforms.overlay_mode == 2) {
+        // Premultiplied, so the filter does not darken an emoji's edges.
+        float3 rgb = sdr_ui_color_to_target_output(
+            sampled.rgb / max(sampled.a, 0.0001),
+            uniforms.target_transfer,
+            uniforms.ui_nits
+        );
+        return float4(rgb, uniforms.color.a * sampled.a);
     }
     sampled.rgb = sdr_ui_color_to_target_output(
         sampled.rgb,

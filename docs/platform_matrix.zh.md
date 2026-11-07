@@ -45,6 +45,33 @@ Android scRGB 和 Linux HDR 需要表面实际支持相应编码。查询
 Linux VA-API → Vulkan 直接导入和 WSL GPU 复制路径为实验性实现。纹理合成、
 硬件解码和解码帧零拷贝是不同的路径，选择步骤在 [Linux 指南](linux.zh.md)。
 
+## 回退字体
+
+字幕和弹幕缺字时先用系统字体，读不了才用内嵌的 Droid Sans Fallback。
+
+| 平台 | 系统字体 |
+|---|---|
+| macOS、Windows、Linux | 读系统字体 |
+| Android | 按 `fonts.xml` 的语言表选择 |
+| OpenHarmony | 读系统字体 |
+| iOS、tvOS | 用内嵌字体。iOS 18 起和 tvOS 的系统中文字体 `PingFangUI.ttc` 轮廓在 `hvgl` 表里，FreeType 读不了 |
+| 浏览器 | 读不到设备字体，用 wasm 内嵌的字体，或由 `fallbackFont` 传入 |
+
+关掉 `embedded-fallback-font` 后没有内嵌字体：iOS、tvOS 上中文无法显示，浏览器页面必须传入字体。
+
+## 彩色表情
+
+弹幕里的表情用字体自带的颜色画，字幕里是单色（libass 只输出 alpha 位图）。
+
+| 平台 | 表情字体 |
+|---|---|
+| macOS、iOS、tvOS | Apple Color Emoji |
+| Windows | Segoe UI Emoji |
+| Linux | 系统里的 Noto Color Emoji 等彩色字体，没有时为单色 |
+| Android | Noto Color Emoji，国旗在 `NotoColorEmojiFlags` |
+| OpenHarmony | 系统彩色字体 |
+| 浏览器 | 浏览器自己的字体 |
+
 ## CI 与验证
 
 原生构建覆盖六个预编译平台；Linux native workflow 使用 Xvfb、Mesa 和 PulseAudio

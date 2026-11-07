@@ -8,6 +8,13 @@ void main(){uv=q[gl_VertexID]; vec2 p=rect.xy+uv*rect.zw; gl_Position=vec4(p/res
 const fragment = `#version 300 es
 precision highp float; in vec2 uv; uniform sampler2D image; uniform vec4 color; uniform int mode; out vec4 pixel;
 void main(){vec4 t=texture(image,uv); pixel=mode==0?t:vec4(color.rgb*color.a*t.r,color.a*t.r);}`;
+const pictureVertex = `#version 300 es
+precision highp float; ${quad}
+uniform vec2 resolution; uniform vec4 rect; uniform vec4 texRect; out vec2 uv;
+void main(){uv=texRect.xy+q[gl_VertexID]*texRect.zw; vec2 p=rect.xy+q[gl_VertexID]*rect.zw; gl_Position=vec4(p/resolution*vec2(2,-2)+vec2(-1,1),0,1);}`;
+const pictureFragment = `#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D image; uniform float opacity; out vec4 pixel;
+void main(){pixel=texture(image,uv)*opacity;}`;
 const maskVertex = `#version 300 es
 precision highp float; ${quad}
 layout(location=0) in vec4 box; layout(location=1) in vec4 tex;
@@ -36,11 +43,13 @@ export class Renderer {
     this.basic = this.program(vertex, fragment);
     this.mask = this.program(maskVertex, maskFragment);
     this.compose = this.program(vertex, composeFragment);
+    this.picture = this.program(pictureVertex, pictureFragment);
     this.video = this.texture();
     this.fill = this.texture();
     this.outline = this.texture();
     this.scratch = this.texture();
     this.sub = this.texture();
+    this.emoji = this.texture();
     this.fbo = gl.createFramebuffer();
     this.instances = gl.createBuffer();
     this.vao = gl.createVertexArray();
@@ -243,7 +252,21 @@ export class Renderer {
       }
       this.uploads++;
     }
-    if (!plan.glyphs.length) return;
+    if (plan.pictureAtlas) {
+      this.bind(this.emoji);
+      g.texImage2D(
+        g.TEXTURE_2D,
+        0,
+        g.RGBA8,
+        plan.pictureWidth,
+        plan.pictureHeight,
+        0,
+        g.RGBA,
+        g.UNSIGNED_BYTE,
+        plan.pictureAtlas,
+      );
+    }
+    if (!plan.glyphs.length) return this.pictures(plan);
     if (this.scratchSize !== `${w}x${h}`) {
       this.bind(this.scratch);
       g.texImage2D(
@@ -326,6 +349,24 @@ export class Renderer {
       g.uniform1i(g.getUniformLocation(this.compose, "image"), 0);
       g.drawArrays(g.TRIANGLES, 0, 6);
     }
+    this.pictures(plan);
+  }
+  /** Emoji go over the text of their comment, in their own colors. */
+  pictures(plan) {
+    if (!plan.pictures?.length) return;
+    const g = this.gl,
+      p = this.picture;
+    g.useProgram(p);
+    this.uniform(p, "resolution", this.width, this.height);
+    this.bind(this.emoji, 0);
+    g.uniform1i(g.getUniformLocation(p, "image"), 0);
+    for (let n = 0; n < plan.pictures.length; n += 9) {
+      const a = plan.pictures;
+      this.uniform(p, "rect", a[n], a[n + 1], a[n + 2], a[n + 3]);
+      this.uniform(p, "texRect", a[n + 4], a[n + 5], a[n + 6], a[n + 7]);
+      this.uniform(p, "opacity", a[n + 8]);
+      g.drawArrays(g.TRIANGLES, 0, 6);
+    }
   }
   destroy() {
     this.clearSubtitles();
@@ -336,9 +377,11 @@ export class Renderer {
       this.outline,
       this.scratch,
       this.sub,
+      this.emoji,
     ])
       g.deleteTexture(t);
-    for (const p of [this.basic, this.mask, this.compose]) g.deleteProgram(p);
+    for (const p of [this.basic, this.mask, this.compose, this.picture])
+      g.deleteProgram(p);
     g.deleteFramebuffer(this.fbo);
     g.deleteBuffer(this.instances);
     g.deleteVertexArray(this.vao);

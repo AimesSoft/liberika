@@ -24,8 +24,9 @@ use ab_glyph::{
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::NIPAPLAY_FALLBACK_FONT;
+use crate::color_glyph::{self, ColorBitmap};
 use crate::font::SubtitleFontAttachment;
+use crate::system_font::PREFERRED_FAMILIES;
 use crate::text::TextShaper;
 use outline::{raster_radius, resolve_width_px};
 use typography::{
@@ -37,6 +38,15 @@ const DEFAULT_SCROLL_DURATION: Duration = Duration::from_millis(9000);
 const DEFAULT_STATIC_DURATION: Duration = Duration::from_millis(3800);
 const DEFAULT_GENERATION: u64 = 1;
 const GLYPH_ATLAS_WIDTH: u32 = 2048;
+/// Emoji pictures start small and grow: most comments have none.
+const COLOR_ATLAS_WIDTH: u32 = 1024;
+const COLOR_ATLAS_MIN_HEIGHT: u32 = 256;
+const COLOR_ATLAS_MAX_HEIGHT: u32 = 4096;
+/// Keeps a picture's edge from filtering into its neighbor.
+const COLOR_ATLAS_GAP: u32 = 2;
+/// What an emoji is measured at in a browser, before the browser draws it.
+#[cfg(target_arch = "wasm32")]
+const BROWSER_EMOJI_ADVANCE: f32 = 1.25;
 const GLYPH_ATLAS_INITIAL_HEIGHT: u32 = 256;
 // Supersample glyphs, never the video surface. Large glyphs already have
 // enough samples; cap their extra raster cost and recycle caches between
@@ -991,6 +1001,8 @@ pub struct DanmakuRenderPlan {
     pub viewport: DanmakuViewport,
     pub atlas: Option<Arc<DanmakuGlyphAtlas>>,
     pub items: Vec<DanmakuGlyphInstance>,
+    pub color_atlas: Option<Arc<DanmakuColorAtlas>>,
+    pub color_glyphs: Vec<DanmakuColorGlyph>,
     pub frame_stats: DanmakuFrameStats,
 }
 
@@ -1011,6 +1023,12 @@ impl DanmakuRenderPlan {
             item.shadow_offset[0] *= sx;
             item.shadow_offset[1] *= sy;
         }
+        for glyph in &mut self.color_glyphs {
+            glyph.rect[0] *= sx;
+            glyph.rect[1] *= sy;
+            glyph.rect[2] *= sx;
+            glyph.rect[3] *= sy;
+        }
         self.viewport = viewport;
     }
 
@@ -1021,12 +1039,14 @@ impl DanmakuRenderPlan {
             viewport,
             atlas: None,
             items: Vec::new(),
+            color_atlas: None,
+            color_glyphs: Vec::new(),
             frame_stats: DanmakuFrameStats::default(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.color_glyphs.is_empty()
     }
 }
 
@@ -1194,6 +1214,24 @@ pub struct DanmakuGlyphInstance {
     pub shadow_offset: [f32; 2],
 }
 
+/// An emoji in a comment: a picture with its own colors, which the comment's
+/// color does not touch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DanmakuColorGlyph {
+    pub rect: [f32; 4],
+    pub tex_rect: [f32; 4],
+    pub opacity: f32,
+}
+
+/// The pictures of the emoji shown so far, as premultiplied RGBA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanmakuColorAtlas {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub version: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DanmakuAtlasUpdate {
     pub from_version: u64,
@@ -1255,6 +1293,8 @@ struct PreparedTextLayout {
 
 #[derive(Debug, Clone, PartialEq)]
 struct PreparedGlyphPlacement {
+    /// Where the glyph's picture is in the color atlas, for an emoji.
+    color: Option<PackedGlyph>,
     glyph: Arc<RasterizedGlyph>,
     packed: PackedGlyph,
     pen_x: f32,
@@ -1290,7 +1330,7 @@ impl DanmakuFontFace {
     }
 
     fn glyph_id(&self, ch: char) -> GlyphId {
-        self.font.glyph_id(ch)
+        color_glyph::glyph_id(&self.font, ch)
     }
 
     fn has_glyph(&self, ch: char) -> bool {
@@ -1300,29 +1340,17 @@ impl DanmakuFontFace {
 
 // Keep the existing CJK, generic, then database order. Preferring a color
 // emoji face can hide symbols an outline-capable generic font could paint.
-const PREFERRED_FALLBACK_FAMILIES: &[&str] = &[
-    "PingFang SC",
-    "Hiragino Sans GB",
-    "Hiragino Sans",
-    "Apple SD Gothic Neo",
-    "Songti SC",
-    "STHeiti",
-    "Microsoft YaHei",
-    "SimHei",
-    "Noto Sans CJK SC",
-    "Noto Sans CJK JP",
-    "Noto Sans CJK",
-    "Source Han Sans SC",
-    "Source Han Sans",
-    "Arial Unicode MS",
-    "Arial Unicode",
-    "Segoe UI Symbol",
-];
 
 #[derive(Debug)]
 struct SystemFontFallback {
+    /// The system's fonts wait until a character needs them: reading them all
+    /// takes long on a phone, and the fallback face covers nearly everything.
+    unread: bool,
     db: fontdb::Database,
     faces: Vec<fontdb::ID>,
+    /// The faces with pictures, tried first for emoji.
+    emoji_faces: Vec<fontdb::ID>,
+    emoji_cache: HashMap<char, Option<u32>>,
     loaded: HashMap<fontdb::ID, Option<DanmakuFontFace>>,
     // GlyphCacheKey and kerning bake DanmakuFontFace::id in, so a face evicted
     // from the resident set must reuse its id when reloaded.
@@ -1335,14 +1363,33 @@ struct SystemFontFallback {
 
 impl SystemFontFallback {
     fn new(next_font_id: u32) -> Self {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
-        Self::with_database(db, next_font_id)
+        Self {
+            unread: true,
+            ..Self::with_database(fontdb::Database::new(), next_font_id)
+        }
     }
 
     fn with_database(db: fontdb::Database, next_font_id: u32) -> Self {
+        let faces = Self::faces_in_order(&db);
+        let emoji_faces = Self::emoji_faces(&db);
+        Self {
+            unread: false,
+            db,
+            faces,
+            emoji_faces,
+            emoji_cache: HashMap::new(),
+            loaded: HashMap::new(),
+            face_ids: HashMap::new(),
+            resident: VecDeque::new(),
+            resident_cap: MAX_RESIDENT_FALLBACK_FACES,
+            char_cache: HashMap::new(),
+            next_font_id,
+        }
+    }
+
+    fn faces_in_order(db: &fontdb::Database) -> Vec<fontdb::ID> {
         let mut faces = Vec::new();
-        for family in PREFERRED_FALLBACK_FAMILIES {
+        for family in PREFERRED_FAMILIES {
             let query = fontdb::Query {
                 families: &[fontdb::Family::Name(family)],
                 weight: fontdb::Weight::NORMAL,
@@ -1368,19 +1415,71 @@ impl SystemFontFallback {
         for id in face_infos {
             push_unique_face(&mut faces, id);
         }
-        Self {
-            db,
-            faces,
-            loaded: HashMap::new(),
-            face_ids: HashMap::new(),
-            resident: VecDeque::new(),
-            resident_cap: MAX_RESIDENT_FALLBACK_FACES,
-            char_cache: HashMap::new(),
-            next_font_id,
+        faces
+    }
+
+    fn read_system_fonts(&mut self) {
+        if std::mem::take(&mut self.unread) {
+            self.db = crate::system_font::database().clone();
+            self.faces = Self::faces_in_order(&self.db);
+            self.emoji_faces = Self::emoji_faces(&self.db);
         }
     }
 
+    fn emoji_faces(db: &fontdb::Database) -> Vec<fontdb::ID> {
+        db.faces()
+            .filter(|face| {
+                face.families
+                    .iter()
+                    .any(|(family, _)| family.to_lowercase().contains("emoji"))
+            })
+            .map(|face| face.id)
+            .collect()
+    }
+
+    /// The face with a picture of `ch`. Other faces may cover it too, down to a
+    /// system's last-resort box, so these go first.
+    fn resolve_emoji(&mut self, ch: char) -> Option<DanmakuFontFace> {
+        self.read_system_fonts();
+        match self.emoji_cache.get(&ch).copied() {
+            Some(None) => return None,
+            Some(Some(font_id)) => {
+                if let Some(face) = self.loaded_font_by_id(font_id) {
+                    self.touch_resident(font_id);
+                    return Some(face);
+                }
+            }
+            None => {}
+        }
+        let faces = self.emoji_faces.clone();
+        let first = color_glyph::first_char(ch);
+        // A sequence wants the face that joins it, as a flag font does; another
+        // that only knows its parts is what remains.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut parts: Option<DanmakuFontFace> = None;
+        for id in faces {
+            if !self.face_covers(id, first) {
+                continue;
+            }
+            let Some(face) = self.load_face(id) else {
+                continue;
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            if color_glyph::is_sequence(ch) && !color_glyph::draws_as_one(&face.font, ch) {
+                parts.get_or_insert(face);
+                continue;
+            }
+            self.emoji_cache.insert(ch, Some(face.id));
+            return Some(face);
+        }
+        let face = parts.take();
+        self.emoji_cache
+            .insert(ch, face.as_ref().map(|face| face.id));
+        face
+    }
+
     fn resolve(&mut self, ch: char) -> Option<DanmakuFontFace> {
+        self.read_system_fonts();
         if let Some(cached) = self.char_cache.get(&ch).copied() {
             let font_id = cached?;
             if let Some(face) = self.loaded_font_by_id(font_id) {
@@ -1430,6 +1529,23 @@ impl SystemFontFallback {
             .cloned()
     }
 
+    fn face_font(&self, id: fontdb::ID) -> Option<FontArc> {
+        // Apple's emoji run past 130 MB, far too much to copy.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((fontdb::Source::File(path), face_index)) = self.db.face_source(id)
+            && let Some(font) = map_font_file(&path, face_index)
+        {
+            return Some(font);
+        }
+        self.db
+            .with_face_data(id, |data, face_index| {
+                FontVec::try_from_vec_and_index(data.to_vec(), face_index)
+                    .map(FontArc::new)
+                    .ok()
+            })
+            .flatten()
+    }
+
     fn load_face(&mut self, id: fontdb::ID) -> Option<DanmakuFontFace> {
         if let Some(face) = self.loaded.get(&id).cloned() {
             if let Some(face) = &face {
@@ -1437,14 +1553,7 @@ impl SystemFontFallback {
             }
             return face;
         }
-        let font = self
-            .db
-            .with_face_data(id, |data, face_index| {
-                FontVec::try_from_vec_and_index(data.to_vec(), face_index)
-                    .map(FontArc::new)
-                    .ok()
-            })
-            .flatten();
+        let font = self.face_font(id);
         let face = font.map(|font| {
             let local_id = self.stable_face_id(id);
             DanmakuFontFace::new(local_id, font)
@@ -1539,6 +1648,7 @@ pub struct DanmakuTextRasterizer {
     glyph_cache: Arc<Mutex<HashMap<GlyphCacheKey, Arc<RasterizedGlyph>>>>,
     text_layout_cache: Arc<Mutex<HashMap<TextLayoutCacheKey, Arc<PreparedTextLayout>>>>,
     glyph_atlas: Arc<Mutex<PersistentGlyphAtlas>>,
+    color_atlas: Arc<Mutex<PersistentColorAtlas>>,
 }
 
 impl Default for DanmakuTextRasterizer {
@@ -1559,6 +1669,7 @@ impl DanmakuTextRasterizer {
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
             text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
+            color_atlas: Arc::new(Mutex::new(PersistentColorAtlas::new())),
         }
     }
 
@@ -1591,6 +1702,7 @@ impl DanmakuTextRasterizer {
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
             text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
+            color_atlas: Arc::new(Mutex::new(PersistentColorAtlas::new())),
         }
     }
 
@@ -1632,7 +1744,24 @@ impl DanmakuTextRasterizer {
         let mut max_descent = 0.0f32;
         let mut max_line_gap = 0.0f32;
         let mut previous: Option<(u32, GlyphId)> = None;
-        for ch in text.chars() {
+        for ch in color_glyph::fold(text).chars() {
+            if color_glyph::is_emoji_modifier(ch) {
+                continue;
+            }
+            #[cfg(target_arch = "wasm32")]
+            if color_glyph::is_emoji(ch) {
+                width += font_size * BROWSER_EMOJI_ADVANCE;
+                if let Some(primary) = &self.primary_font {
+                    let line = primary
+                        .font
+                        .as_scaled(px_scale_for_em(primary.font.as_ref(), font_size));
+                    max_ascent = max_ascent.max(line.ascent());
+                    max_descent = max_descent.max(line.descent().abs());
+                    max_line_gap = max_line_gap.max(line.line_gap());
+                }
+                previous = None;
+                continue;
+            }
             let Some(face) = self.resolve_font(ch) else {
                 let metrics = self.shaper.measure(&ch.to_string(), font_size);
                 width += metrics.width.max(font_size * 0.5);
@@ -1643,16 +1772,25 @@ impl DanmakuTextRasterizer {
             };
             let scale = px_scale_for_em(face.font.as_ref(), font_size);
             let scaled = face.font.as_scaled(scale);
-            let glyph_id = scaled.glyph_id(ch);
+            let glyph_id = color_glyph::glyph_id(&face.font, ch);
             if let Some((previous_font_id, previous_glyph_id)) = previous {
                 if previous_font_id == face.id {
                     width += scaled.kern(previous_glyph_id, glyph_id);
                 }
             }
             width += scaled.h_advance(glyph_id).max(0.0);
-            max_ascent = max_ascent.max(scaled.ascent());
-            max_descent = max_descent.max(scaled.descent().abs());
-            max_line_gap = max_line_gap.max(scaled.line_gap());
+            // A comment of emoji alone keeps the height of a line of text.
+            let line_face = self
+                .primary_font
+                .as_ref()
+                .filter(|_| color_glyph::is_emoji(ch))
+                .unwrap_or(&face);
+            let line = line_face
+                .font
+                .as_scaled(px_scale_for_em(line_face.font.as_ref(), font_size));
+            max_ascent = max_ascent.max(line.ascent());
+            max_descent = max_descent.max(line.descent().abs());
+            max_line_gap = max_line_gap.max(line.line_gap());
             previous = Some((face.id, glyph_id));
         }
         let ascent = max_ascent.max(font_size * 0.8);
@@ -1701,7 +1839,10 @@ impl DanmakuTextRasterizer {
         let mut glyphs = Vec::new();
         let mut pen_x = 0.0f32;
         let mut previous: Option<(u32, GlyphId)> = None;
-        for ch in key.text.chars() {
+        for ch in color_glyph::fold(&key.text).chars() {
+            if color_glyph::is_emoji_modifier(ch) {
+                continue;
+            }
             let face = self.resolve_font(ch);
             let glyph_id = face.as_ref().map(|face| face.glyph_id(ch));
             if let (Some(face), Some((previous_font_id, previous_glyph_id)), Some(current)) =
@@ -1727,10 +1868,17 @@ impl DanmakuTextRasterizer {
             } else {
                 PackedGlyph::default()
             };
+            let color = glyph.color.as_ref().and_then(|bitmap| {
+                self.color_atlas
+                    .lock()
+                    .expect("danmaku color atlas lock")
+                    .pack((glyph.key.font_id, glyph.key.ch), bitmap)
+            });
             let advance = glyph.advance;
             glyphs.push(PreparedGlyphPlacement {
                 glyph,
                 packed,
+                color,
                 pen_x,
             });
             pen_x += advance;
@@ -1753,6 +1901,15 @@ impl DanmakuTextRasterizer {
             if let Some(font) = self.selected_fonts.iter().find(|font| font.has_glyph(ch)) {
                 return Some(font.clone());
             }
+        }
+        if color_glyph::is_emoji(ch)
+            && let Some(face) = self
+                .fallback_fonts
+                .lock()
+                .expect("danmaku system font fallback lock")
+                .resolve_emoji(ch)
+        {
+            return Some(face);
         }
         if let Some(font) = &self.primary_font {
             if font.has_glyph(ch) {
@@ -1805,6 +1962,12 @@ impl DanmakuTextRasterizer {
             .map(|item| item.text_layout.glyphs.len() + if item.is_self { 4 } else { 0 })
             .sum();
         let mut items = Vec::with_capacity(capacity);
+        let mut color_glyphs = Vec::new();
+        let color_atlas = self
+            .color_atlas
+            .lock()
+            .expect("danmaku color atlas lock")
+            .snapshot();
         for item in &layout.items {
             let color = item.color.rgba(item.opacity);
             if color[3] <= 0.0 {
@@ -1821,6 +1984,9 @@ impl DanmakuTextRasterizer {
                 );
             }
             self.append_item_glyphs(item, color, atlas_w, atlas_h, scale, &mut items);
+            if let Some(atlas) = &color_atlas {
+                append_item_pictures(item, color[3], atlas, scale, &mut color_glyphs);
+            }
         }
         DanmakuRenderPlan {
             media_time: layout.media_time,
@@ -1828,6 +1994,8 @@ impl DanmakuTextRasterizer {
             viewport: layout.viewport,
             atlas: Some(atlas_snapshot),
             items,
+            color_atlas,
+            color_glyphs,
             frame_stats,
         }
     }
@@ -1848,11 +2016,14 @@ impl DanmakuTextRasterizer {
             let glyph = &placement.glyph;
             if glyph.has_bitmap() {
                 let packed = placement.packed;
+                let top = glyph.color.as_ref().map_or(baseline, |bitmap| {
+                    picture_top(item, bitmap, glyph.key.font_size(), y, scale)
+                });
                 items.push(DanmakuGlyphInstance {
                     item_id: item.item_id,
                     rect: [
                         x + (placement.pen_x + glyph.offset_x) * scale,
-                        baseline + glyph.offset_y * scale,
+                        top + glyph.offset_y * scale,
                         glyph.width as f32 / glyph.key.raster_scale() * scale,
                         glyph.height as f32 / glyph.key.raster_scale() * scale,
                     ],
@@ -1917,12 +2088,65 @@ impl DanmakuTextRasterizer {
     }
 
     fn rasterize_glyph(&self, key: GlyphCacheKey) -> RasterizedGlyph {
+        #[cfg(target_arch = "wasm32")]
+        if color_glyph::is_emoji(key.ch)
+            && let Some(bitmap) = color_glyph::render_in_browser(key.ch)
+        {
+            return RasterizedGlyph::picture(key, bitmap);
+        }
         if let Some(font) = self.resolve_font(key.ch) {
             if font.id == key.font_id {
                 return rasterize_font_glyph(&font.font, key);
             }
         }
         rasterize_fallback_glyph(&self.shaper, key)
+    }
+}
+
+/// Where an emoji's picture starts: centered on the line, not hung from the
+/// baseline. Where a picture sits around the baseline differs from font to font,
+/// and CJK text is centered well above it.
+fn picture_top(
+    item: &DanmakuPlacedItem,
+    bitmap: &ColorBitmap,
+    font_size: f32,
+    y: f32,
+    scale: f32,
+) -> f32 {
+    let metrics = &item.text_layout.metrics;
+    y + ((metrics.ascent + metrics.descent) - bitmap.em_height * font_size) * 0.5 * scale
+}
+
+/// The emoji of a comment, in the colors they came with, at its opacity.
+fn append_item_pictures(
+    item: &DanmakuPlacedItem,
+    opacity: f32,
+    atlas: &DanmakuColorAtlas,
+    scale: f32,
+    glyphs: &mut Vec<DanmakuColorGlyph>,
+) {
+    let [x, y] = scaled_origin(item, scale);
+    let (atlas_w, atlas_h) = (atlas.width.max(1) as f32, atlas.height.max(1) as f32);
+    for placement in &item.text_layout.glyphs {
+        let (Some(bitmap), Some(packed)) = (&placement.glyph.color, placement.color) else {
+            continue;
+        };
+        let em = placement.glyph.key.font_size() * scale;
+        glyphs.push(DanmakuColorGlyph {
+            rect: [
+                x + placement.pen_x * scale + bitmap.left * em,
+                picture_top(item, bitmap, placement.glyph.key.font_size(), y, scale),
+                bitmap.em_width * em,
+                bitmap.em_height * em,
+            ],
+            tex_rect: [
+                packed.x as f32 / atlas_w,
+                packed.y as f32 / atlas_h,
+                packed.width as f32 / atlas_w,
+                packed.height as f32 / atlas_h,
+            ],
+            opacity,
+        });
     }
 }
 
@@ -2043,9 +2267,50 @@ struct RasterizedGlyph {
     offset_x: f32,
     offset_y: f32,
     advance: f32,
+    /// An emoji's picture, which replaces the masks.
+    color: Option<Arc<ColorBitmap>>,
 }
 
 impl RasterizedGlyph {
+    /// An emoji. Its shape goes in the outline mask, so it gets the outline and
+    /// shadow of the text around it from the same pass; the picture covers the
+    /// inside, and no fill is drawn.
+    fn picture(key: GlyphCacheKey, bitmap: Arc<ColorBitmap>) -> Self {
+        let font_size = key.font_size();
+        let raster_scale = key.raster_scale();
+        let radius = key.raster_outline_radius();
+        let pad = radius + 2 * i32::from(key.raster_scale);
+        let drawn_width = (bitmap.em_width * font_size * raster_scale).ceil().max(1.0) as i32;
+        let drawn_height = (bitmap.em_height * font_size * raster_scale)
+            .ceil()
+            .max(1.0) as i32;
+        let width = (drawn_width + pad * 2) as u32;
+        let height = (drawn_height + pad * 2) as u32;
+        let stride = width as usize;
+        let mut shape = vec![0u8; stride * height as usize];
+        for y in 0..drawn_height {
+            let source_y = (y as u32 * bitmap.height / drawn_height as u32).min(bitmap.height - 1);
+            for x in 0..drawn_width {
+                let source_x = (x as u32 * bitmap.width / drawn_width as u32).min(bitmap.width - 1);
+                let alpha = (source_y * bitmap.width + source_x) as usize * 4 + 3;
+                shape[(y + pad) as usize * stride + (x + pad) as usize] = bitmap.rgba[alpha];
+            }
+        }
+        let outline_alpha = dilate_alpha(&shape, width, height, stride, radius);
+        Self {
+            key,
+            width,
+            height,
+            stride,
+            fill_alpha: vec![0; shape.len()],
+            outline_alpha,
+            offset_x: bitmap.left * font_size - pad as f32 / raster_scale,
+            offset_y: -pad as f32 / raster_scale,
+            advance: bitmap.advance * font_size,
+            color: Some(bitmap),
+        }
+    }
+
     fn placeholder(key: GlyphCacheKey) -> Self {
         Self::empty(key, 0.0)
     }
@@ -2061,6 +2326,7 @@ impl RasterizedGlyph {
             offset_x: 0.0,
             offset_y: 0.0,
             advance,
+            color: None,
         }
     }
 
@@ -2100,6 +2366,92 @@ struct PersistentGlyphAtlas {
     dirty: bool,
     dirty_bounds: Option<[u32; 4]>,
     snapshot: Option<Arc<DanmakuGlyphAtlas>>,
+}
+
+/// The pictures of emoji. Each is packed once, whatever size it shows at.
+#[derive(Debug)]
+struct PersistentColorAtlas {
+    height: u32,
+    cursor_x: u32,
+    cursor_y: u32,
+    row_height: u32,
+    rgba: Vec<u8>,
+    packed: HashMap<(u32, char), PackedGlyph>,
+    version: u64,
+    snapshot: Option<Arc<DanmakuColorAtlas>>,
+}
+
+impl PersistentColorAtlas {
+    fn new() -> Self {
+        Self {
+            height: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            row_height: 0,
+            rgba: Vec::new(),
+            packed: HashMap::new(),
+            version: 0,
+            snapshot: None,
+        }
+    }
+
+    /// `None` when the atlas is full: that emoji stays blank, the rest show.
+    fn pack(&mut self, key: (u32, char), bitmap: &ColorBitmap) -> Option<PackedGlyph> {
+        if let Some(packed) = self.packed.get(&key) {
+            return Some(*packed);
+        }
+        if bitmap.width + COLOR_ATLAS_GAP > COLOR_ATLAS_WIDTH {
+            return None;
+        }
+        if self.cursor_x + bitmap.width + COLOR_ATLAS_GAP > COLOR_ATLAS_WIDTH {
+            self.cursor_x = 0;
+            self.cursor_y += self.row_height + COLOR_ATLAS_GAP;
+            self.row_height = 0;
+        }
+        let bottom = self.cursor_y + bitmap.height;
+        if bottom > COLOR_ATLAS_MAX_HEIGHT {
+            return None;
+        }
+        if bottom > self.height {
+            self.height = bottom.next_power_of_two().max(COLOR_ATLAS_MIN_HEIGHT);
+            self.rgba
+                .resize((COLOR_ATLAS_WIDTH * self.height * 4) as usize, 0);
+        }
+        let packed = PackedGlyph {
+            x: self.cursor_x,
+            y: self.cursor_y,
+            width: bitmap.width,
+            height: bitmap.height,
+        };
+        let row_bytes = bitmap.width as usize * 4;
+        for row in 0..bitmap.height as usize {
+            let source = row * row_bytes;
+            let target =
+                ((packed.y as usize + row) * COLOR_ATLAS_WIDTH as usize + packed.x as usize) * 4;
+            self.rgba[target..target + row_bytes]
+                .copy_from_slice(&bitmap.rgba[source..source + row_bytes]);
+        }
+        self.cursor_x += bitmap.width + COLOR_ATLAS_GAP;
+        self.row_height = self.row_height.max(bitmap.height);
+        self.packed.insert(key, packed);
+        self.version = NEXT_GLYPH_ATLAS_VERSION.fetch_add(1, Ordering::Relaxed);
+        self.snapshot = None;
+        Some(packed)
+    }
+
+    fn snapshot(&mut self) -> Option<Arc<DanmakuColorAtlas>> {
+        if self.packed.is_empty() {
+            return None;
+        }
+        Some(Arc::clone(self.snapshot.get_or_insert_with(|| {
+            Arc::new(DanmakuColorAtlas {
+                width: COLOR_ATLAS_WIDTH,
+                height: self.height,
+                rgba: self.rgba.clone(),
+                version: self.version,
+            })
+        })))
+    }
 }
 
 impl PersistentGlyphAtlas {
@@ -3008,18 +3360,21 @@ fn load_font_from_path(
 }
 
 fn load_font_family(family: &str) -> Option<FontArc> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+    let db = crate::system_font::database();
     let query = fontdb::Query {
         families: &[fontdb::Family::Name(family)],
         weight: fontdb::Weight::NORMAL,
         stretch: fontdb::Stretch::Normal,
         style: fontdb::Style::Normal,
     };
-    db.query(&query).and_then(|id| load_fontdb_face(&db, id))
+    db.query(&query).and_then(|id| load_fontdb_face(db, id))
 }
 
 fn load_fontdb_face(db: &fontdb::Database, id: fontdb::ID) -> Option<FontArc> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((fontdb::Source::File(path), index)) = db.face_source(id) {
+        return map_font_file(&path, index);
+    }
     db.with_face_data(id, |data, face_index| {
         load_font_data(data.to_vec(), face_index)
     })
@@ -3032,20 +3387,33 @@ fn load_font_data(data: Vec<u8>, face_index: u32) -> Option<FontArc> {
         .ok()
 }
 
+/// System fonts run to tens of megabytes, so they stay mapped from their file.
+#[cfg(not(target_arch = "wasm32"))]
+fn map_font_file(path: &Path, face_index: u32) -> Option<FontArc> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: system font files do not change while the system runs.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    SharedFont::try_new(Arc::new(map), face_index).map(FontArc::new)
+}
+
+type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 #[derive(Clone)]
 struct SharedFont {
     // This field must be dropped before `data`, because its internal references
-    // point into the allocation kept alive by `data`.
+    // point into the memory kept alive by `data`.
     font: FontRef<'static>,
-    data: Arc<[u8]>,
+    data: FontBytes,
 }
 
 impl SharedFont {
-    fn try_new(data: Arc<[u8]>, face_index: u32) -> Option<Self> {
-        // SAFETY: `bytes` points into the allocation owned by `data`. The Arc is
-        // stored in the same value and is declared after `font`, so it remains
-        // alive until all references held by FontRef have been dropped.
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+    fn try_new(data: FontBytes, face_index: u32) -> Option<Self> {
+        let bytes = (*data).as_ref();
+        // SAFETY: `bytes` points into the memory owned by `data`, which does not
+        // move. The Arc is stored in the same value and is declared after
+        // `font`, so it remains alive until all references held by FontRef have
+        // been dropped.
+        let bytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let font = FontRef::try_from_slice_and_index(bytes, face_index).ok()?;
         Some(Self { font, data })
     }
@@ -3117,65 +3485,35 @@ impl Font for SharedFont {
     }
 
     fn font_data(&self) -> &[u8] {
-        &self.data
+        (*self.data).as_ref()
     }
 }
 
 fn load_shared_font_data(data: Arc<[u8]>, face_index: u32) -> Option<FontArc> {
-    SharedFont::try_new(data, face_index).map(FontArc::new)
+    SharedFont::try_new(Arc::new(data), face_index).map(FontArc::new)
 }
 
-fn load_default_font() -> Option<FontArc> {
-    if let Ok(font) = FontArc::try_from_slice(NIPAPLAY_FALLBACK_FONT) {
+/// A face given to the player, then the system's, then the one built in.
+pub(crate) fn load_default_font() -> Option<FontArc> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if !cfg!(test)
+        && !crate::font::has_given_fallback_font()
+        && let Some(font) = crate::system_font::fallback()
+        && let Some(font) = map_font_file(&font.path, font.index)
+    {
         return Some(font);
     }
-
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-    let families = [
-        fontdb::Family::Name("PingFang SC"),
-        fontdb::Family::Name("Hiragino Sans GB"),
-        fontdb::Family::Name("Microsoft YaHei"),
-        fontdb::Family::Name("Noto Sans CJK SC"),
-        fontdb::Family::Name("Noto Sans CJK"),
-        fontdb::Family::Name("Source Han Sans SC"),
-        fontdb::Family::SansSerif,
-    ];
-    for family in families {
-        let query = fontdb::Query {
-            families: &[family],
-            weight: fontdb::Weight::NORMAL,
-            stretch: fontdb::Stretch::Normal,
-            style: fontdb::Style::Normal,
-        };
-        if let Some(font) = db.query(&query).and_then(|id| load_fontdb_face(&db, id)) {
-            return Some(font);
-        }
-    }
-    const CANDIDATES: &[&str] = &[
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/SFNS.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-    ];
-    for path in CANDIDATES {
-        if let Ok(font) = load_font_from_path(Path::new(path), 0) {
-            return Some(font);
-        }
-    }
-    None
+    let font = crate::font::fallback_font()?;
+    load_shared_font_data(font.data, font.index)
 }
 
 fn rasterize_font_glyph(font: &FontArc, key: GlyphCacheKey) -> RasterizedGlyph {
+    #[cfg(not(target_arch = "wasm32"))]
+    if color_glyph::is_emoji(key.ch)
+        && let Some(bitmap) = color_glyph::render(font, color_glyph::glyph_id(font, key.ch))
+    {
+        return RasterizedGlyph::picture(key, bitmap);
+    }
     let font_size = key.font_size();
     // Advance/kerning stay in display pixels. Only the outline raster has
     // more samples; its bearings and quad dimensions are mapped back once.
@@ -3226,6 +3564,7 @@ fn rasterize_font_glyph(font: &FontArc, key: GlyphCacheKey) -> RasterizedGlyph {
         offset_x: (bounds.min.x.floor() - pad as f32) / raster_scale,
         offset_y: (bounds.min.y.floor() - pad as f32) / raster_scale,
         advance,
+        color: None,
     }
 }
 
@@ -3267,6 +3606,7 @@ fn rasterize_fallback_glyph(shaper: &TextShaper, key: GlyphCacheKey) -> Rasteriz
         offset_x: -(pad as f32) / raster_scale,
         offset_y: -metrics.ascent - pad as f32 / raster_scale,
         advance: metrics.width.max(font_size * 0.5),
+        color: None,
     }
 }
 
@@ -3314,6 +3654,7 @@ fn dilate_alpha(input: &[u8], width: u32, height: u32, stride: usize, radius: i3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NIPAPLAY_FALLBACK_FONT;
 
     #[test]
     fn danmaku_colors_keep_opaque_fills_and_contrasting_outlines() {

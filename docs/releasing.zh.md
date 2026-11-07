@@ -54,7 +54,7 @@ tag 触发构建和 GitHub Release 发布。手动的 `workflow_dispatch` 只用
 | Android | `erika-capi-android.zip` | 1 |
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
-| Web / WASM | `liberika-web-X.Y.Z.zip` | 1 |
+| Web / WASM | `liberika-web-X.Y.Z.zip`、`liberika-web-nofont-X.Y.Z.zip` | 2 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI 包包含库、`include/erika.h`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、依赖许可证及记录 tag/commit 的 `MANIFEST.txt`。iOS/tvOS 为 device + simulator XCFramework；Android 合并包包含四个 ABI 的静态库、动态库和匹配的 `libc++_shared.so`。Flutter Android 包只携带单个 ABI 的动态运行时。

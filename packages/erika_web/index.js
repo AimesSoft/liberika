@@ -4,7 +4,7 @@ export { AudioSession } from "./audio.js";
 /** liberika browser backend: one player owns demux, WebCodecs, libass, danmaku
  * and WebGL presentation. Serve this package unchanged over HTTPS/localhost. */
 export class Player extends EventTarget {
-  static async create({ canvas, volume = 1, audioSession } = {}) {
+  static async create({ canvas, volume = 1, audioSession, fallbackFont } = {}) {
     if (!canvas?.transferControlToOffscreen)
       throw new Error(
         "An HTML canvas with OffscreenCanvas support is required",
@@ -12,9 +12,11 @@ export class Player extends EventTarget {
     const player = new Player(canvas, volume, audioSession);
     const offscreen = canvas.transferControlToOffscreen();
     try {
-      await player.request("init", { canvas: offscreen, ...player.size() }, [
-        offscreen,
-      ]);
+      await player.request(
+        "init",
+        { canvas: offscreen, ...player.size(), font: fallbackFont },
+        [offscreen],
+      );
       player.observe();
       return player;
     } catch (e) {
