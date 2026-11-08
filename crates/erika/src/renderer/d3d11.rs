@@ -46,10 +46,7 @@ use crate::core::{
     PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererResourceStats,
     RendererRuntimeStats, Result, SurfaceMetrics, TransferFunction, WgpuSurfaceKind,
 };
-use crate::danmaku::{
-    DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuGlyphInstance,
-    DanmakuRenderPlan,
-};
+use crate::danmaku::{DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuRenderPlan};
 use crate::ffmpeg::{Frame, PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 use crate::renderer::d3d11_sr::{D3d11Fsr1, UpscaledLuma};
@@ -69,6 +66,9 @@ use crate::renderer::pipeline::{
 use crate::renderer::presentation::PresentationLayout;
 use crate::renderer::sr::reference::LumaRange;
 use crate::subtitle::AssColor;
+
+mod danmaku;
+use danmaku::{D3d11DanmakuBatch, D3d11DanmakuDraws, D3d11DanmakuPipeline};
 
 const SDR_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const HDR10_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -916,25 +916,6 @@ impl OverlayUniforms {
             ui_nits: overlay_ui_nits(target),
         }
     }
-
-    fn alpha_atlas_rect(
-        color: [f32; 4],
-        rect: [f32; 4],
-        tex_rect: [f32; 4],
-        viewport_w: u32,
-        viewport_h: u32,
-        target: TargetColorState,
-    ) -> Self {
-        Self {
-            rect,
-            tex_rect,
-            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
-            overlay_mode: 1,
-            reserved0: 0,
-            color,
-            ui_nits: overlay_ui_nits(target),
-        }
-    }
 }
 
 impl OverlayUniforms {
@@ -1011,6 +992,7 @@ struct D3d11DeviceState {
     overlay_constants: ID3D11Buffer,
     overlay_sampler: ID3D11SamplerState,
     overlay_blend: ID3D11BlendState,
+    danmaku_pipeline: D3d11DanmakuPipeline,
 }
 
 struct AttachedSurface {
@@ -2071,39 +2053,48 @@ impl D3d11Renderer {
     fn prepare_danmaku_draws(
         &mut self,
         plan: Option<&DanmakuRenderPlan>,
-    ) -> Result<Vec<D3d11OverlayDraw>> {
+    ) -> Result<D3d11DanmakuDraws> {
+        self.prepare_danmaku_draws_for_target(plan, self.overlay_target_color())
+    }
+
+    fn prepare_danmaku_draws_for_target(
+        &mut self,
+        plan: Option<&DanmakuRenderPlan>,
+        target: TargetColorState,
+    ) -> Result<D3d11DanmakuDraws> {
         let Some(plan) = plan else {
-            return Ok(Vec::new());
+            return Ok(D3d11DanmakuDraws::default());
         };
         if plan.is_empty() {
-            return Ok(Vec::new());
+            return Ok(D3d11DanmakuDraws::default());
         }
         self.ensure_default_device()?;
-        let Some(atlas) = plan.atlas.as_ref() else {
-            return Ok(Vec::new());
-        };
-        if !atlas.is_valid() {
-            return Err(PlayerError::Renderer(format!(
-                "d3d11: danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
-                atlas.fill_alpha.len(),
-                atlas.outline_alpha.len(),
-                atlas.required_len(),
-                atlas.width,
-                atlas.height,
-                atlas.stride
-            )));
-        }
         let viewport_w = plan.viewport.width;
         let viewport_h = plan.viewport.height;
-        let target = self.overlay_target_color();
-        let mut draws = Vec::with_capacity(plan.items.len() * 3);
-        let (fill, outline) = self.prepare_danmaku_atlas_textures(atlas)?;
-        for item in &plan.items {
-            self.append_danmaku_glyph_draws(
-                item, &fill, &outline, viewport_w, viewport_h, target, &mut draws,
-            );
+        let mut draws = D3d11DanmakuDraws::default();
+        if let Some(atlas) = plan.atlas.as_ref().filter(|_| !plan.items.is_empty()) {
+            if !atlas.is_valid() {
+                return Err(PlayerError::Renderer(format!(
+                    "d3d11: danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
+                    atlas.fill_alpha.len(),
+                    atlas.outline_alpha.len(),
+                    atlas.required_len(),
+                    atlas.width,
+                    atlas.height,
+                    atlas.stride
+                )));
+            }
+            let (fill, outline) = self.prepare_danmaku_atlas_textures(atlas)?;
+            draws.text = D3d11DanmakuBatch::upload(
+                self.state.as_ref().expect("device ensured"),
+                plan,
+                fill,
+                outline,
+                target,
+            )?;
         }
-        // Emoji go over the text of their comment, in their own colors.
+        // Preserve the existing premultiplied color-atlas path, including
+        // emoji-only plans with no monochrome glyph atlas.
         if let Some(atlas) = plan
             .color_atlas
             .as_ref()
@@ -2111,7 +2102,7 @@ impl D3d11Renderer {
         {
             let texture = self.prepare_danmaku_picture_texture(atlas)?;
             for glyph in &plan.color_glyphs {
-                draws.push(D3d11OverlayDraw {
+                draws.pictures.push(D3d11OverlayDraw {
                     texture: texture.clone(),
                     constants: OverlayUniforms::picture_rect(
                         glyph.opacity,
@@ -2240,59 +2231,6 @@ impl D3d11Renderer {
                     0,
                 );
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn append_danmaku_glyph_draws(
-        &self,
-        item: &DanmakuGlyphInstance,
-        fill_texture: &D3d11OverlayTexture,
-        outline_texture: &D3d11OverlayTexture,
-        viewport_w: u32,
-        viewport_h: u32,
-        target: TargetColorState,
-        draws: &mut Vec<D3d11OverlayDraw>,
-    ) {
-        if item.shadow_rgba[3] > 0.0 {
-            let mut rect = item.rect;
-            rect[0] += item.shadow_offset[0];
-            rect[1] += item.shadow_offset[1];
-            draws.push(D3d11OverlayDraw {
-                texture: outline_texture.clone(),
-                constants: OverlayUniforms::alpha_atlas_rect(
-                    item.shadow_rgba,
-                    rect,
-                    item.tex_rect,
-                    viewport_w,
-                    viewport_h,
-                    target,
-                ),
-            });
-        }
-        if item.outline_rgba[3] > 0.0 {
-            draws.push(D3d11OverlayDraw {
-                texture: outline_texture.clone(),
-                constants: OverlayUniforms::alpha_atlas_rect(
-                    item.outline_rgba,
-                    item.rect,
-                    item.tex_rect,
-                    viewport_w,
-                    viewport_h,
-                    target,
-                ),
-            });
-        }
-        draws.push(D3d11OverlayDraw {
-            texture: fill_texture.clone(),
-            constants: OverlayUniforms::alpha_atlas_rect(
-                item.color_rgba,
-                item.rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-                target,
-            ),
-        });
     }
 
     fn append_alpha_atlas_draws(
@@ -2593,7 +2531,7 @@ impl D3d11Renderer {
             state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
         }
         if !danmaku_draws.is_empty() {
-            state.draw_overlays(
+            state.draw_danmaku(
                 &danmaku_draws,
                 scene_rtv,
                 D3d11DrawRect {
@@ -3069,6 +3007,7 @@ impl D3d11DeviceState {
         let overlay_constants = create_overlay_constants_buffer(&device)?;
         let overlay_sampler = create_sampler(&device)?;
         let overlay_blend = create_overlay_blend_state(&device)?;
+        let danmaku_pipeline = D3d11DanmakuPipeline::new(&device)?;
         Ok(Self {
             device,
             context,
@@ -3084,6 +3023,7 @@ impl D3d11DeviceState {
             overlay_constants,
             overlay_sampler,
             overlay_blend,
+            danmaku_pipeline,
         })
     }
 
@@ -3251,6 +3191,22 @@ impl D3d11DeviceState {
             }
             self.context.PSSetShaderResources(0, Some(&[None]));
             self.context.OMSetBlendState(None, None, u32::MAX);
+        }
+        Ok(())
+    }
+
+    fn draw_danmaku(
+        &self,
+        draws: &D3d11DanmakuDraws,
+        render_target: &ID3D11RenderTargetView,
+        target_rect: D3d11DrawRect,
+    ) -> Result<()> {
+        if let Some(text) = &draws.text {
+            self.danmaku_pipeline
+                .draw(self, text, render_target, target_rect);
+        }
+        if !draws.pictures.is_empty() {
+            self.draw_overlays(&draws.pictures, render_target, target_rect)?;
         }
         Ok(())
     }
@@ -4294,25 +4250,34 @@ fn d3d_error(operation: &'static str, error: ::windows::core::Error) -> PlayerEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::danmaku::DanmakuGlyphInstance;
 
     fn software_test_renderer() -> D3d11Renderer {
-        use ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
+        gpu_test_renderer(
+            ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP,
+            D3D_FEATURE_LEVEL_11_0,
+        )
+    }
 
+    pub(super) fn gpu_test_renderer(
+        driver: ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
+        feature_level: D3D_FEATURE_LEVEL,
+    ) -> D3d11Renderer {
         let mut device = None;
         let mut context = None;
         unsafe {
             D3D11CreateDevice(
                 None,
-                D3D_DRIVER_TYPE_WARP,
+                driver,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                Some(&[feature_level]),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
                 None,
                 Some(&mut context),
             )
-            .expect("create WARP device");
+            .expect("create GPU test device");
         }
         // These tests check rendered pixels and device recovery, not real-time
         // latency. Software rendering on a busy CI runner can exceed the
@@ -4801,6 +4766,24 @@ mod tests {
     }
 
     fn read_bgra_pixel(state: &D3d11DeviceState, texture: &ID3D11Texture2D) -> [u8; 4] {
+        read_bgra_pixels(state, texture)[0]
+    }
+
+    pub(super) fn read_bgra_pixels(
+        state: &D3d11DeviceState,
+        texture: &ID3D11Texture2D,
+    ) -> Vec<[u8; 4]> {
+        read_texture_rows(state, texture, 4)
+            .chunks_exact(4)
+            .map(|pixel| pixel.try_into().unwrap())
+            .collect()
+    }
+
+    pub(super) fn read_texture_rows(
+        state: &D3d11DeviceState,
+        texture: &ID3D11Texture2D,
+        bytes_per_pixel: usize,
+    ) -> Vec<u8> {
         use ::windows::Win32::Graphics::Direct3D11::{
             D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
         };
@@ -4829,9 +4812,20 @@ mod tests {
                 .context
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .unwrap();
-            let bytes = *(mapped.pData as *const [u8; 4]);
+            let row_bytes = desc.Width as usize * bytes_per_pixel;
+            let mut pixels = Vec::with_capacity(row_bytes * desc.Height as usize);
+            for row in 0..desc.Height as usize {
+                let bytes = std::slice::from_raw_parts(
+                    mapped
+                        .pData
+                        .cast::<u8>()
+                        .add(row * mapped.RowPitch as usize),
+                    row_bytes,
+                );
+                pixels.extend_from_slice(bytes);
+            }
             state.context.Unmap(&staging, 0);
-            bytes
+            pixels
         }
     }
 

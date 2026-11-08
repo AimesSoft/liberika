@@ -139,7 +139,9 @@ Font size semantics are split into two layers. `size` in source files and the th
 
 liberika's render plan does not pack the whole danmaku line into a single bitmap. It caches glyphs into a persistent atlas and emits `DanmakuGlyphInstance` records. Each instance contains screen rect, atlas tex rect, fill color, outline color, shadow color, and offset. Metal/WGPU only needs to bind the atlas texture and draw alpha-mask quads.
 
-The current atlas has fill alpha and outline alpha masks so shadow/outline/fill can be drawn in that order. The atlas carries a version, and the renderer uses version, size, and stride to decide whether a GPU texture can be reused, avoiding needless full-ատlas uploads every frame.
+The atlas contains separate fill and outline alpha masks; the outline includes the dilated glyph interior. Its version, size, and stride determine GPU texture reuse, avoiding needless full-atlas uploads.
+
+Metal, D3D11, and WGPU share `renderer/danmaku_batch.rs` to partition each comment into disjoint vertical strips. Each fragment accumulates the neighboring glyphs into separate premultiplied fill, outline, and shadow layers, composites them, and applies comment opacity once. Adjacent glyphs share this composition; different comments still overlap in their original order. This prevents translucent white text from showing its own black outline, without per-comment render targets or extra passes. Existing SDR and linear HDR/EDR color conversions remain unchanged. Shared GPU pixel assertions cover SDR/floating-point targets, 1×/2× glyphs, opacity, outlines, shadows, antialiasing, transparent targets, and moving overlap boundaries. D3D11/WGPU use instanced vertices and an RGBA32Float glyph-data texture, without fragment storage buffers, float filtering, or Shader Model 5 requirements. Color emoji retain their separate picture path.
 
 ## Renderer Composition Point
 

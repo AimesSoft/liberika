@@ -139,7 +139,9 @@ font size semantics は 2 層に分かれます。source file の `size` / Bilib
 
 liberika の render plan は弾幕全体を 1 枚の bitmap にしません。glyph を persistent atlas にキャッシュし、`DanmakuGlyphInstance` を出力します。各 instance には screen rect、atlas tex rect、fill color、outline color、shadow color、offset が含まれます。Metal / WGPU は atlas texture を bind して alpha mask quad を描くだけです。
 
-現在の atlas には fill alpha と outline alpha の 2 つの mask があり、shadow → outline → fill の順で描画します。atlas には version があり、renderer は version / size / stride を見て GPU texture を再利用できるか判断し、毎 frame の無意味な全面再送を避けます。
+atlas は fill alpha と outline alpha を別々に保持し、outline には膨張した字形の内部も含まれます。version / size / stride によって GPU texture の再利用を判断し、毎フレームの全面再送を避けます。
+
+Metal、D3D11、WGPU は `renderer/danmaku_batch.rs` を共有し、各コメントを重ならない縦ストリップに分割します。fragment shader は隣接字形を fill、outline、shadow の各プリマルチプライド層に集約し、合成した後でコメント全体の不透明度を一度だけ適用します。同一コメントの字形はこの合成を共有し、別コメントは元の順番で重なります。半透明の白文字から自身の黒い縁取りが透ける問題を防ぎ、コメントごとの描画先や追加パスも不要です。既存の SDR と HDR/EDR の色変換は維持します。共有 GPU ピクセル検証は SDR/浮動小数点出力、1×/2× 字形、不透明度、縁取り、影、アンチエイリアス、透明な描画先、移動中の重なり境界を対象にします。D3D11/WGPU はインスタンス頂点と RGBA32Float 字形データテクスチャを使い、fragment storage buffer、浮動小数点の線形フィルタリング、Shader Model 5 を要求しません。カラー emoji は従来の独立した picture パスを維持します。
 
 ## Renderer 合成位置
 

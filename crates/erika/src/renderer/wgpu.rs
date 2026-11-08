@@ -18,6 +18,9 @@ use std::{
 };
 use wgpu::util::DeviceExt;
 
+mod danmaku;
+use danmaku::{DanmakuDraws, DanmakuPipeline, DanmakuResources};
+
 #[cfg(target_os = "android")]
 use crate::android::{AndroidDataSpaceErrorKind, AndroidNativeWindow};
 use crate::core::ColorPrimaries;
@@ -34,10 +37,7 @@ use crate::core::{
     LumaUpscalerBackendStatus, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
     RendererBackend, RendererRuntimeStats, Result, SurfaceOutputCapabilities, WgpuSurfaceHandle,
 };
-use crate::danmaku::{
-    DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuGlyphInstance,
-    DanmakuRenderPlan,
-};
+use crate::danmaku::{DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuRenderPlan};
 use crate::ffmpeg::{DecoderBackend, PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 #[cfg(target_os = "android")]
@@ -263,23 +263,6 @@ impl OverlayUniforms {
         }
     }
 
-    fn alpha_atlas_rect(
-        color: [f32; 4],
-        rect: [f32; 4],
-        tex_rect: [f32; 4],
-        viewport_w: u32,
-        viewport_h: u32,
-    ) -> Self {
-        Self {
-            rect,
-            tex_rect,
-            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
-            overlay_mode: 1,
-            output_encoding: 0,
-            color,
-        }
-    }
-
     /// An emoji from the premultiplied picture atlas, at `opacity`.
     fn picture_rect(
         opacity: f32,
@@ -361,13 +344,6 @@ struct OverlayDraw {
     dynamic_offset: u32,
     _texture: wgpu::Texture,
     _uniform: wgpu::Buffer,
-}
-
-#[derive(Clone, Copy)]
-enum DanmakuAtlasTexture {
-    Fill,
-    Outline,
-    Picture,
 }
 
 struct WgpuDanmakuAtlasCache {
@@ -591,6 +567,8 @@ pub struct WgpuRenderer {
     surface: Option<AttachedSurface>,
     video_pipeline: Option<VideoPipeline>,
     overlay_pipeline: Option<OverlayPipeline>,
+    danmaku_pipeline: Option<DanmakuPipeline>,
+    danmaku_resources: Option<DanmakuResources>,
     /// Perceptual gamut-mapping 3D LUT cache, keyed by the source/target
     /// primaries plus the target black/peak (PQ codes) that parametrize the
     /// LUT's I axis.
@@ -1039,7 +1017,7 @@ fn wgpu_backend_candidates() -> Vec<WgpuBackendCandidate> {
     {
         vec![WgpuBackendCandidate {
             label: "platform-default",
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::all().with_env(),
             force_fallback_adapter: false,
         }]
     }
@@ -1767,6 +1745,8 @@ impl WgpuRenderer {
             surface: None,
             video_pipeline: None,
             overlay_pipeline: None,
+            danmaku_pipeline: None,
+            danmaku_resources: None,
             current_video: None,
             current_video_visible: false,
             upload_serial: 0,
@@ -3086,7 +3066,7 @@ impl WgpuRenderer {
         };
         let danmaku_draws = match danmaku {
             Some(plan) if !plan.is_empty() => self.prepare_danmaku_draws(plan, output)?,
-            _ => Vec::new(),
+            _ => DanmakuDraws::default(),
         };
         let (
             native_luma_view,
@@ -3397,10 +3377,7 @@ impl WgpuRenderer {
                 0.0,
                 1.0,
             );
-            for draw in &danmaku_draws {
-                pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
-                pass.draw(0..4, 0..1);
-            }
+            self.encode_danmaku_draws(&mut pass, &danmaku_draws);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -3452,64 +3429,6 @@ impl WgpuRenderer {
 
         self.append_alpha_atlas_draws(frame, viewport_w, viewport_h, output, &mut draws)?;
         Ok(draws)
-    }
-
-    fn prepare_danmaku_draws(
-        &mut self,
-        plan: &DanmakuRenderPlan,
-        output: OutputDescription,
-    ) -> Result<Vec<OverlayDraw>> {
-        if self.overlay_pipeline.is_none() {
-            return Err(PlayerError::Renderer(
-                "overlay pipeline not initialized".to_string(),
-            ));
-        }
-        let Some(atlas) = plan.atlas.as_ref() else {
-            return Ok(Vec::new());
-        };
-        if !atlas.is_valid() {
-            return Err(PlayerError::Renderer(format!(
-                "danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
-                atlas.fill_alpha.len(),
-                atlas.outline_alpha.len(),
-                atlas.required_len(),
-                atlas.width,
-                atlas.height,
-                atlas.stride
-            )));
-        }
-        let viewport_w = plan.viewport.width;
-        let viewport_h = plan.viewport.height;
-        let mut uniforms = Vec::with_capacity(plan.items.len() * 3);
-        let (fill_texture, outline_texture) = self.prepare_danmaku_atlas_textures(atlas);
-        for item in &plan.items {
-            self.append_danmaku_glyph_uniforms(item, viewport_w, viewport_h, output, &mut uniforms);
-        }
-        // Emoji go over the text of their comment, in their own colors.
-        let picture_texture = plan
-            .color_atlas
-            .as_ref()
-            .filter(|_| !plan.color_glyphs.is_empty())
-            .map(|atlas| self.prepare_danmaku_picture_texture(atlas));
-        if picture_texture.is_some() {
-            for glyph in &plan.color_glyphs {
-                let uniform = OverlayUniforms::picture_rect(
-                    glyph.opacity,
-                    glyph.rect,
-                    glyph.tex_rect,
-                    viewport_w,
-                    viewport_h,
-                )
-                .for_output(output);
-                uniforms.push((DanmakuAtlasTexture::Picture, uniform));
-            }
-        }
-        self.make_batched_danmaku_draws(
-            &fill_texture,
-            &outline_texture,
-            picture_texture.as_ref(),
-            &uniforms,
-        )
     }
 
     fn prepare_danmaku_picture_texture(&mut self, atlas: &DanmakuColorAtlas) -> wgpu::Texture {
@@ -3621,154 +3540,6 @@ impl WgpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
-    }
-
-    fn append_danmaku_glyph_uniforms(
-        &self,
-        item: &DanmakuGlyphInstance,
-        viewport_w: u32,
-        viewport_h: u32,
-        output: OutputDescription,
-        draws: &mut Vec<(DanmakuAtlasTexture, OverlayUniforms)>,
-    ) {
-        if item.shadow_rgba[3] > 0.0 {
-            let mut rect = item.rect;
-            rect[0] += item.shadow_offset[0];
-            rect[1] += item.shadow_offset[1];
-            let uniform = OverlayUniforms::alpha_atlas_rect(
-                item.shadow_rgba,
-                rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-            )
-            .for_output(output);
-            draws.push((DanmakuAtlasTexture::Outline, uniform));
-        }
-        if item.outline_rgba[3] > 0.0 {
-            let uniform = OverlayUniforms::alpha_atlas_rect(
-                item.outline_rgba,
-                item.rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-            )
-            .for_output(output);
-            draws.push((DanmakuAtlasTexture::Outline, uniform));
-        }
-        let uniform = OverlayUniforms::alpha_atlas_rect(
-            item.color_rgba,
-            item.rect,
-            item.tex_rect,
-            viewport_w,
-            viewport_h,
-        )
-        .for_output(output);
-        draws.push((DanmakuAtlasTexture::Fill, uniform));
-    }
-
-    fn make_batched_danmaku_draws(
-        &self,
-        fill_texture: &wgpu::Texture,
-        outline_texture: &wgpu::Texture,
-        picture_texture: Option<&wgpu::Texture>,
-        uniforms: &[(DanmakuAtlasTexture, OverlayUniforms)],
-    ) -> Result<Vec<OverlayDraw>> {
-        if uniforms.is_empty() {
-            return Ok(Vec::new());
-        }
-        let uniform_size = std::mem::size_of::<OverlayUniforms>();
-        let alignment = self
-            .device
-            .limits()
-            .min_uniform_buffer_offset_alignment
-            .max(1) as usize;
-        let stride = uniform_size.div_ceil(alignment) * alignment;
-        let buffer_size = stride.checked_mul(uniforms.len()).ok_or_else(|| {
-            PlayerError::Renderer("danmaku dynamic uniform buffer size overflow".to_string())
-        })?;
-        let mut bytes = vec![0u8; buffer_size];
-        for (index, (_, uniform)) in uniforms.iter().enumerate() {
-            let start = index * stride;
-            bytes[start..start + uniform_size].copy_from_slice(bytemuck::bytes_of(uniform));
-        }
-        // TODO(perf): retain a growable per-frame uniform buffer and update it via
-        // `Queue::write_buffer` (or a small ring) instead of allocating a new GPU
-        // buffer for every danmaku frame. Keep `stride` device-aligned when reusing it.
-        let uniform_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("erika-wgpu-danmaku-dynamic-uniforms"),
-                contents: &bytes,
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let make_bind_group = |label: &'static str, texture: &wgpu::Texture| {
-            let pipeline = self
-                .overlay_pipeline
-                .as_ref()
-                .expect("overlay pipeline initialized");
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &pipeline.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &uniform_buffer,
-                            offset: 0,
-                            size: std::num::NonZeroU64::new(uniform_size as u64),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
-                    },
-                ],
-            })
-        };
-        let fill_bind_group = make_bind_group("erika-wgpu-danmaku-fill-bind-group", fill_texture);
-        let outline_bind_group =
-            make_bind_group("erika-wgpu-danmaku-outline-bind-group", outline_texture);
-        let picture = picture_texture.map(|texture| {
-            (
-                make_bind_group("erika-wgpu-danmaku-picture-bind-group", texture),
-                texture.clone(),
-            )
-        });
-        uniforms
-            .iter()
-            .enumerate()
-            .map(|(index, (texture, _))| {
-                let offset = index.checked_mul(stride).ok_or_else(|| {
-                    PlayerError::Renderer("danmaku dynamic uniform offset overflow".to_string())
-                })?;
-                let dynamic_offset = u32::try_from(offset).map_err(|_| {
-                    PlayerError::Renderer(format!(
-                        "danmaku dynamic uniform offset exceeds u32: {offset}"
-                    ))
-                })?;
-                let (bind_group, texture) = match texture {
-                    DanmakuAtlasTexture::Fill => (fill_bind_group.clone(), fill_texture.clone()),
-                    DanmakuAtlasTexture::Outline => {
-                        (outline_bind_group.clone(), outline_texture.clone())
-                    }
-                    DanmakuAtlasTexture::Picture => {
-                        picture.clone().expect("a picture draw has its atlas")
-                    }
-                };
-                Ok(OverlayDraw {
-                    bind_group,
-                    dynamic_offset,
-                    _texture: texture,
-                    _uniform: uniform_buffer.clone(),
-                })
-            })
-            .collect()
     }
 
     /// Pack libass alpha coverage bitmaps horizontally into one R8 atlas and add a
@@ -4064,6 +3835,7 @@ impl WgpuRenderer {
     }
 
     fn ensure_overlay_pipeline(&mut self, format: wgpu::TextureFormat) {
+        self.ensure_danmaku_pipeline(format);
         if self
             .overlay_pipeline
             .as_ref()
@@ -7031,7 +6803,7 @@ mod tests {
         let draws = renderer
             .prepare_danmaku_draws(&plan, OutputDescription::sdr())
             .unwrap();
-        assert_eq!(draws.len(), 2);
+        assert_eq!(draws.len(), 1);
         assert!(
             renderer
                 .danmaku_atlas_cache
@@ -7042,7 +6814,7 @@ mod tests {
         let cached_draws = renderer
             .prepare_danmaku_draws(&plan, OutputDescription::sdr())
             .unwrap();
-        assert_eq!(cached_draws.len(), 2);
+        assert_eq!(cached_draws.len(), 1);
         assert!(
             renderer
                 .danmaku_atlas_cache
@@ -7074,7 +6846,7 @@ mod tests {
         let updated_draws = renderer
             .prepare_danmaku_draws(&updated_plan, OutputDescription::sdr())
             .unwrap();
-        assert_eq!(updated_draws.len(), 2);
+        assert_eq!(updated_draws.len(), 1);
         let updated_cache = renderer
             .danmaku_atlas_cache
             .as_ref()
