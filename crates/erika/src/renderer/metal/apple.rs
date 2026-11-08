@@ -1,5 +1,6 @@
+#[cfg(test)]
 mod danmaku;
-use danmaku::{DanmakuBatch, DanmakuBatchGlyph, DanmakuBatchInstance};
+use crate::renderer::danmaku_batch::{DanmakuBatch, DanmakuBatchGlyph, DanmakuBatchInstance};
 
 use std::ffi::c_void;
 use std::mem;

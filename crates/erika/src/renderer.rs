@@ -14,6 +14,8 @@ mod d3d11_sr_select;
 mod d3d11_vk_coopmat;
 #[cfg(target_os = "windows")]
 mod d3d11_vsr;
+#[cfg(any(target_vendor = "apple", target_os = "windows", feature = "wgpu", test))]
+pub(crate) mod danmaku_batch;
 #[cfg(all(
     test,
     feature = "wgpu",
