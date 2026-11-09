@@ -78,6 +78,12 @@ flowchart LR
 
 这里 `dfm_core` 已经不是从零写的 liberika 算法，而是带 MIT attribution 的 NipaPlay DFM+ core 迁入版本。当前仍需要注意的是：`DanmakuSession` 是 liberika 的输入会话层，它负责多弹幕轨、按轨启用、按轨偏移、全局偏移和旧单轨 API 的兼容；`dfm.rs` 是 liberika adapter，它把 active timeline 和 `DanmakuLayoutConfig` 映射成 DFM+ prepare request，再把 DFM+ prepared/frame output 映射回 liberika 的 `DanmakuFrameLayout`。
 
+### mode 7 高级弹幕
+
+B站 mode 7 弹幕的 `<d>` 内容是 JSON 数组而非纯文本。`parse_bilibili_xml` 从中提取显示文本、从 `(x1,y1)` 到 `(x2,y2)` 的线性路径、时长和渐变 alpha，支持 14 元素新格式与 7/5 元素旧格式。纯文本 mode 7 退化为顶部弹幕，代码弹幕(8) 与 BAS(9) 丢弃；JSON 时间线里 `type: "7"` 且 `content` 为 JSON 数组时同样生效。
+
+动画数据通过 `DanmakuItem.special` 进入 DFM+ 适配层。布局阶段把坐标还原到当前视口：全部坐标落在 `[0,1]` 时按视口比例映射；绝对像素坐标按 `date` 选择历史播放器基准（2013-11-10 之前 545×388，之后 862×568）。mode 7 不参与碰撞轨道，`for_each_frame_item` 按自身的 `[start,end)` 生命周期插值位置，并把渐变 alpha 乘入 `DanmakuPlacedItem.opacity`，因此三套 GPU 后端无需改 shader 即可获得淡入效果；帧查询的回看窗口（`PreparedLayout.max_duration_seconds`）也覆盖自定义时长。`zRotate` 只解析不应用（instanced 渲染器绘制轴对齐矩形），源文本里的 `/n` 在单行字形布局中折为空格。
+
 ## 当前 DFM+ 替换边界
 
 应该替换成“尽量原封不动 DFM+ 内核”的部分，是 `crates/erika/src/danmaku/dfm.rs` 加 `crates/erika/src/danmaku/dfm_core/*` 这一段计算层。

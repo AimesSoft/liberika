@@ -447,7 +447,12 @@ pub fn for_each_frame_item(
 fn merge_duplicate_items(items: &mut [PrepareEntry]) {
     let mut merge_map: FxHashMap<u64, (usize, u32)> = FxHashMap::default();
     let mut dup_indices = Vec::new();
-    for (i, (_, _, _, _, item, _)) in items.iter().enumerate() {
+    for (i, (_, _, _, _, item, special)) in items.iter().enumerate() {
+        // Mode 7 comments can share the same text while animating along
+        // different paths; merging by text would silently drop animations.
+        if special.is_some() {
+            continue;
+        }
         let text_hash = fxhash_str(&item.text);
         match merge_map.get_mut(&text_hash) {
             Some((first_idx, count)) => {

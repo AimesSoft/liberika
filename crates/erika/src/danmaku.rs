@@ -1082,6 +1082,7 @@ pub struct DanmakuFrameStats {
     pub scroll_items: usize,
     pub top_items: usize,
     pub bottom_items: usize,
+    pub special_items: usize,
     pub scroll_rows: usize,
     pub scroll_track_min: usize,
     pub scroll_track_max: usize,
@@ -1106,6 +1107,7 @@ pub struct DanmakuPreparedStats {
     pub prepared_scroll_items: usize,
     pub prepared_top_items: usize,
     pub prepared_bottom_items: usize,
+    pub prepared_special_items: usize,
     pub prepared_scroll_rows: usize,
     pub prepared_scroll_min_y: f32,
     pub prepared_scroll_max_y: f32,
@@ -1143,7 +1145,7 @@ impl DanmakuFrameStats {
                 }
                 DanmakuMode::Top => stats.top_items += 1,
                 DanmakuMode::Bottom => stats.bottom_items += 1,
-                DanmakuMode::Special => {}
+                DanmakuMode::Special => stats.special_items += 1,
             }
         }
         stats.scroll_rows = scroll_rows.len();
@@ -1197,7 +1199,7 @@ impl DanmakuPreparedStats {
                 }
                 DanmakuMode::Top => stats.prepared_top_items += 1,
                 DanmakuMode::Bottom => stats.prepared_bottom_items += 1,
-                DanmakuMode::Special => {}
+                DanmakuMode::Special => stats.prepared_special_items += 1,
             }
         }
         stats.prepared_scroll_rows = scroll_rows.len();
@@ -2891,10 +2893,13 @@ fn prepare_layout(
             font_size,
             paint_width: measure.width as f64,
             paint_height: measure.height.max(font_size * 1.2) as f64,
-            special: source
-                .special
-                .as_ref()
-                .map(|special| scale_special_to_viewport(special, viewport.width, viewport.height)),
+            special: if source.mode == DanmakuMode::Special {
+                source.special.as_ref().map(|special| {
+                    scale_special_to_viewport(special, viewport.width, viewport.height)
+                })
+            } else {
+                None
+            },
         });
     }
     let supported_count = source_items.len();
@@ -3023,9 +3028,11 @@ fn resolve_mode7(
 /// Parse the JSON array carried by a mode 7 comment.
 ///
 /// Three shapes exist in the wild:
+///
 /// - new (>=9 elements): `[x1,y1,"a-b",dur,text,zRot,yRot,x2,y2,...]`
 /// - old (7 elements):   `[x1,y1,"a-b",dur,text,x2,y2]`
 /// - old (5 elements):   `[x1,y1,"a-b",dur,text]` (no movement)
+///
 /// Numbers may also arrive as strings, e.g. `"50"`.
 fn parse_mode7_json(raw: &str, source_date: i64) -> Option<(String, DanmakuSpecial)> {
     let values: Vec<Value> = serde_json::from_str(raw.trim()).ok()?;
@@ -5161,10 +5168,12 @@ mod tests {
         let prepared = engine.prepare(viewport, 1);
         assert_eq!(prepared.items().len(), 1);
         assert_eq!(prepared.items()[0].mode, DanmakuMode::Special);
+        assert_eq!(prepared.stats().prepared_special_items, 1);
 
         let frame_at = |seconds| prepared.frame_layout(Duration::from_secs_f64(seconds), 1);
         let start = frame_at(0.0);
         assert_eq!(start.items.len(), 1);
+        assert_eq!(DanmakuFrameStats::from_layout(&start).special_items, 1);
         assert_close(start.items[0].x, 50.0);
         assert_close(start.items[0].y, 245.0);
         assert_close(start.items[0].opacity, 0.1);
@@ -5223,6 +5232,26 @@ mod tests {
         let special = item.special.as_ref().expect("json mode7 payload");
         assert_eq!(special.x2, 100.0);
         assert_eq!(special.source_date, 1_291_190_667);
+    }
+
+    #[test]
+    fn mode7_duplicate_merge_keeps_distinct_animation_paths() {
+        let xml = r#"<i>
+<d p="0.0,7,25,16777215,1291190667,0,x,1">["10","10","1-1","3","同文本","100","10"]</d>
+<d p="0.5,7,25,16777215,1291190667,0,x,2">["10","50","1-1","3","同文本","100","50"]</d>
+</i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let config = DanmakuLayoutConfig {
+            merge_duplicates: true,
+            ..DanmakuLayoutConfig::default()
+        };
+        let mut engine = DfmLayoutEngine::new(timeline, config);
+        let prepared = engine.prepare(DanmakuViewport::new(545, 388), 1);
+        assert_eq!(prepared.items().len(), 2);
+        assert_eq!(prepared.stats().prepared_special_items, 2);
+        let frame = prepared.frame_layout(Duration::from_secs_f64(1.0), 1);
+        assert_eq!(frame.items.len(), 2);
+        assert_eq!(DanmakuFrameStats::from_layout(&frame).special_items, 2);
     }
 
     #[test]
