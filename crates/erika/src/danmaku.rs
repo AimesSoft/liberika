@@ -174,6 +174,30 @@ impl DanmakuColor {
     }
 }
 
+/// Animation data carried by a Bilibili mode 7 ("advanced") comment.
+///
+/// A mode 7 comment's `<d>` payload is a JSON array describing a linear move
+/// from `(x1, y1)` to `(x2, y2)` over `duration_seconds`, with an alpha ramp
+/// from `alpha_from` to `alpha_to`. Coordinates stay in the source player's
+/// pixel space until the layout scales them to the current viewport.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DanmakuSpecial {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+    pub alpha_from: f32,
+    pub alpha_to: f32,
+    pub duration_seconds: f64,
+    /// Z rotation in radians, converted from the degrees in the source JSON.
+    /// Parsed for completeness: the instanced GPU renderers draw axis-aligned
+    /// quads, so rotation is not applied by the render plan yet.
+    pub z_rotate: f32,
+    /// Unix seconds from the XML `date` field. Selects the historical player
+    /// base size used when the layout scales the coordinates.
+    pub source_date: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DanmakuItem {
     pub id: u64,
@@ -186,6 +210,9 @@ pub struct DanmakuItem {
     /// The viewer sent this comment; it is drawn inside a thin white border.
     /// JSON timelines set it with `is_me` / `isMe`.
     pub is_self: bool,
+    /// Mode 7 animation data; `None` for every other comment. A `Special`
+    /// comment without this payload has nothing to draw and stays filtered.
+    pub special: Option<DanmakuSpecial>,
 }
 
 impl DanmakuItem {
@@ -914,9 +941,6 @@ impl DfmPreparedLayout {
             let Some(item) = self.items.get(frame_item.item_index) else {
                 return;
             };
-            if item.mode == DanmakuMode::Special {
-                return;
-            }
             items.push(DanmakuPlacedItem {
                 item_id: item.id,
                 text: Arc::clone(&item.text),
@@ -932,7 +956,8 @@ impl DfmPreparedLayout {
                 } else {
                     item.color
                 },
-                opacity: item.opacity * self.config.opacity,
+                // Mode 7 carries a per-frame alpha ramp; other items stay at 1.
+                opacity: item.opacity * self.config.opacity * frame_item.alpha,
                 outline_width: resolve_width_px(item.font_size, self.config.outline_width),
                 shadow_offset: scale_offset(self.config.shadow_offset, self.viewport.scale_factor),
                 shadow_alpha: shadow_style_alpha(self.config.shadow_style),
@@ -1057,6 +1082,7 @@ pub struct DanmakuFrameStats {
     pub scroll_items: usize,
     pub top_items: usize,
     pub bottom_items: usize,
+    pub special_items: usize,
     pub scroll_rows: usize,
     pub scroll_track_min: usize,
     pub scroll_track_max: usize,
@@ -1081,6 +1107,7 @@ pub struct DanmakuPreparedStats {
     pub prepared_scroll_items: usize,
     pub prepared_top_items: usize,
     pub prepared_bottom_items: usize,
+    pub prepared_special_items: usize,
     pub prepared_scroll_rows: usize,
     pub prepared_scroll_min_y: f32,
     pub prepared_scroll_max_y: f32,
@@ -1118,7 +1145,7 @@ impl DanmakuFrameStats {
                 }
                 DanmakuMode::Top => stats.top_items += 1,
                 DanmakuMode::Bottom => stats.bottom_items += 1,
-                DanmakuMode::Special => {}
+                DanmakuMode::Special => stats.special_items += 1,
             }
         }
         stats.scroll_rows = scroll_rows.len();
@@ -1172,7 +1199,7 @@ impl DanmakuPreparedStats {
                 }
                 DanmakuMode::Top => stats.prepared_top_items += 1,
                 DanmakuMode::Bottom => stats.prepared_bottom_items += 1,
-                DanmakuMode::Special => {}
+                DanmakuMode::Special => stats.prepared_special_items += 1,
             }
         }
         stats.prepared_scroll_rows = scroll_rows.len();
@@ -2724,7 +2751,7 @@ impl DfmLayoutEngine {
             .timeline
             .items()
             .iter()
-            .filter(|item| item.mode != DanmakuMode::Special)
+            .filter(|item| item.mode != DanmakuMode::Special || item.special.is_some())
             .filter(|item| !self.rejected_items.contains(&item.id))
             .map(|item| item.id)
             .collect::<BTreeSet<_>>();
@@ -2823,6 +2850,8 @@ fn prepare_layout(
             height: viewport.height as f64,
             scroll_duration_seconds: config.scroll_duration_seconds.max(1.0) as f64,
             static_duration_seconds: DEFAULT_STATIC_DURATION.as_secs_f64(),
+            max_duration_seconds: f64::from(config.scroll_duration_seconds.max(1.0))
+                .max(DEFAULT_STATIC_DURATION.as_secs_f64()),
             items: Vec::new(),
             item_times: Vec::new(),
             track_count: 0,
@@ -2844,7 +2873,10 @@ fn prepare_layout(
     let source_count = timeline.items().len();
     let mut source_items = Vec::new();
     for source in timeline.items() {
-        if source.mode == DanmakuMode::Special || rejected_items.contains(&source.id) {
+        // A Special comment without its JSON payload has nothing to draw.
+        if (source.mode == DanmakuMode::Special && source.special.is_none())
+            || rejected_items.contains(&source.id)
+        {
             continue;
         }
         let font_size =
@@ -2861,6 +2893,18 @@ fn prepare_layout(
             font_size,
             paint_width: measure.width as f64,
             paint_height: measure.height.max(font_size * 1.2) as f64,
+            special: if source.mode == DanmakuMode::Special {
+                source
+                    .special
+                    .as_ref()
+                    .cloned()
+                    .and_then(sanitize_mode7_special)
+                    .map(|special| {
+                        scale_special_to_viewport(&special, viewport.width, viewport.height)
+                    })
+            } else {
+                None
+            },
         });
     }
     let supported_count = source_items.len();
@@ -2890,6 +2934,9 @@ fn prepare_layout(
         height: viewport.height as f64,
         scroll_duration_seconds: scroll_duration.as_secs_f64(),
         static_duration_seconds: DEFAULT_STATIC_DURATION.as_secs_f64(),
+        max_duration_seconds: scroll_duration
+            .as_secs_f64()
+            .max(DEFAULT_STATIC_DURATION.as_secs_f64()),
         items: Vec::new(),
         item_times: Vec::new(),
         track_count: 0,
@@ -2959,6 +3006,173 @@ fn prepare_layout(
     }
 }
 
+/// Bilibili player sizes used as the coordinate space of mode 7 comments.
+/// The old player was 545x388 before 2013-11-10; newer comments use 862x568.
+const MODE7_BASE_OLD: (f64, f64) = (545.0, 388.0);
+const MODE7_BASE_NEW: (f64, f64) = (862.0, 568.0);
+const MODE7_HISTORICAL_CUTOFF_DATE: i64 = 1_384_099_200;
+/// Mode 7 durations come from untrusted XML/JSON. Cap them at the same upper
+/// bound as `scroll_duration_seconds` so a single comment cannot widen the
+/// frame look-behind window (shared by every item) without bound.
+const MODE7_MIN_DURATION_SECONDS: f64 = 0.1;
+const MODE7_MAX_DURATION_SECONDS: f64 = 60.0;
+
+/// Resolve a mode 7 payload into display text, an effective mode and its
+/// animation data. Returns `None` when the item cannot be rendered at all.
+///
+/// A plain (non-JSON) mode 7 comment degrades to a fixed top comment, matching
+/// the behaviour of desktop players.
+fn resolve_mode7(
+    text: &str,
+    source_date: i64,
+) -> Option<(String, DanmakuMode, Option<DanmakuSpecial>)> {
+    if !text.trim_start().starts_with('[') {
+        // Plain-text mode 7 still uses Bilibili's `/n` line-break escape. The
+        // render plan is single-line, so fold it into a space here too.
+        return Some((text.replace("/n", " "), DanmakuMode::Top, None));
+    }
+    let (text, special) = parse_mode7_json(text, source_date)?;
+    Some((text, DanmakuMode::Special, Some(special)))
+}
+
+/// Parse the JSON array carried by a mode 7 comment.
+///
+/// Three shapes exist in the wild:
+///
+/// - new (>=9 elements): `[x1,y1,"a-b",dur,text,zRot,yRot,x2,y2,...]`
+/// - old (7 elements):   `[x1,y1,"a-b",dur,text,x2,y2]`
+/// - old (5 elements):   `[x1,y1,"a-b",dur,text]` (no movement)
+///
+/// Numbers may also arrive as strings, e.g. `"50"`.
+fn parse_mode7_json(raw: &str, source_date: i64) -> Option<(String, DanmakuSpecial)> {
+    let values: Vec<Value> = serde_json::from_str(raw.trim()).ok()?;
+    if values.len() < 5 {
+        return None;
+    }
+    let number = |value: &Value| -> Option<f64> {
+        let parsed = match value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(text) => text.trim().parse().ok(),
+            _ => None,
+        };
+        // Numeric strings such as "NaN", "inf" and "1e400" parse successfully
+        // but would poison coordinates and the shared frame window.
+        parsed.filter(|value| value.is_finite())
+    };
+    let x1 = number(values.first()?)?;
+    let y1 = number(values.get(1)?)?;
+    let (alpha_from, alpha_to) = parse_mode7_alpha(values.get(2)?)?;
+    let duration_seconds = number(values.get(3)?)?;
+    // `/n` is the source's escaped line break. The GPU render plan lays out a
+    // single line, so fold it into a space rather than shaping a control
+    // character that has no glyph.
+    let text = values.get(4)?.as_str()?.replace("/n", " ");
+    if text.trim().is_empty() {
+        return None;
+    }
+    let (z_rotate_deg, x2, y2) = if values.len() >= 9 {
+        (
+            number(values.get(5)?).unwrap_or(0.0),
+            number(values.get(7)?)?,
+            number(values.get(8)?)?,
+        )
+    } else if values.len() >= 7 {
+        (0.0, number(values.get(5)?)?, number(values.get(6)?)?)
+    } else {
+        (0.0, x1, y1)
+    };
+    Some((
+        text,
+        sanitize_mode7_special(DanmakuSpecial {
+            x1,
+            y1,
+            x2,
+            y2,
+            alpha_from,
+            alpha_to,
+            duration_seconds,
+            z_rotate: (z_rotate_deg as f32).to_radians(),
+            source_date,
+        })?,
+    ))
+}
+
+/// Alpha field of a mode 7 array, e.g. `"0.1-1.00"`.
+fn parse_mode7_alpha(value: &Value) -> Option<(f32, f32)> {
+    let (from, to) = match value {
+        Value::String(text) => {
+            let (from, to) = text.trim().split_once('-')?;
+            (
+                from.trim().parse::<f32>().ok()?,
+                to.trim().parse::<f32>().ok()?,
+            )
+        }
+        Value::Number(number) => {
+            let alpha = number.as_f64()? as f32;
+            (alpha, alpha)
+        }
+        _ => return None,
+    };
+    (from.is_finite() && to.is_finite()).then_some((from, to))
+}
+
+/// Reject non-finite animation values and cap the lifetime. Payloads may also
+/// be built by callers through the public `DanmakuSpecial` fields, so the
+/// layout applies this too: the frame look-behind window is shared by every
+/// item and would otherwise grow with one malformed duration.
+fn sanitize_mode7_special(mut special: DanmakuSpecial) -> Option<DanmakuSpecial> {
+    let finite = [
+        special.x1,
+        special.y1,
+        special.x2,
+        special.y2,
+        special.duration_seconds,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        && special.alpha_from.is_finite()
+        && special.alpha_to.is_finite()
+        && special.z_rotate.is_finite();
+    if !finite {
+        return None;
+    }
+    special.duration_seconds = special
+        .duration_seconds
+        .clamp(MODE7_MIN_DURATION_SECONDS, MODE7_MAX_DURATION_SECONDS);
+    Some(special)
+}
+
+/// Map mode 7 source coordinates onto the current viewport.
+///
+/// When every coordinate is a fraction in `[0, 1]` the source used normalized
+/// coordinates and is scaled by the viewport directly. Otherwise the values
+/// are absolute pixels in one of the historical player sizes, chosen by the
+/// comment's date.
+fn scale_special_to_viewport(
+    special: &DanmakuSpecial,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> DanmakuSpecial {
+    let mut scaled = special.clone();
+    let width = viewport_width.max(1) as f64;
+    let height = viewport_height.max(1) as f64;
+    let normalized = [scaled.x1, scaled.y1, scaled.x2, scaled.y2]
+        .iter()
+        .all(|&value| (0.0..=1.0).contains(&value));
+    let (sx, sy) = if normalized {
+        (width, height)
+    } else if scaled.source_date < MODE7_HISTORICAL_CUTOFF_DATE {
+        (width / MODE7_BASE_OLD.0, height / MODE7_BASE_OLD.1)
+    } else {
+        (width / MODE7_BASE_NEW.0, height / MODE7_BASE_NEW.1)
+    };
+    scaled.x1 *= sx;
+    scaled.x2 *= sx;
+    scaled.y1 *= sy;
+    scaled.y2 *= sy;
+    scaled
+}
+
 pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
     let mut items = Vec::new();
     for (index, segment) in input.split("<d ").skip(1).enumerate() {
@@ -2984,16 +3198,32 @@ pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
             .get(1)
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);
-        let mode = DanmakuMode::from_bilibili_mode(mode_code);
-        if mode == DanmakuMode::Special {
+        // Code (8) and BAS (9) comments carry scripts, not drawable text.
+        if matches!(mode_code, 8 | 9) {
             continue;
         }
+        let mode = DanmakuMode::from_bilibili_mode(mode_code);
         let Some(pts) = parse_float_field(fields.first(), "pts")
             .ok()
             .and_then(item_duration)
         else {
             continue;
         };
+        let source_date = fields
+            .get(4)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let (text, mode, special) = if mode == DanmakuMode::Special {
+            let Some(resolved) = resolve_mode7(&text, source_date) else {
+                continue;
+            };
+            resolved
+        } else {
+            (text, mode, None)
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
         items.push(DanmakuItem {
             id: fields
                 .get(7)
@@ -3014,6 +3244,7 @@ pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
             opacity: 1.0,
             is_self: false,
             text,
+            special,
         });
     }
     Ok(items)
@@ -3086,6 +3317,20 @@ fn item_from_json_value(value: &Value, fallback_id: u64) -> Result<DanmakuItem> 
         .unwrap_or(DanmakuColor::WHITE);
     let pts = item_duration(numeric_field(object, &["time", "t"]).unwrap_or(0.0))
         .ok_or_else(|| DanmakuError::InvalidField("time".to_string()))?;
+    let source_date =
+        numeric_field(object, &["date", "ctime", "timestamp", "send_time"]).unwrap_or(0.0) as i64;
+    let (text, mode, special) = if mode == DanmakuMode::Special {
+        // Only a JSON array payload is a real mode 7 comment. A bare
+        // "special" type keeps the historical behaviour (filtered out),
+        // whereas Bilibili XML degrades those to fixed top comments.
+        if text.trim_start().starts_with('[') {
+            resolve_mode7(&text, source_date).ok_or(DanmakuError::MissingText)?
+        } else {
+            return Err(DanmakuError::MissingText);
+        }
+    } else {
+        (text, mode, None)
+    };
     Ok(DanmakuItem {
         id: u64_field(object, &["id"]).unwrap_or(fallback_id),
         pts,
@@ -3096,6 +3341,7 @@ fn item_from_json_value(value: &Value, fallback_id: u64) -> Result<DanmakuItem> 
         color,
         opacity: numeric_field(object, &["opacity", "alpha", "a"]).unwrap_or(1.0) as f32,
         is_self: bool_field(object, &["is_me", "isMe", "self", "mine"]).unwrap_or(false),
+        special,
     })
 }
 
@@ -3926,6 +4172,7 @@ mod tests {
             color: DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }
     }
 
@@ -4856,6 +5103,325 @@ mod tests {
         let prepared = engine.prepare(DanmakuViewport::new(640, 360), 1);
 
         assert_eq!(prepared.items().len(), 0);
+    }
+
+    fn mode7_special() -> DanmakuSpecial {
+        DanmakuSpecial {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 200.0,
+            y2: 50.0,
+            alpha_from: 0.1,
+            alpha_to: 1.0,
+            duration_seconds: 4.5,
+            z_rotate: 0.0,
+            source_date: 1_291_190_667,
+        }
+    }
+
+    #[test]
+    fn mode7_xml_parses_new_old_and_plain_text_payloads() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?><i>
+<d p="1.5,7,25,16777215,1291190667,0,x,1">["50","245","0.1-1.00","4.50","达成","0","0","350","0","1000","500","0","","Microsoft YaHei"]</d>
+<d p="2.0,7,25,16777215,1291190667,0,x,2">["50","245","0.1-1.00","4.50","旧格式","350","0"]</d>
+<d p="3.0,7,25,16777215,1291190667,0,x,3">["50","245","1-1","2.0","原地/n换行"]</d>
+<d p="4.0,7,25,16777215,1291190667,0,x,4">纯文本/n退化</d>
+<d p="5.0,8,25,16777215,1291190667,0,x,5">代码弹幕</d>
+<d p="6.0,9,25,16777215,1291190667,0,x,6">BAS 弹幕</d>
+<d p="7.0,7,25,16777215,1291190667,0,x,7">["坏","JSON"]</d>
+<d p="8.0,1,25,16777215,1291190667,0,x,8">普通滚动</d>
+</i>"#;
+        let items = parse_bilibili_xml(xml).unwrap();
+        assert_eq!(items.len(), 5);
+
+        assert_eq!(items[0].mode, DanmakuMode::Special);
+        assert_eq!(items[0].text, "达成");
+        let special = items[0].special.as_ref().expect("new mode7 payload");
+        assert_eq!(special.x1, 50.0);
+        assert_eq!(special.y1, 245.0);
+        assert_eq!(special.x2, 350.0);
+        assert_eq!(special.y2, 0.0);
+        assert_close(special.alpha_from, 0.1);
+        assert_close(special.alpha_to, 1.0);
+        assert_eq!(special.duration_seconds, 4.5);
+        assert_eq!(special.source_date, 1_291_190_667);
+        assert_close(special.z_rotate, 0.0);
+
+        // Seven-element (old) payload: x2/y2 sit at indices 5/6.
+        assert_eq!(items[1].mode, DanmakuMode::Special);
+        assert_eq!(items[1].text, "旧格式");
+        let old = items[1].special.as_ref().expect("old mode7 payload");
+        assert_eq!(old.x2, 350.0);
+        assert_eq!(old.y2, 0.0);
+
+        // Five-element payload does not move; `/n` folds into a space.
+        assert_eq!(items[2].text, "原地 换行");
+        let still = items[2].special.as_ref().expect("still mode7 payload");
+        assert_eq!(still.x2, still.x1);
+        assert_eq!(still.y2, still.y1);
+
+        // Plain-text mode 7 degrades to a fixed top comment; 8/9 and broken
+        // JSON payloads are dropped.
+        assert_eq!(items[3].mode, DanmakuMode::Top);
+        assert!(items[3].special.is_none());
+        assert_eq!(items[3].text, "纯文本 退化");
+        assert_eq!(items[4].mode, DanmakuMode::Scroll);
+        assert_eq!(items[4].text, "普通滚动");
+    }
+
+    #[test]
+    fn mode7_coordinates_follow_historical_player_base_or_normalized_space() {
+        // Date before 2013-11-10: 545x388 is the source space, so the old
+        // viewport reproduces the source coordinates exactly.
+        let old = scale_special_to_viewport(&mode7_special(), 545, 388);
+        assert!((old.x1 - 100.0).abs() < 1e-6);
+        assert!((old.y1 - 100.0).abs() < 1e-6);
+        let doubled = scale_special_to_viewport(&mode7_special(), 1090, 776);
+        assert!((doubled.x1 - 200.0).abs() < 1e-6);
+        assert!((doubled.y1 - 200.0).abs() < 1e-6);
+
+        // Newer comments use the 862x568 base.
+        let newer = DanmakuSpecial {
+            source_date: MODE7_HISTORICAL_CUTOFF_DATE + 1,
+            ..mode7_special()
+        };
+        let scaled = scale_special_to_viewport(&newer, 862, 568);
+        assert!((scaled.x1 - 100.0).abs() < 1e-6);
+        assert!((scaled.y2 - 50.0).abs() < 1e-6);
+
+        // Fractional coordinates are viewport ratios, not tiny pixels.
+        let normalized = DanmakuSpecial {
+            x1: 0.25,
+            y1: 0.5,
+            x2: 0.75,
+            y2: 0.5,
+            ..mode7_special()
+        };
+        let mapped = scale_special_to_viewport(&normalized, 800, 600);
+        assert!((mapped.x1 - 200.0).abs() < 1e-6);
+        assert!((mapped.y1 - 300.0).abs() < 1e-6);
+        assert!((mapped.x2 - 600.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mode7_frame_interpolates_position_alpha_and_lifetime() {
+        let xml = r#"<i><d p="0.0,7,25,16777215,1291190667,0,x,1">["50","245","0.1-1.00","4.50","达成","0","0","350","0"]</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        // 545x388 is the old base, so source coordinates map 1:1.
+        let viewport = DanmakuViewport::new(545, 388);
+        let prepared = engine.prepare(viewport, 1);
+        assert_eq!(prepared.items().len(), 1);
+        assert_eq!(prepared.items()[0].mode, DanmakuMode::Special);
+        assert_eq!(prepared.stats().prepared_special_items, 1);
+
+        let frame_at = |seconds| prepared.frame_layout(Duration::from_secs_f64(seconds), 1);
+        let start = frame_at(0.0);
+        assert_eq!(start.items.len(), 1);
+        assert_eq!(DanmakuFrameStats::from_layout(&start).special_items, 1);
+        assert_close(start.items[0].x, 50.0);
+        assert_close(start.items[0].y, 245.0);
+        assert_close(start.items[0].opacity, 0.1);
+
+        let middle = frame_at(2.25);
+        assert_eq!(middle.items.len(), 1);
+        assert_close(middle.items[0].x, 200.0);
+        assert_close(middle.items[0].y, 122.5);
+        assert_close(middle.items[0].opacity, 0.55);
+
+        // The animation uses [start, end), so its last frame is already gone.
+        assert!(frame_at(4.5).items.is_empty());
+        assert!(frame_at(5.0).items.is_empty());
+    }
+
+    #[test]
+    fn mode7_render_plan_applies_the_frame_alpha_to_glyphs() {
+        let xml = r#"<i><d p="0.0,7,25,16777215,1291190667,0,x,1">["50","245","0-1","5.0","渐变","0","0","50","245"]</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let plan = engine.render_plan(
+            Duration::from_secs_f64(2.5),
+            DanmakuViewport::new(545, 388),
+            1,
+        );
+        assert!(!plan.items.is_empty());
+        for glyph in &plan.items {
+            assert!(
+                (glyph.color_rgba[3] - 0.5).abs() < 0.02,
+                "glyph alpha {} should follow the mode7 ramp",
+                glyph.color_rgba[3]
+            );
+        }
+    }
+
+    #[test]
+    fn mode7_duration_longer_than_scroll_stays_in_the_frame_window() {
+        let xml = r#"<i><d p="0.0,7,25,16777215,1291190667,0,x,1">["10","10","1-1","12","长弹幕","10","10"]</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let viewport = DanmakuViewport::new(545, 388);
+        let prepared = engine.prepare(viewport, 1);
+        let frame = prepared.frame_layout(Duration::from_secs(10), 1);
+        assert_eq!(frame.items.len(), 1);
+        assert_eq!(frame.items[0].mode, DanmakuMode::Special);
+    }
+
+    #[test]
+    fn mode7_parser_rejects_non_finite_values_and_caps_duration() {
+        let xml = r#"<i>
+<d p="1.0,7,25,16777215,1291190667,0,x,1">["10","20","0.1-1","inf","无限时长","0","0","100","200"]</d>
+<d p="2.0,7,25,16777215,1291190667,0,x,2">["NaN","20","0.1-1","4","NaN 坐标","0","0","100","200"]</d>
+<d p="3.0,7,25,16777215,1291190667,0,x,3">["10","20","NaN-1","4","坏 alpha","0","0","100","200"]</d>
+<d p="4.0,7,25,16777215,1291190667,0,x,4">["10","20","0.1-1","999999","超长时长","0","0","100","200"]</d>
+<d p="5.0,7,25,16777215,1291190667,0,x,5">["10","20","0.1-1","4.5","正常","0","0","100","200"]</d>
+</i>"#;
+        let items = parse_bilibili_xml(xml).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "超长时长");
+        assert_eq!(
+            items[0].special.as_ref().unwrap().duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(items[1].text, "正常");
+        assert_eq!(items[1].special.as_ref().unwrap().duration_seconds, 4.5);
+    }
+
+    #[test]
+    fn mode7_sanitizer_rejects_non_finite_and_caps_duration() {
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: f64::INFINITY,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                x1: f64::NAN,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                alpha_from: f32::NAN,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert_eq!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: 1e9,
+                ..mode7_special()
+            })
+            .unwrap()
+            .duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: 0.0,
+                ..mode7_special()
+            })
+            .unwrap()
+            .duration_seconds,
+            MODE7_MIN_DURATION_SECONDS
+        );
+    }
+
+    #[test]
+    fn mode7_layout_caps_the_shared_frame_window() {
+        // Hand-built payloads bypass the parser, so the layout must sanitize
+        // them too before they reach DFM+.
+        let item = DanmakuItem {
+            id: 1,
+            pts: Duration::from_secs(0),
+            text: "外部构造".to_string(),
+            mode: DanmakuMode::Special,
+            font_size: 25.0,
+            color: DanmakuColor::WHITE,
+            opacity: 1.0,
+            is_self: false,
+            special: Some(DanmakuSpecial {
+                duration_seconds: 1e9,
+                ..mode7_special()
+            }),
+        };
+        let timeline = DanmakuTimeline::new(vec![item.clone()]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let prepared = engine.prepare(DanmakuViewport::new(545, 388), 1);
+        assert_eq!(prepared.items().len(), 1);
+        assert_eq!(
+            prepared.dfm_layout.items[0].duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            prepared.dfm_layout.max_duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            prepared
+                .frame_layout(Duration::from_secs(59), 1)
+                .items
+                .len(),
+            1
+        );
+        assert!(
+            prepared
+                .frame_layout(Duration::from_secs(61), 1)
+                .items
+                .is_empty()
+        );
+
+        let broken = DanmakuItem {
+            id: 2,
+            special: Some(DanmakuSpecial {
+                x1: f64::NAN,
+                ..mode7_special()
+            }),
+            ..item
+        };
+        let timeline = DanmakuTimeline::new(vec![broken]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        assert!(
+            engine
+                .prepare(DanmakuViewport::new(545, 388), 1)
+                .items()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn json_mode7_payload_becomes_a_special_comment() {
+        let input = r#"{"comments":[{"time":1,"content":"[\"10\",\"20\",\"1-1\",\"3\",\"JSON高级\",\"100\",\"20\"]","type":"7","date":1291190667}]}"#;
+        let timeline = DanmakuTimeline::from_json(input).unwrap();
+        assert_eq!(timeline.items().len(), 1);
+        let item = &timeline.items()[0];
+        assert_eq!(item.mode, DanmakuMode::Special);
+        assert_eq!(item.text, "JSON高级");
+        let special = item.special.as_ref().expect("json mode7 payload");
+        assert_eq!(special.x2, 100.0);
+        assert_eq!(special.source_date, 1_291_190_667);
+    }
+
+    #[test]
+    fn mode7_duplicate_merge_keeps_distinct_animation_paths() {
+        let xml = r#"<i>
+<d p="0.0,7,25,16777215,1291190667,0,x,1">["10","10","1-1","3","同文本","100","10"]</d>
+<d p="0.5,7,25,16777215,1291190667,0,x,2">["10","50","1-1","3","同文本","100","50"]</d>
+</i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let config = DanmakuLayoutConfig {
+            merge_duplicates: true,
+            ..DanmakuLayoutConfig::default()
+        };
+        let mut engine = DfmLayoutEngine::new(timeline, config);
+        let prepared = engine.prepare(DanmakuViewport::new(545, 388), 1);
+        assert_eq!(prepared.items().len(), 2);
+        assert_eq!(prepared.stats().prepared_special_items, 2);
+        let frame = prepared.frame_layout(Duration::from_secs_f64(1.0), 1);
+        assert_eq!(frame.items.len(), 2);
+        assert_eq!(DanmakuFrameStats::from_layout(&frame).special_items, 2);
     }
 
     #[test]

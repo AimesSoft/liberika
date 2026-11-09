@@ -5065,6 +5065,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }
     }
 
@@ -6149,6 +6150,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: crate::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }])
         .unwrap();
         let mut stale_engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
@@ -6210,6 +6212,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     color: crate::danmaku::DanmakuColor::WHITE,
                     opacity: 1.0,
                     is_self: false,
+                    special: None,
                 })
                 .collect(),
         )
@@ -6420,6 +6423,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: crate::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }])
         .unwrap();
         let mut presenter = PresenterRuntime::new(PresenterConfig {
@@ -6611,6 +6615,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: crate::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }])
         .unwrap();
         let mut fallback_engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());

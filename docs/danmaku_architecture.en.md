@@ -78,6 +78,32 @@ flowchart LR
 
 `dfm_core` is already a migrated version of NipaPlay DFM+ core, not a new algorithm written from scratch. The important boundary is that `DanmakuSession` is liberika's input session layer, while `dfm.rs` is the adapter that maps active timelines and `DanmakuLayoutConfig` into a DFM+ prepare request and back into liberika's `DanmakuFrameLayout`.
 
+### Mode 7 (advanced) comments
+
+Bilibili mode 7 comments store a JSON array instead of plain text in `<d>`.
+`parse_bilibili_xml` extracts the display text, a linear path from `(x1,y1)` to
+`(x2,y2)`, a duration and an alpha ramp; both the 14-element new format and the
+7/5-element legacy formats are accepted. Plain-text mode 7 degrades to a fixed
+top comment, while code (8) and BAS (9) entries are dropped. JSON timelines
+accept the same payload in `content` when `type` is `"7"`.
+
+`DanmakuItem.special` carries the animation into the DFM+ adapter. The layout
+scales coordinates to the viewport: fractions in `[0,1]` are treated as
+viewport ratios; absolute pixels use the historical player base selected by the
+comment's `date` (545x388 before 2013-11-10, 862x568 afterwards). Mode 7
+comments bypass collision tracks: `for_each_frame_item` interpolates their
+position over their own `[start,end)` lifetime and multiplies the alpha ramp
+into `DanmakuPlacedItem.opacity`, so no shader change is needed on any GPU
+backend. The frame look-behind window (`PreparedLayout.max_duration_seconds`)
+includes those custom durations. `zRotate` is parsed but not applied because
+the instanced renderers draw axis-aligned quads; source `/n` escapes are folded
+into spaces for the single-line glyph layout.
+
+Payloads with non-finite numbers are dropped, and durations are clamped to
+`[0.1, 60]` seconds. The look-behind window is shared by every item, so one
+malformed comment must not be able to widen it without bound; the same check
+runs again at layout time for hand-built `DanmakuSpecial` values.
+
 ## Replacement Boundary
 
 The part that should be replaced “as close as possible to the original DFM+ core” is `crates/erika/src/danmaku/dfm.rs` plus `crates/erika/src/danmaku/dfm_core/*`.

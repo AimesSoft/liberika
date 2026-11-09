@@ -78,6 +78,14 @@ flowchart LR
 
 `dfm_core` は NipaPlay DFM+ core を移植したもので、ゼロから書いた別アルゴリズムではありません。重要なのは、`DanmakuSession` が liberika の input session layer であり、`dfm.rs` が active timeline と `DanmakuLayoutConfig` を DFM+ の prepare request に変換し、さらに `DanmakuFrameLayout` に戻す adapter だという点です。
 
+### mode 7 高度弾幕
+
+B站の mode 7 弾幕は `<d>` に JSON 配列を格納します。`parse_bilibili_xml` は表示テキスト、`(x1,y1)` から `(x2,y2)` への線形パス、duration、alpha 変化を取り出し、14 要素の新形式と 7/5 要素の旧形式に対応します。プレーンテキストの mode 7 は上部固定弾幕にフォールバックし、コード弾幕(8) と BAS(9) は破棄します。JSON timeline でも `type: "7"` かつ `content` が JSON 配列なら有効です。
+
+アニメーション情報は `DanmakuItem.special` から DFM+ アダプタへ渡されます。layout 時に座標を viewport へ変換します。全座標が `[0,1]` なら比率として扱い、絶対ピクセルの場合は `date` から歴史的なプレーヤー基準（2013-11-10 以前は 545×388、以降は 862×568）を選びます。mode 7 は衝突トラックに参加せず、`for_each_frame_item` が独自の `[start,end)` 寿命で位置を補間し、alpha 変化を `DanmakuPlacedItem.opacity` に乗算します。そのため GPU バックエンドの shader 変更は不要です。フレームの参照窓（`PreparedLayout.max_duration_seconds`）にはこの独自 duration が含まれます。`zRotate` は解析のみで未適用（instanced renderer は軸平行 quad を描画）、`/n` は単行グリフ配置のため空白に畳み込みます。
+
+NaN や inf などの非有限値を含むペイロードは破棄し、duration は 0.1〜60 秒に制限します。フレーム参照窓は全弾幕で共有するため、1 件の不正な弾幕で無制限に広がらないようにします。外部が手組みした `DanmakuSpecial` に対しても layout 時に同じ検証を行います。
+
 ## 置き換え境界
 
 できるだけ「元の DFM+ core をそのまま受け持つ」べき部分は、`crates/erika/src/danmaku/dfm.rs` と `crates/erika/src/danmaku/dfm_core/*` です。

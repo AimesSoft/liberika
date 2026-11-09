@@ -79,6 +79,7 @@ fn main() -> Result<()> {
         color: DanmakuColor::WHITE,
         opacity: 1.,
         is_self: false,
+        special: None,
     }])?;
     let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
     let plan = engine.render_plan(
