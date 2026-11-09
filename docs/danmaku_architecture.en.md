@@ -99,6 +99,11 @@ includes those custom durations. `zRotate` is parsed but not applied because
 the instanced renderers draw axis-aligned quads; source `/n` escapes are folded
 into spaces for the single-line glyph layout.
 
+Payloads with non-finite numbers are dropped, and durations are clamped to
+`[0.1, 60]` seconds. The look-behind window is shared by every item, so one
+malformed comment must not be able to widen it without bound; the same check
+runs again at layout time for hand-built `DanmakuSpecial` values.
+
 ## Replacement Boundary
 
 The part that should be replaced “as close as possible to the original DFM+ core” is `crates/erika/src/danmaku/dfm.rs` plus `crates/erika/src/danmaku/dfm_core/*`.

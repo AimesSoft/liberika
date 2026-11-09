@@ -84,6 +84,8 @@ B站 mode 7 弹幕的 `<d>` 内容是 JSON 数组而非纯文本。`parse_bilibi
 
 动画数据通过 `DanmakuItem.special` 进入 DFM+ 适配层。布局阶段把坐标还原到当前视口：全部坐标落在 `[0,1]` 时按视口比例映射；绝对像素坐标按 `date` 选择历史播放器基准（2013-11-10 之前 545×388，之后 862×568）。mode 7 不参与碰撞轨道，`for_each_frame_item` 按自身的 `[start,end)` 生命周期插值位置，并把渐变 alpha 乘入 `DanmakuPlacedItem.opacity`，因此三套 GPU 后端无需改 shader 即可获得淡入效果；帧查询的回看窗口（`PreparedLayout.max_duration_seconds`）也覆盖自定义时长。`zRotate` 只解析不应用（instanced 渲染器绘制轴对齐矩形），源文本里的 `/n` 在单行字形布局中折为空格。
 
+载荷中出现 NaN、inf 等非有限数值时整条丢弃，时长限制在 0.1–60 秒。帧回看窗口由所有弹幕共享，不能让单条异常弹幕把它无限放大；布局阶段对外部手工构造的 `DanmakuSpecial` 会再做一次同样的校验。
+
 ## 当前 DFM+ 替换边界
 
 应该替换成“尽量原封不动 DFM+ 内核”的部分，是 `crates/erika/src/danmaku/dfm.rs` 加 `crates/erika/src/danmaku/dfm_core/*` 这一段计算层。

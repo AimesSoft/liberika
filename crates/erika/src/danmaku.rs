@@ -2894,9 +2894,14 @@ fn prepare_layout(
             paint_width: measure.width as f64,
             paint_height: measure.height.max(font_size * 1.2) as f64,
             special: if source.mode == DanmakuMode::Special {
-                source.special.as_ref().map(|special| {
-                    scale_special_to_viewport(special, viewport.width, viewport.height)
-                })
+                source
+                    .special
+                    .as_ref()
+                    .cloned()
+                    .and_then(sanitize_mode7_special)
+                    .map(|special| {
+                        scale_special_to_viewport(&special, viewport.width, viewport.height)
+                    })
             } else {
                 None
             },
@@ -3006,6 +3011,11 @@ fn prepare_layout(
 const MODE7_BASE_OLD: (f64, f64) = (545.0, 388.0);
 const MODE7_BASE_NEW: (f64, f64) = (862.0, 568.0);
 const MODE7_HISTORICAL_CUTOFF_DATE: i64 = 1_384_099_200;
+/// Mode 7 durations come from untrusted XML/JSON. Cap them at the same upper
+/// bound as `scroll_duration_seconds` so a single comment cannot widen the
+/// frame look-behind window (shared by every item) without bound.
+const MODE7_MIN_DURATION_SECONDS: f64 = 0.1;
+const MODE7_MAX_DURATION_SECONDS: f64 = 60.0;
 
 /// Resolve a mode 7 payload into display text, an effective mode and its
 /// animation data. Returns `None` when the item cannot be rendered at all.
@@ -3040,16 +3050,19 @@ fn parse_mode7_json(raw: &str, source_date: i64) -> Option<(String, DanmakuSpeci
         return None;
     }
     let number = |value: &Value| -> Option<f64> {
-        match value {
+        let parsed = match value {
             Value::Number(number) => number.as_f64(),
             Value::String(text) => text.trim().parse().ok(),
             _ => None,
-        }
+        };
+        // Numeric strings such as "NaN", "inf" and "1e400" parse successfully
+        // but would poison coordinates and the shared frame window.
+        parsed.filter(|value| value.is_finite())
     };
     let x1 = number(values.first()?)?;
     let y1 = number(values.get(1)?)?;
     let (alpha_from, alpha_to) = parse_mode7_alpha(values.get(2)?)?;
-    let duration_seconds = number(values.get(3)?)?.max(0.1);
+    let duration_seconds = number(values.get(3)?)?;
     // `/n` is the source's escaped line break. The GPU render plan lays out a
     // single line, so fold it into a space rather than shaping a control
     // character that has no glyph.
@@ -3070,7 +3083,7 @@ fn parse_mode7_json(raw: &str, source_date: i64) -> Option<(String, DanmakuSpeci
     };
     Some((
         text,
-        DanmakuSpecial {
+        sanitize_mode7_special(DanmakuSpecial {
             x1,
             y1,
             x2,
@@ -3080,21 +3093,53 @@ fn parse_mode7_json(raw: &str, source_date: i64) -> Option<(String, DanmakuSpeci
             duration_seconds,
             z_rotate: (z_rotate_deg as f32).to_radians(),
             source_date,
-        },
+        })?,
     ))
 }
 
 /// Alpha field of a mode 7 array, e.g. `"0.1-1.00"`.
 fn parse_mode7_alpha(value: &Value) -> Option<(f32, f32)> {
-    let text = match value {
-        Value::String(text) => text.trim(),
+    let (from, to) = match value {
+        Value::String(text) => {
+            let (from, to) = text.trim().split_once('-')?;
+            (
+                from.trim().parse::<f32>().ok()?,
+                to.trim().parse::<f32>().ok()?,
+            )
+        }
         Value::Number(number) => {
-            return number.as_f64().map(|alpha| (alpha as f32, alpha as f32));
+            let alpha = number.as_f64()? as f32;
+            (alpha, alpha)
         }
         _ => return None,
     };
-    let (from, to) = text.split_once('-')?;
-    Some((from.trim().parse().ok()?, to.trim().parse().ok()?))
+    (from.is_finite() && to.is_finite()).then_some((from, to))
+}
+
+/// Reject non-finite animation values and cap the lifetime. Payloads may also
+/// be built by callers through the public `DanmakuSpecial` fields, so the
+/// layout applies this too: the frame look-behind window is shared by every
+/// item and would otherwise grow with one malformed duration.
+fn sanitize_mode7_special(mut special: DanmakuSpecial) -> Option<DanmakuSpecial> {
+    let finite = [
+        special.x1,
+        special.y1,
+        special.x2,
+        special.y2,
+        special.duration_seconds,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        && special.alpha_from.is_finite()
+        && special.alpha_to.is_finite()
+        && special.z_rotate.is_finite();
+    if !finite {
+        return None;
+    }
+    special.duration_seconds = special
+        .duration_seconds
+        .clamp(MODE7_MIN_DURATION_SECONDS, MODE7_MAX_DURATION_SECONDS);
+    Some(special)
 }
 
 /// Map mode 7 source coordinates onto the current viewport.
@@ -5219,6 +5264,131 @@ mod tests {
         let frame = prepared.frame_layout(Duration::from_secs(10), 1);
         assert_eq!(frame.items.len(), 1);
         assert_eq!(frame.items[0].mode, DanmakuMode::Special);
+    }
+
+    #[test]
+    fn mode7_parser_rejects_non_finite_values_and_caps_duration() {
+        let xml = r#"<i>
+<d p="1.0,7,25,16777215,1291190667,0,x,1">["10","20","0.1-1","inf","无限时长","0","0","100","200"]</d>
+<d p="2.0,7,25,16777215,1291190667,0,x,2">["NaN","20","0.1-1","4","NaN 坐标","0","0","100","200"]</d>
+<d p="3.0,7,25,16777215,1291190667,0,x,3">["10","20","NaN-1","4","坏 alpha","0","0","100","200"]</d>
+<d p="4.0,7,25,16777215,1291190667,0,x,4">["10","20","0.1-1","999999","超长时长","0","0","100","200"]</d>
+<d p="5.0,7,25,16777215,1291190667,0,x,5">["10","20","0.1-1","4.5","正常","0","0","100","200"]</d>
+</i>"#;
+        let items = parse_bilibili_xml(xml).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "超长时长");
+        assert_eq!(
+            items[0].special.as_ref().unwrap().duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(items[1].text, "正常");
+        assert_eq!(items[1].special.as_ref().unwrap().duration_seconds, 4.5);
+    }
+
+    #[test]
+    fn mode7_sanitizer_rejects_non_finite_and_caps_duration() {
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: f64::INFINITY,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                x1: f64::NAN,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                alpha_from: f32::NAN,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert_eq!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: 1e9,
+                ..mode7_special()
+            })
+            .unwrap()
+            .duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: 0.0,
+                ..mode7_special()
+            })
+            .unwrap()
+            .duration_seconds,
+            MODE7_MIN_DURATION_SECONDS
+        );
+    }
+
+    #[test]
+    fn mode7_layout_caps_the_shared_frame_window() {
+        // Hand-built payloads bypass the parser, so the layout must sanitize
+        // them too before they reach DFM+.
+        let item = DanmakuItem {
+            id: 1,
+            pts: Duration::from_secs(0),
+            text: "外部构造".to_string(),
+            mode: DanmakuMode::Special,
+            font_size: 25.0,
+            color: DanmakuColor::WHITE,
+            opacity: 1.0,
+            is_self: false,
+            special: Some(DanmakuSpecial {
+                duration_seconds: 1e9,
+                ..mode7_special()
+            }),
+        };
+        let timeline = DanmakuTimeline::new(vec![item.clone()]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let prepared = engine.prepare(DanmakuViewport::new(545, 388), 1);
+        assert_eq!(prepared.items().len(), 1);
+        assert_eq!(
+            prepared.dfm_layout.items[0].duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            prepared.dfm_layout.max_duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            prepared
+                .frame_layout(Duration::from_secs(59), 1)
+                .items
+                .len(),
+            1
+        );
+        assert!(
+            prepared
+                .frame_layout(Duration::from_secs(61), 1)
+                .items
+                .is_empty()
+        );
+
+        let broken = DanmakuItem {
+            id: 2,
+            special: Some(DanmakuSpecial {
+                x1: f64::NAN,
+                ..mode7_special()
+            }),
+            ..item
+        };
+        let timeline = DanmakuTimeline::new(vec![broken]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        assert!(
+            engine
+                .prepare(DanmakuViewport::new(545, 388), 1)
+                .items()
+                .is_empty()
+        );
     }
 
     #[test]
