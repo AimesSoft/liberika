@@ -3012,7 +3012,9 @@ fn resolve_mode7(
     source_date: i64,
 ) -> Option<(String, DanmakuMode, Option<DanmakuSpecial>)> {
     if !text.trim_start().starts_with('[') {
-        return Some((text.to_string(), DanmakuMode::Top, None));
+        // Plain-text mode 7 still uses Bilibili's `/n` line-break escape. The
+        // render plan is single-line, so fold it into a space here too.
+        return Some((text.replace("/n", " "), DanmakuMode::Top, None));
     }
     let (text, special) = parse_mode7_json(text, source_date)?;
     Some((text, DanmakuMode::Special, Some(special)))
@@ -5071,7 +5073,7 @@ mod tests {
 <d p="1.5,7,25,16777215,1291190667,0,x,1">["50","245","0.1-1.00","4.50","达成","0","0","350","0","1000","500","0","","Microsoft YaHei"]</d>
 <d p="2.0,7,25,16777215,1291190667,0,x,2">["50","245","0.1-1.00","4.50","旧格式","350","0"]</d>
 <d p="3.0,7,25,16777215,1291190667,0,x,3">["50","245","1-1","2.0","原地/n换行"]</d>
-<d p="4.0,7,25,16777215,1291190667,0,x,4">纯文本退化</d>
+<d p="4.0,7,25,16777215,1291190667,0,x,4">纯文本/n退化</d>
 <d p="5.0,8,25,16777215,1291190667,0,x,5">代码弹幕</d>
 <d p="6.0,9,25,16777215,1291190667,0,x,6">BAS 弹幕</d>
 <d p="7.0,7,25,16777215,1291190667,0,x,7">["坏","JSON"]</d>
@@ -5110,7 +5112,7 @@ mod tests {
         // JSON payloads are dropped.
         assert_eq!(items[3].mode, DanmakuMode::Top);
         assert!(items[3].special.is_none());
-        assert_eq!(items[3].text, "纯文本退化");
+        assert_eq!(items[3].text, "纯文本 退化");
         assert_eq!(items[4].mode, DanmakuMode::Scroll);
         assert_eq!(items[4].text, "普通滚动");
     }
