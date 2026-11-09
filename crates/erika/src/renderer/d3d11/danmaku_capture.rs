@@ -19,6 +19,7 @@ fn real_text_plan() -> DanmakuRenderPlan {
         color: DanmakuColor::WHITE,
         opacity: 1.0,
         is_self: false,
+        special: None,
     }])
     .unwrap();
     let mut engine = DfmLayoutEngine::new(

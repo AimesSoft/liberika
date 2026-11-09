@@ -265,6 +265,7 @@ mod tests {
             color: DanmakuColor::WHITE,
             opacity: 1.,
             is_self: false,
+            special: None,
         }])?;
         let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
         let mut host = Host::new(std::env::var_os("ERIKA_REQUIRE_HARDWARE_GPU").is_some())?;

@@ -302,6 +302,7 @@ mod windows_demo {
                 },
                 opacity: 1.0,
                 is_self: false,
+                special: None,
             });
         }
         DanmakuTimeline::new(items).map_err(|error| erika::PlayerError::Renderer(error.to_string()))

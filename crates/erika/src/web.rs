@@ -170,6 +170,7 @@ impl WebDanmaku {
             color,
             opacity: 1.0,
             is_self: true,
+            special: None,
         });
         self.timeline =
             DanmakuTimeline::new(items).map_err(|e| JsValue::from_str(&e.to_string()))?;
