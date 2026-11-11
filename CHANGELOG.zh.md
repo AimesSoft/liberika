@@ -2,6 +2,16 @@
 
 [English](CHANGELOG.md) · [日本語](CHANGELOG.ja.md)
 
+## Unreleased
+
+### 原生纹理输出
+
+- 新增 `PresenterRuntime::export_frame_dmabuf(w, h, scale)`：与 `export_frame_texture`
+  相同的合成结果，以一块线性 RGBA8 dma-buf 交出（fourcc `ABGR8888`、modifier 0，附带驱动
+  给出的行跨度与偏移）。宿主只要能导入 dma-buf（GTK 的 `GdkDmabufTexture`、EGL、Wayland
+  合成器），就不必自建 Vulkan 设备。`ExternalTextureInfo`、`ExternalTextureKind` 与 C API
+  均未改动。
+
 ## 0.3.6 - 2026-11-07
 
 ### 发布包

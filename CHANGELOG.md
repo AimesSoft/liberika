@@ -2,6 +2,17 @@
 
 [中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
 
+## Unreleased
+
+### Native texture output
+
+- `PresenterRuntime::export_frame_dmabuf(w, h, scale)` delivers the same
+  composite as `export_frame_texture` as one linear RGBA8 dma-buf (fourcc
+  `ABGR8888`, modifier 0, with the row pitch and offset the driver reports), so
+  a host that imports a dma-buf — GTK's `GdkDmabufTexture`, EGL, a Wayland
+  compositor — needs no Vulkan device of its own. `ExternalTextureInfo`,
+  `ExternalTextureKind` and the C API are unchanged.
+
 ## 0.3.6 - 2026-11-07
 
 ### Release packages

@@ -2,6 +2,17 @@
 
 [中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
 
+## Unreleased
+
+### ネイティブテクスチャ出力
+
+- `PresenterRuntime::export_frame_dmabuf(w, h, scale)` を追加しました。
+  `export_frame_texture` と同じ合成結果を、リニアな RGBA8 dma-buf 1 枚として渡します
+  （fourcc は `ABGR8888`、modifier は 0、ドライバが報告する行ピッチとオフセット付き）。
+  dma-buf を import できるホスト（GTK の `GdkDmabufTexture`、EGL、Wayland コンポジタ）は
+  自前の Vulkan デバイスを持つ必要がありません。`ExternalTextureInfo`、
+  `ExternalTextureKind`、C API はいずれも変更ありません。
+
 ## 0.3.6 - 2026-11-07
 
 ### リリースパッケージ
