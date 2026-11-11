@@ -549,6 +549,10 @@ pub struct WgpuRenderer {
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     linux_vulkan_export:
         Option<std::result::Result<crate::renderer::vulkan_export::VulkanExportContext, String>>,
+    /// Ring of linear dma-buf export targets (`export_frame_dmabuf`), reused
+    /// across frames and rebuilt when the export size changes.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    linux_dmabuf_pool: Option<crate::renderer::vulkan_dmabuf_export::DmabufExportPool>,
     adapter: wgpu::Adapter,
     #[cfg(target_os = "android")]
     android_vulkan: Option<AndroidVulkanInterop>,
@@ -1725,6 +1729,8 @@ impl WgpuRenderer {
             linux_import_failure: None,
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             linux_vulkan_export: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_dmabuf_pool: None,
             flutter_metrics: None,
             flutter_frame: None,
             adapter: context.adapter,
@@ -5063,6 +5069,81 @@ impl RendererBackend for WgpuRenderer {
             #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
             Ok(Some(crate::core::ExternalTextureFrame::new(info, texture)))
         }
+    }
+
+    /// The same composite, delivered as a linear dma-buf the host imports
+    /// without a Vulkan device of its own: renders into a fast offscreen
+    /// target, then copies it into a `DMA_BUF`-backed linear image.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn export_current_frame_dmabuf(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<crate::core::DmabufFrame>> {
+        self.validate_export_texture_size(width, height)?;
+        if !self.current_video_visible || self.current_video.is_none() {
+            return Ok(None);
+        }
+        // Ring of export targets, made once per size: allocating a linear
+        // dma-buf image, its memory and its descriptor per frame costs more
+        // than the copy itself (and shows up as engine-thread CPU time).
+        let stale = self
+            .linux_dmabuf_pool
+            .as_ref()
+            .is_none_or(|pool| pool.size() != (width, height));
+        if stale {
+            self.linux_dmabuf_pool = None;
+            let pool = crate::renderer::vulkan_dmabuf_export::DmabufExportPool::new(
+                linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?,
+                &self.device,
+                width,
+                height,
+            )
+            .map_err(PlayerError::Renderer)?;
+            self.linux_dmabuf_pool = Some(pool);
+        }
+        let source = self
+            .linux_dmabuf_pool
+            .as_ref()
+            .expect("pool was just made")
+            .source();
+
+        self.ensure_video_pipeline(OFFSCREEN_FORMAT);
+        if context.overlay.is_some_and(overlay_has_planes)
+            || context.danmaku.is_some_and(|plan| !plan.is_empty())
+        {
+            self.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
+        }
+        let danmaku = context.danmaku.filter(|plan| {
+            plan.generation == context.generation
+                && plan.viewport.width == width
+                && plan.viewport.height == height
+        });
+        let view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let draws = self.draw_current_video(
+            &view,
+            width,
+            height,
+            context.overlay,
+            danmaku,
+            OutputDescription::sdr(),
+        )?;
+        // No wait here: the slot's own fence is waited on when it comes round
+        // again, so the CPU prepares the next frame while the GPU copies this one.
+        let frame = self
+            .linux_dmabuf_pool
+            .as_mut()
+            .expect("pool was just made")
+            .present(&self.device, &self.queue, &source)
+            .map_err(PlayerError::Renderer)?;
+        self.stats.rendered_frames += 1;
+        self.stats.offscreen_frames += 1;
+        if draws > 0 {
+            self.stats.danmaku_passes += 1;
+            self.stats.danmaku_items += draws as u64;
+        }
+        Ok(Some(frame))
     }
 
     fn capture_current_frame(

@@ -14,6 +14,10 @@ const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
         | vk::ImageUsageFlags::SAMPLED.as_raw()
         | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
 );
+/// What a linear dma-buf target is used for: the composite is copied into it.
+const DMABUF_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::TRANSFER_DST.as_raw() | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
+);
 
 struct Allocation {
     raw: ash::Device,
@@ -54,6 +58,31 @@ pub(crate) struct VulkanExportContext {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     device_uuid: [u8; 16],
     driver_uuid: [u8; 16],
+    /// What the linear `DMA_BUF` probe found, as one line: it ends up in the
+    /// error a failed dma-buf export reports, so a host can tell why.
+    dma_buf_note: String,
+}
+
+impl VulkanExportContext {
+    /// The raw device, to encode the ownership release of an exported image.
+    pub(crate) fn raw_device(&self) -> &ash::Device {
+        &self.raw
+    }
+
+    /// `vkGetMemoryFdKHR` for the handle type an export used.
+    pub(crate) fn fd_api(&self) -> &khr::external_memory_fd::Device {
+        &self.fd_api
+    }
+
+    /// Every memory type the device has, to pick one for an external image.
+    pub(crate) fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+        &self.memory_properties
+    }
+
+    /// What the linear `DMA_BUF` probe found (`extension=… format=… exportable=…`).
+    pub(crate) fn dma_buf_note(&self) -> &str {
+        &self.dma_buf_note
+    }
 }
 
 fn error(stage: &str, error: vk::Result) -> String {
@@ -65,7 +94,7 @@ fn error(stage: &str, error: vk::Result) -> String {
 /// device-coherent, protected and lazily allocated types need features or
 /// usage this renderer does not enable. Software and unified-memory devices
 /// that only offer host-visible types use the first allowed one.
-fn memory_type_index(
+pub(crate) fn memory_type_index(
     properties: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
 ) -> Option<u32> {
@@ -142,6 +171,45 @@ impl VulkanExportContext {
         let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut identity);
         unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+        // What a linear DMA_BUF target would need, asked once and reported in
+        // one line: a failed export then says which part is missing instead of
+        // only "unsupported".
+        let extension = hal
+            .enabled_device_extensions()
+            .contains(&ash::ext::external_memory_dma_buf::NAME);
+        let (mut format_ok, mut exportable, mut query_error) = (false, false, String::new());
+        if extension {
+            let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+                .format(FORMAT)
+                .ty(vk::ImageType::TYPE_2D)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(DMABUF_USAGE)
+                .push_next(&mut external);
+            let mut external_properties = vk::ExternalImageFormatProperties::default();
+            let mut properties =
+                vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+            match unsafe {
+                instance.get_physical_device_image_format_properties2(
+                    physical,
+                    &format_info,
+                    &mut properties,
+                )
+            } {
+                Ok(()) => {
+                    format_ok = true;
+                    exportable = external_properties
+                        .external_memory_properties
+                        .external_memory_features
+                        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE);
+                }
+                Err(error) => query_error = format!(" ({error:?})"),
+            }
+        }
+        let dma_buf_note = format!(
+            "extension={extension} format={format_ok}{query_error} exportable={exportable}"
+        );
         let raw = hal.raw_device().clone();
         Ok(Self {
             fd_api: khr::external_memory_fd::Device::new(instance, &raw),
@@ -151,6 +219,7 @@ impl VulkanExportContext {
             memory_properties,
             device_uuid: identity.device_uuid,
             driver_uuid: identity.driver_uuid,
+            dma_buf_note,
         })
     }
 

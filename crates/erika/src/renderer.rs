@@ -41,6 +41,8 @@ pub(crate) mod presentation;
 #[doc(hidden)]
 pub mod sr;
 #[cfg(all(feature = "wgpu", target_os = "linux", not(target_env = "ohos")))]
+pub(crate) mod vulkan_dmabuf_export;
+#[cfg(all(feature = "wgpu", target_os = "linux", not(target_env = "ohos")))]
 pub(crate) mod vulkan_export;
 #[cfg(feature = "wgpu")]
 pub mod wgpu;
