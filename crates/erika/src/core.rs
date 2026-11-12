@@ -654,6 +654,89 @@ impl ExternalTextureFrame {
     }
 }
 
+/// An exported frame as a Linux dma-buf: one linear, single-planar RGBA8
+/// image that another API imports directly (GTK's `GdkDmabufTexture`, EGL,
+/// Wayland, a compositor).
+///
+/// The buffer is described by `fourcc = ABGR8888`, `modifier = 0`, one
+/// plane, with the layout here: `offset` bytes in, `stride` bytes between
+/// rows, `width × height` pixels.
+///
+/// Unlike [`ExternalTextureFrame`], nothing has to be imported into a second
+/// Vulkan device: the consumer maps the memory itself. The descriptor owns
+/// the allocation, so a consumer may keep reading it after this value and
+/// the producer's image are gone — close the last handle to free it.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[derive(Debug)]
+pub struct DmabufFrame {
+    fd: std::os::fd::OwnedFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+    offset: u32,
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+impl DmabufFrame {
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn new(
+        fd: std::os::fd::OwnedFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        offset: u32,
+    ) -> Self {
+        Self {
+            fd,
+            width,
+            height,
+            stride,
+            offset,
+        }
+    }
+
+    /// The dma-buf, borrowed. Import it with the layout below, not with
+    /// assumptions about the row order.
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+
+    /// The dma-buf's raw descriptor, borrowed (it stays owned by the frame).
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.fd)
+    }
+
+    /// The dma-buf, owned: the caller closes it (GTK's release callback).
+    pub fn into_fd(self) -> std::os::fd::OwnedFd {
+        self.fd
+    }
+
+    /// A new descriptor for the same buffer, owned by the caller.
+    pub fn try_clone_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.fd.try_clone()
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Bytes from one row to the next (at least `width * 4`).
+    pub fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// Bytes from the start of the descriptor to the first pixel.
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+}
+
 impl<'a> RenderFrameContext<'a> {
     pub fn new(media_time: Duration, generation: u64) -> Self {
         Self {
@@ -964,6 +1047,19 @@ pub trait RendererBackend {
         _width: u32,
         _height: u32,
     ) -> Result<Option<ExternalTextureFrame>> {
+        Err(PlayerError::Renderer(EXPORT_UNSUPPORTED.into()))
+    }
+
+    /// Render video, subtitles and danmaku into a linear dma-buf the host
+    /// imports without a Vulkan device of its own (Linux). Unsupported
+    /// backends return an error, never a CPU fallback.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn export_current_frame_dmabuf(
+        &mut self,
+        _context: RenderFrameContext<'_>,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<crate::core::DmabufFrame>> {
         Err(PlayerError::Renderer(EXPORT_UNSUPPORTED.into()))
     }
 

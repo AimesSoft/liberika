@@ -7,7 +7,8 @@ GPU テクスチャへ直接描画します。ウィンドウ surface や Flutte
 公開 API は wgpu の Rust 型を渡しません。ホストは異なる wgpu バージョンから
 ネイティブリソースを import できます。
 
-wgpu renderer の **Linux Vulkan OPAQUE_FD** と **Apple Metal** を実装しています。
+wgpu renderer の **Linux Vulkan OPAQUE_FD**、**Linux Vulkan DMA_BUF**（リニア、
+`export_frame_dmabuf` 経由）、**Apple Metal** を実装しています。
 その他の backend はエラーを返し、CPU へ暗黙にフォールバックしません。出力は
 sRGB 値を格納した SDR RGBA8Unorm で、debug HUD は含みません。必要な transfer
 変換はホストが行います。CPU ピクセルには `capture_frame_rgba_with_danmaku` を使います。
@@ -35,6 +36,29 @@ presenter に従います。
 seek、トラック変更、サイズ変更の後は数フレーム遅れて表示されることがあります。
 非対応の backend やサイズは再生処理の前にエラーになります。
 
+### dma-buf（Linux）
+
+dma-buf を自分で import できるホスト（GTK の `GdkDmabufTexture`、EGL、Wayland
+コンポジタ、別プロセス）は自前の Vulkan デバイスを必要としません。
+
+```rust,ignore
+if let Some(frame) = presenter.export_frame_dmabuf(1920, 1080, 2.0)? {
+    // 単一プレーン、fourcc は ABGR8888、modifier は 0。行間は `frame.stride()` バイト、
+    // 先頭ピクセルは `frame.offset()` バイト。
+    // frame.raw_fd() を import するか、frame.into_fd() で受け取って閉じてください。
+}
+```
+
+ポンプと描画は `export_frame_texture` と同一です。呼び出し位置も「ホストフレームに
+1 回」も、映像フレームができるまで `None` を返す点も同じです。合成先は今も
+`OPTIMAL` で、同一デバイス内のコピー 1 回でリニアな `DMA_BUF` 画像へ移します。
+つまり 2 つの export の違いは渡すハンドルだけです。OPAQUE_FD の import は Vulkan
+デバイスと完全一致する画像パラメータが要り、dma-buf の import は行ストライドだけで済みます。
+
+export は小さなリングからスロットを取るため、記述子は同じスロットが再利用される
+（3 回後）までに閉じてください。毎フレーム描画するコンポジタはこれを満たします。
+バッファはハンドルが開いている間は生き続け、生産側の画像が破棄されても残ります。
+
 ## C
 
 `erika_presenter_create_for_texture_export(config)` で wgpu を選びます。既存の
@@ -56,6 +80,7 @@ producer GPU の完了を待って返し、timeout は五秒です。producer se
 | Kind | 契約 |
 |---|---|
 | `Metal` | `native_handle` は借用 `id<MTLTexture>`、`device_id` は MTLDevice registry ID。同じ GPU を使い、consumer コマンド完了まで frame を保持します。または MTLTexture を独立に retain してから frame を解放し、その参照を完了まで保持します。 |
+| `DmabufFrame`（`export_frame_dmabuf` 由来） | 単一プレーンでリニアな RGBA8。fourcc は `ABGR8888`（`0x3432_4241`）、modifier は 0、行間は `stride` バイト、先頭ピクセルは `offset` バイト。dma-buf を import できるものであれば何でも受け取れます。Vulkan も device UUID の照合も不要です。使い終わったら記述子を閉じてください。バッファは生産側より長く生きます。 |
 | `VulkanOpaqueFd` | device/driver UUID を一致させ、借用 FD を複製します（0 も有効）。Vulkan は import 成功時に複製を消費します。指定の format/usage/tiling、flags 0、EXCLUSIVE、単一 mip/layer/sample の 2D image と dedicated allocation を使い、指定の size/type index で import します。サンプリング前に EXTERNAL から ownership を取得し、旧 layout は GENERAL とします。 |
 
 producer は export 後の image を再利用・更新しません。consumer GPU の完了後、

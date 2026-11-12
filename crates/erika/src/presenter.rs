@@ -2273,6 +2273,97 @@ impl PresenterRuntime {
         Ok(frame)
     }
 
+    /// The same composite as [`Self::export_frame_texture`], delivered as a
+    /// linear dma-buf (Linux).
+    ///
+    /// The host imports the descriptor with its own graphics API (GTK's
+    /// `GdkDmabufTexture`, EGL, a compositor) instead of importing a Vulkan
+    /// image into a second device: nothing to duplicate, no device to match.
+    /// Call once per host frame instead of `render_tick`, as
+    /// `export_frame_texture`; it drives subtitles, video and audio alike.
+    ///
+    /// ```no_run
+    /// # use erika::presenter::PresenterRuntime;
+    /// # fn tick(presenter: &mut PresenterRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    /// if let Some(frame) = presenter.export_frame_dmabuf(1280, 720, 1.0)? {
+    ///     // fourcc = ABGR8888, modifier = 0, one plane, frame.stride() apart.
+    ///     let fd = frame.into_fd();
+    ///     # let _ = fd;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    pub fn export_frame_dmabuf(
+        &mut self,
+        width: u32,
+        height: u32,
+        content_scale: f64,
+    ) -> Result<Option<crate::core::DmabufFrame>> {
+        // As `export_frame_texture`: validate before doing playback work.
+        self.renderer.validate_export_texture_size(width, height)?;
+        if self.audio_only_tick_active {
+            if self.video_decode_resume_attempts < MAX_VIDEO_DECODE_RESUME_ATTEMPTS {
+                self.resume_video_decode_now();
+            }
+        } else {
+            self.resume_pending = false;
+            self.video_decode_resume_attempts = 0;
+        }
+        let tick_started = Instant::now();
+        self.presentation.on_tick(tick_started);
+        self.commit_pending_playback_rate()?;
+        let viewport =
+            surface_metrics_to_viewport(SurfaceMetrics::new(width, height, content_scale));
+        self.export_danmaku_viewport = Some(viewport);
+        let pump_started = Instant::now();
+        self.pump_frame_inputs(None);
+
+        let plan_started = Instant::now();
+        if self.current_surface_metrics.is_none() && self.current_danmaku_viewport != Some(viewport)
+        {
+            self.move_danmaku_viewport(viewport);
+        }
+        self.refresh_stale_danmaku_plan();
+        self.last_danmaku_plan_duration = plan_started.elapsed();
+        self.last_pump_duration = pump_started.elapsed();
+
+        let overlay = self.capture_overlay(width, height);
+        let retargeted;
+        let danmaku = match self.current_danmaku.as_ref() {
+            Some(plan) if plan.viewport != viewport => {
+                let mut plan = plan.clone();
+                plan.retarget(viewport);
+                retargeted = plan;
+                Some(&retargeted)
+            }
+            plan => plan,
+        };
+        let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
+            .overlay(Some(&overlay))
+            .danmaku(danmaku)
+            .output_size(width, height);
+        let render_started = Instant::now();
+        let result = self
+            .renderer
+            .export_current_frame_dmabuf(context, width, height);
+        self.last_render_current_duration = render_started.elapsed();
+        self.last_render_duration = self.last_render_current_duration;
+        self.last_render_test_duration = Duration::ZERO;
+        self.last_tick_duration = tick_started.elapsed();
+        let frame = result.inspect_err(|_| self.stats.render_failures += 1)?;
+        if frame.is_some() {
+            self.stats.rendered_video_frames += 1;
+            self.presentation.on_render(
+                Instant::now(),
+                true,
+                self.is_playing(),
+                self.playback_rate,
+            );
+        }
+        Ok(frame)
+    }
+
     pub fn take_flutter_frame(&mut self) -> Option<crate::core::RendererFrameCapture> {
         self.renderer.take_flutter_frame()
     }
