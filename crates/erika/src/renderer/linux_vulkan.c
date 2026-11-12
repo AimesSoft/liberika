@@ -301,7 +301,7 @@ ErikaLinuxVkLease *erika_linux_vk_import_direct(ErikaLinuxVk *s, const AVFrame *
     mapped->format = AV_PIX_FMT_VULKAN;
     mapped->hw_frames_ctx = av_buffer_ref(s->frames_ref);
     int ret = mapped->hw_frames_ctx ?
-        av_hwframe_map(mapped, src, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT) : AVERROR(ENOMEM);
+        av_hwframe_map(mapped, src, AV_HWFRAME_MAP_READ ) : AVERROR(ENOMEM);
     if (ret < 0) {
         fail(s, "direct VA-API/DRM import", ret); av_frame_free(&mapped);
         av_buffer_unref(&s->frames_ref); return NULL;
@@ -349,7 +349,7 @@ int erika_linux_vk_copy(ErikaLinuxVk *s, const AVFrame *src, uint64_t luma, uint
     if (src->format == AV_PIX_FMT_VAAPI) {
         mapped->hw_frames_ctx = av_buffer_ref(s->frames_ref);
         if (!mapped->hw_frames_ctx) { ret = AVERROR(ENOMEM); goto done; }
-        ret = av_hwframe_map(mapped, src, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
+        ret = av_hwframe_map(mapped, src, AV_HWFRAME_MAP_READ);
     } else {
         ret = av_hwframe_get_buffer(s->frames_ref, mapped, 0);
         if (ret >= 0) ret = av_hwframe_transfer_data(mapped, src, 0); // CUDA -> Vulkan, GPU memory only
