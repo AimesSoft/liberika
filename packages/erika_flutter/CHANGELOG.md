@@ -7,6 +7,8 @@
 - Linux x64/ARM64 native release archives offer `bundled` and `system` variants
   on a glibc 2.35 baseline. Point `ERIKA_LIBRARY_DIR` at the extracted `lib/`;
   Linux libraries are not downloaded automatically.
+- Migrate the example to the official `material_ui` package for newer Flutter
+  SDKs. Playback smoke apps use core widgets; the plugin's Flutter minimum is unchanged.
 
 ## 0.3.6 - 2026-11-07
 
