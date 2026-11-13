@@ -22,10 +22,16 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
 
 > 英語版：[building.md](building.md)。
 
-## Linux のシステムライブラリビルド
+## Linux の 2 アーキテクチャ・2 依存モード
 
-Linux は FFmpeg 8、PulseAudio と liberika パッチ済み libass を使います。
-以下の xtask リリースターゲットとは別経路です。[Linux ガイド](linux.md) から始めます。
+`x86_64-unknown-linux-gnu` と `aarch64-unknown-linux-gnu` を対応するネイティブホストでビルドします。
+各 CPU に `bundled` / `system` を用意し、両方とも Ubuntu 22.04 / glibc 2.35 が基準です。
+共通入口は `ERIKA_LINUX_DEPENDENCIES=bundled bash scripts/build_linux_release.sh`。
+`system` に変更すると FFmpeg・フォントライブラリを外部依存にします。
+bundled は `xtask deps build --all` を再利用し、system は固定 FFmpeg 8 共有 SDK をビルド・テストのみに使用し配布しません。
+利用者は ABI 互換の FFmpeg 8 共有ライブラリを自分で導入できます。
+両方ともパッチ済み libass と SoundTouch を内蔵し、システムのデスクトップ・ドライバに依存するため完全静的ではありません。
+導入と検証は [Linux ガイド](linux.ja.md) を参照してください。
 
 ## 前提
 
@@ -114,6 +120,8 @@ workspace テストは libass を有効にするため、基本セットだけ�
 
 | `--target` | Triple | 備考 |
 |------------|--------|------|
+| `x86_64-unknown-linux-gnu`（`linux-x64`） | Linux x86_64 | 同一 CPU の GNU/Linux ホスト専用。PIC + VA-API/NVDEC/Vulkan。 |
+| `aarch64-unknown-linux-gnu`（`linux-arm64`） | Linux ARM64 | 同一 CPU の GNU/Linux ホスト専用。musl / cross build は対象外。 |
 | `host` | 現在のマシン | 既定。 |
 | `aarch64-apple-darwin` | Apple Silicon macOS | |
 | `x86_64-apple-darwin` | Intel macOS | |

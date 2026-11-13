@@ -12,6 +12,7 @@ on:
       - "crates/**"
       - "examples/**"
       - "packaging/**"
+      - "scripts/*linux*.sh"
       - "packages/erika_flutter/**"
       - "!packages/erika_flutter/**/*.md"
       - "packages/erika_ohos/**"
@@ -30,6 +31,7 @@ on:
       - "crates/**"
       - "examples/**"
       - "packaging/**"
+      - "scripts/*linux*.sh"
       - "packages/erika_flutter/**"
       - "!packages/erika_flutter/**/*.md"
       - "packages/erika_ohos/**"
@@ -110,6 +112,8 @@ jobs:
         env:
           CXX: g++
         run: python3 packaging/tests/test_api_alignment.py -v
+      - name: Test Linux bundle and ABI contracts
+        run: python3 packaging/tests/test_linux_bundle.py -v
       - name: Check license policy
         run: cargo run --locked -p xtask -- check license
       - name: Test native dependency plans

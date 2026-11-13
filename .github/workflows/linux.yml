@@ -6,12 +6,14 @@ on:
     paths:
       - ".cargo/**"
       - ".github/workflows/linux.yml"
+      - ".github/workflows/release.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**"
       - "examples/linux_native_demo/**"
-      - "packaging/tests/**"
+      - "packaging/**"
       - "scripts/*linux*.sh"
+      - "xtask/**"
       - "third_party/patches/**"
       - "third_party/wgpu-hal/**"
   push:
@@ -19,59 +21,193 @@ on:
     paths:
       - ".cargo/**"
       - ".github/workflows/linux.yml"
+      - ".github/workflows/release.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**"
       - "examples/linux_native_demo/**"
-      - "packaging/tests/**"
+      - "packaging/**"
       - "scripts/*linux*.sh"
+      - "xtask/**"
       - "third_party/patches/**"
       - "third_party/wgpu-hal/**"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
   group: linux-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   native:
-    runs-on: ubuntu-24.04
-    container: ubuntu:26.04
-    timeout-minutes: 45
+    name: Linux ${{ matrix.arch }} ${{ matrix.dependencies }}
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        dependencies: [bundled, system]
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    defaults:
+      run:
+        shell: bash
     env:
       DEBIAN_FRONTEND: noninteractive
       LIBGL_ALWAYS_SOFTWARE: "1"
-      # Compile/link the optional WSL bridge on CI; runtime GPU acceptance
-      # remains a separate real-device check.
-      ERIKA_LINUX_D3D12_INTEROP: "1"
+      ERIKA_LINUX_DEPENDENCIES: ${{ matrix.dependencies }}
+      ERIKA_BUILD_JOBS: "4"
+      CARGO_BUILD_JOBS: "4"
+      CARGO_HOME: /opt/cargo
+      RUSTUP_HOME: /opt/rustup
     steps:
-      - name: Install FFmpeg 8 and native build dependencies
+      - name: Install build and desktop test dependencies (no distro FFmpeg)
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates git curl build-essential pkg-config clang libclang-dev \
-            rustc cargo rustfmt python3 meson ninja-build patch xz-utils \
-            libavdevice-dev libavfilter-dev libavformat-dev libavcodec-dev \
-            libswresample-dev libswscale-dev libavutil-dev \
+            ca-certificates git curl build-essential cmake pkg-config clang libclang-dev \
+            python3 python3-venv ninja-build nasm patch xz-utils zip unzip \
             libfreetype-dev libharfbuzz-dev libfribidi-dev libfontconfig-dev \
             libpulse-dev libx11-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-0 \
             libxcursor1 libxi6 libxrandr2 \
-            libvulkan-dev mesa-vulkan-drivers libegl1 libgl1-mesa-dri \
-            directx-headers-dev libva-dev \
+            libvulkan-dev libva-dev libdrm-dev mesa-vulkan-drivers libegl1 libgl1-mesa-dri \
             fonts-dejavu-core pulseaudio pulseaudio-utils xvfb xauth
+          python3 -m venv /opt/build-tools
+          /opt/build-tools/bin/pip install meson==1.8.5
+          echo /opt/build-tools/bin >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
-      - name: Test as an unprivileged desktop user
-        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Cache native dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/cache
+            third_party/src
+            third_party/build
+            third_party/dist
+          key: native-linux-v1-jammy-${{ matrix.arch }}-${{ matrix.dependencies }}-${{ hashFiles('xtask/**', 'scripts/*linux*.sh', 'third_party/patches/**', '.github/workflows/linux.yml') }}
+      - name: Build, test and package as an unprivileged desktop user
         run: |
           useradd --create-home erika-ci
-          chown -R erika-ci:erika-ci "$GITHUB_WORKSPACE"
-          runuser -u erika-ci -- bash -c '
+          chown -R erika-ci:erika-ci "$GITHUB_WORKSPACE" /opt/cargo /opt/rustup
+          # The child shell expands these variables, not the root shell.
+          # shellcheck disable=SC2016
+          runuser -u erika-ci -- bash -euc '
+            source scripts/linux_build_env.sh
+            erika_prepare_linux_deps
             export XDG_RUNTIME_DIR="$(mktemp -d)"
             pulseaudio --start --exit-idle-time=-1
             pactl load-module module-null-sink sink_name=erika_ci
-            trap "pulseaudio --kill" EXIT
+            trap "pulseaudio --kill; rm -rf $XDG_RUNTIME_DIR" EXIT
             xvfb-run -a bash scripts/check_linux.sh
+            bash scripts/build_linux_release.sh
+            if [[ "$ERIKA_LINUX_DEPENDENCIES" == system ]]; then
+              mkdir -p test-sdk
+              ( cd "$ERIKA_LINUX_FFMPEG/lib"
+                tar -czf "$ERIKA_REPO_ROOT/test-sdk/ffmpeg-shared.tar.gz" ./*.so* )
+            fi
+            # Compile AND link the optional WSL bridge separately, AFTER packaging.
+            # The ordinary release is never built with this opt-in flag.
+            export ERIKA_LINUX_D3D12_INTEROP=1
+            bash scripts/prepare_linux_headers.sh
+            cargo build --locked -p erika_capi
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erika-capi-linux-${{ matrix.arch }}-${{ matrix.dependencies }}
+          path: dist/erika-capi-linux-${{ matrix.arch }}-${{ matrix.dependencies }}.zip
+          if-no-files-found: error
+      - name: Transfer test-only FFmpeg SDK (never a release asset)
+        if: matrix.dependencies == 'system'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-sdk-${{ matrix.arch }}
+          path: test-sdk/ffmpeg-shared.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  runtime:
+    name: Clean runtime ${{ matrix.arch }} ${{ matrix.dependencies }}
+    needs: native
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        dependencies: [bundled, system]
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      ARCH: ${{ matrix.arch }}
+      MODE: ${{ matrix.dependencies }}
+    steps:
+      - name: Install runtime libraries and C smoke-test compiler
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential binutils python3 unzip libx11-dev \
+            libpulse0 libfontconfig1 libva2 libva-drm2 libdrm2 libvulkan1 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2 \
+            mesa-vulkan-drivers libegl1 libgl1-mesa-dri fonts-dejavu-core \
+            pulseaudio pulseaudio-utils xvfb xauth
+          if [[ "$MODE" == system ]]; then
+            apt-get install -y --no-install-recommends libfreetype6 libharfbuzz0b libfribidi0
+          fi
+          # Neither mode may accidentally get the distro FFmpeg or libass.
+          if dpkg-query -W -f='${db:Status-Status} ${binary:Package}\n' \
+            | grep -E '^installed lib(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|ass)[0-9]'; then
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: erika-capi-linux-${{ matrix.arch }}-${{ matrix.dependencies }}
+          path: archives
+      - uses: actions/download-artifact@v4
+        if: matrix.dependencies == 'system'
+        with:
+          name: linux-test-sdk-${{ matrix.arch }}
+          path: test-sdk
+      - name: Verify extracted release and play through its C ABI
+        run: |
+          unzip -q "archives/erika-capi-linux-$ARCH-$MODE.zip" -d unpacked
+          if [[ "$MODE" == system ]]; then
+            mkdir test-sdk/lib
+            tar -xzf test-sdk/ffmpeg-shared.tar.gz -C test-sdk/lib
+            export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/test-sdk/lib"
+          fi
+          useradd --create-home erika-ci
+          chown -R erika-ci:erika-ci "$GITHUB_WORKSPACE"
+          # The child shell expands these variables, not the root shell.
+          # shellcheck disable=SC2016
+          runuser -u erika-ci -- bash -euc '
+            if [[ "$MODE" == system ]]; then
+              export LD_LIBRARY_PATH="$PWD/test-sdk/lib"
+            fi
+            export XDG_RUNTIME_DIR="$(mktemp -d)"
+            pulseaudio --start --exit-idle-time=-1
+            pactl load-module module-null-sink sink_name=erika_ci
+            trap "pulseaudio --kill; rm -rf $XDG_RUNTIME_DIR" EXIT
+            xvfb-run -a bash scripts/check_linux_bundle.sh \
+              "unpacked/erika-capi-linux-$ARCH-$MODE" "$ARCH" "$MODE"
           '

@@ -29,7 +29,7 @@ git push origin "v${VERSION}"
 
 ## Automated pipeline
 
-[release.yml](../.github/workflows/release.yml) builds platforms in parallel. iOS, tvOS, and Android build independent architecture slices and then assemble their archives; macOS arm64/x64 outputs form the universal bundle. The workflow creates a GitHub Release with 13 native/Flutter archives, the Web archive, and `SHA256SUMS`.
+[release.yml](../.github/workflows/release.yml) builds platforms in parallel. iOS, tvOS, and Android build independent architecture slices and then assemble their archives; macOS arm64/x64 outputs form the universal bundle. The workflow creates a GitHub Release with 17 native/Flutter archives, two Web archives, and `SHA256SUMS`.
 
 [release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) then:
 
@@ -44,7 +44,7 @@ A tag triggers the builds and the GitHub Release publish step. The manual `workf
 
 ## Release artifacts
 
-A complete release contains 15 ZIPs plus `SHA256SUMS`:
+A complete release contains 20 ZIPs plus `SHA256SUMS`:
 
 | Platform | Archive naming | Count |
 |---|---|---|
@@ -55,11 +55,12 @@ A complete release contains 15 ZIPs plus `SHA256SUMS`:
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
 | Web / WASM | `liberika-web-X.Y.Z.zip`, `liberika-web-nofont-X.Y.Z.zip` | 2 |
+| Linux x64 / ARM64 | `erika-capi-linux-{x64,arm64}-{bundled,system}.zip` | 4 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI bundles include the library, `include/erika.h`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, dependency license texts, and a `MANIFEST.txt` with the tag/commit. iOS/tvOS contain device + simulator XCFramework slices. The combined Android bundle contains static/shared libraries and matching `libc++_shared.so` for four ABIs. Flutter Android bundles contain one ABI's shared runtime each.
 
-OpenHarmony uses the 5.1.0 Native SDK with compatible SDK 18. Linux currently builds from source; use the [Linux guide](linux.md).
+OpenHarmony uses the 5.1.0 Native SDK with compatible SDK 18. The four Linux combinations reuse the [Linux workflow](../.github/workflows/linux.yml), all built on Ubuntu 22.04 / glibc 2.35; publishing waits for clean-runtime acceptance. Bundled embeds FFmpeg/subtitle libraries; system excludes the FFmpeg SDK and accepts user-installed ABI-compatible FFmpeg 8 shared libraries, whose licensing depends on their configuration. Neither is fully static. Dependency reports accompany each archive. Flutter Linux uses `ERIKA_LIBRARY_DIR`, not automatic downloads. See the [Linux guide](linux.md).
 
 ## OHPM upload timeout
 

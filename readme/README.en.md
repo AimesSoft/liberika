@@ -42,7 +42,7 @@ the server.
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | Matching C ABI bundle and `erika.h` | [Native integration](../docs/integration.md) |
 | Rust | Git dependency pinned to `v0.3.4` | [Build guide](../docs/building.md) |
-| Linux | System FFmpeg 8 and patched libass; source build | [Linux guide](../docs/linux.md) |
+| Linux | x64 / ARM64, bundled / system modes, glibc 2.35 baseline | [Linux guide](../docs/linux.md) |
 
 As of 2026-11-06, OHPM lists 0.3.4 as the latest public version.
 Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.4).
@@ -109,7 +109,7 @@ subscriptions; `PresenterRuntime` owns rendering and audio. C hosts use
 | Windows 10+ | D3D11VA / software | D3D11 | WASAPI | x64 / ARM64 bundles, Flutter |
 | Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | Four ABI bundles, Flutter |
 | OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 bundle, Flutter, OHPM |
-| Linux (experimental) | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust, C ABI and Flutter source builds |
+| Linux (experimental) | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system release builds; Rust, C ABI, Flutter |
 | Browser | WebCodecs | WebGL2 / Canvas | Web Audio | Release Web archive or source-built JS / WASM package |
 
 The [platform matrix](../docs/platform_matrix.zh.md) summarizes surface and HDR
@@ -125,7 +125,8 @@ cargo run -p xtask -- deps build --all --profile lgpl
 cargo build -p erika_capi
 ```
 
-Cross builds require the target triple. Linux uses the system-library path.
+Cross builds require the target triple. Linux uses `scripts/build_linux_release.sh`
+for both modes on Ubuntu 22.04; system mode accepts self-installed compatible FFmpeg 8 shared libraries.
 See [building](../docs/building.md), [releasing](../docs/releasing.md) and
 [contributing](../CONTRIBUTING.md).
 

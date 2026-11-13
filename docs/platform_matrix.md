@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-These platforms use 0.3.4 as their baseline. The browser backend is integrated into Erika Web and a separate Web archive is available in the Release. Linux is currently an experimental source-build target.
+These platforms use 0.3.4 as their baseline. The browser backend is integrated into Erika Web and a separate Web archive is available in the Release. Linux remains experimental; the current release workflow adds x64 / ARM64 × bundled / system packages, all built on Ubuntu 22.04.
 
 | Platform | Minimum | Decode / render | Audio | Distribution and builds |
 |---|---|---|---|---|
@@ -12,7 +12,7 @@ These platforms use 0.3.4 as their baseline. The browser backend is integrated i
 | Windows | 10 | D3D11VA / software + D3D11 | WASAPI | x64 / ARM64; Flutter |
 | Android | 8 / API 26 | MediaCodec / software + wgpu | AAudio | Four ABIs; Flutter |
 | OpenHarmony | API 18 | AVCodec / software + wgpu | OHAudio | arm64; Flutter / ArkTS OHPM |
-| Linux (experimental) | FFmpeg 8.x | NVDEC / VA-API / software + wgpu | PulseAudio / pipewire-pulse | Rust / C ABI / Flutter source build; no prebuilt package |
+| Linux (experimental) | glibc 2.35; system mode also needs FFmpeg 8 shared libraries | NVDEC / VA-API / software + wgpu | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system; Rust / C ABI / Flutter |
 | Browser | HTTPS / localhost; WebCodecs video and audio, OffscreenCanvas, WebGL2, Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | Prebuilt Release archive or JS / WASM source build; not published on npm |
 
 Native platforms provide a C ABI Presenter; browsers use the JavaScript / TypeScript `Player`. Hardware decode depends on the codec, device and driver; browser codec configuration support is checked at runtime.
@@ -69,6 +69,6 @@ since libass only produces alpha bitmaps.
 
 ## CI and validation
 
-Native builds cover six prebuilt platforms; the Linux native workflow runs source playback checks using Xvfb, Mesa and PulseAudio. The Flutter consumer workflow checks six prebuilt platforms. Device experiments for HDR output and platform lifecycle are in the [validation archive](investigations/README.md).
+Native builds cover seven prebuilt platforms. The Linux workflow builds both modes on both native architectures, using Xvfb, Mesa and PulseAudio for source and extracted-release playback checks, plus clean Ubuntu 22.04 runtime/ABI validation. The Flutter consumer workflow still checks its original six platforms; Linux uses `ERIKA_LIBRARY_DIR` for manual integration. Device experiments for HDR output and platform lifecycle are in the [validation archive](investigations/README.md).
 
 The Web workflow builds the complete WASM package and runs standalone player regressions. Erika Web was validated on macOS with Chrome 155.0.8059.85 using H.264/AAC/ASS and attached-font MKV, VP9/Opus WebM, 2,000 danmaku, live settings, chapters, screenshots and player lifecycle; Safari and Firefox remain unvalidated.

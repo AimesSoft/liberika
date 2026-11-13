@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-以下は 0.3.4 を基準としたプラットフォームです。ブラウザバックエンドは Erika Web に組み込まれ、Release には独立した Web アーカイブがあります。Linux は現在、実験的なソースビルド対象です。
+以下は 0.3.4 を基準としたプラットフォームです。ブラウザバックエンドは Erika Web に組み込まれ、Release には独立した Web アーカイブがあります。Linux の機能は実験的ですが、現在のリリースフローは x64 / ARM64 × bundled / system の 4 種類を Ubuntu 22.04 上でビルドします。
 
 | プラットフォーム | 最低バージョン | デコード / 描画 | 音声 | 配布とビルド |
 |---|---|---|---|---|
@@ -12,7 +12,7 @@
 | Windows | 10 | D3D11VA / ソフトウェア + D3D11 | WASAPI | x64 / ARM64；Flutter |
 | Android | 8 / API 26 | MediaCodec / ソフトウェア + wgpu | AAudio | 4 ABI；Flutter |
 | OpenHarmony | API 18 | AVCodec / ソフトウェア + wgpu | OHAudio | arm64；Flutter / ArkTS OHPM |
-| Linux（実験的） | FFmpeg 8.x | NVDEC / VA-API / ソフトウェア + wgpu | PulseAudio / pipewire-pulse | Rust / C ABI / Flutter をソースからビルド。ビルド済みパッケージなし |
+| Linux（実験的） | glibc 2.35；system は FFmpeg 8 共有ライブラリも必要 | NVDEC / VA-API / ソフトウェア + wgpu | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system；Rust / C ABI / Flutter |
 | ブラウザ | HTTPS / localhost、WebCodecs 動画・音声、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | Release アーカイブまたは JS / WASM ソースビルド。npm 未公開 |
 
 ネイティブプラットフォームは C ABI Presenter を提供し、ブラウザは JavaScript / TypeScript の `Player` を使用します。ハードウェアデコードの可否はコーデック、デバイス、ドライバに依存し、ブラウザのコーデック設定は実行時に対応を確認します。
@@ -69,6 +69,6 @@ Fallback を使います。
 
 ## CI と検証
 
-ネイティブビルドはビルド済み配布のある 6 プラットフォームを対象とします。Linux native workflow は Xvfb、Mesa、PulseAudio を使ってソースから再生を検証します。Flutter consumer workflow はビルド済み配布のある 6 プラットフォームを確認します。HDR 出力とプラットフォームのライフサイクルに関する実機検証は [検証記録](investigations/README.md) にあります。
+ネイティブビルドは 7 プラットフォームを対象とします。Linux workflow は両 CPU・両モードをネイティブビルドし、Xvfb・Mesa・PulseAudio でソースと展開済み Release の再生を確認し、クリーンな Ubuntu 22.04 で実行依存と ABI 基準を検証します。Flutter consumer workflow は従来の 6 プラットフォームを確認し、Linux は `ERIKA_LIBRARY_DIR` による手動組み込みです。HDR 出力とプラットフォームのライフサイクルに関する実機検証は [検証記録](investigations/README.md) にあります。
 
 Web workflow は完全な WASM パッケージをビルドし、独立プレーヤーの回帰テストを実行します。Erika Web は macOS の Chrome 155.0.8059.85 で H.264/AAC/ASS・添付フォント付き MKV、VP9/Opus WebM、2,000 件の弾幕、リアルタイム設定、チャプター、スクリーンショット、プレーヤーのライフサイクルを検証しました。Safari / Firefox は未検証です。

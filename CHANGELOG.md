@@ -4,6 +4,26 @@
 
 ## Unreleased
 
+## 0.3.7 - 2026-11-13
+
+### Linux release packages
+
+- Add x86_64 and ARM64 archives in both `bundled` and `system` variants,
+  all built on Ubuntu 22.04 / glibc 2.35. Each includes shared/static C ABI
+  libraries, headers, licenses and a dependency report.
+- `bundled` embeds FFmpeg and the subtitle stack; `system` uses ABI-compatible
+  FFmpeg 8 shared libraries, including user-installed builds. Neither is fully
+  static: desktop audio, Fontconfig and GPU driver interfaces remain external.
+- Gate publishing on native builds for all four combinations, ELF/ABI checks
+  and C ABI playback tests in clean Ubuntu 22.04 environments. Flutter Linux
+  consumes an extracted library through `ERIKA_LIBRARY_DIR`, not automatic downloads.
+
+### Danmaku
+
+- Support Bilibili mode 7 advanced comments.
+- Fix whole-comment opacity in D3D11 and wgpu by applying opacity after
+  composing each comment's text, outline and shadow.
+
 ### Native texture output
 
 - `PresenterRuntime::export_frame_dmabuf(w, h, scale)` delivers the same

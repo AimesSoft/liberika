@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.7 - 2026-11-13
+
+- Align with the 0.3.7 native runtime: Bilibili mode 7 advanced comments and
+  corrected whole-comment opacity in wgpu. The ArkTS API is unchanged.
+
 ## 0.3.6 - 2026-11-07
 
 - Align with the 0.3.6 release: color emoji in danmaku, and system fonts first for
