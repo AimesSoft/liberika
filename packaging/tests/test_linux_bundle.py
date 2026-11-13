@@ -191,6 +191,10 @@ class BundleContract(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
 
     def test_ci_runner_keeps_arguments_and_failure_status(self):
+        gdb_script = ROOT / "scripts/linux_test_runner.gdb"
+        gdb_text = gdb_script.read_text()
+        self.assertIn("thread apply all bt 32", gdb_text)
+        self.assertIn("quit 139", gdb_text)
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             gdb = work / "gdb"
@@ -200,18 +204,20 @@ class BundleContract(unittest.TestCase):
             for code in (0, 101, 255):
                 env = {**os.environ, "PATH": str(work) + os.pathsep + os.environ["PATH"],
                        "TEST_EXIT_CODE": str(code)}
+                # Run from a crate subdirectory like Cargo does for workspace tests.
                 result = subprocess.run(["bash", str(ROOT / "scripts/linux_test_runner.sh"), *arguments],
-                                        env=env, capture_output=True, text=True)
+                                        cwd=ROOT / "crates/erika", env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, code)
                 passed = result.stdout.splitlines()
                 self.assertIn("--return-child-result", passed)
-                self.assertIn("thread apply all bt 32", passed)
+                self.assertIn(str(gdb_script), passed)
                 self.assertEqual(passed[passed.index("--args") + 1:], arguments)
         workflow = (ROOT / ".github/workflows/linux.yml").read_text()
         self.assertIn('ERIKA_LINUX_TEST_BACKTRACE: "1"', workflow)
         script = (ROOT / "scripts/check_linux.sh").read_text()
+        self.assertIn('RUNNER="$PWD/scripts/linux_test_runner.sh"', script)
         for arch in ("X86_64", "AARCH64"):
-            self.assertIn(f'CARGO_TARGET_{arch}_UNKNOWN_LINUX_GNU_RUNNER="bash scripts/linux_test_runner.sh"', script)
+            self.assertIn(f'CARGO_TARGET_{arch}_UNKNOWN_LINUX_GNU_RUNNER="bash $RUNNER"', script)
         self.assertIn("--lib -- --test-threads=2", script)
 
     def test_release_gates_on_four_combinations_and_clean_runtime(self):
