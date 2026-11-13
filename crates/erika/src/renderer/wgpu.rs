@@ -876,7 +876,10 @@ struct WgpuBackendCandidate {
     force_fallback_adapter: bool,
     #[cfg(target_os = "android")]
     android_ahb_interop: bool,
-    #[cfg(target_os = "android")]
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     allow_cpu_adapter: bool,
     #[cfg(target_env = "ohos")]
     ohos_native_buffer_interop: bool,
@@ -945,6 +948,49 @@ fn fit_extent_without_upscale(
     }
 }
 
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn linux_wgpu_backend_candidates(
+    env_backends: Option<wgpu::Backends>,
+) -> Vec<WgpuBackendCandidate> {
+    if let Some(backends) = env_backends {
+        return vec![WgpuBackendCandidate {
+            label: "linux-env",
+            backends,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        }];
+    }
+    // Probe Vulkan and GL in separate instances so Vulkan hosts do not pay to
+    // initialize Mesa's EGL/DRI stack, while preserving hardware GL over
+    // software Vulkan when no hardware Vulkan driver is available.
+    vec![
+        WgpuBackendCandidate {
+            label: "linux-vulkan",
+            backends: wgpu::Backends::VULKAN,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: false,
+        },
+        WgpuBackendCandidate {
+            label: "linux-gl",
+            backends: wgpu::Backends::GL,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: false,
+        },
+        WgpuBackendCandidate {
+            label: "linux-vulkan-software",
+            backends: wgpu::Backends::VULKAN,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        },
+        WgpuBackendCandidate {
+            label: "linux-gl-software",
+            backends: wgpu::Backends::GL,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        },
+    ]
+}
+
 fn wgpu_backend_candidates() -> Vec<WgpuBackendCandidate> {
     #[cfg(target_os = "android")]
     {
@@ -1011,11 +1057,7 @@ fn wgpu_backend_candidates() -> Vec<WgpuBackendCandidate> {
     }
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
-        vec![WgpuBackendCandidate {
-            label: "linux",
-            backends: wgpu::Backends::all().with_env(),
-            force_fallback_adapter: false,
-        }]
+        linux_wgpu_backend_candidates(wgpu::Backends::from_env())
     }
     #[cfg(not(any(target_os = "android", target_os = "linux", target_env = "ohos")))]
     {
@@ -1296,6 +1338,32 @@ fn request_wgpu_device(
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         let hardware = linux_adapter_is_hardware(adapter_info.device_type, &adapter_info.name);
+        if !hardware && std::env::var("ERIKA_REQUIRE_HARDWARE_GPU").as_deref() == Ok("1") {
+            crate::trace::diagnostic(
+                serde_json::json!({
+                    "event": "wgpu_renderer",
+                    "stage": "adapter_selected",
+                    "backend": format!("{:?}", adapter_info.backend),
+                    "deviceType": format!("{:?}", adapter_info.device_type),
+                    "name": adapter_info.name,
+                    "driver": adapter_info.driver,
+                    "driverInfo": adapter_info.driver_info,
+                    "hardware": hardware,
+                    "displayBound": linux_surface.is_some(),
+                })
+                .to_string(),
+            );
+            return Err(format!(
+                "hardware GPU required, but selected CPU adapter {}",
+                adapter_info.name
+            ));
+        }
+        if !hardware && !candidate.allow_cpu_adapter {
+            return Err(format!(
+                "software adapter {} is deferred while probing hardware backends",
+                adapter_info.name
+            ));
+        }
         crate::trace::diagnostic(
             serde_json::json!({
                 "event": "wgpu_renderer",
@@ -1310,12 +1378,6 @@ fn request_wgpu_device(
             })
             .to_string(),
         );
-        if !hardware && std::env::var("ERIKA_REQUIRE_HARDWARE_GPU").as_deref() == Ok("1") {
-            return Err(format!(
-                "hardware GPU required, but selected CPU adapter {}",
-                adapter_info.name
-            ));
-        }
     }
     #[cfg(target_os = "android")]
     if candidate.backends == wgpu::Backends::VULKAN
@@ -6165,6 +6227,60 @@ mod tests {
             wgpu::DeviceType::Other,
             "llvmpipe (LLVM 21)"
         ));
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn linux_backend_candidates_prefer_hardware_before_software() {
+        let default = linux_wgpu_backend_candidates(None);
+        let summary: Vec<_> = default
+            .iter()
+            .map(|c| (c.label, c.backends, c.allow_cpu_adapter))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("linux-vulkan", wgpu::Backends::VULKAN, false),
+                ("linux-gl", wgpu::Backends::GL, false),
+                ("linux-vulkan-software", wgpu::Backends::VULKAN, true),
+                ("linux-gl-software", wgpu::Backends::GL, true),
+            ]
+        );
+        let overridden = linux_wgpu_backend_candidates(Some(wgpu::Backends::GL));
+        assert_eq!(overridden.len(), 1);
+        assert_eq!(overridden[0].backends, wgpu::Backends::GL);
+        assert!(overridden[0].allow_cpu_adapter);
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn linux_gl_repeated_instance_create_and_drop_is_safe() {
+        if std::env::var("ERIKA_REQUIRE_HARDWARE_GPU").as_deref() == Ok("1") {
+            return;
+        }
+        let candidate = WgpuBackendCandidate {
+            label: "linux-gl-reinit",
+            backends: wgpu::Backends::GL,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        };
+        let mut had_gl = false;
+        for iteration in 0..6 {
+            match request_wgpu_device(candidate, 0, 0, 1, None) {
+                Ok(context) => {
+                    had_gl = true;
+                    drop(context);
+                }
+                Err(error) if !had_gl && iteration == 0 => {
+                    eprintln!("skipping GL re-init check without EGL/GL adapter: {error}");
+                    return;
+                }
+                Err(error) => {
+                    panic!("GL re-initialization failed on iteration {iteration}: {error}");
+                }
+            }
+        }
+        assert!(had_gl);
     }
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]

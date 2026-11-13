@@ -3,9 +3,12 @@
 import os
 from pathlib import Path
 import runpy
+import re
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +85,51 @@ class ElfContract(unittest.TestCase):
             self.verify(symbols=SYMBOLS.replace("12 erika_destroy", "UND erika_destroy"))
 
 
+    def test_preprocessed_header_removes_inactive_declarations_and_comments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            header = Path(temporary) / "api.h"
+            header.write_text(HEADER + """
+/* Example: erika_documentation_example(); */
+#if defined(_WIN32)
+void erika_windows_only(void);
+#else
+void erika_platform_export(void);
+#endif
+""")
+            with patch.dict(os.environ, CC="cc -U_WIN32"):
+                api = VERIFY["preprocess_api_header"](header)
+            self.assertNotIn("erika_windows_only", api)
+            self.assertNotIn("erika_documentation_example", api)
+            with self.assertRaisesRegex(ValueError, "erika_platform_export"):
+                self.verify(api_header=api)
+            self.verify(api_header=api, symbols=SYMBOLS + "\n3: 0 1 FUNC GLOBAL DEFAULT 12 erika_platform_export")
+
+    def test_public_header_platform_contract(self):
+        header = ROOT / "crates/erika_capi/include/erika.h"
+        windows_only = {
+            "erika_presenter_windows_composition_swapchain_iunknown",
+            "erika_presenter_windows_flutter_texture_iunknown",
+        }
+        with patch.dict(os.environ, CC="cc -U_WIN32"):
+            native = VERIFY["preprocess_api_header"](header)
+        with patch.dict(os.environ, CC="cc -D_WIN32"):
+            windows = VERIFY["preprocess_api_header"](header)
+        names = lambda text: set(re.findall(r"\b(erika_\w+)\s*\(", text))
+        self.assertEqual(names(windows) - names(native), windows_only)
+        self.assertFalse(names(native) - names(windows))
+        symbols = "\n".join(f"{i}: 0 1 FUNC GLOBAL DEFAULT 12 {name}" for i, name in enumerate(sorted(names(native))))
+        self.verify(api_header=native, symbols=symbols)
+        with self.assertRaisesRegex(ValueError, "Missing C ABI exports:.*erika_presenter_windows"):
+            self.verify(api_header=windows, symbols=symbols)
+
+    def test_preprocessor_errors_are_not_ignored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            header = Path(temporary) / "api.h"
+            header.write_text("#error broken public header\n" + HEADER)
+            with self.assertRaises(subprocess.CalledProcessError):
+                VERIFY["preprocess_api_header"](header)
+
+
 class BundleContract(unittest.TestCase):
     def test_four_archives_and_other_platform_compatibility(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -142,6 +190,93 @@ class BundleContract(unittest.TestCase):
                 env = {**base, "FAKE_RUST_HOST": "x86_64-unknown-linux-gnu", **extra}
                 result = subprocess.run(["bash", "-c", script], cwd=ROOT, env=env, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_ci_runner_keeps_arguments_and_failure_status(self):
+        gdb_script = ROOT / "scripts/linux_test_runner.gdb"
+        gdb_text = gdb_script.read_text()
+        self.assertIn("thread apply all bt 32", gdb_text)
+        self.assertIn("quit 139", gdb_text)
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            gdb = work / "gdb"
+            gdb.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit "$TEST_EXIT_CODE"\n')
+            gdb.chmod(0o755)
+            arguments = ["/test binary", "--test-threads=2", "filter with spaces"]
+            for code in (0, 101, 255):
+                env = {**os.environ, "PATH": str(work) + os.pathsep + os.environ["PATH"],
+                       "TEST_EXIT_CODE": str(code)}
+                # Run from a crate subdirectory like Cargo does for workspace tests.
+                result = subprocess.run(["bash", str(ROOT / "scripts/linux_test_runner.sh"), *arguments],
+                                        cwd=ROOT / "crates/erika", env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code)
+                passed = result.stdout.splitlines()
+                self.assertIn("--return-child-result", passed)
+                self.assertIn(str(gdb_script), passed)
+                self.assertEqual(passed[passed.index("--args") + 1:], arguments)
+        workflow = (ROOT / ".github/workflows/linux.yml").read_text()
+        self.assertIn('ERIKA_LINUX_TEST_BACKTRACE: "1"', workflow)
+        script = (ROOT / "scripts/check_linux.sh").read_text()
+        self.assertIn('RUNNER="$PWD/scripts/linux_test_runner.sh"', script)
+        for arch in ("X86_64", "AARCH64"):
+            self.assertIn(f'CARGO_TARGET_{arch}_UNKNOWN_LINUX_GNU_RUNNER="bash $RUNNER"', script)
+        self.assertIn("--lib -- --test-threads=2", script)
+
+    def test_audio_cleanup_reaps_child_and_preserves_failures(self):
+        for command_exit, pulse_exit, sink_exit, expected in (
+            (0, 0, 0, 0), (37, 0, 0, 37), (0, 31, 0, 31), (0, 0, 23, 23),
+        ):
+            with self.subTest(command=command_exit, pulse=pulse_exit, sink=sink_exit), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                pulse = work / "pulseaudio"
+                pulse.write_text(f"#!{sys.executable}\n" + '''import os, signal, sys, time
+from pathlib import Path
+root = Path(os.environ["XDG_RUNTIME_DIR"])
+record = Path(os.environ["TEST_RECORD"])
+def stop(*args):
+    # Model a server that still writes during asynchronous shutdown.
+    time.sleep(0.1)
+    (root / "late-shutdown-file").write_text("finished")
+    record.with_suffix(".stopped").write_text("reaped before directory removal")
+    sys.exit(int(os.environ["TEST_PULSE_EXIT"]))
+signal.signal(signal.SIGTERM, stop)
+record.write_text(str(root) + "\\n" + str(os.getpid()))
+socket = Path(os.environ["PULSE_SERVER"].removeprefix("unix:"))
+socket.parent.mkdir()
+socket.touch()
+while True:
+    signal.pause()
+''')
+                pulse.chmod(0o755)
+                pactl = work / "pactl"
+                pactl.write_text('''#!/bin/sh
+if [ "$1" = info ]; then
+    test -f "${PULSE_SERVER#unix:}"
+else
+    exit "$TEST_SINK_EXIT"
+fi
+''')
+                pactl.chmod(0o755)
+                record = work / "record"
+                command_marker = work / "command-ran"
+                env = {**os.environ, "PATH": str(work) + os.pathsep + os.environ["PATH"],
+                       "TEST_RECORD": str(record), "TEST_PULSE_EXIT": str(pulse_exit),
+                       "TEST_SINK_EXIT": str(sink_exit)}
+                result = subprocess.run(
+                    ["bash", str(ROOT / "scripts/with_linux_audio.sh"), sys.executable, "-I", "-c",
+                     "from pathlib import Path; import sys; Path(sys.argv[1]).touch(); sys.exit(int(sys.argv[2]))",
+                     str(command_marker), str(command_exit)],
+                    env=env, capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertTrue(record.with_suffix(".stopped").exists(), result.stderr)
+                runtime, pid = record.read_text().splitlines()
+                self.assertFalse(Path(runtime).exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid), 0)
+                self.assertEqual(command_marker.exists(), sink_exit == 0)
+        workflow = (ROOT / ".github/workflows/linux.yml").read_text()
+        self.assertEqual(workflow.count("bash scripts/with_linux_audio.sh xvfb-run"), 2)
+        self.assertNotIn("pulseaudio --kill", workflow)
 
     def test_release_gates_on_four_combinations_and_clean_runtime(self):
         workflow = (ROOT / ".github/workflows/linux.yml").read_text()

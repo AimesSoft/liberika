@@ -951,6 +951,7 @@ ErikaStatus erika_presenter_attach_windows_hwnd(
     uint32_t height,
     double scale);
 
+#ifdef _WIN32
 /* Windows only. Returns an AddRef'd IUnknown for a DirectComposition swap
  * chain created by an attachment whose direct_composition capability is true.
  * The caller owns the returned COM reference and must Release it. */
@@ -964,6 +965,7 @@ ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(
 ErikaStatus erika_presenter_windows_flutter_texture_iunknown(
     ErikaPresenterHandle *handle,
     void **out_texture);
+#endif
 
 ErikaStatus erika_presenter_resize_surface(
     ErikaPresenterHandle *handle,

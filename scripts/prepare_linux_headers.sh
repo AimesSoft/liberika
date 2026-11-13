@@ -81,4 +81,40 @@ if [[ "${ERIKA_LINUX_D3D12_INTEROP:-0}" == 1 && ! -f "$PREFIX/directx-$DIRECTX_S
   cp "$source_dir/LICENSE" "$PREFIX/licenses/LICENSE.DirectX-Headers"
   touch "$PREFIX/directx-$DIRECTX_SHA"
 fi
+# Upstream DirectX-Headers.pc omits the directx/wsl/stubs include paths and -L
+# search path that Debian's package adds; ensure pkg-config exposes all of them.
+pc_file="$PREFIX/lib/pkgconfig/DirectX-Headers.pc"
+if [[ "${ERIKA_LINUX_D3D12_INTEROP:-0}" == 1 && -f "$pc_file" ]] && {
+  ! grep -q '/wsl/stubs' "$pc_file" || ! grep -q '^Libs:.*-L' "$pc_file"
+}; then
+  python3 -I - "$pc_file" "$PREFIX" <<'PY'
+from pathlib import Path
+import sys
+
+pc = Path(sys.argv[1])
+prefix = sys.argv[2]
+lines = pc.read_text().splitlines()
+has_libdir = any(line.startswith("libdir=") for line in lines)
+has_prefix = any(line.startswith("prefix=") for line in lines)
+lib_flag = "-L${libdir}" if has_libdir else ("-L${prefix}/lib" if has_prefix else f"-L{prefix}/lib")
+updated = []
+for line in lines:
+    if line.startswith("Cflags:"):
+        parts = line.split()
+        inc = next((p[2:] for p in parts[1:] if p.startswith("-I")), None)
+        if inc:
+            for suffix in ("/directx", "/wsl/stubs"):
+                flag = f"-I{inc}{suffix}"
+                if flag not in parts:
+                    parts.append(flag)
+            line = " ".join(parts)
+    elif line.startswith("Libs:"):
+        parts = line.split()
+        if not any(p.startswith("-L") for p in parts[1:]):
+            parts.insert(1, lib_flag)
+            line = " ".join(parts)
+    updated.append(line)
+pc.write_text("\n".join(updated) + "\n")
+PY
+fi
 printf 'Linux build headers ready: %s\n' "$PREFIX"

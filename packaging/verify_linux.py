@@ -5,6 +5,7 @@ import ctypes
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 
 MACHINES = {"x64": "Advanced Micro Devices X86-64", "arm64": "AArch64"}
@@ -64,6 +65,15 @@ def command(*args):
     return subprocess.check_output(args, text=True, env={**os.environ, "LC_ALL": "C"}, stderr=subprocess.STDOUT)
 
 
+def preprocess_api_header(path):
+    """Inspect the same platform declarations a native C consumer sees.
+
+    Preprocessing also removes documentation examples from the symbol contract.
+    The build and clean-runtime jobs both have the native C compiler installed.
+    """
+    return command(*shlex.split(os.environ.get("CC", "cc")), "-E", "-P", "-x", "c", str(path))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library", type=Path)
@@ -77,7 +87,7 @@ def main():
     needed, requirements = inspect_elf(
         command("readelf", "-hW", str(library)), command("readelf", "-dW", str(library)),
         command("readelf", "-VW", str(library)), command("readelf", "--dyn-syms", "-W", str(library)),
-        args.header.read_text(), args.arch, args.mode,
+        preprocess_api_header(args.header), args.arch, args.mode,
     )
     if args.archive:
         headers = command("readelf", "-hW", str(args.archive))

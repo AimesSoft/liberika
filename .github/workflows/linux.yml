@@ -65,6 +65,7 @@ jobs:
       LIBGL_ALWAYS_SOFTWARE: "1"
       ERIKA_LINUX_DEPENDENCIES: ${{ matrix.dependencies }}
       ERIKA_BUILD_JOBS: "4"
+      ERIKA_LINUX_TEST_BACKTRACE: "1"
       CARGO_BUILD_JOBS: "4"
       CARGO_HOME: /opt/cargo
       RUSTUP_HOME: /opt/rustup
@@ -74,7 +75,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates git curl build-essential cmake pkg-config clang libclang-dev \
-            python3 python3-venv ninja-build nasm patch xz-utils zip unzip \
+            python3 python3-venv ninja-build nasm patch xz-utils zip unzip gdb \
             libfreetype-dev libharfbuzz-dev libfribidi-dev libfontconfig-dev \
             libpulse-dev libx11-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-0 \
             libxcursor1 libxi6 libxrandr2 \
@@ -105,11 +106,7 @@ jobs:
           runuser -u erika-ci -- bash -euc '
             source scripts/linux_build_env.sh
             erika_prepare_linux_deps
-            export XDG_RUNTIME_DIR="$(mktemp -d)"
-            pulseaudio --start --exit-idle-time=-1
-            pactl load-module module-null-sink sink_name=erika_ci
-            trap "pulseaudio --kill; rm -rf $XDG_RUNTIME_DIR" EXIT
-            xvfb-run -a bash scripts/check_linux.sh
+            bash scripts/with_linux_audio.sh xvfb-run -a bash scripts/check_linux.sh
             bash scripts/build_linux_release.sh
             if [[ "$ERIKA_LINUX_DEPENDENCIES" == system ]]; then
               mkdir -p test-sdk
@@ -204,10 +201,6 @@ jobs:
             if [[ "$MODE" == system ]]; then
               export LD_LIBRARY_PATH="$PWD/test-sdk/lib"
             fi
-            export XDG_RUNTIME_DIR="$(mktemp -d)"
-            pulseaudio --start --exit-idle-time=-1
-            pactl load-module module-null-sink sink_name=erika_ci
-            trap "pulseaudio --kill; rm -rf $XDG_RUNTIME_DIR" EXIT
-            xvfb-run -a bash scripts/check_linux_bundle.sh \
+            bash scripts/with_linux_audio.sh xvfb-run -a bash scripts/check_linux_bundle.sh \
               "unpacked/erika-capi-linux-$ARCH-$MODE" "$ARCH" "$MODE"
           '

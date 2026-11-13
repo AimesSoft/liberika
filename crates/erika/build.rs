@@ -92,9 +92,29 @@ fn main() {
                 .compile("erika_linux_vulkan");
             if env::var("ERIKA_LINUX_D3D12_INTEROP").as_deref() == Ok("1") {
                 let directx = pkg_config::Config::new()
+                    .cargo_metadata(false)
                     .probe("DirectX-Headers")
                     .expect("WSL interop requires DirectX-Headers development files");
+                let mut directx_includes = Vec::new();
+                let mut fallback_link_search = None;
+                for path in &directx.include_paths {
+                    for subdir in ["directx", "wsl/stubs"] {
+                        let candidate = path.join(subdir);
+                        if candidate.is_dir() {
+                            directx_includes.push(candidate);
+                        }
+                    }
+                    if fallback_link_search.is_none() {
+                        if let Some(lib_dir) = path.parent().map(|root| root.join("lib")) {
+                            if lib_dir.join("libDirectX-Headers.a").is_file() {
+                                fallback_link_search = Some(lib_dir);
+                            }
+                        }
+                    }
+                    directx_includes.push(path.clone());
+                }
                 let va = pkg_config::Config::new()
+                    .cargo_metadata(false)
                     .probe("libva")
                     .expect("WSL interop requires libva-dev");
                 println!("cargo:rerun-if-changed=src/renderer/linux_wsl_d3d12.cpp");
@@ -103,13 +123,18 @@ fn main() {
                     .std("c++17")
                     .file("src/renderer/linux_wsl_d3d12.cpp")
                     .includes(&avutil_includes)
-                    .includes(directx.include_paths)
+                    .includes(directx_includes)
                     .includes(va.include_paths)
                     .includes(&vulkan.include_paths)
                     .warnings(true)
                     .compile("erika_linux_wsl");
 
                 // Static objects refer to GUIDs/libva after the archive.
+                if directx.link_paths.is_empty() {
+                    if let Some(lib_dir) = fallback_link_search {
+                        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+                    }
+                }
                 pkg_config::Config::new().probe("DirectX-Headers").unwrap();
                 pkg_config::Config::new().probe("libva").unwrap();
             }
