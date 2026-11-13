@@ -2,13 +2,57 @@
 
 > [中文](linux.zh.md) · [English](linux.md) · [日本語](linux.ja.md)
 
-Linux では、システムの FFmpeg 8.x、liberika のパッチ適用済み libass、wgpu、PulseAudio を使用して Rust プレーヤー、C ABI、Flutter をサポートします。PipeWire デスクトップには `pipewire-pulse` が必要です。WSL2 では WSLg の表示・音声サービスを使用します。
+Linux では、内蔵またはシステムの FFmpeg 8.x、liberika のパッチ適用済み libass、wgpu、PulseAudio を使用して Rust プレーヤー、C ABI、Flutter をサポートします。PipeWire デスクトップには `pipewire-pulse` が必要です。WSL2 では WSLg の表示・音声サービスを使用します。
 
-動画は X11 / Wayland のウィンドウに描画できます。Flutter では RGBA SDR テクスチャか Wayland ネイティブ動画レイヤーを使用できます。NVIDIA は NVDEC、Intel/AMD は VA-API を使用し、FFmpeg のソフトウェアデコードも利用できます。Linux は現在ソースからビルドします。
+動画は X11 / Wayland のウィンドウに描画できます。Flutter では RGBA SDR テクスチャか Wayland ネイティブ動画レイヤーを使用できます。NVIDIA は NVDEC、Intel/AMD は VA-API を使用し、FFmpeg のソフトウェアデコードも利用できます。リリースフローは x86_64 / ARM64 の両依存モードをビルドします。ソースビルドも利用できます。
 
 HDR サーフェスのネゴシエーションと VA-API の直接インポートは実験的です。[WSL D3D12 GPU コピー](wsl-gpu-copy.md) もデコードフレームの転送方法の一つです。デバイス、性能、検証結果は [Linux 検証記録](investigations/linux-validation.en.md) にあります。
 
-## Ubuntu 26.04 でのビルド
+## 配布アーカイブと Ubuntu 22.04 ビルド
+
+| CPU | 依存ライブラリ内蔵 | システム依存 |
+|---|---|---|
+| x86_64 | `erika-capi-linux-x64-bundled.zip` | `erika-capi-linux-x64-system.zip` |
+| ARM64 | `erika-capi-linux-arm64-bundled.zip` | `erika-capi-linux-arm64-system.zip` |
+
+**両モードとも Ubuntu 22.04 / glibc 2.35** をビルド基準とし、最大要件は
+GLIBCXX_3.4.30 / CXXABI_1.3.13 です。Ubuntu 26.04 への更新は不要です。
+`bundled` は FFmpeg、dav1d、zlib、パッチ済み libass、FreeType、HarfBuzz、FriBidi を静的に内蔵します。
+完全静的ではなく、libc/libstdc++、PulseAudio、Fontconfig、VA-API/DRM、Vulkan loader と GPU ドライバは外部依存です。
+Fontconfig 自体はシステムの FreeType に依存する場合があります。
+
+`system` は FFmpeg 8 とフォント共有ライブラリを利用し、パッチ済み libass と SoundTouch は内蔵します。
+ディストリビューションに FFmpeg 8 がなければ、互換共有ライブラリを自分で導入・ビルド
+（`--enable-shared`）し、`ldconfig` または `LD_LIBRARY_PATH` を設定できます。
+`ffmpeg` コマンドだけでは不十分で、旧ライブラリの名前変更は不可です。
+ABI メジャーは avdevice 62、avfilter 11、avformat/avcodec 62、swresample 6、swscale 9、avutil 60。
+FFmpeg 自体も対象の libc に対応する必要があり、ライセンスはそのビルド設定に依存します。
+ビルド・テスト専用 SDK は system アーカイブに含めません。
+
+各アーカイブには `.so`、`.a`、対応する `include/erika.h`、ライセンス、`MANIFEST.txt`、
+`DEPENDENCIES.txt` と実行手順を含みます。[同梱 README](../packaging/README.linux.md) に実行依存一覧があります。
+Flutter は展開先の `lib/` を `ERIKA_LIBRARY_DIR` に指定します。Linux の自動ダウンロードはありません。
+
+同一構造のアーカイブを生成するには、対象 CPU のネイティブ GNU/Linux で Rust 1.92+、
+C/C++/Clang、CMake、Ninja、NASM（x64）、Meson 1.8.5、pkg-config、Python 3、zip と
+フォント・PulseAudio・X11/Wayland・Vulkan・VA-API・DRM の開発パッケージを用意します。
+Ubuntu 22.04 の完全な一覧は [Linux workflow](../.github/workflows/linux.yml) を参照し、標準の古い Rust/Meson は使わないでください。
+
+```bash
+ERIKA_LINUX_DEPENDENCIES=bundled bash scripts/build_linux_release.sh
+```
+
+```bash
+ERIKA_LINUX_DEPENDENCIES=system bash scripts/build_linux_release.sh
+```
+
+固定 FFmpeg 8 SDK とハッシュ検証済みビルド用ヘッダーを準備し、libc/loader の置換やドライバの導入は行いません。
+出力は `target/linux-<mode>/<triple>/release`、ZIP は `dist/` です。
+新しいホストで基準を超える ABI が入ると検証が失敗するため、リリースには 22.04 を使用します。
+同じ環境で demo/検証を動かすには、Bash で `ERIKA_LINUX_DEPENDENCIES=bundled`（または `system`）を export し、
+`scripts/linux_build_env.sh` を source して `erika_prepare_linux_deps` を実行します。
+
+## Ubuntu 26.04 のシステム依存でビルド（別の方法）
 
 Rust 1.92 以降と FFmpeg **8.x** の開発ライブラリが必要です。Ubuntu 22.04 / 24.04 の標準 FFmpeg パッケージは、このビルドには古すぎます。
 
@@ -76,7 +120,7 @@ Rust 利用者は `wgpu` feature を有効にしてください。[ネイティ�
 
 `erika_presenter_attach_wgpu_surface` では、`XlibWindow` に X11 の `Window` ID と `Display*`、`WaylandSurface` に `wl_surface*` と `wl_display*` を渡します。ポインタは `uintptr_t` を経由して `uint64_t` にキャストします。detach または presenter の破棄が完了するまで、両方のホスト所有ハンドルを有効に保ってください。ウィンドウのイベントループスレッドで attach / render / resize / detach を行い、presenter ごとの呼び出しを直列化し、表示フレームごとに `render_tick` を実行します。幅と高さは物理ピクセル、scale は独立した DPI 係数です。`.so` 依存関係は rpath または `LD_LIBRARY_PATH` で解決し、`ldd` で確認します。
 
-Linux はシステムの FFmpeg 共有ライブラリと、静的 PIC の**パッチ適用済み libass 0.17.5**、システムのフォントライブラリを使用します。スクリプトは上流アーカイブの SHA256 を検証し、liberika のメモリフォントの順序付きフォールバックパッチを適用します。標準 libass はこの動作を保持しません。`ERIKA_LIBASS_DIR` に同等のパッチ適用済み prefix を指定できます。`ERIKA_FFMPEG_DIR` は既存の静的 FFmpeg バンドルを選択し、`ERIKA_USE_SYSTEM_LIBS=0` は従来のバンドル検索パスを維持しますが、対応する依存関係をすべて別途準備する必要があります。このガイドはシステムライブラリを使うネイティブ GNU/Linux ビルドを検証したもので、クロスコンパイルや musl は対象外です。ディストリビューションの FFmpeg コーデックとライセンスが適用され、`ERIKA_NATIVE_PROFILE=lgpl` はその構成を変更しません。PulseAudio 切断時はエラーを報告し、自動再接続は未実装です。
+通常の Cargo ビルドは既定でシステムの FFmpeg 共有ライブラリと、静的 PIC の**パッチ適用済み libass 0.17.5**、システムのフォントライブラリを使います。スクリプトは SHA256 を検証し、liberika のメモリフォントの順序付きフォールバックパッチを適用します。標準 libass は代替できません。手動ビルドでは `ERIKA_LIBASS_DIR` に同等のパッチ済み prefix、`ERIKA_FFMPEG_DIR` に静的 FFmpeg prefix を指定できます。統一パッケージ入口はこれらの上書きを拒否し、`ERIKA_LINUX_DEPENDENCIES=bundled|system` に対応する依存と環境を準備します。両モードの環境を混在させないでください。クロスコンパイルと musl は対象外です。外部 FFmpeg のコーデックとライセンスはその構成に依存し、`ERIKA_NATIVE_PROFILE=lgpl` は変更しません。PulseAudio 切断時はエラーを報告し、自動再接続は未実装です。
 
 ## 検証
 

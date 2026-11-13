@@ -2,13 +2,65 @@
 
 > [中文](linux.zh.md) · [English](linux.md) · [日本語](linux.ja.md)
 
-Linux supports the Rust player, C ABI, and Flutter through system FFmpeg 8.x, liberika's patched libass, wgpu, and PulseAudio. PipeWire desktops need `pipewire-pulse`; WSL2 uses WSLg display and audio services.
+Linux supports the Rust player, C ABI, and Flutter through bundled or system FFmpeg 8.x, liberika's patched libass, wgpu, and PulseAudio. PipeWire desktops need `pipewire-pulse`; WSL2 uses WSLg display and audio services.
 
-Video can render into X11 / Wayland windows. Flutter offers an RGBA SDR texture or a native Wayland video layer. NVIDIA uses NVDEC, Intel/AMD use VA-API, and FFmpeg software decoding is also available. Linux currently builds from source.
+Video can render into X11 / Wayland windows. Flutter offers an RGBA SDR texture or a native Wayland video layer. NVIDIA uses NVDEC, Intel/AMD use VA-API, and FFmpeg software decoding is also available. The release workflow builds x86_64 and ARM64 prebuilt bundles in both dependency modes; source builds remain available.
 
 HDR surface negotiation and direct VA-API import are experimental. The [WSL D3D12 GPU-copy bridge](wsl-gpu-copy.md) provides another decode-frame transfer path. Device, performance, and validation results are kept in the [Linux validation record](investigations/linux-validation.en.md).
 
-## Build on Ubuntu 26.04
+## Prebuilt bundles and Ubuntu 22.04 builds
+
+| CPU | Embedded dependencies | System dependencies |
+|---|---|---|
+| x86_64 | `erika-capi-linux-x64-bundled.zip` | `erika-capi-linux-x64-system.zip` |
+| ARM64 | `erika-capi-linux-arm64-bundled.zip` | `erika-capi-linux-arm64-system.zip` |
+
+**Both modes build on Ubuntu 22.04 / glibc 2.35**, with maximum requirements
+GLIBCXX_3.4.30 and CXXABI_1.3.13. Ubuntu 26.04 is not required.
+`bundled` statically embeds FFmpeg, dav1d, zlib, patched libass, FreeType,
+HarfBuzz and FriBidi. It is not fully static: libc/libstdc++, PulseAudio,
+Fontconfig, VA-API/DRM, Vulkan loader and GPU drivers remain system dependencies.
+Fontconfig may itself depend on the system FreeType.
+
+`system` uses FFmpeg 8 and font shared libraries; patched libass and SoundTouch
+remain embedded. If your distribution does not ship FFmpeg 8, install or build
+ABI-compatible shared libraries yourself (`--enable-shared`) and configure
+`ldconfig` or `LD_LIBRARY_PATH`. An `ffmpeg` executable alone is insufficient;
+do not rename older libraries. ABI majors: avdevice 62, avfilter 11,
+avformat/avcodec 62, swresample 6, swscale 9, avutil 60. Your FFmpeg build must
+also support your libc baseline. Its licensing depends on its configuration.
+The private FFmpeg build/test SDK is not included in the system archive.
+
+Each archive contains `.so`, `.a`, matching `include/erika.h`, licenses,
+`MANIFEST.txt`, `DEPENDENCIES.txt` and a runtime README. See the
+[bundle README](../packaging/README.linux.md) for runtime packages.
+Flutter accepts `ERIKA_LIBRARY_DIR=/absolute/path/to/extracted/lib`;
+there is no automatic Linux archive download.
+
+To build an archive, use a native GNU/Linux host of the desired architecture
+with Rust 1.92+, C/C++/Clang, CMake, Ninja, NASM (x64), Meson 1.8.5, pkg-config,
+Python 3, zip, and development packages for fonts, PulseAudio, X11/Wayland,
+Vulkan, VA-API and DRM. The [Linux workflow](../.github/workflows/linux.yml)
+contains the complete Ubuntu 22.04 installation list; its distro Rust/Meson
+are too old. Run each mode independently from the repository root:
+
+```bash
+ERIKA_LINUX_DEPENDENCIES=bundled bash scripts/build_linux_release.sh
+```
+
+```bash
+ERIKA_LINUX_DEPENDENCIES=system bash scripts/build_linux_release.sh
+```
+
+The entry point prepares a pinned FFmpeg 8 SDK and verified build-only headers,
+without replacing libc/loaders or installing GPU drivers. Outputs are isolated
+at `target/linux-<mode>/<triple>/release`; ZIP files go to `dist/`. A newer build
+host that introduces newer ABI requirements fails verification: use 22.04 for
+releases. To run demos/checks in this environment, in Bash first export
+`ERIKA_LINUX_DEPENDENCIES=bundled` (or `system`), source
+`scripts/linux_build_env.sh`, then call `erika_prepare_linux_deps`.
+
+## Build using distro libraries on Ubuntu 26.04 (alternative)
 
 Rust 1.92+ and FFmpeg **8.x** development libraries are required. Ubuntu 22.04
 and 24.04's default FFmpeg packages are too old for this build path.
@@ -174,15 +226,16 @@ the window event-loop thread, serialize calls per presenter, and drive
 an independent DPI factor. Resolve `.so` dependencies using rpath or
 `LD_LIBRARY_PATH` and inspect them with `ldd`.
 
-Linux uses system FFmpeg shared libraries and a static, PIC, **patched libass
-0.17.5**, with system font libraries. The script verifies the upstream archive
-SHA256 and applies liberika's ordered memory-font fallback patch. Stock libass
-does not preserve that behavior. `ERIKA_LIBASS_DIR` can point to an equivalent
-patched prefix. `ERIKA_FFMPEG_DIR` selects an existing static FFmpeg bundle;
-`ERIKA_USE_SYSTEM_LIBS=0` preserves the original bundle lookup path but requires
-all matching dependencies to be prepared separately. This guide validates the
-system-library path and native GNU/Linux builds, not cross-compilation or musl.
-The distro's FFmpeg codecs and licensing apply; `ERIKA_NATIVE_PROFILE=lgpl`
+Bare Cargo builds default to system FFmpeg shared libraries and static PIC
+**patched libass 0.17.5**, with system font libraries. The script verifies the
+upstream archive SHA256 and applies liberika's ordered memory-font fallback
+patch; stock libass does not preserve that behavior. For manual builds,
+`ERIKA_LIBASS_DIR` accepts an equivalent patched prefix and `ERIKA_FFMPEG_DIR`
+selects a static FFmpeg prefix. The reproducible packaging entry point rejects
+such overrides and prepares matching dependencies using
+`ERIKA_LINUX_DEPENDENCIES=bundled|system`; do not mix the modes' environments.
+Cross-compilation and musl are outside this build matrix.
+The external FFmpeg's codecs and licensing apply; `ERIKA_NATIVE_PROFILE=lgpl`
 does not change its configuration. PulseAudio disconnections report an error;
 automatic reconnection is not implemented.
 

@@ -152,18 +152,22 @@ fn configure_bundled_ffmpeg() -> Vec<PathBuf> {
         "cargo:rustc-link-search=native={}",
         dav1d_dir.join("lib").display()
     );
-    println!("cargo:rustc-link-lib=static=avdevice");
-    println!("cargo:rustc-link-lib=static=avfilter");
-    println!("cargo:rustc-link-lib=static=avformat");
-    println!("cargo:rustc-link-lib=static=avcodec");
-    println!("cargo:rustc-link-lib=static=swresample");
-    println!("cargo:rustc-link-lib=static=swscale");
-    println!("cargo:rustc-link-lib=static=avutil");
-    println!("cargo:rustc-link-lib=static=dav1d");
+    for library in [
+        "avdevice",
+        "avfilter",
+        "avformat",
+        "avcodec",
+        "swresample",
+        "swscale",
+        "avutil",
+    ] {
+        link_bundled_archive(&dist_dir, library);
+    }
+    link_bundled_archive(&dav1d_dir, "dav1d");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-lib=static=zlib");
     } else {
-        println!("cargo:rustc-link-lib=static=z");
+        link_bundled_archive(&zlib_dir, "z");
     }
 
     if matches!(
@@ -199,6 +203,23 @@ fn configure_bundled_ffmpeg() -> Vec<PathBuf> {
         ] {
             println!("cargo:rustc-link-lib={lib}");
         }
+    } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
+    {
+        // FFmpeg itself is bundled, not the distribution's driver interfaces.
+        // Match xtask's explicit VA-API/DRM configuration (Vulkan/CUDA load
+        // their driver entry points at runtime).
+        for library in ["libva", "libva-drm", "libdrm"] {
+            pkg_config::Config::new()
+                .statik(false)
+                .probe(library)
+                .unwrap_or_else(|error| {
+                    panic!("Linux FFmpeg driver dependency {library}: {error}")
+                });
+        }
+        for library in ["dl", "m", "pthread"] {
+            println!("cargo:rustc-link-lib={library}");
+        }
     } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         for lib in [
             "android",
@@ -214,6 +235,23 @@ fn configure_bundled_ffmpeg() -> Vec<PathBuf> {
     }
 
     vec![include_dir]
+}
+
+fn link_bundled_archive(prefix: &Path, library: &str) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
+    {
+        // System pkg-config search paths must not select a distro's older .a.
+        let archive = prefix.join(format!("lib/lib{library}.a"));
+        println!("cargo:rerun-if-changed={}", archive.display());
+        let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+        fs::copy(&archive, out.join(format!("liberika_bundled_{library}.a")))
+            .unwrap_or_else(|error| panic!("copy bundled {}: {error}", archive.display()));
+        println!("cargo:rustc-link-search=native={}", out.display());
+        println!("cargo:rustc-link-lib=static=erika_bundled_{library}");
+    } else {
+        println!("cargo:rustc-link-lib=static={library}");
+    }
 }
 
 /// FFmpeg's VideoToolbox availability checks call __isPlatformVersionAtLeast.

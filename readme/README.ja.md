@@ -41,7 +41,7 @@ HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.ja.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
 | Rust | Git 依存を `v0.3.4` に固定 | [ビルド](../docs/building.ja.md) |
-| Linux | システム FFmpeg 8 とパッチ済み libass、ソースビルド | [Linux](../docs/linux.md) |
+| Linux | x64 / ARM64、bundled / system、glibc 2.35 基準 | [Linux](../docs/linux.md) |
 
 2026-11-06 時点の OHPM 公開最新バージョンは 0.3.4 です。
 ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.4) にあります。
@@ -107,7 +107,7 @@ player.play()?;
 | Windows 10+ | D3D11VA / software | D3D11 | WASAPI | x64 / ARM64 バンドル、Flutter |
 | Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | 4 ABI バンドル、Flutter |
 | OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 バンドル、Flutter、OHPM |
-| Linux（実験的） | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust、C ABI、Flutter ソースビルド |
+| Linux（実験的） | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system リリースビルド；Rust、C ABI、Flutter |
 | ブラウザー | WebCodecs | WebGL2 / Canvas | Web Audio | Release の Web archive または JS / WASM ソースビルド |
 
 サーフェスと HDR の対応は [プラットフォーム表](../docs/platform_matrix.zh.md) にまとめています。
@@ -122,7 +122,7 @@ cargo run -p xtask -- deps build --all --profile lgpl
 cargo build -p erika_capi
 ```
 
-クロスビルドでは target triple を指定します。Linux はシステムライブラリを使います。
+クロスビルドでは target triple を指定します。Linux は `scripts/build_linux_release.sh` で両モードを Ubuntu 22.04 上で構築し、system は自分で導入した ABI 互換の FFmpeg 8 共有ライブラリも利用できます。
 [ビルド](../docs/building.ja.md)、[リリース](../docs/releasing.ja.md)、
 [開発者ガイド](../CONTRIBUTING.ja.md) に手順をまとめています。
 

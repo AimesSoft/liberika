@@ -22,10 +22,18 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
                                   cargo build -p erika
 ```
 
-## Linux system-library builds
+## Linux dual architecture and dependency modes
 
-Linux uses system FFmpeg 8 and PulseAudio, with liberika-patched libass. It does
-not use the xtask release-target path below. Start with [Linux integration](linux.md).
+Linux release targets are `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`,
+each on a matching native host. Both offer `bundled` / `system` archives built on
+Ubuntu 22.04 / glibc 2.35. The common entry point is
+`ERIKA_LINUX_DEPENDENCIES=bundled bash scripts/build_linux_release.sh`; change
+the mode to `system` for external FFmpeg/font libraries. Bundled reuses
+`xtask deps build --all`; system uses a pinned FFmpeg 8 shared SDK only for
+building/testing, not distribution. Users may install compatible FFmpeg 8
+shared libraries themselves. Both embed patched libass and SoundTouch, while
+retaining system desktop/driver dependencies; neither is fully static.
+See [Linux integration](linux.md) for prerequisites, verification and archive use.
 
 ## Prerequisites
 
@@ -131,6 +139,8 @@ Subcommands: `plan` (print the plan), `fetch` (download sources only),
 
 | `--target` | Triple | Notes |
 |------------|--------|-------|
+| `x86_64-unknown-linux-gnu` (`linux-x64`) | Linux x86_64 | Matching native GNU/Linux host; PIC + VA-API/NVDEC/Vulkan. |
+| `aarch64-unknown-linux-gnu` (`linux-arm64`) | Linux ARM64 | Matching native GNU/Linux host; no musl/cross build. |
 | `host` | current machine | Default. |
 | `aarch64-apple-darwin` | Apple Silicon macOS | |
 | `x86_64-apple-darwin` | Intel macOS | |

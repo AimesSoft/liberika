@@ -3,7 +3,7 @@
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
 以下平台以 0.3.4 为基线；浏览器后端已接入 Erika Web，并随 Release 提供独立 Web 归档。
-Linux 目前为实验性源码构建目标。
+Linux 功能仍为实验性；当前发布流程增加 x64 / ARM64 × bundled / system 四种包，均以 Ubuntu 22.04 构建。
 
 | 平台 | 最低版本 | 解码 / 渲染 | 音频 | 分发与构建 |
 |---|---|---|---|---|
@@ -13,7 +13,7 @@ Linux 目前为实验性源码构建目标。
 | Windows | 10 | D3D11VA / 软解 + D3D11 | WASAPI | x64 / ARM64；Flutter |
 | Android | 8 / API 26 | MediaCodec / 软解 + wgpu | AAudio | 四个 ABI；Flutter |
 | OpenHarmony | API 18 | AVCodec / 软解 + wgpu | OHAudio | arm64；Flutter / ArkTS OHPM |
-| Linux（实验性） | FFmpeg 8.x | NVDEC / VA-API / 软解 + wgpu | PulseAudio / pipewire-pulse | Rust / C ABI / Flutter 源码构建，无预编译包 |
+| Linux（实验性） | glibc 2.35；system 另需 FFmpeg 8 共享库 | NVDEC / VA-API / 软解 + wgpu | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system；Rust / C ABI / Flutter |
 | 浏览器 | HTTPS / localhost；WebCodecs 视频与音频、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | Release 预编译归档或源码构建 JS / WASM；尚未发布到 npm |
 
 原生平台提供 C ABI Presenter；浏览器通过 JavaScript / TypeScript `Player` 接入。
@@ -74,8 +74,9 @@ Linux VA-API → Vulkan 直接导入和 WSL GPU 复制路径为实验性实现�
 
 ## CI 与验证
 
-原生构建覆盖六个预编译平台；Linux native workflow 使用 Xvfb、Mesa 和 PulseAudio
-运行源码播放检查。Flutter consumer workflow 检查六个预编译平台。
+原生构建覆盖七个预编译平台；Linux workflow 在两个原生架构上构建并检查两种依赖模式，
+使用 Xvfb、Mesa、PulseAudio 检查源码与解压后的 Release 包，另在干净 22.04 环境验证运行依赖和 ABI 基线。
+Flutter consumer workflow 仍检查原来的六个预编译平台；Linux 通过 `ERIKA_LIBRARY_DIR` 手工接入。
 HDR 输出和平台生命周期的设备实验保存在 [验证记录目录](investigations/README.md)。
 
 Web workflow 构建完整 WASM 包并运行独立播放器回归。Erika Web 应用已在 macOS 的

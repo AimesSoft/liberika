@@ -237,12 +237,46 @@ fn main() {
         );
     }
 
-    println!("cargo:rustc-link-lib=static=ass");
-    println!("cargo:rustc-link-lib=static=fribidi");
-    println!("cargo:rustc-link-lib=static=harfbuzz");
-    println!("cargo:rustc-link-lib=static=freetype");
+    let linux = target_os.as_deref() == Some("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos");
+    for (prefix, library) in [
+        (&libass, "ass"),
+        (&fribidi, "fribidi"),
+        (&harfbuzz, "harfbuzz"),
+        (&freetype, "freetype"),
+    ] {
+        if linux {
+            // pkg-config (e.g. PulseAudio) can add /usr/lib before our prefixes.
+            // A distinct name prevents accidentally linking a distro archive.
+            let archive = prefix.join(format!("lib/lib{library}.a"));
+            println!("cargo:rerun-if-changed={}", archive.display());
+            let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+            fs::copy(&archive, out.join(format!("liberika_bundled_{library}.a")))
+                .unwrap_or_else(|error| panic!("copy bundled {}: {error}", archive.display()));
+            println!("cargo:rustc-link-search=native={}", out.display());
+            println!("cargo:rustc-link-lib=static=erika_bundled_{library}");
+        } else {
+            println!("cargo:rustc-link-lib=static={library}");
+        }
+    }
 
-    if target_os.as_deref() == Some("windows") {
+    if target_os.as_deref() == Some("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
+    {
+        // Fontconfig is the system font-discovery interface, not a bundled
+        // rasterizer. Do not emit its transitive -lfreetype: we already linked
+        // the bundled FreeType above, and must not select a distro archive.
+        let fontconfig = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .statik(false)
+            .probe("fontconfig")
+            .expect("Linux subtitles require libfontconfig-dev");
+        for path in fontconfig.link_paths {
+            println!("cargo:rustc-link-search=native={}", path.display());
+        }
+        println!("cargo:rustc-link-lib=dylib=fontconfig");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    } else if target_os.as_deref() == Some("windows") {
         println!("cargo:rustc-link-lib=dwrite");
     } else if matches!(target_os.as_deref(), Some("ios" | "tvos" | "macos")) {
         if target_os.as_deref() == Some("macos") {

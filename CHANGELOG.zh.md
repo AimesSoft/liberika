@@ -4,6 +4,22 @@
 
 ## Unreleased
 
+## 0.3.7 - 2026-11-13
+
+### Linux 发布包
+
+- 新增 x86_64、ARM64 × `bundled`、`system` 四种归档，统一使用 Ubuntu 22.04 /
+  glibc 2.35 构建；每包含 C ABI 动态库、静态库、头文件、许可证及依赖报告。
+- `bundled` 内嵌 FFmpeg 与字幕栈；`system` 使用 ABI 兼容的 FFmpeg 8 共享库，支持用户
+  自行安装。两种模式均非全静态，仍使用系统音频、Fontconfig 和显卡驱动接口。
+- 发布前必须通过四组合原生构建、ELF/ABI 检查及干净 Ubuntu 22.04 环境中的 C ABI
+  播放验收。Flutter Linux 通过 `ERIKA_LIBRARY_DIR` 使用解压后的库，不自动下载。
+
+### 弹幕
+
+- 支持 Bilibili mode 7 高级弹幕。
+- 修复 D3D11、wgpu 弹幕整体透明度：先合成每条弹幕的文字、描边与阴影，再统一应用不透明度。
+
 ### 原生纹理输出
 
 - 新增 `PresenterRuntime::export_frame_dmabuf(w, h, scale)`：与 `export_frame_texture`

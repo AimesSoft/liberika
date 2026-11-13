@@ -29,7 +29,7 @@ git push origin "v${VERSION}"
 
 ## 自动发布流程
 
-[release.yml](../.github/workflows/release.yml) 并行构建各平台。iOS、tvOS、Android 按架构分片构建，再合并归档；macOS arm64/x64 合成 universal。完成后创建 GitHub Release，上传 13 个原生/Flutter 归档、Web 归档与 `SHA256SUMS`。
+[release.yml](../.github/workflows/release.yml) 并行构建各平台。iOS、tvOS、Android 按架构分片构建，再合并归档；macOS arm64/x64 合成 universal。完成后创建 GitHub Release，上传 17 个原生/Flutter 归档、两个 Web 归档与 `SHA256SUMS`。
 
 [release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) 接着执行：
 
@@ -44,7 +44,7 @@ tag 触发构建和 GitHub Release 发布。手动的 `workflow_dispatch` 只用
 
 ## 发布产物
 
-完整发布共 15 个 ZIP，另附 `SHA256SUMS`：
+完整发布共 20 个 ZIP，另附 `SHA256SUMS`：
 
 | 平台 | 归档命名 | 数量 |
 |---|---|---|
@@ -55,11 +55,12 @@ tag 触发构建和 GitHub Release 发布。手动的 `workflow_dispatch` 只用
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
 | Web / WASM | `liberika-web-X.Y.Z.zip`、`liberika-web-nofont-X.Y.Z.zip` | 2 |
+| Linux x64 / ARM64 | `erika-capi-linux-{x64,arm64}-{bundled,system}.zip` | 4 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI 包包含库、`include/erika.h`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、依赖许可证及记录 tag/commit 的 `MANIFEST.txt`。iOS/tvOS 为 device + simulator XCFramework；Android 合并包包含四个 ABI 的静态库、动态库和匹配的 `libc++_shared.so`。Flutter Android 包只携带单个 ABI 的动态运行时。
 
-OpenHarmony 使用 5.1.0 Native SDK、compatible SDK 18。Linux 当前从源码构建，步骤在 [Linux 接入](linux.zh.md)。
+OpenHarmony 使用 5.1.0 Native SDK、compatible SDK 18。Linux 四组合复用 [Linux workflow](../.github/workflows/linux.yml)，全部以 Ubuntu 22.04 / glibc 2.35 构建，发布等待干净运行环境验收完成。bundled 内嵌 FFmpeg/字幕栈；system 不分发 FFmpeg SDK，运行时可自行安装 ABI 兼容的 FFmpeg 8 共享库，许可取决于外部 FFmpeg 配置。两者都不是全静态，包内附依赖报告；Flutter Linux 使用 `ERIKA_LIBRARY_DIR`，不自动下载。详见 [Linux 接入](linux.zh.md)。
 
 ## OHPM 上传超时
 

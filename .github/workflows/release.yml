@@ -8,14 +8,13 @@ name: Release
 #
 # Bundles (per platform): liberika_capi.{dylib,a} / erika_capi.dll + libs /
 # iOS/tvOS erika_capi.xcframework bundles / Android ABI archives /
-# OpenHarmony shared libraries,
-# plus erika.h, LICENSE (MPL-2.0), and THIRD_PARTY_NOTICES.md. Native deps
-# (FFmpeg/libass/...) are statically linked via the `lgpl` profile.
+# OpenHarmony shared libraries and Linux x64/arm64 bundled + system variants,
+# plus erika.h, LICENSE (MPL-2.0), and THIRD_PARTY_NOTICES.md. Bundled native
+# deps use the `lgpl` profile; Linux system mode uses externally supplied FFmpeg.
 #
 # Windows uses MSYS2 + MSVC + LLVM/libclang. Android uses NDK LLVM at API 26;
 # xtask supports both Linux-hosted CI and Windows-hosted Git Bash builds.
-#
-# NOTE: desktop Linux is intentionally not published yet.
+# Linux variants both build/test on Ubuntu 22.04 (glibc 2.35).
 
 on:
   push:
@@ -717,9 +716,14 @@ jobs:
           path: dist/liberika-web-*.zip
           if-no-files-found: error
 
+  linux:
+    name: Linux dual architecture and dependency modes
+    needs: version
+    uses: ./.github/workflows/linux.yml
+
   release:
     name: Publish Release
-    needs: [macos, macos-universal, ios, tvos, windows, android, openharmony, web]
+    needs: [macos, macos-universal, ios, tvos, windows, android, openharmony, web, linux]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -752,10 +756,20 @@ jobs:
             SHA256SUMS
           generate_release_notes: true
           body: |
-            Prebuilt `erika_capi` C ABI bundles (static `lgpl` profile),
-            for macOS arm64, macOS x64, macOS universal, Windows x64,
-            Windows ARM64, iOS, tvOS, and Android arm64-v8a, armeabi-v7a,
-            x86_64, and x86, plus OpenHarmony arm64.
+            Prebuilt `erika_capi` C ABI bundles for macOS arm64, macOS x64,
+            macOS universal, Windows x64, Windows ARM64, iOS, tvOS, Android
+            arm64-v8a, armeabi-v7a, x86_64 and x86, OpenHarmony arm64,
+            and Linux x64/arm64.
+
+            Linux offers `bundled` and `system` archives for each architecture,
+            both built on Ubuntu 22.04 (glibc 2.35). Bundled embeds FFmpeg and
+            the subtitle stack using the static `lgpl` profile; system needs
+            FFmpeg 8 shared libraries (which you can install yourself) and system
+            font libraries. Patched libass and SoundTouch remain embedded.
+            External FFmpeg licensing depends on its build configuration.
+            Neither Linux variant bundles libc or GPU drivers. Other native
+            platforms continue to use the static `lgpl` dependency profile.
+            See each Linux archive's README, manifest and dependency report.
 
             Native archives contain the library, `include/erika.h`, `LICENSE`
             (MPL-2.0), and `THIRD_PARTY_NOTICES.md`. `SHA256SUMS` in this

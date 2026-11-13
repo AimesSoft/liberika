@@ -2,20 +2,27 @@
 // Uses ohos/tests/presenter_stub.cpp; this does not validate media decoding.
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter/services.dart';
 
 const player = MethodChannel('erika_flutter/player');
 final shownTexture = ValueNotifier<int?>(null);
 void main() {
-  runApp(MaterialApp(home: Scaffold(body: Center(
-    child: ValueListenableBuilder<int?>(
-      valueListenable: shownTexture,
-      builder: (context, id, child) => id == null
-        ? const Text('Erika owner-thread check')
-        : SizedBox(width: 128, height: 72, child: Texture(textureId: id)),
+  runApp(WidgetsApp(
+    color: const Color(0xff000000),
+    textStyle: const TextStyle(color: Color(0xff000000), fontSize: 14),
+    builder: (context, child) => ColoredBox(
+      color: const Color(0xffffffff),
+      child: Center(
+        child: ValueListenableBuilder<int?>(
+          valueListenable: shownTexture,
+          builder: (context, id, child) => id == null
+            ? const Text('Erika owner-thread check')
+            : SizedBox(width: 128, height: 72, child: Texture(textureId: id)),
+        ),
+      ),
     ),
-  ))));
+  ));
   WidgetsBinding.instance.addPostFrameCallback((_) { smoke(); });
 }
 Future<void> smoke() async {

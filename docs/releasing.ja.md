@@ -29,7 +29,7 @@ git push origin "v${VERSION}"
 
 ## 自動公開の流れ
 
-[release.yml](../.github/workflows/release.yml) は platform を並列 build します。iOS、tvOS、Android は architecture slice を個別に build して archive を組み立て、macOS arm64/x64 は universal に結合します。GitHub Release に 13 個の native/Flutter archive、Web archive と `SHA256SUMS` を公開します。
+[release.yml](../.github/workflows/release.yml) は platform を並列 build します。iOS、tvOS、Android は architecture slice を個別に build して archive を組み立て、macOS arm64/x64 は universal に結合します。GitHub Release に 17 個の native/Flutter archive、2 個の Web archive と `SHA256SUMS` を公開します。
 
 [release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) が続けて実行します：
 
@@ -44,7 +44,7 @@ tag で build と GitHub Release の公開が始まります。手動の `workfl
 
 ## 公開する成果物
 
-完了したリリースは ZIP 15 個と `SHA256SUMS` を含みます。
+完了したリリースは ZIP 20 個と `SHA256SUMS` を含みます。
 
 | Platform | Archive 命名 | 数 |
 |---|---|---|
@@ -55,11 +55,12 @@ tag で build と GitHub Release の公開が始まります。手動の `workfl
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
 | Web / WASM | `liberika-web-X.Y.Z.zip`、`liberika-web-nofont-X.Y.Z.zip` | 2 |
+| Linux x64 / ARM64 | `erika-capi-linux-{x64,arm64}-{bundled,system}.zip` | 4 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI bundle は library、`include/erika.h`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、依存 license、tag/commit を記録した `MANIFEST.txt` を含みます。iOS/tvOS は device + simulator XCFramework、Android 統合 bundle は 4 ABI の static/shared library と対応する `libc++_shared.so` を含みます。Flutter Android bundle は各 ABI の shared runtime のみを含みます。
 
-OpenHarmony は Native SDK 5.1.0、compatible SDK 18 を使います。Linux は現在ソースから build します。[Linux ガイド](linux.md)。
+OpenHarmony は Native SDK 5.1.0、compatible SDK 18 を使います。Linux の 4 組は [Linux workflow](../.github/workflows/linux.yml) を再利用し、Ubuntu 22.04 / glibc 2.35 でビルドしてクリーン環境の検証完了を待って公開します。bundled は FFmpeg と字幕スタックを内蔵し、system は FFmpeg SDK を配布せず、利用者が導入した ABI 互換 FFmpeg 8 共有ライブラリを使います。外部 FFmpeg のライセンスは構成によって異なります。両者とも完全静的ではなく、依存レポートを同梱します。Flutter Linux は `ERIKA_LIBRARY_DIR` を使い、自動ダウンロードはありません。[Linux ガイド](linux.ja.md) を参照してください。
 
 ## OHPM upload timeout
 

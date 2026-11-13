@@ -19,10 +19,15 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
 
 > 英文版：[building.md](building.md)。
 
-## Linux 系统库构建
+## Linux 双架构、双依赖模式
 
-Linux 使用系统 FFmpeg 8、PulseAudio 和 liberika 补丁 libass，入口不同于下文
-xtask 发布目标。安装依赖和构建步骤在 [Linux 接入](linux.zh.md)。
+Linux 发布支持 `x86_64-unknown-linux-gnu` 与 `aarch64-unknown-linux-gnu`，
+均使用同架构原生主机。两个架构各提供 `bundled` / `system`，发布基线均为 Ubuntu 22.04 / glibc 2.35。
+统一入口为 `ERIKA_LINUX_DEPENDENCIES=bundled bash scripts/build_linux_release.sh`，
+将模式换成 `system` 可生成非内嵌 FFmpeg 的包。
+前者复用 `xtask deps build --all`；后者只用固定 FFmpeg 8 共享 SDK 构建/测试，不随包分发，
+运行时可以使用用户自行安装的 ABI 兼容 FFmpeg 8 共享库。两者均静态包含补丁 libass 与 SoundTouch，
+仍需系统驱动/桌面库，并非全静态。安装、验收与预编译包接入见 [Linux 接入](linux.zh.md)。
 
 ## 前置依赖
 
@@ -118,6 +123,8 @@ libass，因此需要 `--all`，仅构建基础集不够。
 
 | `--target` | Triple | 备注 |
 |------------|--------|------|
+| `x86_64-unknown-linux-gnu`（`linux-x64`） | Linux x86_64 | 仅同架构 GNU/Linux 原生构建，PIC + VA-API/NVDEC/Vulkan。 |
+| `aarch64-unknown-linux-gnu`（`linux-arm64`） | Linux ARM64 | 仅同架构 GNU/Linux 原生构建；不支持 musl。 |
 | `host` | 当前机器 | 默认。 |
 | `aarch64-apple-darwin` | Apple Silicon macOS | |
 | `x86_64-apple-darwin` | Intel macOS | |

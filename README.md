@@ -40,7 +40,7 @@ WASM 内的 libass 还原字幕字体、定位、描边与特效，Rust 弹幕�
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.zh.md) |
 | C / C++ | 下载匹配版本的 C ABI 归档与 `erika.h` | [原生接入](docs/integration.zh.md) |
 | Rust | Git 依赖，固定 `tag = "v0.3.4"` | [构建与依赖](docs/building.zh.md) |
-| Linux | 系统 FFmpeg 8 + liberika 补丁 libass，从源码构建 | [Linux 接入](docs/linux.zh.md) |
+| Linux | x64 / ARM64，bundled / system 双模式，glibc 2.35 基线 | [Linux 接入](docs/linux.zh.md) |
 
 截至 2026-11-06，OHPM 公开的最新版本为 0.3.4。原生二进制从
 [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.4) 下载。
@@ -104,7 +104,7 @@ player.play()?;
 | Windows 10+ | D3D11VA / 软解 | D3D11 | WASAPI | x64 / ARM64 预编译、Flutter |
 | Android 8+ | MediaCodec / 软解 | wgpu Vulkan / GLES | AAudio | 四个 ABI 预编译、Flutter |
 | OpenHarmony API 18+ | AVCodec / 软解 | wgpu | OHAudio | arm64 预编译、Flutter、OHPM |
-| Linux（实验性） | NVDEC / VA-API / 软解 | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust、C ABI、Flutter 源码构建 |
+| Linux（实验性） | NVDEC / VA-API / 软解 | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system 发布构建；Rust、C ABI、Flutter |
 | 浏览器 | WebCodecs | WebGL2 / Canvas | Web Audio | Release Web 归档或源码构建 JS / WASM 包 |
 
 各平台的视频表面和 HDR 路径在 [平台矩阵](docs/platform_matrix.zh.md) 中汇总。
@@ -119,7 +119,8 @@ cargo run -p xtask -- deps build --all --profile lgpl
 cargo build -p erika_capi
 ```
 
-交叉编译需设置目标 triple；Linux 使用独立的系统库构建入口。
+交叉编译需设置目标 triple；Linux 双模式入口为 `scripts/build_linux_release.sh`，
+均以 Ubuntu 22.04 构建，system 可使用自行安装的兼容 FFmpeg 8 共享库。
 构建参数在 [构建指南](docs/building.zh.md)，发布流程在 [发布指南](docs/releasing.zh.md)，
 代码约定在 [贡献指南](CONTRIBUTING.zh.md)。
 

@@ -342,6 +342,22 @@ impl NativeDependencyProfile {
             }
         } else if target.is_apple() {
             flags.push("--enable-videotoolbox");
+        } else if target.is_linux() {
+            // Build both from the same PIC objects. Bundled consumers explicitly
+            // link the .a archives; system-mode CI uses the .so files only as an
+            // FFmpeg 8 SDK and does not include them in its release archive.
+            flags.retain(|flag| *flag != "--disable-shared");
+            flags.extend([
+                "--enable-shared",
+                "--enable-pic",
+                "--enable-vaapi",
+                "--enable-libdrm",
+                "--enable-vulkan",
+                "--enable-ffnvcodec",
+                "--enable-cuda",
+                "--enable-nvdec",
+                "--enable-cuvid",
+            ]);
         }
         if target.is_android() {
             assert_android_software_decoder_fallbacks(&flags);
@@ -386,6 +402,8 @@ enum NativeTarget {
     X86_64TvosSimulator,
     X86_64WindowsMsvc,
     Aarch64WindowsMsvc,
+    X86_64Linux,
+    Aarch64Linux,
     Aarch64Android,
     Armv7Android,
     X86_64Android,
@@ -408,6 +426,8 @@ impl NativeTarget {
             "x86_64-apple-tvos" => Ok(Self::X86_64TvosSimulator),
             "x86_64-pc-windows-msvc" | "windows-x64" => Ok(Self::X86_64WindowsMsvc),
             "aarch64-pc-windows-msvc" | "windows-arm64" => Ok(Self::Aarch64WindowsMsvc),
+            "x86_64-unknown-linux-gnu" | "linux-x64" => Ok(Self::X86_64Linux),
+            "aarch64-unknown-linux-gnu" | "linux-arm64" => Ok(Self::Aarch64Linux),
             "aarch64-linux-android" | "arm64-v8a" => Ok(Self::Aarch64Android),
             "armv7-linux-androideabi" | "armeabi-v7a" => Ok(Self::Armv7Android),
             "x86_64-linux-android" | "android-x64" => Ok(Self::X86_64Android),
@@ -431,6 +451,8 @@ impl NativeTarget {
             Self::X86_64TvosSimulator => Some("x86_64-apple-tvos"),
             Self::X86_64WindowsMsvc => Some("x86_64-pc-windows-msvc"),
             Self::Aarch64WindowsMsvc => Some("aarch64-pc-windows-msvc"),
+            Self::X86_64Linux => Some("x86_64-unknown-linux-gnu"),
+            Self::Aarch64Linux => Some("aarch64-unknown-linux-gnu"),
             Self::Aarch64Android => Some("aarch64-linux-android"),
             Self::Armv7Android => Some("armv7-linux-androideabi"),
             Self::X86_64Android => Some("x86_64-linux-android"),
@@ -450,6 +472,8 @@ impl NativeTarget {
             Self::Aarch64TvosSimulator | Self::X86_64TvosSimulator => Some("appletvsimulator"),
             Self::X86_64WindowsMsvc
             | Self::Aarch64WindowsMsvc
+            | Self::X86_64Linux
+            | Self::Aarch64Linux
             | Self::Aarch64Android
             | Self::Armv7Android
             | Self::X86_64Android
@@ -470,9 +494,9 @@ impl NativeTarget {
             Self::X86_64Macos | Self::X86_64IosSimulator | Self::X86_64TvosSimulator => {
                 Some("x86_64")
             }
-            Self::X86_64WindowsMsvc => Some("x86_64"),
+            Self::X86_64WindowsMsvc | Self::X86_64Linux => Some("x86_64"),
             Self::Aarch64WindowsMsvc => Some("aarch64"),
-            Self::Aarch64Android => Some("aarch64"),
+            Self::Aarch64Android | Self::Aarch64Linux => Some("aarch64"),
             Self::Armv7Android => Some("arm"),
             Self::X86_64Android => Some("x86_64"),
             Self::I686Android => Some("x86"),
@@ -492,9 +516,9 @@ impl NativeTarget {
             Self::X86_64Macos | Self::X86_64IosSimulator | Self::X86_64TvosSimulator => {
                 Some("x86_64")
             }
-            Self::X86_64WindowsMsvc => Some("x86_64"),
+            Self::X86_64WindowsMsvc | Self::X86_64Linux => Some("x86_64"),
             Self::Aarch64WindowsMsvc => Some("aarch64"),
-            Self::Aarch64Android => Some("aarch64"),
+            Self::Aarch64Android | Self::Aarch64Linux => Some("aarch64"),
             Self::Armv7Android => Some("arm"),
             Self::X86_64Android => Some("x86_64"),
             Self::I686Android => Some("x86"),
@@ -514,9 +538,9 @@ impl NativeTarget {
             Self::X86_64Macos | Self::X86_64IosSimulator | Self::X86_64TvosSimulator => {
                 Some("x86_64")
             }
-            Self::X86_64WindowsMsvc => Some("x86_64"),
+            Self::X86_64WindowsMsvc | Self::X86_64Linux => Some("x86_64"),
             Self::Aarch64WindowsMsvc => Some("arm64"),
-            Self::Aarch64Android => Some("aarch64"),
+            Self::Aarch64Android | Self::Aarch64Linux => Some("aarch64"),
             Self::Armv7Android => Some("armv7"),
             Self::X86_64Android => Some("x86_64"),
             Self::I686Android => Some("i686"),
@@ -578,6 +602,26 @@ impl NativeTarget {
         ) || (matches!(self, Self::Host) && cfg!(target_vendor = "apple"))
     }
 
+    fn is_linux(self) -> bool {
+        matches!(self, Self::X86_64Linux | Self::Aarch64Linux)
+            || (matches!(self, Self::Host) && cfg!(all(target_os = "linux", target_env = "gnu")))
+    }
+
+    fn validate_linux_host(self, os: &str, arch: &str, target_env: &str) -> Result<()> {
+        let expected_arch = match self {
+            Self::X86_64Linux => "x86_64",
+            Self::Aarch64Linux => "aarch64",
+            _ => return Ok(()),
+        };
+        if os != "linux" || arch != expected_arch || target_env != "gnu" {
+            bail!(
+                "{} requires a native {expected_arch} GNU/Linux host; Linux cross-compilation is not supported",
+                self.triple().unwrap()
+            );
+        }
+        Ok(())
+    }
+
     fn is_android(self) -> bool {
         matches!(
             self,
@@ -623,6 +667,8 @@ impl NativeTarget {
             )),
             Self::X86_64WindowsMsvc
             | Self::Aarch64WindowsMsvc
+            | Self::X86_64Linux
+            | Self::Aarch64Linux
             | Self::Aarch64Android
             | Self::Armv7Android
             | Self::X86_64Android
@@ -756,6 +802,9 @@ impl FfmpegSet {
             flags.push("--enable-hwaccel=*_videotoolbox");
         } else if target.is_windows() {
             flags.push("--enable-hwaccel=*_d3d11va,*_d3d11va2,*_dxva2");
+        } else if target.is_linux() {
+            flags.push("--enable-hwaccel=*_vaapi,*_nvdec");
+            flags.push("--enable-decoder=h264_cuvid,hevc_cuvid,mpeg2_cuvid,mpeg4_cuvid,vp8_cuvid,vp9_cuvid,av1_cuvid");
         }
         for (index, group) in FFMPEG_GROUPS.iter().enumerate() {
             if mask & (1 << index) != 0 {
@@ -1160,6 +1209,15 @@ fn prepare_dependency_dirs(layout: &WorkspaceLayout) -> Result<()> {
 }
 
 fn ensure_required_tools(options: DepsOptions, layout: &WorkspaceLayout) -> Result<()> {
+    options.target.validate_linux_host(
+        env::consts::OS,
+        env::consts::ARCH,
+        if cfg!(target_env = "gnu") {
+            "gnu"
+        } else {
+            "other"
+        },
+    )?;
     for tool in ["tar"] {
         if which(tool).is_none() {
             bail!("required build tool `{tool}` was not found in PATH");
@@ -1262,7 +1320,7 @@ fn ensure_required_tools(options: DepsOptions, layout: &WorkspaceLayout) -> Resu
             || !dav1d_build_marker_is_current(layout, options))
         && which("nasm").is_none()
     {
-        bail!("required build tool `nasm` was not found for x86_64 Apple dav1d assembly");
+        bail!("required build tool `nasm` was not found for x86_64 FFmpeg/dav1d assembly");
     }
 
     let compiler = "clang";
@@ -1454,6 +1512,7 @@ fn dav1d_requires_nasm(target: NativeTarget) -> bool {
     matches!(
         target,
         NativeTarget::X86_64Macos
+            | NativeTarget::X86_64Linux
             | NativeTarget::X86_64IosSimulator
             | NativeTarget::X86_64TvosSimulator
             | NativeTarget::X86_64Android
@@ -1465,6 +1524,7 @@ fn ffmpeg_requires_nasm(target: NativeTarget) -> bool {
     matches!(
         target,
         NativeTarget::X86_64Macos
+            | NativeTarget::X86_64Linux
             | NativeTarget::X86_64IosSimulator
             | NativeTarget::X86_64TvosSimulator
             | NativeTarget::X86_64WindowsMsvc
@@ -1709,7 +1769,11 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("--buildtype=release")
         .arg("-Dtest=disabled")
         .arg("-Dprofile=disabled")
-        .arg("-Dfontconfig=disabled")
+        .arg(if options.target.is_linux() {
+            "-Dfontconfig=enabled"
+        } else {
+            "-Dfontconfig=disabled"
+        })
         .arg("-Dasm=disabled")
         .arg("-Dlibunibreak=disabled")
         .env("PKG_CONFIG_PATH", &pkg_config_path)
@@ -1723,6 +1787,11 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         setup
             .arg("-Dcoretext=enabled")
             .arg("-Ddirectwrite=disabled");
+    } else if options.target.is_linux() {
+        setup
+            .arg("-Dcoretext=disabled")
+            .arg("-Ddirectwrite=disabled")
+            .arg("-Drequire-system-font-provider=true");
     } else {
         setup
             .arg("-Dcoretext=disabled")
@@ -1856,6 +1925,10 @@ fn cmake_command(target: NativeTarget) -> Result<Command> {
 }
 
 fn apply_cmake_target(command: &mut Command, target: NativeTarget) -> Result<()> {
+    if target.is_linux() {
+        command.arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+        command.arg("-DCMAKE_INSTALL_LIBDIR=lib");
+    }
     apply_cmake_apple_target(command, target)?;
     if let Some(config) = android_toolchain(target)? {
         command
@@ -1954,6 +2027,11 @@ fn apply_meson_target(
     target: NativeTarget,
     name: &str,
 ) -> Result<()> {
+    if target.is_linux() {
+        // Native Meson defaults to lib/<multiarch> on Debian/Ubuntu, but the
+        // dependency layout and Rust link search consistently use prefix/lib.
+        command.arg("--libdir=lib").arg("-Db_staticpic=true");
+    }
     let Some(cross_file) = meson_cross_file(layout, target, name)? else {
         return Ok(());
     };
@@ -2822,6 +2900,28 @@ fn download_url(agent: &ureq::Agent, url: &str, partial_path: &Path) -> Result<(
     Ok(())
 }
 
+fn configure_ffmpeg_pkg_config(
+    command: &mut Command,
+    layout: &WorkspaceLayout,
+    target: NativeTarget,
+) -> Result<()> {
+    let dav1d = layout.dav1d_prefix.join("lib/pkgconfig");
+    if target.is_linux() {
+        // Native Linux also needs the system VA-API/DRM interfaces and the
+        // build-only Vulkan/NVIDIA headers. Keep the bundled dav1d first.
+        let mut paths = vec![dav1d];
+        if let Some(path) = env::var_os("PKG_CONFIG_PATH") {
+            paths.extend(env::split_paths(&path));
+        }
+        command.env("PKG_CONFIG_PATH", env::join_paths(paths)?);
+        command.env_remove("PKG_CONFIG_LIBDIR");
+    } else {
+        command.env("PKG_CONFIG_PATH", &dav1d);
+        command.env("PKG_CONFIG_LIBDIR", &dav1d);
+    }
+    Ok(())
+}
+
 fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     let marker_is_current = ffmpeg_build_marker_is_current(layout, options);
     if marker_is_current && !options.force {
@@ -2881,15 +2981,13 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         path_to_forward_slashes(&layout.ffmpeg_prefix)
     ));
     let pkg_config = ensure_ffmpeg_pkg_config_shim(layout)?;
-    let dav1d_pkg_config_dir = layout.dav1d_prefix.join("lib/pkgconfig");
+    configure_ffmpeg_pkg_config(&mut configure, layout, options.target)?;
     configure
         .arg(format!(
             "--pkg-config={}",
             ffmpeg_flag_path_arg(&pkg_config)
         ))
         .arg("--pkg-config-flags=--static")
-        .env("PKG_CONFIG_PATH", &dav1d_pkg_config_dir)
-        .env("PKG_CONFIG_LIBDIR", &dav1d_pkg_config_dir)
         .env("ERIKA_PKG_CONFIG_RELATIVE_BASE", &layout.ffmpeg_build_dir);
     let mut extra_cflags = if options.target.is_windows() {
         Vec::new()
@@ -2962,6 +3060,8 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             NativeTarget::Host
             | NativeTarget::X86_64WindowsMsvc
             | NativeTarget::Aarch64WindowsMsvc
+            | NativeTarget::X86_64Linux
+            | NativeTarget::Aarch64Linux
             | NativeTarget::Aarch64Android
             | NativeTarget::Armv7Android
             | NativeTarget::X86_64Android
@@ -3054,6 +3154,12 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         apply_windows_target_env(&mut configure, options.target)?;
     } else {
         configure.arg("--cc=clang");
+        if options.target.is_linux() {
+            configure.arg("--target-os=linux");
+            if let Some(arch) = options.target.ffmpeg_arch() {
+                configure.arg(format!("--arch={arch}"));
+            }
+        }
         extra_cflags.push(format!(
             "-I{}",
             ffmpeg_flag_path_arg(&layout.zlib_prefix.join("include"))
@@ -3692,16 +3798,13 @@ fn ffmpeg_install_is_complete(layout: &WorkspaceLayout, target: NativeTarget) ->
         ]
         .iter()
         .all(|library| {
-            layout
-                .ffmpeg_prefix
-                .join("lib")
+            let lib_dir = layout.ffmpeg_prefix.join("lib");
+            let static_exists = lib_dir
                 .join(format!("{library}.{library_extension}"))
                 .is_file()
-                || layout
-                    .ffmpeg_prefix
-                    .join("lib")
-                    .join(format!("lib{library}.a"))
-                    .is_file()
+                || lib_dir.join(format!("lib{library}.a")).is_file();
+            static_exists
+                && (!target.is_linux() || lib_dir.join(format!("lib{library}.so")).is_file())
         })
 }
 
@@ -5084,6 +5187,135 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_targets_use_native_gnu_hosts_and_distinct_prefixes() {
+        for (target, triple, alias, arch) in [
+            (
+                NativeTarget::X86_64Linux,
+                "x86_64-unknown-linux-gnu",
+                "linux-x64",
+                "x86_64",
+            ),
+            (
+                NativeTarget::Aarch64Linux,
+                "aarch64-unknown-linux-gnu",
+                "linux-arm64",
+                "aarch64",
+            ),
+        ] {
+            assert_eq!(NativeTarget::parse(triple).unwrap(), target);
+            assert_eq!(NativeTarget::parse(alias).unwrap(), target);
+            assert_eq!(target.triple(), Some(triple));
+            assert_eq!(target.ffmpeg_arch(), Some(arch));
+            assert_eq!(target.meson_cpu_family(), Some(arch));
+            assert_eq!(target.meson_cpu(), Some(arch));
+            assert!(target.sdk().is_none());
+            assert!(target.is_linux());
+            assert!(!target.is_android() && !target.is_ohos() && !target.is_apple());
+            assert!(target.validate_linux_host("linux", arch, "gnu").is_ok());
+            assert!(target.validate_linux_host("macos", arch, "gnu").is_err());
+            assert!(target.validate_linux_host("linux", arch, "musl").is_err());
+            assert!(
+                target
+                    .validate_linux_host("linux", "wrong-arch", "gnu")
+                    .is_err()
+            );
+            let layout = workspace_layout(
+                NativeDependencyProfile::Lgpl,
+                target,
+                WindowsCrt::Dynamic,
+                FfmpegSet::Full,
+            )
+            .unwrap();
+            assert!(layout.dist_dir.ends_with(format!("{triple}/lgpl")));
+        }
+        assert!(!NativeTarget::Aarch64Ohos.is_linux());
+        assert!(!NativeTarget::Aarch64Android.is_linux());
+        assert!(dav1d_requires_nasm(NativeTarget::X86_64Linux));
+        assert!(!dav1d_requires_nasm(NativeTarget::Aarch64Linux));
+        assert!(ffmpeg_requires_nasm(NativeTarget::X86_64Linux));
+    }
+
+    #[test]
+    fn linux_ffmpeg_provides_both_linkages_and_explicit_hardware_support() {
+        for target in [NativeTarget::X86_64Linux, NativeTarget::Aarch64Linux] {
+            for profile in [
+                NativeDependencyProfile::Lgpl,
+                NativeDependencyProfile::GplFull,
+            ] {
+                for set in [FfmpegSet::Full, FfmpegSet::COMMON, FfmpegSet::Slim(0)] {
+                    let flags =
+                        profile.ffmpeg_configure_flags_for(target, WindowsCrt::Dynamic, set);
+                    for required in [
+                        "--enable-static",
+                        "--enable-shared",
+                        "--enable-pic",
+                        "--enable-vaapi",
+                        "--enable-libdrm",
+                        "--enable-vulkan",
+                        "--enable-ffnvcodec",
+                        "--enable-cuda",
+                        "--enable-nvdec",
+                        "--enable-cuvid",
+                        "--enable-libdav1d",
+                    ] {
+                        assert!(flags.contains(&required), "{target:?}: missing {required}");
+                    }
+                    assert!(!flags.contains(&"--disable-shared"));
+                    assert!(!flags.contains(&"--enable-videotoolbox"));
+                    assert!(!flags.contains(&"--enable-mediacodec"));
+                    assert!(!flags.contains(&"--enable-nonfree"));
+                    if set != FfmpegSet::Full {
+                        assert!(flags.contains(&"--enable-hwaccel=*_vaapi,*_nvdec"));
+                    }
+                }
+            }
+        }
+        let flags = NativeDependencyProfile::Lgpl
+            .ffmpeg_configure_flags_for_target(NativeTarget::Aarch64Ohos);
+        assert!(flags.contains(&"--disable-shared"));
+        assert!(!flags.contains(&"--enable-vaapi"));
+    }
+
+    #[test]
+    fn linux_dependencies_use_pic_flat_libdir_and_system_driver_search() {
+        for target in [NativeTarget::X86_64Linux, NativeTarget::Aarch64Linux] {
+            let layout = workspace_layout(
+                NativeDependencyProfile::Lgpl,
+                target,
+                WindowsCrt::Dynamic,
+                FfmpegSet::Full,
+            )
+            .unwrap();
+            let mut cmake = Command::new("cmake");
+            apply_cmake_target(&mut cmake, target).unwrap();
+            assert!(
+                cmake
+                    .get_args()
+                    .any(|arg| arg == "-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
+            );
+            assert!(
+                cmake
+                    .get_args()
+                    .any(|arg| arg == "-DCMAKE_INSTALL_LIBDIR=lib")
+            );
+            let mut meson = Command::new("meson");
+            apply_meson_target(&mut meson, &layout, target, "test").unwrap();
+            assert!(meson.get_args().any(|arg| arg == "--libdir=lib"));
+            assert!(meson.get_args().any(|arg| arg == "-Db_staticpic=true"));
+            assert!(!meson.get_args().any(|arg| arg == "--cross-file"));
+            let mut configure = Command::new("configure");
+            configure_ffmpeg_pkg_config(&mut configure, &layout, target).unwrap();
+            let vars: HashMap<_, _> = configure.get_envs().collect();
+            assert_eq!(vars.get(OsStr::new("PKG_CONFIG_LIBDIR")), Some(&None));
+            let path = vars[OsStr::new("PKG_CONFIG_PATH")].unwrap();
+            assert_eq!(
+                env::split_paths(path).next().unwrap(),
+                layout.dav1d_prefix.join("lib/pkgconfig")
+            );
+        }
+    }
+
+    #[test]
     fn ffmpeg_sets_keep_the_default_and_shrink_on_request() {
         let target = NativeTarget::Aarch64Macos;
         let flags = |set| {
@@ -5811,7 +6043,7 @@ fn print_help() {
     println!("  deps build also takes --ffmpeg full|common|slim[,group...], full by default");
     println!("  cargo run -p xtask -- deps status --profile lgpl");
     println!(
-        "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios|aarch64-apple-tvos|aarch64-apple-tvos-sim|x86_64-apple-tvos|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android|i686-linux-android|aarch64-unknown-linux-ohos|x86_64-unknown-linux-ohos] [--force] [--jobs N]"
+        "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios|aarch64-apple-tvos|aarch64-apple-tvos-sim|x86_64-apple-tvos|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-linux-android|armv7-linux-androideabi|x86_64-linux-android|i686-linux-android|aarch64-unknown-linux-ohos|x86_64-unknown-linux-ohos] [--force] [--jobs N]"
     );
     println!("  cargo run -p xtask -- check cargo-patches");
     println!("  cargo run -p xtask -- check license");

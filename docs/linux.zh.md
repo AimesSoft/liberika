@@ -2,13 +2,58 @@
 
 > [中文](linux.zh.md) · [English](linux.md) · [日本語](linux.ja.md)
 
-Linux 支持 Rust 播放器、C ABI 与 Flutter，使用系统 FFmpeg 8.x、liberika 补丁 libass、wgpu 和 PulseAudio。PipeWire 桌面需启用 `pipewire-pulse`；WSL2 使用 WSLg 的显示与音频服务。
+Linux 支持 Rust 播放器、C ABI 与 Flutter，可选择内嵌或系统 FFmpeg 8.x，配合 liberika 补丁 libass、wgpu 和 PulseAudio。PipeWire 桌面需启用 `pipewire-pulse`；WSL2 使用 WSLg 的显示与音频服务。
 
-视频可通过 X11 / Wayland 窗口呈现；Flutter 可选 RGBA SDR 纹理或 Wayland 原生视频层。NVIDIA 使用 NVDEC，Intel/AMD 使用 VA-API，也可使用 FFmpeg 软件解码。Linux 当前从源码构建。
+视频可通过 X11 / Wayland 窗口呈现；Flutter 可选 RGBA SDR 纹理或 Wayland 原生视频层。NVIDIA 使用 NVDEC，Intel/AMD 使用 VA-API，也可使用 FFmpeg 软件解码。Linux 发布流程构建 x86_64 和 ARM64 的双模式预编译包，也保留源码构建。
 
 HDR 表面协商和 VA-API 直接导入为实验性路径。[WSL D3D12 GPU 复制](wsl-gpu-copy.md)提供另一种解码帧传输方式。设备、性能与验证结果保存在 [Linux 验证记录](investigations/linux-validation.zh.md)。
 
-## 1. 安装依赖
+## 预编译包与 Ubuntu 22.04 构建
+
+每个架构提供两种包，共四个：
+
+| 架构 | 内嵌依赖 | 系统依赖 |
+|---|---|---|
+| x86_64 | `erika-capi-linux-x64-bundled.zip` | `erika-capi-linux-x64-system.zip` |
+| ARM64 | `erika-capi-linux-arm64-bundled.zip` | `erika-capi-linux-arm64-system.zip` |
+
+两种模式均以 **Ubuntu 22.04 / glibc 2.35** 为发布构建基线；最高要求
+`GLIBCXX_3.4.30`、`CXXABI_1.3.13`，不要求升级到 Ubuntu 26.04。
+
+- **bundled**：静态内嵌 FFmpeg、dav1d、zlib、补丁 libass、FreeType、HarfBuzz、FriBidi。
+  不需要安装 FFmpeg 共享库，但并非全静态：仍需要系统 libc/libstdc++、PulseAudio、
+  Fontconfig、VA-API/DRM、Vulkan loader 和实际显卡驱动。Fontconfig 自身的传递依赖可使用系统 FreeType。
+- **system**：动态使用 FFmpeg 8 和字体库；补丁 libass、SoundTouch 仍内嵌。
+  发行版仓库没有 FFmpeg 8 时，可以自行安装或以 `--enable-shared` 构建兼容共享库，
+  再配置 `ldconfig` 或 `LD_LIBRARY_PATH`。只有 `ffmpeg` 命令不够，也不能重命名旧库冒充新 ABI。
+  FFmpeg 的 ABI 主版本为 avdevice 62、avfilter 11、avformat/avcodec 62、swresample 6、swscale 9、avutil 60；
+  自行安装的 FFmpeg 也须兼容本机 libc。构建/测试 SDK 不随 system 包分发。
+
+包内含 `.so`、`.a`、匹配的 `include/erika.h`、许可证、`MANIFEST.txt`、`DEPENDENCIES.txt`
+和运行说明。详细运行包清单见 [包内 README](../packaging/README.linux.md)。
+Flutter 可直接将 `ERIKA_LIBRARY_DIR` 指向解压后的 `lib/`；Linux 不自动下载预编译包。
+
+从源码生成相同结构的包：在对应架构原生 GNU/Linux 主机上准备 Rust 1.92+、
+C/C++/Clang、CMake、Ninja、NASM（x64）、Meson 1.8.5、pkg-config、Python 3、zip，以及
+字体、PulseAudio、X11/Wayland、Vulkan、VA-API、DRM 开发包。
+Ubuntu 22.04 的完整安装清单见 [Linux workflow](../.github/workflows/linux.yml)；不要使用该系统自带的旧 Rust/Meson。
+
+```bash
+ERIKA_LINUX_DEPENDENCIES=bundled bash scripts/build_linux_release.sh
+```
+
+```bash
+ERIKA_LINUX_DEPENDENCIES=system bash scripts/build_linux_release.sh
+```
+
+脚本下载并校验固定版本构建头文件，使用旧系统 loader，不安装驱动或更换 libc。
+两种模式均在本地准备 FFmpeg 8 SDK；system 仅用于编译/测试。
+Cargo 输出按模式和 triple 隔离在 `target/linux-<mode>/<triple>/release`，ZIP 在 `dist/`。
+在较新系统本地构建若引入超过基线的符号，打包检查会失败；发布应使用 22.04 构建环境。
+可在 Bash 中先 `export ERIKA_LINUX_DEPENDENCIES=bundled`（或 `system`），
+`source scripts/linux_build_env.sh` 并执行 `erika_prepare_linux_deps`，再运行原有 demo/检查命令。
+
+## 1. 安装系统依赖（另一种源码构建方式）
 
 以下命令适用于 **Ubuntu 26.04**。需要 Rust 1.92+ 和 **FFmpeg 8.x** 开发包；
 Ubuntu 22.04/24.04 默认仓库中的旧版 FFmpeg 不满足此构建路径。
@@ -191,7 +236,7 @@ HDR 使用原生视频层的 FP16 scRGB；仅接受 Vulkan WSI 实际提供的
 Rust 依赖需要启用 `erika` 的 `wgpu` feature，参考
 [`examples/linux_native_demo/src/main.rs`](../examples/linux_native_demo/src/main.rs)。
 C 接入使用 [`erika.h`](../crates/erika_capi/include/erika.h)，默认 C ABI 构建已启用 wgpu。
-动态加载时需让加载器找到 `.so` 与当前发行版的 FFmpeg、PulseAudio、字体库依赖；
+动态加载时需让加载器找到 `.so` 与包内 `DEPENDENCIES.txt` 所列系统依赖（system 模式另需 FFmpeg 8 和字体库）；
 可配置 rpath 或 `LD_LIBRARY_PATH`，并用 `ldd` 检查。
 
 `erika_presenter_attach_wgpu_surface` 参数映射如下：
@@ -216,8 +261,9 @@ detach 在宿主窗口事件线程执行。每个 presenter 的调用应串行�
 - libass 使用 liberika 补丁版本 0.17.5；系统 libass 缺少有序内存字体回退补丁，不能直接替代。
   脚本将其安装到 `third_party/dist/<rust-host-triple>/system/libass`。
   `ERIKA_LIBASS_DIR` 可指定兼容的补丁构建前缀。
-- `ERIKA_FFMPEG_DIR` 可指定已有的静态 FFmpeg bundle。`ERIKA_USE_SYSTEM_LIBS=0`
-  保留原有 bundle 查找路径，需要另行准备全部匹配的原生依赖；本指南仅验收系统库路径。
+- `ERIKA_FFMPEG_DIR` 可在手工构建时指定静态 FFmpeg prefix。统一打包入口不接受依赖目录覆盖，
+  而由 `ERIKA_LINUX_DEPENDENCIES=bundled|system` 准备匹配的依赖与链接设置。
+  裸 Cargo 命令仍默认使用系统库；不要将两种模式的环境混用。
 - 系统 FFmpeg 的编解码器与许可由发行版构建配置决定。
   设置 `ERIKA_NATIVE_PROFILE=lgpl` **不会改变系统 FFmpeg 的配置或许可**。
 - 构建脚本使用本机 GNU/Linux 工具链；跨编译与 musl 不在本次验收范围内。
