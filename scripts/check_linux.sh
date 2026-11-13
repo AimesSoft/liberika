@@ -14,6 +14,12 @@ fi
 BUILD_DIR="$CARGO_TARGET_DIR${CARGO_BUILD_TARGET:+/$CARGO_BUILD_TARGET}/debug"
 cargo fmt --all -- --check
 python3 packaging/tests/test_api_alignment.py -v
+if [[ "${ERIKA_LINUX_TEST_BACKTRACE:-0}" == 1 ]]; then
+  # Only test executables run in GDB; dependency builds remain unchanged.
+  # --return-child-result keeps an assertion failure or native crash fatal.
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="bash scripts/linux_test_runner.sh"
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="bash scripts/linux_test_runner.sh"
+fi
 cargo test --locked -j "${ERIKA_BUILD_JOBS:-4}" -p erika -p erika_capi --features wgpu --lib -- --test-threads=2
 cargo test --locked -p erika --features wgpu --test wgpu_artcnn -- --test-threads=1
 cargo test --locked -p erika --features wgpu --lib pulse_audio_pause_resume_flush_and_reconfigure -- --ignored

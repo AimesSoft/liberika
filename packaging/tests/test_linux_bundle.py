@@ -3,9 +3,11 @@
 import os
 from pathlib import Path
 import runpy
+import re
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +84,51 @@ class ElfContract(unittest.TestCase):
             self.verify(symbols=SYMBOLS.replace("12 erika_destroy", "UND erika_destroy"))
 
 
+    def test_preprocessed_header_removes_inactive_declarations_and_comments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            header = Path(temporary) / "api.h"
+            header.write_text(HEADER + """
+/* Example: erika_documentation_example(); */
+#if defined(_WIN32)
+void erika_windows_only(void);
+#else
+void erika_platform_export(void);
+#endif
+""")
+            with patch.dict(os.environ, CC="cc -U_WIN32"):
+                api = VERIFY["preprocess_api_header"](header)
+            self.assertNotIn("erika_windows_only", api)
+            self.assertNotIn("erika_documentation_example", api)
+            with self.assertRaisesRegex(ValueError, "erika_platform_export"):
+                self.verify(api_header=api)
+            self.verify(api_header=api, symbols=SYMBOLS + "\n3: 0 1 FUNC GLOBAL DEFAULT 12 erika_platform_export")
+
+    def test_public_header_platform_contract(self):
+        header = ROOT / "crates/erika_capi/include/erika.h"
+        windows_only = {
+            "erika_presenter_windows_composition_swapchain_iunknown",
+            "erika_presenter_windows_flutter_texture_iunknown",
+        }
+        with patch.dict(os.environ, CC="cc -U_WIN32"):
+            native = VERIFY["preprocess_api_header"](header)
+        with patch.dict(os.environ, CC="cc -D_WIN32"):
+            windows = VERIFY["preprocess_api_header"](header)
+        names = lambda text: set(re.findall(r"\b(erika_\w+)\s*\(", text))
+        self.assertEqual(names(windows) - names(native), windows_only)
+        self.assertFalse(names(native) - names(windows))
+        symbols = "\n".join(f"{i}: 0 1 FUNC GLOBAL DEFAULT 12 {name}" for i, name in enumerate(sorted(names(native))))
+        self.verify(api_header=native, symbols=symbols)
+        with self.assertRaisesRegex(ValueError, "Missing C ABI exports:.*erika_presenter_windows"):
+            self.verify(api_header=windows, symbols=symbols)
+
+    def test_preprocessor_errors_are_not_ignored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            header = Path(temporary) / "api.h"
+            header.write_text("#error broken public header\n" + HEADER)
+            with self.assertRaises(subprocess.CalledProcessError):
+                VERIFY["preprocess_api_header"](header)
+
+
 class BundleContract(unittest.TestCase):
     def test_four_archives_and_other_platform_compatibility(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -142,6 +189,30 @@ class BundleContract(unittest.TestCase):
                 env = {**base, "FAKE_RUST_HOST": "x86_64-unknown-linux-gnu", **extra}
                 result = subprocess.run(["bash", "-c", script], cwd=ROOT, env=env, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_ci_runner_keeps_arguments_and_failure_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            gdb = work / "gdb"
+            gdb.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit "$TEST_EXIT_CODE"\n')
+            gdb.chmod(0o755)
+            arguments = ["/test binary", "--test-threads=2", "filter with spaces"]
+            for code in (0, 101, 255):
+                env = {**os.environ, "PATH": str(work) + os.pathsep + os.environ["PATH"],
+                       "TEST_EXIT_CODE": str(code)}
+                result = subprocess.run(["bash", str(ROOT / "scripts/linux_test_runner.sh"), *arguments],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code)
+                passed = result.stdout.splitlines()
+                self.assertIn("--return-child-result", passed)
+                self.assertIn("thread apply all bt 32", passed)
+                self.assertEqual(passed[passed.index("--args") + 1:], arguments)
+        workflow = (ROOT / ".github/workflows/linux.yml").read_text()
+        self.assertIn('ERIKA_LINUX_TEST_BACKTRACE: "1"', workflow)
+        script = (ROOT / "scripts/check_linux.sh").read_text()
+        for arch in ("X86_64", "AARCH64"):
+            self.assertIn(f'CARGO_TARGET_{arch}_UNKNOWN_LINUX_GNU_RUNNER="bash scripts/linux_test_runner.sh"', script)
+        self.assertIn("--lib -- --test-threads=2", script)
 
     def test_release_gates_on_four_combinations_and_clean_runtime(self):
         workflow = (ROOT / ".github/workflows/linux.yml").read_text()
