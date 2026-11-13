@@ -81,4 +81,28 @@ if [[ "${ERIKA_LINUX_D3D12_INTEROP:-0}" == 1 && ! -f "$PREFIX/directx-$DIRECTX_S
   cp "$source_dir/LICENSE" "$PREFIX/licenses/LICENSE.DirectX-Headers"
   touch "$PREFIX/directx-$DIRECTX_SHA"
 fi
+# Upstream DirectX-Headers.pc omits the directx and wsl/stubs include paths
+# that Debian's package adds; ensure pkg-config exposes both for Linux/WSL.
+pc_file="$PREFIX/lib/pkgconfig/DirectX-Headers.pc"
+if [[ "${ERIKA_LINUX_D3D12_INTEROP:-0}" == 1 && -f "$pc_file" ]] && ! grep -q '/wsl/stubs' "$pc_file"; then
+  python3 -I - "$pc_file" <<'PY'
+from pathlib import Path
+import sys
+
+pc = Path(sys.argv[1])
+updated = []
+for line in pc.read_text().splitlines():
+    if line.startswith("Cflags:"):
+        parts = line.split()
+        inc = next((p[2:] for p in parts[1:] if p.startswith("-I")), None)
+        if inc:
+            for suffix in ("/directx", "/wsl/stubs"):
+                flag = f"-I{inc}{suffix}"
+                if flag not in parts:
+                    parts.append(flag)
+            line = " ".join(parts)
+    updated.append(line)
+pc.write_text("\n".join(updated) + "\n")
+PY
+fi
 printf 'Linux build headers ready: %s\n' "$PREFIX"

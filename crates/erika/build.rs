@@ -94,6 +94,16 @@ fn main() {
                 let directx = pkg_config::Config::new()
                     .probe("DirectX-Headers")
                     .expect("WSL interop requires DirectX-Headers development files");
+                let mut directx_includes = Vec::new();
+                for path in directx.include_paths {
+                    for subdir in ["directx", "wsl/stubs"] {
+                        let candidate = path.join(subdir);
+                        if candidate.is_dir() {
+                            directx_includes.push(candidate);
+                        }
+                    }
+                    directx_includes.push(path);
+                }
                 let va = pkg_config::Config::new()
                     .probe("libva")
                     .expect("WSL interop requires libva-dev");
@@ -103,7 +113,7 @@ fn main() {
                     .std("c++17")
                     .file("src/renderer/linux_wsl_d3d12.cpp")
                     .includes(&avutil_includes)
-                    .includes(directx.include_paths)
+                    .includes(directx_includes)
                     .includes(va.include_paths)
                     .includes(&vulkan.include_paths)
                     .warnings(true)
