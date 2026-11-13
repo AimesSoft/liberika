@@ -383,7 +383,15 @@ fn terminate_display(
         // EGL initialization is not reference-counted by the driver. GTK may
         // use this same display outside wgpu, so terminating a borrowed display
         // would invalidate Flutter's contexts during native-surface detach.
-        if externally_owned { Ok(()) } else { egl.terminate(display) }
+        // Desktop Linux surfaceless/default displays are also process-wide
+        // singletons: calling eglTerminate unloads DRI drivers such as
+        // swrast_dri.so while libLLVM remains resident, causing subsequent
+        // eglCreateContext calls in Mesa 23 to segfault.
+        if externally_owned || cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
+            Ok(())
+        } else {
+            egl.terminate(display)
+        }
     }
 }
 
@@ -722,28 +730,50 @@ impl crate::Instance for Instance {
 
         profiling::scope!("Init OpenGL (EGL) Backend");
         #[cfg(Emscripten)]
-        let egl_result: Result<EglInstance, khronos_egl::Error> =
-            Ok(khronos_egl::Instance::new(khronos_egl::Static));
+        let egl: Arc<EglInstance> = Arc::new(khronos_egl::Instance::new(khronos_egl::Static));
 
-        #[cfg(not(Emscripten))]
-        let egl_result = if cfg!(windows) {
-            unsafe {
-                khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
-                    "libEGL.dll",
-                )
+        #[cfg(all(not(Emscripten), target_os = "linux", not(target_env = "ohos")))]
+        let egl: Arc<EglInstance> = {
+            struct RetainedEgl(Arc<EglInstance>);
+            unsafe impl Send for RetainedEgl {}
+            unsafe impl Sync for RetainedEgl {}
+
+            static LINUX_EGL: Mutex<Option<RetainedEgl>> = Mutex::new(None);
+            let mut guard = LINUX_EGL.lock();
+            if let Some(cached) = guard.as_ref() {
+                Arc::clone(&cached.0)
+            } else {
+                let loaded = unsafe {
+                    khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required()
+                }
+                .map(Arc::new)
+                .map_err(instance_err("unable to open libEGL"))?;
+                *guard = Some(RetainedEgl(Arc::clone(&loaded)));
+                loaded
             }
-        } else if cfg!(target_vendor = "apple") {
-            unsafe {
-                khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
-                    "libEGL.dylib",
-                )
-            }
-        } else {
-            unsafe { khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required() }
         };
-        let egl = egl_result
-            .map(Arc::new)
-            .map_err(instance_err("unable to open libEGL"))?;
+
+        #[cfg(all(not(Emscripten), not(all(target_os = "linux", not(target_env = "ohos")))))]
+        let egl = {
+            let egl_result = if cfg!(windows) {
+                unsafe {
+                    khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
+                        "libEGL.dll",
+                    )
+                }
+            } else if cfg!(target_vendor = "apple") {
+                unsafe {
+                    khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
+                        "libEGL.dylib",
+                    )
+                }
+            } else {
+                unsafe { khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required() }
+            };
+            egl_result
+                .map(Arc::new)
+                .map_err(instance_err("unable to open libEGL"))?
+        };
 
         let client_extensions = egl.query_string(None, khronos_egl::EXTENSIONS);
 
