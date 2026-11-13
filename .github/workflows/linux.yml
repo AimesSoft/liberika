@@ -106,11 +106,7 @@ jobs:
           runuser -u erika-ci -- bash -euc '
             source scripts/linux_build_env.sh
             erika_prepare_linux_deps
-            export XDG_RUNTIME_DIR="$(mktemp -d)"
-            pulseaudio --start --exit-idle-time=-1
-            pactl load-module module-null-sink sink_name=erika_ci
-            trap "pulseaudio --kill; rm -rf $XDG_RUNTIME_DIR" EXIT
-            xvfb-run -a bash scripts/check_linux.sh
+            bash scripts/with_linux_audio.sh xvfb-run -a bash scripts/check_linux.sh
             bash scripts/build_linux_release.sh
             if [[ "$ERIKA_LINUX_DEPENDENCIES" == system ]]; then
               mkdir -p test-sdk
@@ -205,10 +201,6 @@ jobs:
             if [[ "$MODE" == system ]]; then
               export LD_LIBRARY_PATH="$PWD/test-sdk/lib"
             fi
-            export XDG_RUNTIME_DIR="$(mktemp -d)"
-            pulseaudio --start --exit-idle-time=-1
-            pactl load-module module-null-sink sink_name=erika_ci
-            trap "pulseaudio --kill; rm -rf $XDG_RUNTIME_DIR" EXIT
-            xvfb-run -a bash scripts/check_linux_bundle.sh \
+            bash scripts/with_linux_audio.sh xvfb-run -a bash scripts/check_linux_bundle.sh \
               "unpacked/erika-capi-linux-$ARCH-$MODE" "$ARCH" "$MODE"
           '

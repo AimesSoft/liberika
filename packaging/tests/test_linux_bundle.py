@@ -5,6 +5,7 @@ from pathlib import Path
 import runpy
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -219,6 +220,63 @@ class BundleContract(unittest.TestCase):
         for arch in ("X86_64", "AARCH64"):
             self.assertIn(f'CARGO_TARGET_{arch}_UNKNOWN_LINUX_GNU_RUNNER="bash $RUNNER"', script)
         self.assertIn("--lib -- --test-threads=2", script)
+
+    def test_audio_cleanup_reaps_child_and_preserves_failures(self):
+        for command_exit, pulse_exit, sink_exit, expected in (
+            (0, 0, 0, 0), (37, 0, 0, 37), (0, 31, 0, 31), (0, 0, 23, 23),
+        ):
+            with self.subTest(command=command_exit, pulse=pulse_exit, sink=sink_exit), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                pulse = work / "pulseaudio"
+                pulse.write_text(f"#!{sys.executable}\n" + '''import os, signal, sys, time
+from pathlib import Path
+root = Path(os.environ["XDG_RUNTIME_DIR"])
+record = Path(os.environ["TEST_RECORD"])
+def stop(*args):
+    # Model a server that still writes during asynchronous shutdown.
+    time.sleep(0.1)
+    (root / "late-shutdown-file").write_text("finished")
+    record.with_suffix(".stopped").write_text("reaped before directory removal")
+    sys.exit(int(os.environ["TEST_PULSE_EXIT"]))
+signal.signal(signal.SIGTERM, stop)
+record.write_text(str(root) + "\\n" + str(os.getpid()))
+socket = Path(os.environ["PULSE_SERVER"].removeprefix("unix:"))
+socket.parent.mkdir()
+socket.touch()
+while True:
+    signal.pause()
+''')
+                pulse.chmod(0o755)
+                pactl = work / "pactl"
+                pactl.write_text('''#!/bin/sh
+if [ "$1" = info ]; then
+    test -f "${PULSE_SERVER#unix:}"
+else
+    exit "$TEST_SINK_EXIT"
+fi
+''')
+                pactl.chmod(0o755)
+                record = work / "record"
+                command_marker = work / "command-ran"
+                env = {**os.environ, "PATH": str(work) + os.pathsep + os.environ["PATH"],
+                       "TEST_RECORD": str(record), "TEST_PULSE_EXIT": str(pulse_exit),
+                       "TEST_SINK_EXIT": str(sink_exit)}
+                result = subprocess.run(
+                    ["bash", str(ROOT / "scripts/with_linux_audio.sh"), sys.executable, "-I", "-c",
+                     "from pathlib import Path; import sys; Path(sys.argv[1]).touch(); sys.exit(int(sys.argv[2]))",
+                     str(command_marker), str(command_exit)],
+                    env=env, capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertTrue(record.with_suffix(".stopped").exists(), result.stderr)
+                runtime, pid = record.read_text().splitlines()
+                self.assertFalse(Path(runtime).exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid), 0)
+                self.assertEqual(command_marker.exists(), sink_exit == 0)
+        workflow = (ROOT / ".github/workflows/linux.yml").read_text()
+        self.assertEqual(workflow.count("bash scripts/with_linux_audio.sh xvfb-run"), 2)
+        self.assertNotIn("pulseaudio --kill", workflow)
 
     def test_release_gates_on_four_combinations_and_clean_runtime(self):
         workflow = (ROOT / ".github/workflows/linux.yml").read_text()
