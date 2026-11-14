@@ -1,6 +1,6 @@
 {
   "name": "erika",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Native ArkTS media SDK powered by the liberika engine",
   "main": "Index.ets",
   "author": {
