@@ -162,7 +162,9 @@ Installed plugins resolve sibling shared libraries through `$ORIGIN`.
 ### GPU frame import and HDR
 
 The experimental Vulkan bridge maps VA-API frames through FFmpeg with
-`AV_HWFRAME_MAP_DIRECT`, then samples the imported NV12/P010 VkImages directly.
+`AV_HWFRAME_MAP_READ`, then samples the imported NV12/P010 VkImages. As of
+0.3.7 it no longer forces `AV_HWFRAME_MAP_DIRECT`, which caused `EINVAL` on
+some FFmpeg 8.1 / 9 driver paths.
 This path allocates no destination plane and performs no CPU or GPU pixel copy
 between decoder and shader. It requires matching device/format
 support, external-memory/semaphore extensions, timeline semaphores and
@@ -216,6 +218,46 @@ Rust consumers must enable the `wgpu` feature. See the
 [native demo](../examples/linux_native_demo/src/main.rs). C consumers use
 [`erika.h`](../crates/erika_capi/include/erika.h) and the shared library; see
 [the C smoke example](../examples/linux_native_demo/capi_smoke.c).
+
+For an **external Cargo workspace**, also put the HAL patch in that workspace's
+root `Cargo.toml`. Cargo does not inherit `[patch.crates-io]` from a dependency.
+The Vulkan direct-import path requires liberika's `wgpu-hal` fork to preserve
+initialized external image contents; enabling `wgpu` alone is not sufficient.
+Pin the dependency and patch to the **same tag or commit**, for example:
+
+```toml
+[dependencies]
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7", features = ["wgpu"] }
+
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7" }
+```
+
+For a local checkout, replace the patch with
+`wgpu-hal = { path = "/absolute/path/to/liberika/third_party/wgpu-hal" }`.
+This is a `[patch.crates-io]` entry in the consumer's root manifest, not a Cargo
+`paths` override. If an existing lockfile still selects the registry HAL, run
+`cargo update -p wgpu-hal --precise 29.0.3`, then use `cargo tree -i wgpu-hal`
+to confirm it resolves from liberika. Commit the resulting `Cargo.lock`; update
+the HAL version along with the liberika tag on upgrades. Other dependencies in
+the workspace must accept this HAL version. Prebuilt C/Flutter artifacts already
+include the patch and require no consumer Cargo configuration.
+
+Linux Rust consumers also need these settings in their own `.cargo/config.toml`.
+The bundled `soundtouch-ffi` disables PIC by default, while erika builds a shared
+library; Cargo does not load dependency repositories' `.cargo` settings:
+
+```toml
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CFLAGS_aarch64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-fPIC"
+```
+
+`bash scripts/check_linux_rust_consumer.sh` compiles and links a fresh, separate consumer
+workspace with an explicit local patch and PIC configuration; the Linux CI runs it for both CPU
+architectures and dependency modes.
 
 For `erika_presenter_attach_wgpu_surface`, `XlibWindow` takes an X11 `Window` ID
 and `Display*`; `WaylandSurface` takes `wl_surface*` and `wl_display*`. Cast

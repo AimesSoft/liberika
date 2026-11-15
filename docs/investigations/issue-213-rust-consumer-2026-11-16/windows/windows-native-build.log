@@ -1,0 +1,20 @@
+适用于 .NET Framework MSBuild 版本 17.14.51+25f168cee
+
+  1>Checking Build System
+  Building Custom Rule D:/CodexWork/erika-issues-20261116/packages/erika_flutter/windows/tests/CMakeLists.txt
+  erika_flutter_plugin.cpp
+  erika_flutter_plugin_c_api.cpp
+  erika_windows_smtc.cpp
+  core_implementations.cc
+  plugin_registrar.cc
+  standard_codec.cc
+  正在生成代码...
+    正在创建库 D:/CodexWork/erika-issues-20261116/build-windows-tests/Debug/plugin_build_check.lib 和对象 D:/CodexWork/erika-issues-20261116/build-windows-tests/Debug/plugin_build_check.exp
+  plugin_build_check.vcxproj -> D:\CodexWork\erika-issues-20261116\build-windows-tests\Debug\plugin_build_check.dll
+  Building Custom Rule D:/CodexWork/erika-issues-20261116/packages/erika_flutter/windows/tests/CMakeLists.txt
+  presenter_worker_test.cpp
+  presenter_worker_test.vcxproj -> D:\CodexWork\erika-issues-20261116\build-windows-tests\Debug\presenter_worker_test.exe
+  Building Custom Rule D:/CodexWork/erika-issues-20261116/packages/erika_flutter/windows/tests/CMakeLists.txt
+  texture_publication_test.cpp
+  texture_publication_test.vcxproj -> D:\CodexWork\erika-issues-20261116\build-windows-tests\Debug\texture_publication_test.exe
+  Building Custom Rule D:/CodexWork/erika-issues-20261116/packages/erika_flutter/windows/tests/CMakeLists.txt
