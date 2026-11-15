@@ -17,6 +17,22 @@ overlay 和呈现,宿主提供一个 surface 并每帧调一次 `render_tick`。
 （Win32 + `HWND`）。它们直接驱动 Rust 的 `PresenterRuntime`;下文的 C ABI 调用是
 一一对应的等价物。
 
+## 0.3.5–0.3.7 升级要点
+
+- **外挂字幕（0.3.5）**：开头重复的 UTF-8 BOM 会归一；添加失败仍由调用返回错误，
+  但不会再发出全局播放错误事件，已打开的视频可继续播放。宿主应在字幕添加操作处
+  展示错误并允许重试。Windows Flutter 的控件层级修复位于插件，须连同原生库一起升级。
+- **字体与弹幕（0.3.6）**：缺字先用系统字体，再用内嵌回退字体；弹幕可显示彩色 Emoji，
+  libass 字幕仍为单色 Emoji。源码构建可关闭 `embedded-fallback-font` 与 `artcnn-r8f64`，
+  官方预编译保留默认功能。iOS 18+ / tvOS 需保留内嵌字体或提供可读取的替代字体，
+  详见[按需构建](building.zh.md)。
+- **Linux 与 mode 7（0.3.7）**：[Linux 指南](linux.zh.md)提供 x64 / ARM64、
+  bundled / system 四种包的选择。Rust `PresenterRuntime::export_frame_dmabuf(w, h, scale)`
+  输出合成后的线性 RGBA8 dma-buf，通过一次同设备 GPU 拷贝生成；C API 不变。
+  [纹理指南](external_textures.zh.md)说明 stride、offset 与缓冲槽复用约束。
+  Bilibili mode 7 支持定位、直线运动、时长和透明度渐变，尚不支持旋转、多行、mode 8 / 9。
+  直接构造普通 Rust `DanmakuItem` 时新增 `special: None`；XML / JSON 解析入口自动填充。
+
 ## 1. 选择 handle 族
 
 除非你有理由自己渲染,否则用 `ErikaPresenterHandle`。拉取模型的 `ErikaHandle` 适合

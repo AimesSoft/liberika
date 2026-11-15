@@ -4,6 +4,18 @@
 
 Flutter plugin for the liberika media playback engine.
 
+The latest [pub.dev release](https://pub.dev/packages/erika_flutter) is **0.3.7**
+(verified 2026-11-16). Use the matching native runtime and rebuild the application.
+
+Since 0.3.5, Windows native video stays below the transparent Flutter host so
+controls and menus remain visible; replacing the DLL alone does not update the
+plugin's window ordering. A failed `addExternalSubtitle` still fails that call,
+but no longer raises a global playback error or stops the opened video.
+Version 0.3.6 adds color emoji danmaku and improves font fallback; subtitle emoji
+remain monochrome. Version 0.3.7 adds Bilibili mode 7 positioning, linear motion,
+duration and alpha fades, plus the Linux archives described below. Rotation,
+multiline mode 7 and modes 8 / 9 remain unsupported.
+
 The plugin keeps Dart out of the hot path:
 
 - Dart exposes low-frequency player commands and event streams.
@@ -87,10 +99,18 @@ vsync ticks.
 
 ## Linux Setup
 
-Build the Linux C ABI library as described in [Linux setup](https://github.com/AimesSoft/liberika/blob/main/docs/linux.md),
-then set `ERIKA_LIBRARY_DIR` to the directory containing `liberika_capi.so` before
-running `flutter build linux`. The plugin bundles that library and uses a GTK
-Flutter texture. Use `ErikaTextureVideoView` (also selected by `ErikaVideoView`
+Download the matching Linux archive from the
+[0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7): choose
+x64 or ARM64, then `bundled` (embedded FFmpeg/font libraries) or `system`
+(ABI-compatible FFmpeg 8 shared libraries and system font libraries). All four
+use an Ubuntu 22.04 / glibc 2.35 baseline. Bundled still needs system audio and
+graphics libraries and drivers; system needs the actual shared libraries, not
+just the `ffmpeg` executable. See [Linux setup](https://github.com/AimesSoft/liberika/blob/main/docs/linux.md)
+for dependencies or a source build.
+
+Set `ERIKA_LIBRARY_DIR` to the extracted `lib/` directory before running
+`flutter build linux`. Linux archives are not downloaded automatically.
+The plugin bundles that library and uses a GTK Flutter texture. Use `ErikaTextureVideoView` (also selected by `ErikaVideoView`
 on Linux). GPU composition includes subtitles and danmaku; pixels are read back
 as RGBA for Flutter. Linux screenshots return tightly packed RGBA bytes.
 

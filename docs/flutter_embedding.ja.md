@@ -293,4 +293,8 @@ Flutter は layout と controls を担当し、liberika は video plane、subtit
 `ErikaVideoView` と `ErikaTextureVideoView` は GPU の結果を SDR RGBA として読み戻します。
 Wayland の `ErikaWindowOverlayVideoView` は透明 Flutter UI の下にネイティブ映像を置き、
 フレームごとの読み戻しを減らします。映像への Flutter クリップやフィルターは使えません。
-ローカルのランタイムをビルドし `ERIKA_LIBRARY_DIR` を設定します。[Linux ガイド](linux.md)。
+v0.3.7 の Linux x86_64 または ARM64 ランタイムアーカイブ（`bundled` / `system`）を
+ダウンロードするか、ソースからビルドし、`ERIKA_LIBRARY_DIR` に `liberika_capi.so` を
+含むディレクトリの絶対パス（アーカイブ内では `lib`）を設定します。
+Linux ランタイムの自動ダウンロードはありません。
+手順は [Linux ガイド](linux.ja.md)を参照してください。

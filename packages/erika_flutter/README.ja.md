@@ -4,6 +4,16 @@
 
 liberika メディア再生エンジン向けの Flutter plugin です。
 
+[pub.dev](https://pub.dev/packages/erika_flutter) の最新公開版は **0.3.7** です
+（2026-11-16 確認）。対応するネイティブランタイムと組み合わせ、アプリを再ビルドしてください。
+
+0.3.5 以降、Windows のネイティブ映像は透明な Flutter ホストの下に配置され、操作 UI や
+メニューを隠しません。DLL だけの交換ではプラグインのウィンドウ順修正は反映されません。
+`addExternalSubtitle` の失敗は呼び出し元に返しますが、グローバルな再生エラーを発行せず、
+開いた動画を止めません。0.3.6 はカラー Emoji 弾幕とフォントのフォールバックを改善し、
+字幕 Emoji は単色のままです。0.3.7 は Bilibili mode 7 の位置、直線移動、時間、alpha 変化と
+下記の Linux 配布物を追加しました。mode 7 の回転・複数行、mode 8 / 9 は非対応です。
+
 この plugin は Dart を hot path から外します。
 
 - Dart は低頻度の player command と event stream だけを公開します。
@@ -61,7 +71,13 @@ Windows の `ErikaVideoView` も native swapchain を使い、HDR10 を維持し
 
 ## Linux Setup
 
-[Linux ガイド](https://github.com/AimesSoft/liberika/blob/main/docs/linux.md)に従い `liberika_capi.so` を build し、所在 directory を `ERIKA_LIBRARY_DIR` に設定して `flutter build linux` を実行します。
+[0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) から Linux x64 または
+ARM64 を選び、`bundled`（FFmpeg とフォントスタックを内蔵）か `system`
+（ABI 互換の FFmpeg 8 共有ライブラリとシステムフォントライブラリ）をダウンロードします。
+4 種とも Ubuntu 22.04 / glibc 2.35 を基準とし、bundled もシステム音声・グラフィックスライブラリと
+ドライバーが必要です。system は `ffmpeg` コマンドのインストールだけでは動きません。
+展開した `lib/` を `ERIKA_LIBRARY_DIR` に設定し、`flutter build linux` を実行してください。
+Linux の自動ダウンロードはありません。依存一覧とソース構築は[Linux ガイド](https://github.com/AimesSoft/liberika/blob/main/docs/linux.ja.md)を参照してください。
 
 `ErikaTextureVideoView` は GTK Flutter texture を使います。Linux の `ErikaVideoView` もこの path を選択します。映像・字幕・弾幕を GPU で合成して RGBA を読み戻し、SDR で表示します。Wayland では `ErikaWindowOverlayVideoView` が透明な Flutter UI の下に native video layer を置き、毎フレームの読み戻しを省きます。Wayland session が必要で、X11 には対応しません。
 

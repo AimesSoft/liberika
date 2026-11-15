@@ -3,7 +3,7 @@
 An embeddable browser player for MKV with ASS subtitles, attached fonts and
 danmaku. The backend is part of liberika and is integrated into Erika Web.
 
-Download `liberika-web-0.3.3.zip` from the 0.3.3 Release, or
+Download `liberika-web-0.3.7.zip` from the [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7), or
 build from current source with `cargo run -p xtask -- web build`; deploy the
 complete runtime in `target/web/`, preserving its relative paths. This source
 directory alone is not a deployable package, and no npm release is available.
@@ -18,9 +18,15 @@ subtitles and danmaku into one canvas. Embedded ASS fonts load automatically,
 and subtitle/danmaku supersampling is independent of the video resolution.
 The complete fallback font is embedded once in the Rust WASM and supplied to
 libass by the worker; no standalone font download is required. The
-`liberika-web-nofont` package, or a build with `web build --without-fallback-font`,
-takes one instead:
+`liberika-web-nofont-0.3.7.zip` archive, or a build with `web build --without-fallback-font`,
+requires the host to supply font bytes instead; the WASM subtitle/text pipeline
+cannot load installed system font files automatically:
 `Player.create({ canvas, fallbackFont: { data, index } })`.
+
+Version 0.3.7 supports Bilibili mode 7 positioning, linear motion, custom duration
+and alpha fades; rotation, multiline text and modes 8 / 9 remain unsupported.
+Color emoji danmaku arrived in 0.3.6 and uses the browser’s own color fonts
+through canvas text drawing; libass subtitle emoji remain monochrome.
 
 ```js
 import { AudioSession, Player } from './liberika/index.js';

@@ -299,5 +299,7 @@ Flutter 负责布局和 controls。liberika 负责 video plane、subtitle plane�
 
 `ErikaVideoView` 与 `ErikaTextureVideoView` 将 GPU 合成结果读回为 SDR RGBA 纹理。
 Wayland 的 `ErikaWindowOverlayVideoView` 使用透明 Flutter UI 下的原生视频层，
-减少逐帧纹理读回；视频本身不接受 Flutter 裁剪或颜色滤镜。先构建本地内核并设置
-`ERIKA_LIBRARY_DIR`，步骤在 [Linux 接入](linux.zh.md)。
+减少逐帧纹理读回；视频本身不接受 Flutter 裁剪或颜色滤镜。下载 v0.3.7 Linux
+x86_64 或 ARM64 运行库包（`bundled` 或 `system`），或从源码构建，然后将
+`ERIKA_LIBRARY_DIR` 设为包含 `liberika_capi.so` 的目录绝对路径（压缩包内为 `lib`）。
+Linux 运行库不会自动下载，步骤在 [Linux 接入](linux.zh.md)。
