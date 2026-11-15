@@ -1,0 +1,111 @@
+{
+  "baseline": {
+    "backend": "wgpu/Metal",
+    "decodedFrames": 95,
+    "decodedSubtitleFrames": 1,
+    "decoder": {
+      "activeBackend": "software",
+      "codec": "h264",
+      "fallbackCount": 0,
+      "fellBack": false,
+      "hardware": false,
+      "lineSizes": null,
+      "pixelFormat": null,
+      "previousBackend": null,
+      "reason": null,
+      "requestedBackend": "software",
+      "stage": "open"
+    },
+    "device": "Apple M5 Pro",
+    "expectRedundantOverlay": true,
+    "exportSize": [
+      640,
+      360
+    ],
+    "exportedFrames": 95,
+    "inspectedFrames": 83,
+    "mediaSeconds": 3.970720417,
+    "playbackOverlayFrames": 95,
+    "sourceSize": [
+      1920,
+      1080
+    ],
+    "surfaceAttached": false,
+    "wallSeconds": 4.006611625,
+    "whiteSubtitlePixelsMax": 698,
+    "whiteSubtitlePixelsMin": 698,
+    "updateOverlayCalls": 95,
+    "clockOverlayCalls": 95,
+    "clockOverlayViewports": [
+      "3840x2160"
+    ],
+    "passed": true
+  },
+  "patched": {
+    "backend": "wgpu/Metal",
+    "decodedFrames": 100,
+    "decodedSubtitleFrames": 1,
+    "decoder": {
+      "activeBackend": "software",
+      "codec": "h264",
+      "fallbackCount": 0,
+      "fellBack": false,
+      "hardware": false,
+      "lineSizes": null,
+      "pixelFormat": null,
+      "previousBackend": null,
+      "reason": null,
+      "requestedBackend": "software",
+      "stage": "open"
+    },
+    "device": "Apple M5 Pro",
+    "expectRedundantOverlay": false,
+    "exportSize": [
+      640,
+      360
+    ],
+    "exportedFrames": 100,
+    "inspectedFrames": 89,
+    "mediaSeconds": 4.000695584,
+    "playbackOverlayFrames": 0,
+    "sourceSize": [
+      1920,
+      1080
+    ],
+    "surfaceAttached": false,
+    "wallSeconds": 4.043413209,
+    "whiteSubtitlePixelsMax": 698,
+    "whiteSubtitlePixelsMin": 698,
+    "updateOverlayCalls": 0,
+    "clockOverlayCalls": 0,
+    "clockOverlayViewports": [],
+    "passed": true
+  },
+  "baseCommit": "f5deb2a",
+  "harnessSha256": "384dfaaf0001a88ae72398c41f4afdd61a9b12ffcc2643ec2278e6e4b9f469a1",
+  "fixtureSha256": "69fa01a7aab1ca2be68b42e6e66199fcc0b2f78d3d2c797ef0db902b1f47ddaf",
+  "equalPngBytes": true,
+  "baselinePresenterSha256": "90374f12b0fe8c47ab5cd4ce66f0198b528c73ba8dbc15aca6fb56e7c36cdff8",
+  "patchedPresenterSha256": "f1886feb8521c8cf8a3c90e8514ba27205d052c0dbaebc76113f6abfaa3487c0",
+  "fixtureProbe": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "index": 0,
+        "codec_name": "h264",
+        "codec_type": "video",
+        "width": 1920,
+        "height": 1080
+      },
+      {
+        "index": 1,
+        "codec_name": "ass",
+        "codec_type": "subtitle"
+      }
+    ]
+  },
+  "exportPngSha256": "49d0ad9ca8df026bfec2dfc6e11d301d1188e706664a9dc38240626c1832fbaf",
+  "scope": "Real macOS Apple M5 Pro wgpu/Metal export with software H.264 decode. The original Linux/AMD RADV environment was not tested.",
+  "interpretation": "Functional/call-count regression, not a frame-rate or throughput benchmark. Diagnostic counts are overlay-generation calls, not distinct libass bitmap redraws."
+}

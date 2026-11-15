@@ -857,12 +857,14 @@ impl PresenterRuntime {
             return Err(error);
         }
         self.current_surface_metrics = Some(metrics);
+        self.refresh_current_overlay();
         self.clear_current_danmaku_state();
         Ok(())
     }
 
     pub fn detach_surface(&mut self) -> Result<()> {
         self.current_surface_metrics = None;
+        self.current_overlay = None;
         self.clear_current_danmaku_state();
         self.player.detach_surface()?;
         self.renderer.detach_surface()
@@ -2820,21 +2822,28 @@ impl PresenterRuntime {
         );
         let source = OverlayViewport::new(viewport.width, viewport.height);
         self.subtitle_resolution.source = Some(source);
-        let overlay = self.render_playback_overlay(pts, source);
-        if subtitle_diag_enabled() {
-            eprintln!(
-                "[erika-subtitle-diag] stage=update_overlay pts={} gen={} video={}x{} overlay={}",
-                duration_label(Some(pts)),
-                generation,
-                viewport.width,
-                viewport.height,
-                overlay_debug_summary(&overlay),
-            );
+        // Export-only hosts rasterize through capture_overlay at the export
+        // size. Keep the source size for a later surface attachment, but do
+        // not render an unused playback overlay or disturb libass's viewport.
+        if self.current_surface_metrics.is_some() {
+            let overlay = self.render_playback_overlay(pts, source);
+            if subtitle_diag_enabled() {
+                eprintln!(
+                    "[erika-subtitle-diag] stage=update_overlay pts={} gen={} video={}x{} overlay={}",
+                    duration_label(Some(pts)),
+                    generation,
+                    viewport.width,
+                    viewport.height,
+                    overlay_debug_summary(&overlay),
+                );
+            }
+            if !overlay.is_empty() {
+                self.stats.overlay_frames += 1;
+            }
+            self.current_overlay = Some(overlay);
+        } else {
+            self.current_overlay = None;
         }
-        if !overlay.is_empty() {
-            self.stats.overlay_frames += 1;
-        }
-        self.current_overlay = Some(overlay);
         let generation = generation.max(self.danmaku_generation).max(1);
         let candidate_viewport = self
             .current_surface_metrics
@@ -3039,7 +3048,9 @@ impl PresenterRuntime {
             .max(1);
         if player_time != self.current_media_time {
             self.current_media_time = player_time;
-            if let Some(source) = self.subtitle_resolution.source {
+            if self.current_surface_metrics.is_some()
+                && let Some(source) = self.subtitle_resolution.source
+            {
                 let overlay = self.render_playback_overlay(player_time, source);
                 if subtitle_diag_enabled() {
                     eprintln!(
@@ -3067,6 +3078,10 @@ impl PresenterRuntime {
     }
 
     fn refresh_current_overlay(&mut self) {
+        if self.current_surface_metrics.is_none() {
+            self.current_overlay = None;
+            return;
+        }
         let Some(source) = self.subtitle_resolution.source else {
             return;
         };
@@ -4907,6 +4922,7 @@ mod tests {
             subtitle_changed: false,
         });
         presenter.subtitle_resolution.source = Some(OverlayViewport::new(640, 360));
+        presenter.current_surface_metrics = Some(SurfaceMetrics::new(640, 360, 1.0));
         // Replaying the same display target after other work must not move it.
         for hz in [60.0, 120.0] {
             for frame in 1..=6 {
@@ -5552,8 +5568,135 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
     #[test]
+    fn headless_subtitles_render_only_at_capture_size() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.current_media_time = Duration::from_millis(500);
+        presenter.export_danmaku_viewport = Some(DanmakuViewport::new(640, 360));
+        let resources = Arc::new(AssTrackResources::new(
+            2,
+            Arc::<[u8]>::from(ass_test_header().as_bytes()),
+            Arc::from([]),
+        ));
+        presenter.subtitles.push(ass_subtitle_frame(
+            2,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(3),
+            0,
+            resources,
+        ));
+        let first = presenter.capture_overlay(640, 360);
+        assert!(!first.subtitle_alpha_planes.is_empty());
+
+        for millis in [600, 700, 800] {
+            let pts = Duration::from_millis(millis);
+            presenter.update_overlay(pts, 1, 1920, 1080);
+            presenter.apply_playback_snapshot(
+                &PlaybackSnapshot {
+                    clock: PlaybackClock::paused_at(pts),
+                    generation: 1,
+                    state: PlayerState::Paused,
+                },
+                None,
+            );
+            presenter.refresh_current_overlay();
+            assert!(presenter.current_overlay.is_none());
+            assert_eq!(presenter.stats.overlay_frames, 0);
+            assert_eq!(
+                presenter.subtitle_resolution.source,
+                Some(OverlayViewport::new(1920, 1080))
+            );
+            assert_eq!(
+                presenter.current_danmaku_viewport,
+                presenter.export_danmaku_viewport
+            );
+            let capture = presenter.capture_overlay(640, 360);
+            assert!(!capture.subtitle_alpha_planes.is_empty());
+            assert!(
+                !capture.subtitle_changed,
+                "playback must not invalidate the export's libass canvas"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
+    fn subtitle_overlay_follows_surface_attachment_while_paused() {
+        use crate::core::{FlutterTextureHandle, FlutterTextureKind};
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::new(Mutex::new(None)),
+        });
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.subtitles.push(text_subtitle_frame(
+            2,
+            Duration::from_millis(500),
+            Some(Duration::from_secs(3)),
+            "Paused subtitle",
+        ));
+        presenter.update_overlay(Duration::from_secs(1), 1, 640, 360);
+        presenter.set_subtitle_scale(1.25);
+        assert!(presenter.current_overlay.is_none());
+        assert!(presenter.subtitles.text_renderer.renderer.is_none());
+
+        let surface = PlatformSurface::FlutterTexture(FlutterTextureHandle::new(
+            FlutterTextureKind::Unknown,
+            1,
+            640,
+            360,
+            1.0,
+        ));
+        presenter.attach_surface(surface).unwrap();
+        let overlay = presenter.current_overlay.as_ref().unwrap();
+        assert_eq!(overlay.pts, Duration::from_secs(1));
+        assert!(!overlay.subtitle_alpha_planes.is_empty());
+        presenter.resize_surface(1280, 720, 2.0).unwrap();
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+
+        presenter.detach_surface().unwrap();
+        assert!(presenter.current_overlay.is_none());
+        presenter.set_subtitle_delay(2_000_000);
+        assert!(presenter.current_overlay.is_none());
+        assert!(
+            presenter
+                .capture_overlay(320, 180)
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+        presenter.set_subtitle_delay(0);
+        assert!(
+            !presenter
+                .capture_overlay(320, 180)
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+        presenter.attach_surface(surface).unwrap();
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
     fn subtitle_quality_toggles_refresh_paused_frames_without_accumulating_scale() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.current_surface_metrics = Some(SurfaceMetrics::new(640, 360, 1.0));
         presenter.current_media_time = Duration::from_secs(1);
         presenter.subtitles.push(text_subtitle_frame(
             2,
