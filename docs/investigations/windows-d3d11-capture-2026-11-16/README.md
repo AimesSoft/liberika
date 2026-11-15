@@ -1,7 +1,9 @@
 # Windows D3D11 截图与 4K 播放验证（2026-11-16）
 
-本次在检查 [#93](https://github.com/AimesSoft/liberika/issues/93) 的实际播放验收时，确认
-D3D11 后端没有实现 `capture_current_frame`：旧 DLL 在已经渲染真实视频后仍返回空截图。
+全平台 presenter owner 改造已由 [#196](https://github.com/AimesSoft/liberika/pull/196)
+（`e83f1c8`）合入主干，并随 0.3.4 发布；本次没有重新实现渲染线程改造。
+在补充 Windows 实际播放回归检查时，确认 D3D11 后端没有实现 `capture_current_frame`：
+旧 DLL 在已经渲染真实视频后仍返回空截图。本次新增的是 D3D11 截图能力及其回归测试。
 独立工作区以 `f5deb2a` 为基线，仅加入本次截图实现和测试，不包含 PR #214 的修复。
 测试的源码、DLL 与环境哈希分别见 [backend manifest](backend/manifest.json) 和
 [runtime manifest](runtime/manifest.json)。
@@ -70,7 +72,7 @@ Pause 而失败。它们不是最终验收通过的证据。本次没有修改�
 这些早期 GPU 超时已被修复。逐次变更、退出码及原始日志见 [run history](runtime/run-history.json)。
 
 未覆盖完整 Flutter UI、SMTC 系统按钮、带音轨连续性、物理 HDR 显示质量或 Windows ARM64
-实机。这份记录补充 #93 的验收证据，不代表关闭其所有验收项。
+实机。这些是本轮测试的覆盖边界，不表示已经合入的 #93/#94 渲染线程改造尚未完成。
 
 ## 重跑
 
