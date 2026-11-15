@@ -4,7 +4,7 @@ cargo : warning: unused import: `GamutLut`
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (warning: unused import: `GamutLut`:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
   --> crates\erika\src\renderer\d3d11.rs:56:5
    |
 56 |     GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,

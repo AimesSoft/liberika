@@ -4,7 +4,7 @@ cargo.exe :    Compiling xtask v0.3.7 (D:\CodexWork\erika-issues-20261116\xtask)
 +   ~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (   Compiling xt...20261116\xtask):String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.30s
      Running `target\debug\xtask.exe deps plan --all --profile lgpl`
 Erika native dependency plan

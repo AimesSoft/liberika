@@ -4,7 +4,7 @@
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (   Compiling er...6\crates\erika):String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
 warning: unused import: `GamutLut`
   --> crates\erika\src\renderer\d3d11.rs:56:5
    |

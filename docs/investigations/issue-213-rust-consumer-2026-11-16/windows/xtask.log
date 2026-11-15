@@ -4,7 +4,7 @@ cargo :    Compiling find-msvc-tools v0.1.9
 + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (   Compiling find-msvc-tools v0.1.9:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
    Compiling shlex v2.0.1
    Compiling version_check v0.9.5
    Compiling cfg-if v1.0.4
@@ -83,4 +83,3 @@ test tests::msvc_archive_response_file_is_written_by_make ... ok
 test tests::gas_preprocessor_patch_adds_armasm64_tbnz_support ... ok
 
 test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
-

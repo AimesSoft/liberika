@@ -4,7 +4,7 @@ cargo.exe :    Compiling windows-core v0.62.2
 +   ~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (   Compiling windows-core v0.62.2:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
- 
+
    Compiling erika v0.3.7 (D:\CodexWork\erika-issues-20261116\crates\erika)
    Compiling erika_capi v0.3.7 (D:\CodexWork\erika-issues-20261116\crates\erika_capi)
    Compiling windows-future v0.3.2
