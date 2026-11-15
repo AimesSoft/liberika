@@ -6,6 +6,9 @@
 
 | 记录 | 范围 |
 |---|---|
+| [#197 无 surface 字幕导出实测（中文）](issue-197-headless-subtitles-2026-11-16/README.md) | 2026-11-16，Apple Metal：1080p ASS → 640×360 原生纹理；原主干与修复版 A/B、逐帧像素与字幕层调用数 |
+| [#205 HTTP 取消与连续 seek 实测（中文）](issue-205-http-seek-2026-11-16/README.md) | 2026-11-16，macOS / Windows：真实 HTTP Range、12 轮在途取消、旧主干失败对照与修复后自然结束 |
+| [Issue #213：Rust 消费端与 Windows host 验证（English）](issue-213-rust-consumer-2026-11-16/README.md) | 2026-11-16；显式 HAL patch、Linux 编译链接与 Windows xtask/C API/原生检查 |
 | [Vulkan 半精度空间末层优化](sr-gpu-head-2026-11-03/README.md) | 2026-11-03，RTX 5060 Ti；布局、半精度、误差验证与约 7–8% 整网收益 |
 | [PR #150–#159 的目的、取舍与运行验证](pr-150-159/review.zh.md) · [English](pr-150-159/review.en.md) · [日本語](pr-150-159/review.ja.md) | 2026-10-05 调查，10-08 鸿蒙补充，10-13 主分支集成；HTTP、媒体识别、时间戳、音频、GPU 与生命周期 |
 | [主分支集成与运行验证](pr-150-159/merge-validation.zh.md) · [English](pr-150-159/merge-validation.en.md) · [日本語](pr-150-159/merge-validation.ja.md) | 2026-10-13，PR #164 的集成与 Windows、Linux、OHOS 实测 |

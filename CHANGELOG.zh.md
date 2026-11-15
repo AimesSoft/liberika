@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- 仅导出画面的宿主不再生成无人使用的播放字幕层；挂载 surface 时恢复当前字幕，暂停时也生效（#197）。
+- 将 seek 取消读取与真正的 I/O 故障区分，等待后续解复用命令，并在 seek 前清除 AVIO 的旧错误（#205）。
+- 补全文档中外部 Rust workspace 必须显式配置的 `wgpu-hal` 补丁，并在 Linux CI 编译独立消费者。
+  Windows 依赖构建的 `host` 自动使用 Cargo 预期的 MSVC 目标目录（#213）。
+
 ## 0.3.7 - 2026-11-13
 
 ### Linux 发布包

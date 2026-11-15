@@ -413,6 +413,17 @@ enum NativeTarget {
 }
 
 impl NativeTarget {
+    fn resolve_host(self, os: &str, arch: &str) -> Self {
+        // Cargo's native-library lookup uses the MSVC target directory, even
+        // without `cargo --target`. Resolve before selecting either the build
+        // layout or toolchain so a bare `deps build` produces the same SDK.
+        match (self, os, arch) {
+            (Self::Host, "windows", "x86_64") => Self::X86_64WindowsMsvc,
+            (Self::Host, "windows", "aarch64") => Self::Aarch64WindowsMsvc,
+            _ => self,
+        }
+    }
+
     fn parse(value: &str) -> Result<Self> {
         match value {
             "host" => Ok(Self::Host),
@@ -884,6 +895,9 @@ impl DepsOptions {
                 other => bail!("unknown deps option: {other}"),
             }
         }
+        options.target = options
+            .target
+            .resolve_host(env::consts::OS, env::consts::ARCH);
         if options.crt == WindowsCrt::Static && !options.target.is_windows() {
             bail!("--crt static applies to Windows targets only");
         }
@@ -5185,6 +5199,57 @@ fn command_display(command: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_host_dependencies_use_the_cargo_target_directory() {
+        for (arch, expected) in [
+            ("x86_64", NativeTarget::X86_64WindowsMsvc),
+            ("aarch64", NativeTarget::Aarch64WindowsMsvc),
+        ] {
+            let target = NativeTarget::Host.resolve_host("windows", arch);
+            assert_eq!(target, expected);
+            for crt in [WindowsCrt::Dynamic, WindowsCrt::Static] {
+                let layout =
+                    workspace_layout(NativeDependencyProfile::Lgpl, target, crt, FfmpegSet::Full)
+                        .unwrap();
+                let profile = if crt == WindowsCrt::Static {
+                    "lgpl-crt-static"
+                } else {
+                    "lgpl"
+                };
+                assert!(
+                    layout
+                        .dist_dir
+                        .ends_with(Path::new(expected.triple().unwrap()).join(profile))
+                );
+            }
+        }
+        // An explicit cross target must not be replaced by the host CPU.
+        assert_eq!(
+            NativeTarget::Aarch64WindowsMsvc.resolve_host("windows", "x86_64"),
+            NativeTarget::Aarch64WindowsMsvc
+        );
+        assert_eq!(
+            NativeTarget::Host.resolve_host("macos", "aarch64"),
+            NativeTarget::Host
+        );
+        assert_eq!(
+            NativeTarget::Host.resolve_host("linux", "x86_64"),
+            NativeTarget::Host
+        );
+    }
+
+    #[test]
+    fn default_and_explicit_host_dependency_options_agree() {
+        let expected = NativeTarget::Host.resolve_host(env::consts::OS, env::consts::ARCH);
+        assert_eq!(DepsOptions::parse(&[]).unwrap().target, expected);
+        assert_eq!(
+            DepsOptions::parse(&["--target".into(), "host".into()])
+                .unwrap()
+                .target,
+            expected
+        );
+    }
 
     #[test]
     fn linux_targets_use_native_gnu_hosts_and_distinct_prefixes() {

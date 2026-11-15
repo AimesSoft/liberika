@@ -1,0 +1,143 @@
+   Compiling erika v0.3.7 (/Users/sakiko/.codex/worktrees/issue-197-and-fixes/Erika/crates/erika)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.79s
+     Running tests/media_lifecycle.rs (target/debug/deps/media_lifecycle-fe1621804f810f29)
+
+running 1 test
+test http_seek_interruption_recovers_and_reaches_natural_eof ... {"codec":"mpeg4","event":"video_decoder","requestedThreads":0,"stage":"software_threads","threadType":"frame","threads":16}
+{"activeBackend":"software","codec":"mpeg4","event":"video_decoder_changed","fallbackCount":0,"lineSizes":null,"pixelFormat":null,"previousBackend":null,"reason":null,"requestedBackend":"software","stage":"open"}
+HTTP_SEEK_E2E initial_frame_pts=Some(0ns)
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":5,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x76d1458000] Read error at pos. 10304449 (0x9d3bc1)
+[matroska,webm @ 0x76d1458000] Read error at pos. 766223 (0xbb10f)
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x76d1458000] Read error at pos. 766223 (0xbb10f)
+[matroska,webm @ 0x76d1458000] Read error at pos. 766223 (0xbb10f)
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":3.200167,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=1 cancelled_ms=0.22 generation=6 recovered_frames=7 position=201.847041ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.716791,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=2 cancelled_ms=0.21 generation=10 recovered_frames=7 position=202.147041ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.882875,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=3 cancelled_ms=0.17 generation=14 recovered_frames=7 position=201.172291ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.847042,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=4 cancelled_ms=0.16 generation=18 recovered_frames=7 position=200.884875ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":3.0534999999999997,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=5 cancelled_ms=0.21 generation=22 recovered_frames=7 position=202.475125ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":3.023917,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=6 cancelled_ms=0.20 generation=26 recovered_frames=7 position=200.422375ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.954416,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=7 cancelled_ms=0.19 generation=30 recovered_frames=7 position=200.706291ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.992458,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=8 cancelled_ms=0.21 generation=34 recovered_frames=7 position=202.321084ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.5414169999999996,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=9 cancelled_ms=0.18 generation=38 recovered_frames=7 position=200.667ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.5994170000000003,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=10 cancelled_ms=0.19 generation=42 recovered_frames=7 position=200.171375ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.811917,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=11 cancelled_ms=0.08 generation=46 recovered_frames=7 position=200.114875ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.7117500000000003,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=12 cancelled_ms=0.21 generation=50 recovered_frames=7 position=200.726375ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":157.0,"videoBackend":"software"}
+{"absoluteTargetMicros":157000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":157000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":157000,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":6.7892079999999995,"event":"video_seek_preroll","firstOutputPtsSeconds":157.0,"reason":"target_reached","stage":"complete","targetSeconds":157.0,"totalDroppedFrames":0}
+{"audioComplete":true,"event":"decoder_eof_drain","polls":1,"stage":"complete","videoBackend":"software","videoComplete":true}
+HTTP_SEEK_E2E natural_eof=true fatal_events=0 final_frames=90 last_pts=159.967s
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":0,"discardedVideoFrames":0,"discardedVideoPackets":0,"event":"playback_engine_teardown","pendingAudioFrame":false,"pendingSubtitleFrame":false,"pendingVideoFrame":false,"stage":"drop_before_decoder"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 5.60s

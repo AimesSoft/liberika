@@ -2,8 +2,8 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-以下平台以 0.3.4 为基线；浏览器后端已接入 Erika Web，并随 Release 提供独立 Web 归档。
-Linux 功能仍为实验性；当前发布流程增加 x64 / ARM64 × bundled / system 四种包，均以 Ubuntu 22.04 构建。
+以下平台以 0.3.7 为基线；浏览器后端已接入 Erika Web，并随 Release 提供独立 Web 归档。
+Linux 功能仍为实验性；0.3.7 Release 已提供 x64 / ARM64 × bundled / system 四种包，均以 Ubuntu 22.04 构建。
 
 | 平台 | 最低版本 | 解码 / 渲染 | 音频 | 分发与构建 |
 |---|---|---|---|---|
@@ -81,4 +81,5 @@ HDR 输出和平台生命周期的设备实验保存在 [验证记录目录](inv
 
 Web workflow 构建完整 WASM 包并运行独立播放器回归。Erika Web 应用已在 macOS 的
 Chrome 155.0.8059.85 验证 H.264/AAC/ASS/字体附件 MKV、VP9/Opus WebM、2000 条
-弹幕、实时参数、章节、截图与播放器生命周期；Safari / Firefox 尚未验证。
+弹幕、实时参数、章节、截图与播放器生命周期。Safari 27.0.1 的 HEVC Main 10 / Opus / ASS
+播放及 seek 已手动验证，详见[浏览器指南](web.zh.md)；Firefox 尚未验证。

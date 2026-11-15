@@ -104,7 +104,7 @@ Flutter では `erika_capi --release` をビルドし、`liberika_capi.so` が�
 
 ### GPU フレームインポートと HDR
 
-実験的な Vulkan ブリッジは FFmpeg の `AV_HWFRAME_MAP_DIRECT` で VA-API フレームをマップし、インポートした NV12/P010 VkImage を直接サンプリングします。デコーダーとシェーダーの間で転送先プレーンの確保や CPU / GPU ピクセルコピーを行いません。対応するデバイス・フォーマット、外部メモリ / セマフォ拡張、タイムラインセマフォ、synchronization2 が必要です。Intel/AMD 実機でのインポートは未検証です。FFmpeg 8 の CUDA/Vulkan 転送は、インポート失敗時のクリーンアップでクラッシュしうるため拒否されます（[上流の修正](https://github.com/FFmpeg/FFmpeg/commit/c29d710cd5d0f80bbb56f7ec1f35d5fb7ed44d05)）。FFmpeg 9 には修正が含まれますが、この組み込みを使った再ビルドは未検証です。通常の NVDEC デコードは CPU プレーン転送で引き続き利用できます。
+実験的な Vulkan ブリッジは FFmpeg の `AV_HWFRAME_MAP_READ` で VA-API フレームをマップし、インポートした NV12/P010 VkImage をサンプリングします。0.3.7 からは `AV_HWFRAME_MAP_DIRECT` を強制せず、一部の FFmpeg 8.1 / 9 ドライバーパスでの `EINVAL` を回避します。デコーダーとシェーダーの間で転送先プレーンの確保や CPU / GPU ピクセルコピーを行いません。対応するデバイス・フォーマット、外部メモリ / セマフォ拡張、タイムラインセマフォ、synchronization2 が必要です。Intel/AMD 実機でのインポートは未検証です。FFmpeg 8 の CUDA/Vulkan 転送は、インポート失敗時のクリーンアップでクラッシュしうるため拒否されます（[上流の修正](https://github.com/FFmpeg/FFmpeg/commit/c29d710cd5d0f80bbb56f7ec1f35d5fb7ed44d05)）。FFmpeg 9 には修正が含まれますが、この組み込みを使った再ビルドは未検証です。通常の NVDEC デコードは CPU プレーン転送で引き続き利用できます。
 
 `ERIKA_REQUIRE_GPU_FRAMES=1` はデコードプレーンの CPU アップロードを拒否します。`ERIKA_REQUIRE_ZERO_COPY=1` は直接 VA-API パスのみを許可し、ソフトウェアフレーム、インポート失敗、WSL D3D12 コピー、CUDA GPU コピーを拒否します。ゼロコピーのカウンタは直接インポート成功後にのみ増加します。Flutter の RGBA 読み戻しも避けるには Wayland ネイティブ表示を使用します。明示的なスクリーンショットは引き続き読み戻します。
 
@@ -117,6 +117,46 @@ Flutter では `erika_capi --release` をビルドし、`liberika_capi.so` が�
 検証した WSL 環境では、独立した Mesa Dozen 26.0.8 が RTX 5070 を Vulkan デバイスとして認識しました。ローカルのフォーマット特性実験は CUDA 外部メモリインポートまで到達しましたが、`CUDA_ERROR_NOT_SUPPORTED` が返されました。WSLg は HDR の色管理 / WSI 機能も公開しませんでした。これは特定の相互運用 / 表示の制限であり、OpenGL と Vulkan のハードウェア描画はどちらも動作します。実験的 Mesa ビルドは必須依存関係ではなく、liberika のランチャーもインストールしません。任意の WSL GPU コピーブリッジは CUDA 外部メモリインポートの代わりに Mesa D3D12 VA-API を使います。[ビルド手順、性能結果、表示上の制限](wsl-gpu-copy.md) を参照してください。
 
 Rust 利用者は `wgpu` feature を有効にしてください。[ネイティブデモ](../examples/linux_native_demo/src/main.rs) を参照。C 利用者は [`erika.h`](../crates/erika_capi/include/erika.h) と共有ライブラリを使用します。[C smoke example](../examples/linux_native_demo/capi_smoke.c) を参照してください。
+
+**リポジトリ外の Cargo workspace** では、そのルート `Cargo.toml` にも HAL の
+パッチを追加してください。Cargo は依存先の `[patch.crates-io]` を継承しません。
+Vulkan の直接インポートでは外部画像の初期化済み内容を保持する liberika の
+`wgpu-hal` fork が必要で、`wgpu` feature だけでは不足します。依存とパッチを
+**同じ tag または commit** に固定してください：
+
+```toml
+[dependencies]
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7", features = ["wgpu"] }
+
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7" }
+```
+
+ローカル checkout ではパッチを
+`wgpu-hal = { path = "/absolute/path/to/liberika/third_party/wgpu-hal" }`
+に置き換えます。利用側のルート manifest の `[patch.crates-io]` に記述し、Cargo の
+`paths` override は使用しません。既存の lockfile が registry の HAL を選ぶ場合は
+`cargo update -p wgpu-hal --precise 29.0.3` を実行し、`cargo tree -i wgpu-hal`
+で liberika が参照されることを確認します。更新した `Cargo.lock` をコミットし、
+liberika の tag 更新時には HAL のバージョンも確認してください。workspace 内の他の
+依存もこの HAL バージョンに対応する必要があります。ビルド済みの C/Flutter 配布物は
+パッチ適用済みで、利用側の Cargo 設定は不要です。
+
+Linux の Rust 利用側では、自分の `.cargo/config.toml` にも次の設定が必要です。
+同梱 `soundtouch-ffi` は既定で PIC を無効にしますが、erika は共有ライブラリを
+ビルドします。Cargo は依存リポジトリの `.cargo` 設定を読み込みません：
+
+```toml
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CFLAGS_aarch64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-fPIC"
+```
+
+`bash scripts/check_linux_rust_consumer.sh` は独立した新規 workspace に明示的な
+ローカルパッチと PIC 設定を追加し、コンパイルとリンクを確認します。Linux CI は両 CPU アーキテクチャと
+依存モードでこのチェックを実行します。
 
 `erika_presenter_attach_wgpu_surface` では、`XlibWindow` に X11 の `Window` ID と `Display*`、`WaylandSurface` に `wl_surface*` と `wl_display*` を渡します。ポインタは `uintptr_t` を経由して `uint64_t` にキャストします。detach または presenter の破棄が完了するまで、両方のホスト所有ハンドルを有効に保ってください。ウィンドウのイベントループスレッドで attach / render / resize / detach を行い、presenter ごとの呼び出しを直列化し、表示フレームごとに `render_tick` を実行します。幅と高さは物理ピクセル、scale は独立した DPI 係数です。`.so` 依存関係は rpath または `LD_LIBRARY_PATH` で解決し、`ldd` で確認します。
 

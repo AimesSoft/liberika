@@ -18,10 +18,10 @@ provides an `XComponent` surface id through `attachSurface()` and drives
 ohpm install erika
 ```
 
-As of 2026-11-06, OHPM lists 0.3.4 as the latest public version.
-This checkout documents the 0.3.4 SDK.
+As of 2026-11-16, [OHPM](https://ohpm.openharmony.cn/#/en/detail/erika) lists 0.3.7 as the latest public version.
+This guide documents the 0.3.7 SDK.
 
-Native presenter operations are serialized on a dedicated owner thread. The ArkTS wrapper shown below retains synchronous method signatures; the native bridge also provides async entry points. `ErikaOhosPlayerFromId` returns null in 0.3.4; use the bridge instead of retaining a raw native player pointer.
+Native presenter operations are serialized on a dedicated owner thread. The ArkTS wrapper shown below retains synchronous method signatures; the native bridge also provides async entry points. `ErikaOhosPlayerFromId` has returned null since 0.3.4; use the bridge instead of retaining a raw native player pointer.
 
 ## Player configuration
 

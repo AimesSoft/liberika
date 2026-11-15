@@ -1,0 +1,167 @@
+cargo.exe :    Compiling windows-core v0.62.2
+所在位置 D:\CodexWork\erika-issues-20261116\erika-issues-windows-tests.ps1:14 字符: 3
++   & cargo @cargoArgs 2>&1 | Out-File -Encoding utf8 "$root\validation ...
++   ~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling windows-core v0.62.2:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+   Compiling erika v0.3.7 (D:\CodexWork\erika-issues-20261116\crates\erika)
+   Compiling erika_capi v0.3.7 (D:\CodexWork\erika-issues-20261116\crates\erika_capi)
+   Compiling windows-future v0.3.2
+   Compiling windows-collections v0.3.2
+   Compiling windows-numerics v0.3.1
+   Compiling windows v0.62.2
+   Compiling gpu-allocator v0.28.0
+   Compiling wgpu-hal v29.0.3 (D:\CodexWork\erika-issues-20261116\third_party\wgpu-hal)
+   Compiling wgpu-core-deps-windows-linux-android v29.0.3
+   Compiling wgpu-core v29.0.3
+   Compiling wgpu v29.0.3
+warning: unused import: `GamutLut`
+  --> crates\erika\src\renderer\d3d11.rs:56:5
+   |
+56 |     GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates\erika\src\renderer\wgpu.rs:4238:17
+     |
+4238 |             let mut config = wgpu::SurfaceConfiguration {
+     |                 ----^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates\erika\src\renderer\wgpu.rs:4257:17
+     |
+4257 |             let mut fallback_reason = selection.fallback_reason;
+     |                 ----^^^^^^^^^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: unused variable: `recovery_attempt`
+    --> crates\erika\src\renderer\wgpu.rs:4353:13
+     |
+4353 |         for recovery_attempt in 0..2 {
+     |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_recovery_attempt`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `bytes` is never read
+   --> crates\erika\src\renderer\d3d11_d3d12_linalg.rs:586:5
+    |
+580 | struct Layout {
+    |        ------ field in this struct
+...
+586 |     bytes: u64,
+    |     ^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `allocated_bytes` is never used
+   --> crates\erika\src\renderer\metal\mod.rs:296:8
+    |
+280 | impl ImportedVideoFrame {
+    | ----------------------- method in this implementation
+...
+296 |     fn allocated_bytes(&self) -> u64 {
+    |        ^^^^^^^^^^^^^^^
+
+warning: variant `Rgb` is never constructed
+   --> crates\erika\src\renderer\wgpu.rs:372:5
+    |
+367 | enum UploadedVideoTextures {
+    |      --------------------- variant in this enum
+...
+372 |     Rgb {
+    |     ^^^
+
+warning: field `sdr_format` is never read
+   --> crates\erika\src\renderer\wgpu.rs:491:5
+    |
+488 | struct AttachedSurface {
+    |        --------------- field in this struct
+...
+491 |     sdr_format: wgpu::TextureFormat,
+    |     ^^^^^^^^^^
+
+warning: function `attempted_candidate_prefix` is never used
+    --> crates\erika\src\renderer\wgpu.rs:1087:4
+     |
+1087 | fn attempted_candidate_prefix(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: linker stdout: 正在创建库 D:\CodexWork\erika-issues-20261116\target\debug\deps\erika.dll.lib 和对象 D:\CodexWork\erika
+-issues-20261116\target\debug\deps\erika.dll.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `erika` (lib) generated 10 warnings (run `cargo fix --lib -p erika` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 50.45s
+     Running unittests src\lib.rs (target\debug\deps\erika_capi-08b21ac9a64d9b5d.exe)
+
+running 57 tests
+test diagnostics::tests::log_read_validates_arguments ... ok
+test presenter_json::tests::dispatch_table_and_match_arms_stay_in_sync ... ok
+test presenter_json::tests::base64_matches_the_rfc_4648_vectors ... ok
+test presenter_json::tests::json_bridge_parses_http_byte_count_options ... ok
+test diagnostics::tests::log_read_returns_a_filtered_redacted_document ... ok
+test tests::c_event_counts_tracks ... ok
+test tests::c_event_exposes_audio_recovery_transition_message ... ok
+test tests::c_event_exposes_video_decoder_transition_message ... ok
+test tests::c_external_subtitle_api_rejects_null_pointers ... ok
+test tests::c_event_reports_track_selection_changed ... ok
+test tests::c_http_headers_reject_reserved_and_malformed_headers ... ok
+test tests::c_open_options_accepts_null_and_defaults ... ok
+test tests::c_flutter_texture_attach_emits_event ... ok
+test tests::c_open_options_parses_headers_and_read_ahead ... ok
+test tests::c_open_options_rejects_nonzero_reserved ... ok
+test tests::c_presenter_config_maps_output_modes ... ok
+test tests::c_http_headers_validate_parameters_and_preserve_order ... ok
+test tests::c_presenter_config_keeps_windows_native_decode_path ... ok
+test tests::c_presenter_config_maps_upscaler_modes ... ok
+test presenter_json::tests::global_methods_work_without_a_handle_and_unknown_methods_are_coded ... ok
+test tests::c_subtitle_style_maps_all_fields_and_normalizes_override_mask ... ok
+test tests::c_surface_attach_emits_events ... ok
+test tests::c_surface_output_capabilities_preserve_auto_headroom ... ok
+test tests::c_track_info_maps_source_selection_and_strings ... ok
+test tests::c_track_selection_uses_negative_one_for_disabled_tracks ... ok
+test presenter_json::tests::list_methods_states_which_methods_block_and_which_write_files ... ok
+test tests::c_wgpu_surface_keeps_physical_extent_separate_from_scale ... ok
+test tests::c_wgpu_surface_attach_emits_event ... ok
+test tests::erika_open_with_options_rejects_null_pointer_arguments ... ok
+test tests::open_options_raw_matches_legacy_pair ... ok
+test tests::null_handle_is_rejected ... ok
+test tests::gif_export_c_api_validates_boundary_before_opening_input ... ok
+test tests::frame_export_c_api_returns_owned_pixels_and_validates_its_boundary ... ok
+test tests::frame_export_session_c_api_takes_many_pictures_from_one_open_media ... ok
+test presenter_json::tests::export_frame_methods_work_without_a_handle ... ok
+test tests::presenter_open_discards_events_from_the_previous_content_boundary ... ok
+test tests::presenter_open_preserves_surface_lifecycle_events ... ok
+test tests::c_presenter_memory_font_rejects_invalid_pointers_and_ids ... ok
+test tests::presenter_capture_distinguishes_absent_frame_from_capture_failure ... ok
+test tests::c_presenter_toggles_debug_hud ... ok
+test diagnostics::tests::presenter_diagnostics_json_has_the_documented_sections ... ok
+test presenter_json::tests::json_bridge_exposes_memory_font_selection_and_status ... ok
+test tests::c_presenter_reports_upscaler_status ... ok
+test tests::c_presenter_reports_resource_status_without_changing_stats_abi ... ok
+test tests::c_presenter_set_volume_accepts_valid_handle ... ok
+test presenter_json::tests::json_bridge_exposes_resource_status ... ok
+test tests::c_presenter_set_upscaler_accepts_valid_handle ... ok
+test tests::c_presenter_lifecycle_rejects_null_and_can_be_destroyed ... ok
+test presenter_json::tests::pass_through_reaches_hud_tracks_danmaku_and_nested_calls ... ok
+test tests::c_presenter_can_be_created_with_edr_config ... ok
+test tests::c_presenter_danmaku_api_loads_configures_and_clears ... ok
+test presenter_json::tests::mute_keeps_the_volume_it_reports ... ok
+test presenter_json::tests::json_bridge_is_exported_on_supported_hosts ... ok
+test presenter_json::tests::chapters_report_container_timeline_and_explain_no_media ... ok
+test presenter_json::tests::container_reports_the_format_and_explains_no_media ... ok
+test tests::c_presenter_memory_font_round_trip_exposes_status_and_info ... ok
+test presenter_json::tests::json_bridge_exposes_diagnostics_snapshot_and_logs ... ok
+
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+EXIT=0

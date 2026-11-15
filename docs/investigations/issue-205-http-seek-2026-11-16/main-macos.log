@@ -1,0 +1,186 @@
+   Compiling erika v0.3.7 (/private/tmp/erika-205-baseline-main/crates/erika)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.71s
+     Running tests/media_lifecycle.rs (/Users/sakiko/.codex/worktrees/issue-197-and-fixes/Erika/target/debug/deps/media_lifecycle-fe1621804f810f29)
+
+running 1 test
+test http_seek_interruption_recovers_and_reaches_natural_eof ... {"codec":"mpeg4","event":"video_decoder","requestedThreads":0,"stage":"software_threads","threadType":"frame","threads":16}
+{"activeBackend":"software","codec":"mpeg4","event":"video_decoder_changed","fallbackCount":0,"lineSizes":null,"pixelFormat":null,"previousBackend":null,"reason":null,"requestedBackend":"software","stage":"open"}
+HTTP_SEEK_E2E initial_frame_pts=Some(0ns)
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":5,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error at pos. 10304449 (0x9d3bc1)
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error at pos. 766223 (0xbb10f)
+[matroska,webm @ 0x7ab7058000] Read error at pos. 766223 (0xbb10f)
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error at pos. 766223 (0xbb10f)
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":3.228833,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=1 cancelled_ms=0.18 generation=6 recovered_frames=7 position=200.493584ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.718375,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=2 cancelled_ms=0.15 generation=10 recovered_frames=7 position=200.730959ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.9845,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=3 cancelled_ms=0.24 generation=14 recovered_frames=7 position=201.55ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.911541,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=4 cancelled_ms=0.14 generation=18 recovered_frames=7 position=200.2305ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}[matroska,webm @ 0x7ab7058000] Read error
+
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.842291,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=5 cancelled_ms=0.16 generation=22 recovered_frames=7 position=201.472834ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.5956249999999996,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=6 cancelled_ms=0.19 generation=26 recovered_frames=7 position=201.854ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":3.008334,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=7 cancelled_ms=0.20 generation=30 recovered_frames=7 position=200.014208ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.9787500000000002,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=8 cancelled_ms=0.20 generation=34 recovered_frames=7 position=201.943125ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":3.183292,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=9 cancelled_ms=0.25 generation=38 recovered_frames=7 position=200.652625ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.9692920000000003,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=10 cancelled_ms=0.18 generation=42 recovered_frames=7 position=202.036625ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":3.0764579999999997,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=11 cancelled_ms=0.26 generation=46 recovered_frames=7 position=202.336625ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":80.0,"videoBackend":"software"}
+{"absoluteTargetMicros":80000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":80000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":80000,"timelineOriginMicros":0}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":2.0,"videoBackend":"software"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":0.0,"videoBackend":"software"}
+[matroska,webm @ 0x7ab7058000] Read error
+[matroska,webm @ 0x7ab7058000] Read error
+{"absoluteTargetMicros":0,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":0,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":0,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":2.5464580000000003,"event":"video_seek_preroll","firstOutputPtsSeconds":0.0,"reason":"target_reached","stage":"complete","targetSeconds":0.0,"totalDroppedFrames":0}
+HTTP_SEEK_E2E round=12 cancelled_ms=0.31 generation=50 recovered_frames=7 position=201.262708ms
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_queue_cleanup","stage":"seek_before_decoder_transition"}
+{"event":"video_seek_preroll","stage":"waiting_for_keyframe","targetSeconds":157.0,"videoBackend":"software"}
+{"absoluteTargetMicros":157000000,"availableVideoStreams":[0],"event":"ffmpeg_seek","relativeTargetMicros":157000000,"selectedStreams":[0,1,3,4],"stage":"backward_keyframe_request","streamIndex":0,"targetInSeekTimeBase":157000,"timelineOriginMicros":0}
+{"backend":"software","event":"video_decoder_recovery_keyframe","mediaCodecMode":null,"stream":0}
+{"elapsedMs":8.190292,"event":"video_seek_preroll","firstOutputPtsSeconds":157.0,"reason":"target_reached","stage":"complete","targetSeconds":157.0,"totalDroppedFrames":0}
+{"event":"playback_fatal","reason":"demux worker error: source error: ffmpeg error in av_read_frame: Input/output error (-5); custom AVIO read at offset 4248361 failed earlier: source read cancelled","stage":"audio_tick"}
+
+thread 'http_seek_interruption_recovers_and_reaches_natural_eof' (18319344) panicked at crates/erika/tests/media_lifecycle.rs:585:46:
+EOF phase playback fatal: Playback("demux worker error: source error: ffmpeg error in av_read_frame: Input/output error (-5); custom AVIO read at offset 4248361 failed earlier: source read cancelled")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+{"decoderAliveDuringCleanup":true,"discardedAudioFrames":0,"discardedSubtitleFrames":1,"discardedVideoFrames":29,"discardedVideoPackets":0,"event":"playback_engine_teardown","pendingAudioFrame":false,"pendingSubtitleFrame":false,"pendingVideoFrame":true,"stage":"drop_before_decoder"}
+FAILED
+
+failures:
+
+failures:
+    http_seek_interruption_recovers_and_reaches_natural_eof
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 4.10s
+
+error: test failed, to rerun pass `-p erika --test media_lifecycle`

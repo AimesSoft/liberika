@@ -1,0 +1,13 @@
+# Selected original output from the Linux validation log.
+# Line numbers refer to the full log; omitted output is not reproduced.
+
+20: Project version: 0.17.5
+63:     b_staticpic      : true
+66:     default_library  : static
+116: Patched libass ready: /workspace/third_party/dist/x86_64-unknown-linux-gnu/system/libass
+203: External consumer resolves wgpu-hal 29.0.3 from /workspace/third_party/wgpu-hal/Cargo.toml
+317:    Compiling wgpu-hal v29.0.3 (/workspace/third_party/wgpu-hal)
+389:    Compiling erika v0.3.7 (/workspace/crates/erika)
+468: warning: `erika` (lib) generated 7 warnings (run `cargo fix --lib -p erika` to apply 3 suggestions)
+469:    Compiling erika-external-rust-consumer v0.0.0 (/tmp/erika-rust-consumer.yDDtD0)
+470:     Finished `dev` profile [unoptimized + debuginfo] target(s) in 52.79s

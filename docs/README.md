@@ -2,13 +2,18 @@
 
 # liberika 文档 / Documentation
 
-当前接入说明以 **0.3.4** 为基线。选择 SDK 后，先读其安装和使用指南；需要自建
+当前接入说明以 **0.3.7** 为基线。选择 SDK 后，先读其安装和使用指南；需要自建
 渲染宿主或开发内核时，再进入下列参考文档。
 
 当前源码另提供 **浏览器 / WASM 播放后端**，已接入 Erika Web。支持在浏览器读取
 MKV 内嵌 ASS 和字体附件，由 libass 绘制字幕、Rust 引擎绘制弹幕，统一交给 WebGL2
 合成，音视频使用 WebCodecs 解码。从 [Web 接入指南](web.zh.md) 开始，可一次构建
 完整运行时并接入自有网页界面；也可下载 Release 提供的 Web 归档，尚未发布到 npm。
+
+0.3.5 的 Windows / 外挂字幕修复、0.3.6 的字体与彩色 Emoji，以及 0.3.7 的
+Linux 预编译包、mode 7 弹幕和 dma-buf 输出见[更新日志](../CHANGELOG.zh.md)。
+截至 2026-11-16，Flutter、Swift SDK 和 OHPM 均已公开发布 0.3.7；未发布改动列在
+更新日志的 Unreleased 节。
 
 ## 接入 / Integration
 

@@ -17,8 +17,8 @@ use crate::core::{
 use crate::diagnostics::{PlaybackTimingCounters, QueueDepths};
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
-    DoviRejectReason, Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat, StreamSelection,
-    SubtitleDecoder,
+    DoviRejectReason, FfmpegError, Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat,
+    StreamSelection, SubtitleDecoder,
 };
 use crate::source::{self, source_from_uri_with_hint, source_from_uri_with_options};
 use crate::subtitle::{
@@ -399,6 +399,17 @@ fn run_demux_worker(
                 ));
                 DemuxMessage::Eof { generation }
             }
+            Err(FfmpegError::SourceCancelled)
+                if demuxer
+                    .source_cancellation()
+                    .is_some_and(|source| source.is_cancelled()) =>
+            {
+                // The interrupt precedes enqueueing Seek/Stop. Park until the
+                // command arrives; retrying here would spin on the cancelled
+                // token, and publishing an error can poison the new generation.
+                active = false;
+                continue;
+            }
             Err(error) => {
                 eof = true;
                 trace::log(format!(
@@ -531,6 +542,16 @@ fn handle_demux_command(
                 *generation = seek_generation;
                 *eof = false;
                 if let Err(error) = demuxer.seek(position) {
+                    if matches!(error, FfmpegError::SourceCancelled)
+                        && demuxer
+                            .source_cancellation()
+                            .is_some_and(|source| source.is_cancelled())
+                    {
+                        // A newer seek or shutdown interrupted this seek's own
+                        // reads. Its queued command will supply the next target.
+                        *active = false;
+                        return true;
+                    }
                     let _ = packets.send(DemuxMessage::Error {
                         generation: *generation,
                         message: error.to_string(),
@@ -6948,6 +6969,167 @@ mod tests {
             receiver.try_recv().is_ok(),
             "demux drop returned with a live media source"
         );
+    }
+
+    struct CancellableFixtureSource {
+        source: source::LocalFileSource,
+        cancellation: source::SourceCancellation,
+        interrupted: Sender<()>,
+        block_next_read: Arc<AtomicBool>,
+        read_started: Sender<()>,
+    }
+
+    impl source::MediaSource for CancellableFixtureSource {
+        fn uri(&self) -> &str {
+            self.source.uri()
+        }
+
+        fn len(&mut self) -> source::Result<Option<u64>> {
+            self.source.len()
+        }
+
+        fn read_range(&mut self, range: source::ByteRange) -> source::Result<Vec<u8>> {
+            if self.block_next_read.swap(false, Ordering::SeqCst) {
+                let _ = self.read_started.send(());
+                let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+                while !self.cancellation.is_cancelled() {
+                    if Instant::now() >= deadline {
+                        return Err(source::SourceError::Io("read was not interrupted".into()));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            if self.cancellation.is_cancelled() {
+                let _ = self.interrupted.send(());
+                return Err(source::SourceError::Cancelled);
+            }
+            self.source.read_range(range)
+        }
+
+        fn cancellation(&self) -> Option<source::SourceCancellation> {
+            Some(self.cancellation.clone())
+        }
+    }
+
+    struct FixtureSourceControl {
+        cancellation: source::SourceCancellation,
+        interrupted: Receiver<()>,
+        block_next_read: Arc<AtomicBool>,
+        read_started: Receiver<()>,
+    }
+
+    fn cancellable_fixture_demuxer() -> (Demuxer, FixtureSourceControl) {
+        let cancellation = source::SourceCancellation::default();
+        let (interrupted, interrupt_receiver) = unbounded();
+        let block_next_read = Arc::new(AtomicBool::new(false));
+        let (read_started, read_receiver) = unbounded();
+        let demuxer = Demuxer::open_source(Box::new(CancellableFixtureSource {
+            source: source::LocalFileSource::open(playback_fixture_path()).unwrap(),
+            cancellation: cancellation.clone(),
+            interrupted,
+            block_next_read: block_next_read.clone(),
+            read_started,
+        }))
+        .unwrap();
+        (
+            demuxer,
+            FixtureSourceControl {
+                cancellation,
+                interrupted: interrupt_receiver,
+                block_next_read,
+                read_started: read_receiver,
+            },
+        )
+    }
+
+    #[test]
+    fn demux_worker_does_not_publish_a_cancelled_read_as_error_or_eof() {
+        let (demuxer, control) = cancellable_fixture_demuxer();
+        let (packet_sender, packets) = unbounded();
+        let (commands, command_receiver) = unbounded();
+        control.block_next_read.store(true, Ordering::SeqCst);
+        commands
+            .send(DemuxCommand::Start { generation: 1 })
+            .unwrap();
+        let worker = thread::spawn(move || {
+            run_demux_worker(demuxer, packet_sender, command_receiver);
+        });
+        control
+            .read_started
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .unwrap();
+        control.cancellation.interrupt();
+        control
+            .interrupted
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .unwrap();
+        // End the interrupt-to-command window by disconnecting the control
+        // channel. Joining makes the assertions independent of scheduling.
+        drop(commands);
+        worker.join().unwrap();
+        for message in packets.try_iter() {
+            match message {
+                DemuxMessage::Packet { .. } => {}
+                DemuxMessage::Error { message, .. } => panic!("{message}"),
+                DemuxMessage::Eof { .. } => panic!("cancelled read became EOF"),
+            }
+        }
+    }
+
+    #[test]
+    fn demux_worker_recovers_when_a_new_seek_interrupts_an_older_resume() {
+        let (demuxer, control) = cancellable_fixture_demuxer();
+        let first = control.cancellation.interrupt();
+        let latest = control.cancellation.interrupt();
+        let (packet_sender, packets) = unbounded();
+        let (commands, command_receiver) = unbounded();
+        // The second seek has interrupted I/O but is not yet enqueued. The
+        // first resume must not reset its token or turn its read into fatal.
+        commands
+            .send(DemuxCommand::Seek {
+                generation: 2,
+                position: Duration::ZERO,
+                io_generation: Some(first),
+            })
+            .unwrap();
+        commands
+            .send(DemuxCommand::Start { generation: 2 })
+            .unwrap();
+        let worker = thread::spawn(move || {
+            run_demux_worker(demuxer, packet_sender, command_receiver);
+        });
+        control
+            .interrupted
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .unwrap();
+        commands
+            .send(DemuxCommand::Seek {
+                generation: 3,
+                position: Duration::from_secs(1),
+                io_generation: Some(latest),
+            })
+            .unwrap();
+        commands
+            .send(DemuxCommand::Start { generation: 3 })
+            .unwrap();
+        let mut latest_packets = 0;
+        loop {
+            match packets.recv_timeout(FIXTURE_WAIT_TIMEOUT).unwrap() {
+                DemuxMessage::Packet { generation, .. } => {
+                    if generation == 3 {
+                        latest_packets += 1;
+                    }
+                }
+                DemuxMessage::Eof { generation } => {
+                    assert_eq!(generation, 3);
+                    break;
+                }
+                DemuxMessage::Error { message, .. } => panic!("{message}"),
+            }
+        }
+        assert!(latest_packets > 0);
+        commands.send(DemuxCommand::Stop).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

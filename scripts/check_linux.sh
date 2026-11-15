@@ -14,6 +14,7 @@ fi
 BUILD_DIR="$CARGO_TARGET_DIR${CARGO_BUILD_TARGET:+/$CARGO_BUILD_TARGET}/debug"
 cargo fmt --all -- --check
 python3 packaging/tests/test_api_alignment.py -v
+bash scripts/check_linux_rust_consumer.sh
 if [[ "${ERIKA_LINUX_TEST_BACKTRACE:-0}" == 1 ]]; then
   # Only test executables run in GDB; dependency builds remain unchanged.
   # Cargo executes test binaries with each crate's directory as CWD, so the runner
