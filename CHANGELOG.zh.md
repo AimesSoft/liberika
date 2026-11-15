@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- 补齐 Windows D3D11 SDR 截图，包含字幕和可选弹幕，支持 HDR 色调映射及非预乘 alpha（straight alpha）的
+  RGBA 输出。截图保留实时输出配置并对 GPU 读回设置超时；不应用超分增强。
+  新增像素回归与真实 4K HEVC 插件检查。
+
 ## 0.3.7 - 2026-11-13
 
 ### Linux 发布包

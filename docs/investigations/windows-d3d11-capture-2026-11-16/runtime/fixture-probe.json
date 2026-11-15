@@ -1,0 +1,22 @@
+{
+  "programs": [],
+  "stream_groups": [],
+  "streams": [
+    {
+      "codec_name": "hevc",
+      "profile": "Main 10",
+      "codec_type": "video",
+      "width": 3840,
+      "height": 2160,
+      "pix_fmt": "yuv420p10le",
+      "r_frame_rate": "24/1",
+      "nb_frames": "72"
+    }
+  ],
+  "format": {
+    "duration": "3.000000",
+    "size": "4893428"
+  },
+  "sha256": "3b715b9f6601c6d82fd20c681ee30f02880cf8ca904c7714acb12e72482e8fb3",
+  "provenance": "Reused existing Windows erika93-4k-hevc.mp4 acceptance fixture; visual inspection confirms a synthetic test pattern. No media file is committed."
+}

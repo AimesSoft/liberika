@@ -1,0 +1,35 @@
+2026-11-16 03:08:24 [tid 18828] loaded Erika C API from D:\CodexWork\erika-windows-capture\validation-logs\issue-93\baseline-erika_capi.dll
+2026-11-16 03:08:25 [tid 18828] presenter shutdown begin player=73
+2026-11-16 03:08:25 [tid 17560] presenter shutdown detach player=73
+2026-11-16 03:08:25 [tid 17560] presenter shutdown destroy player=73
+2026-11-16 03:08:25 [tid 17560] presenter shutdown destroyed player=73
+2026-11-16 03:08:25 [tid 18828] presenter shutdown joined player=73
+2026-11-16 03:08:25 [tid 24412] attach_windows_hwnd failed with ErikaStatus_PlayerError (3)
+2026-11-16 03:08:25 [tid 18828] presenter shutdown begin player=11
+2026-11-16 03:08:25 [tid 11756] presenter shutdown detach player=11
+2026-11-16 03:08:25 [tid 11756] presenter shutdown destroy player=11
+2026-11-16 03:08:25 [tid 11756] presenter shutdown destroyed player=11
+2026-11-16 03:08:25 [tid 18828] presenter shutdown joined player=11
+2026-11-16 03:08:25 [tid 18828] presenter shutdown begin player=22
+2026-11-16 03:08:25 [tid 12928] presenter shutdown detach player=22
+2026-11-16 03:08:25 [tid 12928] presenter shutdown destroy player=22
+2026-11-16 03:08:25 [tid 12928] presenter shutdown destroyed player=22
+2026-11-16 03:08:25 [tid 18828] presenter shutdown joined player=22
+2026-11-16 03:08:25 [tid 18828] presenter shutdown begin player=33
+2026-11-16 03:08:25 [tid 24412] presenter shutdown detach player=33
+2026-11-16 03:08:25 [tid 24412] presenter shutdown destroy player=33
+2026-11-16 03:08:25 [tid 24412] presenter shutdown destroyed player=33
+2026-11-16 03:08:25 [tid 18828] presenter shutdown joined player=33
+2026-11-16 03:08:25 [tid 18828] presenter shutdown begin player=72
+2026-11-16 03:08:25 [tid 18224] presenter shutdown detach player=72
+2026-11-16 03:08:25 [tid 18224] presenter shutdown destroy player=72
+2026-11-16 03:08:25 [tid 18224] presenter shutdown destroyed player=72
+2026-11-16 03:08:25 [tid 18828] presenter shutdown joined player=72
+2026-11-16 03:08:26 [tid 18756] presenter_worker player=71 platform_thread=18828 render_thread=18756 off_platform=true
+2026-11-16 03:08:26 [tid 18756] frame_tick player=71 count=1 delta_ms=361.325900 work_ms=1.906500
+2026-11-16 03:08:26 [tid 18756] frame_tick player=71 count=2 delta_ms=63.130400 work_ms=188.780500
+2026-11-16 03:08:26 [tid 18756] frame_tick player=71 count=3 delta_ms=236.228100 work_ms=1.652300
+2026-11-16 03:08:26 [tid 18756] frame_tick player=71 count=4 delta_ms=63.326200 work_ms=2.075800
+2026-11-16 03:08:26 [tid 18756] frame_tick player=71 count=5 delta_ms=63.918600 work_ms=2.357800
+2026-11-16 03:08:26 [tid 18756] frame_tick player=71 count=6 delta_ms=64.783100 work_ms=2.301400
+2026-11-16 03:08:26 [tid 18756] screenshot unavailable: capture_frame_rgba has no current video frame for 320x180 capture

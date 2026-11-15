@@ -1,0 +1,27 @@
+{
+  "width": 320,
+  "height": 180,
+  "bytes": 23682,
+  "sha256": "a52926c8bef2b34bebd76e76f50827ad1e38932c10880c6f08ec092d46297880",
+  "decoded_rgba_bytes": 230400,
+  "unique_rgba_colors": 3825,
+  "channel_ranges": {
+    "red": [
+      0,
+      255
+    ],
+    "green": [
+      0,
+      255
+    ],
+    "blue": [
+      0,
+      255
+    ],
+    "alpha": [
+      255,
+      255
+    ]
+  },
+  "visual_check": "Synthetic color bars and moving test-pattern marks are visible; not blank or black."
+}

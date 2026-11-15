@@ -923,11 +923,21 @@ requested `width`×`height` (independent of the display surface size). Danmaku
 is deliberately not included — screenshots represent the video rather than
 transient on-screen comments. `out_capacity` must be at least `width*height*4`.
 It returns `PlayerError` when no frame is available yet. Metal and wgpu
-(including Android) implement capture; the current D3D11 backend does not.
+(including Android) implement capture. Windows D3D11 capture is implemented in
+unreleased source; the published v0.3.7 D3D11 runtime still returns no capture.
 Capture always uses an SDR RGBA8 offscreen target and tone-maps
 HDR/extended-linear content, so the returned
 bytes are SDR even when the display output is Apple EDR, HDR10, or Android
 extended-linear scRGB.
+
+D3D11 captures use straight RGBA, preserving packed-alpha colors for PNG encoding,
+and do not change the live surface, output mode or published Flutter texture.
+They use the standard video scaler without ArtCNN/FSR/VSR enhancement. GPU
+readback has a bounded wait; a timeout returns an error without prematurely
+returning a sampled frame to the decoder pool. If destruction also times out
+on a valid device, that frame and its associated pool resources are retained
+until process exit, with a warning.
+
 
 ```c
 uint32_t w = 1920, h = 1080;

@@ -1,0 +1,56 @@
+2026-11-16 02:42:49 [tid 27252] loaded Erika C API from D:\CodexWork\erika-issues-20261116\target\debug\erika_capi.dll
+2026-11-16 02:42:49 [tid 27252] presenter shutdown begin player=73
+2026-11-16 02:42:49 [tid 12792] presenter shutdown detach player=73
+2026-11-16 02:42:49 [tid 12792] presenter shutdown destroy player=73
+2026-11-16 02:42:49 [tid 12792] presenter shutdown destroyed player=73
+2026-11-16 02:42:49 [tid 27252] presenter shutdown joined player=73
+2026-11-16 02:42:50 [tid 20668] attach_windows_hwnd failed with ErikaStatus_PlayerError (3)
+2026-11-16 02:42:50 [tid 27252] presenter shutdown begin player=11
+2026-11-16 02:42:50 [tid 27044] presenter shutdown detach player=11
+2026-11-16 02:42:50 [tid 27044] presenter shutdown destroy player=11
+2026-11-16 02:42:50 [tid 27044] presenter shutdown destroyed player=11
+2026-11-16 02:42:50 [tid 27252] presenter shutdown joined player=11
+2026-11-16 02:42:50 [tid 27252] presenter shutdown begin player=22
+2026-11-16 02:42:50 [tid 26320] presenter shutdown detach player=22
+2026-11-16 02:42:50 [tid 26320] presenter shutdown destroy player=22
+2026-11-16 02:42:50 [tid 26320] presenter shutdown destroyed player=22
+2026-11-16 02:42:50 [tid 27252] presenter shutdown joined player=22
+2026-11-16 02:42:50 [tid 27252] presenter shutdown begin player=33
+2026-11-16 02:42:50 [tid 20668] presenter shutdown detach player=33
+2026-11-16 02:42:50 [tid 20668] presenter shutdown destroy player=33
+2026-11-16 02:42:50 [tid 20668] presenter shutdown destroyed player=33
+2026-11-16 02:42:50 [tid 27252] presenter shutdown joined player=33
+2026-11-16 02:42:50 [tid 27252] presenter shutdown begin player=72
+2026-11-16 02:42:50 [tid 16452] presenter shutdown detach player=72
+2026-11-16 02:42:50 [tid 16452] presenter shutdown destroy player=72
+2026-11-16 02:42:50 [tid 16452] presenter shutdown destroyed player=72
+2026-11-16 02:42:50 [tid 27252] presenter shutdown joined player=72
+2026-11-16 02:42:50 [tid 5108] presenter_worker player=71 platform_thread=27252 render_thread=5108 off_platform=true
+2026-11-16 02:42:50 [tid 5108] frame_tick player=71 count=1 delta_ms=277.317500 work_ms=2.486800
+2026-11-16 02:42:50 [tid 5108] frame_tick player=71 count=2 delta_ms=63.195800 work_ms=0.085500
+2026-11-16 02:42:50 [tid 5108] frame_tick player=71 count=3 delta_ms=62.751200 work_ms=186.331000
+2026-11-16 02:42:50 [tid 5108] frame_tick player=71 count=4 delta_ms=202.590000 work_ms=1.450700
+2026-11-16 02:42:50 [tid 5108] frame_tick player=71 count=5 delta_ms=64.999200 work_ms=1.887300
+2026-11-16 02:42:50 [tid 5108] frame_tick player=71 count=6 delta_ms=62.646700 work_ms=1.856900
+2026-11-16 02:42:50 [tid 5108] frame_tick player=71 count=7 delta_ms=62.639300 work_ms=1.597900
+2026-11-16 02:42:51 [tid 5108] screenshot unavailable: capture_frame_rgba has no current video frame for 320x180 capture
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=8 delta_ms=139.503100 work_ms=2.125400
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=9 delta_ms=78.736700 work_ms=0.049000
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=10 delta_ms=46.522900 work_ms=0.054200
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=11 delta_ms=47.347300 work_ms=0.053000
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=12 delta_ms=31.270000 work_ms=0.045400
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=13 delta_ms=31.393600 work_ms=0.047000
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=14 delta_ms=31.125600 work_ms=0.051200
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=15 delta_ms=30.914700 work_ms=0.048200
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=16 delta_ms=31.519300 work_ms=0.045700
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=17 delta_ms=31.239300 work_ms=0.045100
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=18 delta_ms=47.628400 work_ms=0.052600
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=19 delta_ms=30.933400 work_ms=0.048800
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=20 delta_ms=32.430600 work_ms=0.063200
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=21 delta_ms=30.952000 work_ms=0.046900
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=22 delta_ms=30.346100 work_ms=0.048200
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=23 delta_ms=30.447100 work_ms=0.044400
+2026-11-16 02:42:51 [tid 5108] render_tick failed with ErikaStatus_PlayerError (3): render_tick failed: renderer error: d3d11: compositor GPU handoff timed out; retaining the current decoder frame
+2026-11-16 02:42:51 [tid 5108] presenter render failed: render_tick failed with ErikaStatus_PlayerError (3): render_tick failed: renderer error: d3d11: compositor GPU handoff timed out; retaining the current decoder frame
+2026-11-16 02:42:51 [tid 5108] frame_tick player=71 count=24 delta_ms=94.402500 work_ms=190.463000
+2026-11-16 02:42:52 [tid 5108] frame_tick player=71 count=25 delta_ms=247.200300 work_ms=1.857400

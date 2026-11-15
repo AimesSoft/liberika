@@ -1,0 +1,128 @@
+[
+  {
+    "run": "enhanced",
+    "session": 0,
+    "variant": "strict progress assertions; nullable screenshot",
+    "exit_code": 3,
+    "outcome": "Aborted after seek due to compositor GPU handoff timeout; render_failures became nonzero.",
+    "evidence": "enhanced-native.log"
+  },
+  {
+    "run": "enhanced-repeat",
+    "session": 0,
+    "variant": "same strict progress assertions; nullable screenshot",
+    "exit_code": 0,
+    "outcome": "Playback, pause, seek, resize, texture reattach and disposal passed; screenshot returned null.",
+    "evidence": "enhanced-repeat-stdout.log"
+  },
+  {
+    "run": "surface-baseline",
+    "session": 0,
+    "variant": "same strict progress assertions; --surface-clip",
+    "exit_code": 3,
+    "outcome": "Aborted in preceding texture playback seek due to compositor GPU handoff timeout; HWND phase was not reached.",
+    "evidence": "surface-baseline-native.log"
+  },
+  {
+    "run": "recovery-diagnostic",
+    "session": 0,
+    "variant": "temporary diagnostic copy deferred the zero-render-failures assertion to the end; repository assertion remained strict",
+    "exit_code": 3,
+    "outcome": "Texture playback had zero failures and advanced, so recovery after a timeout was not observed in this run. HWND attachment then failed: CreateSwapChainForHwnd reported resource currently unavailable in SSH Session 0.",
+    "evidence": "recovery-diagnostic-native.log"
+  },
+  {
+    "run": "interactive-recovery",
+    "session": 2,
+    "variant": "same temporary diagnostic copy, run in logged-in desktop",
+    "exit_code": 2,
+    "outcome": "Texture and HWND rendering advanced. The old surface loop outlasted the 3-second clip, then called Pause after Stopped. The test aborted and a CRT error dialog required the 45-second outer timeout. This was a harness short-fixture assumption, not a playback acceptance pass.",
+    "evidence": "interactive-recovery-native.log"
+  },
+  {
+    "run": "baseline-desktop",
+    "session": 2,
+    "variant": "surface harness corrected to stop after observed position/frame progress; nullable screenshot",
+    "exit_code": 0,
+    "outcome": "NVIDIA D3D11VA texture, HWND and Composition playback/lifecycle passed; real screenshot returned null.",
+    "evidence": "baseline-desktop-stdout.log"
+  },
+  {
+    "run": "baseline-regression",
+    "session": 2,
+    "variant": "initial strict 320x180 PNG harness with saved old DLL",
+    "exit_code": 3,
+    "outcome": "Expected regression failure: real capture returned null after actual 4K playback started.",
+    "evidence": "baseline-regression-native.log",
+    "harness_sha256": "26c2a2b566ff782be0c473a7cda460a08f7b83405937c9dc9393be8c7bc7bd6b"
+  },
+  {
+    "run": "fixed-desktop",
+    "session": 2,
+    "variant": "same initial strict 320x180 PNG harness with main plus D3D11 capture fix DLL",
+    "exit_code": 0,
+    "outcome": "Real 320x180 PNG plus playback progress, stable pause, seek/resume, resize, texture detach/reattach, native HWND and Composition, and joined disposal/DLL unloading passed; zero render failures.",
+    "evidence": "fixed-desktop-stdout.log",
+    "harness_sha256": "26c2a2b566ff782be0c473a7cda460a08f7b83405937c9dc9393be8c7bc7bd6b"
+  },
+  {
+    "run": "final-ctest",
+    "session": 0,
+    "variant": "initial strict 320x180 PNG source and fixed DLL, no media argument for the lifecycle CTest",
+    "exit_code": 0,
+    "outcome": "3/3 passed: presenter_worker, texture_publication, source_texture_lifecycle. The screenshot stub inside this CTest is not counted as real screenshot evidence.",
+    "evidence": "final-ctest.log",
+    "harness_sha256": "26c2a2b566ff782be0c473a7cda460a08f7b83405937c9dc9393be8c7bc7bd6b"
+  },
+  {
+    "run": "fixed-4k-desktop",
+    "session": 2,
+    "variant": "final strict 320x180 and 3840x2160 PNG harness; --surface-clip",
+    "harness_sha256": "62112dd57cccea3c8af10115320c0c68d15897fa3f7ed41e79529dd3a13610cb",
+    "exit_code": 0,
+    "outcome": "Both real PNG captures passed; playback, stable pause, seek, resize, detach/reattach, HWND/Composition and DLL unload passed with zero render failures.",
+    "evidence": "fixed-4k-desktop-stdout.log",
+    "dll_sha256": "8c5e8d0f6fd1e5ba6415a4df4343724d4e64e30bc3379c20e76c5646312a34a9",
+    "source_stage": "Before the final live-render resource preparation ordering adjustment."
+  },
+  {
+    "run": "baseline-4k-regression",
+    "session": 2,
+    "variant": "identical final binary with saved baseline DLL; --clip",
+    "harness_sha256": "62112dd57cccea3c8af10115320c0c68d15897fa3f7ed41e79529dd3a13610cb",
+    "exit_code": 3,
+    "outcome": "Expected regression failure at first real screenshot request: old DLL returns no current frame instead of PNG.",
+    "evidence": "baseline-4k-regression-native.log"
+  },
+  {
+    "run": "final-4k-ctest",
+    "session": 0,
+    "variant": "final source hashes and fixed DLL",
+    "harness_sha256": "62112dd57cccea3c8af10115320c0c68d15897fa3f7ed41e79529dd3a13610cb",
+    "exit_code": 0,
+    "outcome": "3/3 passed in 0.71 seconds; no real-media argument in CTest, and its stub screenshot is not counted as real capture evidence.",
+    "evidence": "final-4k-ctest.log",
+    "dll_sha256": "8c5e8d0f6fd1e5ba6415a4df4343724d4e64e30bc3379c20e76c5646312a34a9",
+    "source_stage": "Before the final live-render resource preparation ordering adjustment."
+  },
+  {
+    "run": "final-4k-desktop",
+    "session": 2,
+    "variant": "Unchanged final strict 320x180 and 3840x2160 PNG harness; rebuilt DLL after final live-render resource preparation ordering adjustment; --surface-clip",
+    "harness_sha256": "62112dd57cccea3c8af10115320c0c68d15897fa3f7ed41e79529dd3a13610cb",
+    "dll_sha256": "2955d22b757c73753e9ed8f939bf1fc9490b78b6ea5197a08c7d3b0b52b40b96",
+    "exit_code": 0,
+    "outcome": "Both real PNG captures passed; playback, 716 ms stable pause with zero drift, seek, resize, detach/reattach, HWND/Composition and DLL unload passed with zero render failures. SR is off in this fixture.",
+    "evidence": "final-4k-desktop-stdout.log"
+  },
+  {
+    "run": "final-lifetime-ctest",
+    "session": 0,
+    "variant": "Unchanged final harness and rebuilt final DLL after live-render resource preparation ordering adjustment",
+    "harness_sha256": "62112dd57cccea3c8af10115320c0c68d15897fa3f7ed41e79529dd3a13610cb",
+    "dll_sha256": "2955d22b757c73753e9ed8f939bf1fc9490b78b6ea5197a08c7d3b0b52b40b96",
+    "exit_code": 0,
+    "outcome": "3/3 passed in 1.33 seconds; no real-media argument in CTest, and its stub screenshot is not counted as real capture evidence.",
+    "evidence": "final-lifetime-ctest.log"
+  }
+]

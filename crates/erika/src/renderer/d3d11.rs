@@ -67,6 +67,7 @@ use crate::renderer::presentation::PresentationLayout;
 use crate::renderer::sr::reference::LumaRange;
 use crate::subtitle::AssColor;
 
+mod capture;
 mod danmaku;
 use danmaku::{D3d11DanmakuBatch, D3d11DanmakuDraws, D3d11DanmakuPipeline};
 
@@ -1035,6 +1036,7 @@ struct ImportedVideoFrame {
     _array_index: u32,
     frame_token: u64,
     constants: VideoUniforms,
+    source_color: SourceColorState,
 }
 
 struct FlutterTextureScene {
@@ -1334,17 +1336,14 @@ impl D3d11Renderer {
     }
 
     fn retire_current_video(&mut self) -> Result<()> {
-        // Preserve main's HWND playback policy. Only compositor-owned surfaces
-        // need this additional handoff barrier. Do not grow the decoder pool or
-        // accumulate an unbounded queue of AVFrames on delayed/failed fences.
+        // Compositor draws and capture readbacks install a fence for their
+        // last video read. Capture can also run without an attached surface.
+        // Do not grow the decoder pool or accumulate an unbounded queue of
+        // AVFrames on delayed/failed fences.
         // The barrier is the last draw that read the frame, not everything
         // queued since: a hardware decoder's seek preroll can keep the GPU
         // busy for hundreds of milliseconds after it.
         if self.current_video.is_some()
-            && self
-                .surface
-                .as_ref()
-                .is_some_and(|s| s.composition || s.flutter_texture)
             && let (Some(state), Some(fence)) =
                 (self.state.as_ref(), self.current_video_fence.as_ref())
         {
@@ -1878,6 +1877,7 @@ impl D3d11Renderer {
             frame_token,
             constants: constants_for_frame(source_color, texture_format, target_color)
                 .packed_alpha_right(self.video_alpha_mode.has_alpha()),
+            source_color,
         };
         self.retire_current_video()?;
         self.current_video = Some(imported);
@@ -1954,6 +1954,7 @@ impl D3d11Renderer {
             frame_token,
             constants: constants_for_frame(source_color, texture_format, target_color)
                 .packed_alpha_right(self.video_alpha_mode.has_alpha()),
+            source_color,
         });
         self.next_frame_token = self.next_frame_token.wrapping_add(1);
         self.stats.software_video_frames += 1;
@@ -1995,6 +1996,14 @@ impl D3d11Renderer {
         &mut self,
         frame: Option<&OverlayFrame>,
     ) -> Result<Vec<D3d11OverlayDraw>> {
+        self.prepare_overlay_draws_for_target(frame, self.overlay_target_color())
+    }
+
+    fn prepare_overlay_draws_for_target(
+        &mut self,
+        frame: Option<&OverlayFrame>,
+        target: TargetColorState,
+    ) -> Result<Vec<D3d11OverlayDraw>> {
         let Some(frame) = frame else {
             return Ok(Vec::new());
         };
@@ -2010,7 +2019,6 @@ impl D3d11Renderer {
             as u64;
         let viewport_w = frame.viewport.width;
         let viewport_h = frame.viewport.height;
-        let target = self.overlay_target_color();
         let mut draws = Vec::new();
 
         for plane in &frame.subtitle_planes {
@@ -2466,11 +2474,6 @@ impl D3d11Renderer {
         let upscale_requested = !self.video_alpha_mode.has_alpha()
             && self.upscaler_mode.is_enabled()
             && target_rect.width > video_width as f32;
-        let video_override = if upscale_requested {
-            self.upscale_current_video(target_rect, native_luma.clone(), frame_token)
-        } else {
-            None
-        };
         let mut video_constants = {
             let video = self.current_video.as_ref().expect("video checked");
             video.constants
@@ -2481,26 +2484,49 @@ impl D3d11Renderer {
             // path until the LUT lands.
             video_constants.gamut_lut_enabled = 0;
         }
-        let video = self.current_video.as_ref().expect("video checked");
-        let state = self.state.as_ref().expect("device ensured");
-        let surface = self.surface.as_ref().expect("surface ensured");
-        let rtv = surface
-            .render_target
-            .as_ref()
-            .ok_or_else(|| PlayerError::Renderer("d3d11: no render target attached".to_string()))?;
-        let linear_target = if matches!(surface.output_mode, D3d11OutputMode::Hdr10) {
-            Some((
-                surface.linear_render_target.as_ref().ok_or_else(|| {
-                    PlayerError::Renderer("d3d11: no linear render target attached".to_string())
-                })?,
-                surface.linear_shader_resource.as_ref().ok_or_else(|| {
-                    PlayerError::Renderer("d3d11: no linear shader resource attached".to_string())
-                })?,
-            ))
+        // Complete fallible preparation before upscaling can submit reads of
+        // the decoder frame. Retain target handles across that mutable call.
+        let (rtv, linear_target, fence) = {
+            let state = self.state.as_ref().expect("device ensured");
+            let surface = self.surface.as_ref().expect("surface ensured");
+            let rtv = surface.render_target.clone().ok_or_else(|| {
+                PlayerError::Renderer("d3d11: no render target attached".to_string())
+            })?;
+            let linear_target = if matches!(surface.output_mode, D3d11OutputMode::Hdr10) {
+                Some((
+                    surface.linear_render_target.clone().ok_or_else(|| {
+                        PlayerError::Renderer("d3d11: no linear render target attached".to_string())
+                    })?,
+                    surface.linear_shader_resource.clone().ok_or_else(|| {
+                        PlayerError::Renderer(
+                            "d3d11: no linear shader resource attached".to_string(),
+                        )
+                    })?,
+                ))
+            } else {
+                None
+            };
+            // Once capture installs a retirement fence, keep tracking readers
+            // when HWND playback resumes, including the upscaler's reads.
+            let fence =
+                if surface.composition || flutter_texture || self.current_video_fence.is_some() {
+                    Some(create_d3d11_event_query(&state.device)?)
+                } else {
+                    None
+                };
+            (rtv, linear_target, fence)
+        };
+        let video_override = if upscale_requested {
+            self.upscale_current_video(target_rect, native_luma.clone(), frame_token)
         } else {
             None
         };
-        let scene_rtv = linear_target.map_or(rtv, |(linear_rtv, _)| linear_rtv);
+        let video = self.current_video.as_ref().expect("video checked");
+        let state = self.state.as_ref().expect("device ensured");
+        let surface = self.surface.as_ref().expect("surface ensured");
+        let scene_rtv = linear_target
+            .as_ref()
+            .map_or(&rtv, |(linear_rtv, _)| linear_rtv);
         unsafe {
             state.context.ClearRenderTargetView(
                 scene_rtv,
@@ -2516,54 +2542,52 @@ impl D3d11Renderer {
                 ],
             );
         }
-        state.draw_video(
-            video,
-            video_constants,
-            video_override.as_ref(),
-            gamut_lut.as_ref(),
-            scene_rtv,
-            target_rect,
-        )?;
-        if !overlay_draws.is_empty() {
-            // Subtitle coordinates are produced in the video-frame viewport.
-            // Composite them through the same aspect-fit viewport as the video
-            // so resizing the window cannot stretch the subtitle independently.
-            state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
-        }
-        if !danmaku_draws.is_empty() {
-            state.draw_danmaku(
-                &danmaku_draws,
+        let draw_result: Result<()> = (|| {
+            state.draw_video(
+                video,
+                video_constants,
+                video_override.as_ref(),
+                gamut_lut.as_ref(),
                 scene_rtv,
-                D3d11DrawRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: physical.width.max(1) as f32,
-                    height: physical.height.max(1) as f32,
-                },
+                target_rect,
             )?;
+            if !overlay_draws.is_empty() {
+                // Subtitle coordinates are produced in the video-frame viewport.
+                // Composite them through the same aspect-fit viewport as the video
+                // so resizing the window cannot stretch the subtitle independently.
+                state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
+            }
+            if !danmaku_draws.is_empty() {
+                state.draw_danmaku(
+                    &danmaku_draws,
+                    scene_rtv,
+                    D3d11DrawRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: physical.width.max(1) as f32,
+                        height: physical.height.max(1) as f32,
+                    },
+                )?;
+            }
+            if let Some((_, linear_srv)) = linear_target.as_ref() {
+                state.draw_encode(
+                    linear_srv,
+                    &rtv,
+                    physical.width,
+                    physical.height,
+                    video.constants,
+                )?;
+            }
+            Ok(())
+        })();
+        // Protect the last read even if a later pass or Present fails.
+        if let Some(fence) = fence {
+            unsafe { state.context.End(&fence) };
+            self.current_video_fence = Some(fence);
         }
-        if let Some((_, linear_srv)) = linear_target {
-            state.draw_encode(
-                linear_srv,
-                rtv,
-                physical.width,
-                physical.height,
-                video.constants,
-            )?;
-        }
+        draw_result?;
         if let Some(swapchain) = surface.swapchain.as_ref() {
             present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
-        }
-        // What retiring this frame waits for.
-        let fence = if surface.composition || flutter_texture {
-            let fence = create_d3d11_event_query(&state.device)?;
-            unsafe { state.context.End(&fence) };
-            Some(fence)
-        } else {
-            None
-        };
-        if fence.is_some() {
-            self.current_video_fence = fence;
         }
         if flutter_texture {
             self.publish_flutter_texture()?;
@@ -2778,6 +2802,15 @@ impl RendererBackend for D3d11Renderer {
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         self.drop_device_if_removed();
         self.render_video(context)
+    }
+
+    fn capture_current_frame(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<crate::core::RendererFrameCapture>> {
+        self.capture_rgba(context, width, height)
     }
 
     fn resource_stats(&self) -> RendererResourceStats {

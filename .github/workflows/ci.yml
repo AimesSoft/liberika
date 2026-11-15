@@ -373,3 +373,10 @@ jobs:
         run: |
           ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="${{ matrix.target }}" \
             cargo test --locked -p erika --lib --target "${{ matrix.target }}" software_
+      - name: Test D3D11 screenshot pixels with WARP
+        shell: bash
+        run: |
+          ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="${{ matrix.target }}" \
+          ERIKA_D3D11_CAPTURE_TEST_DRIVER=warp \
+            cargo test --locked -p erika --lib --target "${{ matrix.target }}" \
+              renderer::d3d11::capture::tests

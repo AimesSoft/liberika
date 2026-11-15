@@ -1,0 +1,58 @@
+[
+  {
+    "file": "fixed-4k-desktop.png",
+    "width": 320,
+    "height": 180,
+    "bytes": 23631,
+    "sha256": "c7b0e39f9c8c6f0e170af14aab4336a7c61a0d2f51bc9226a10f75cc78ec3422",
+    "decoded_rgba_bytes": 230400,
+    "unique_rgba_colors": 3859,
+    "channel_ranges": {
+      "red": [
+        0,
+        255
+      ],
+      "green": [
+        0,
+        255
+      ],
+      "blue": [
+        0,
+        255
+      ],
+      "alpha": [
+        255,
+        255
+      ]
+    },
+    "visual_check": "Synthetic color bars and moving test-pattern marks; not blank or black."
+  },
+  {
+    "file": "fixed-4k-desktop.4k.png",
+    "width": 3840,
+    "height": 2160,
+    "bytes": 1966624,
+    "sha256": "ccad6860f04777e42d22ecc1b33c52df3504fffea36b61860a0cbeff1ae32da6",
+    "decoded_rgba_bytes": 33177600,
+    "unique_rgba_colors": 274417,
+    "channel_ranges": {
+      "red": [
+        0,
+        255
+      ],
+      "green": [
+        0,
+        255
+      ],
+      "blue": [
+        0,
+        255
+      ],
+      "alpha": [
+        255,
+        255
+      ]
+    },
+    "visual_check": "Synthetic color bars and moving test-pattern marks; not blank or black."
+  }
+]

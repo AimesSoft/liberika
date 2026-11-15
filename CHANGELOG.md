@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Implement Windows D3D11 SDR screenshots, including subtitles and optional
+  danmaku, with HDR tone mapping and straight-alpha RGBA output. Capture leaves
+  live output settings intact and uses bounded GPU readback; it does not apply
+  super-resolution enhancement. Add pixel regressions and real 4K HEVC plugin checks.
+
 ## 0.3.7 - 2026-11-13
 
 ### Linux release packages

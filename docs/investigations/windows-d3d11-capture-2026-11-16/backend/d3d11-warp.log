@@ -1,0 +1,98 @@
+cargo :    Compiling erika v0.3.7 (D:\CodexWork\erika-windows-capture\crates\erika)
+所在位置 D:\CodexWork\erika-capture-validation.ps1:9 字符: 1
++ cargo test -p erika --lib renderer::d3d11:: -- --nocapture --test-thr ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling er...e\crates\erika):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+warning: unused import: `GamutLut`
+  --> crates\erika\src\renderer\d3d11.rs:56:5
+   |
+56 |     GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `CapturedComposition` is never constructed
+    --> crates\erika\src\presenter.rs:4956:12
+     |
+4956 |     struct CapturedComposition {
+     |            ^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `CaptureCompositionProbe` is never constructed
+    --> crates\erika\src\presenter.rs:4967:12
+     |
+4967 |     struct CaptureCompositionProbe {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `allocated_bytes` is never used
+   --> crates\erika\src\renderer\metal\mod.rs:296:8
+    |
+280 | impl ImportedVideoFrame {
+    | ----------------------- method in this implementation
+...
+296 |     fn allocated_bytes(&self) -> u64 {
+    |        ^^^^^^^^^^^^^^^
+
+warning: `erika` (lib test) generated 4 warnings (run `cargo fix --lib -p erika --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.43s
+     Running unittests src\lib.rs (D:\CodexWork\erika-issues-20261116\target\debug\deps\erika-e5036cc54abeab3b.exe)
+
+running 35 tests
+capture GPU: Microsoft Basic Render Driver
+test renderer::d3d11::capture::tests::capture_composites_subtitles_and_matching_optional_danmaku ... ok
+capture GPU: Microsoft Basic Render Driver
+test renderer::d3d11::capture::tests::capture_fence_protects_headless_video_retirement ... ok
+capture GPU: Microsoft Basic Render Driver
+test renderer::d3d11::capture::tests::capture_hdr_uses_sdr_tone_mapping_without_changing_live_uniforms ... ok
+capture GPU: Microsoft Basic Render Driver
+test renderer::d3d11::capture::tests::capture_headless_rgba_order_row_pitch_letterbox_and_validation ... ok
+capture GPU: Microsoft Basic Render Driver
+test renderer::d3d11::capture::tests::capture_packed_alpha_uses_logical_width_and_transparent_letterbox ... ok
+capture GPU: Microsoft Basic Render Driver
+test renderer::d3d11::capture::tests::capture_preserves_published_surface_and_subsequent_live_draw ... ok
+test renderer::d3d11::danmaku::tests::capture::d3d11_danmaku_capture_before_after ... ignored, writes opt-in GPU comparison images; set ERIKA_DANMAKU_CAPTURE_DIR
+danmaku GPU: Microsoft Basic Render Driver FL=0xa000 linear=false
+danmaku GPU: Microsoft Basic Render Driver FL=0xa000 linear=true
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_feature_level_10_gpu_pixels ... ok
+danmaku GPU: Microsoft Basic Render Driver FL=0xb000 linear=true
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_hdr_converts_rgb_before_group_composition ... ok
+danmaku GPU: Microsoft Basic Render Driver FL=0xb000 linear=true
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_hdr_linear_gpu_pixels ... ok
+danmaku GPU: Microsoft Basic Render Driver FL=0xa000 linear=false
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_loads_glyph_texture_rows_on_feature_level_10 ... ok
+danmaku GPU: Microsoft Basic Render Driver FL=0xb000 linear=false
+white text over white at opacity=0.5: old=[0.68235296, 0.68235296, 0.68235296, 1.0], corrected=[1.0, 1.0, 1.0, 1.0]
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_old_per_effect_opacity_was_wrong ... ok
+danmaku GPU: Microsoft Basic Render Driver FL=0xb000 linear=false
+danmaku GPU: Microsoft Basic Render Driver FL=0xb000 linear=true
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_preserves_premultiplied_emoji_and_overlay_state ... ok
+danmaku GPU: Microsoft Basic Render Driver FL=0xb000 linear=false
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_sdr_gpu_pixels ... ok
+test renderer::d3d11::danmaku::tests::d3d11_danmaku_shader_compiles_for_feature_level_10 ... ok
+test renderer::d3d11::tests::d3d11_overlay_shader_compiles ... ok
+test renderer::d3d11::tests::d3d11_renderer_config_initializes_upscaler_mode ... ok
+test renderer::d3d11::tests::d3d11_surface_extent_is_already_physical ... ok
+test renderer::d3d11::tests::d3d11_tex_rect_crops_padded_decoder_texture ... ok
+test renderer::d3d11::tests::d3d11_video_shader_compiles ... ok
+test renderer::d3d11::tests::dxgi_hdr10_metadata_uses_source_mastering_values ... ok
+test renderer::d3d11::tests::flutter_publication_is_sdr_immutable_and_stable_while_idle ... ok
+test renderer::d3d11::tests::flutter_scene_detects_danmaku_motion_and_visibility_changes ... ok
+test renderer::d3d11::tests::flutter_scene_ignores_clock_ticks_but_detects_output_changes ... ok
+test renderer::d3d11::tests::flutter_scene_reuses_unchanged_cpu_buffers_across_video_frames ... ok
+test renderer::d3d11::tests::hdr10_output_mode_targets_bt2020_pq ... ok
+test renderer::d3d11::tests::hdr10_video_constants_request_scene_linear_output ... ok
+test renderer::d3d11::tests::hlsl_evaluates_reinhard_and_mobius_in_linear_nits ... ok
+test renderer::d3d11::tests::hlsl_gamut_lut_samples_the_target_black_to_peak_axis ... ok
+test renderer::d3d11::tests::overlay_uniforms_enable_scene_linear_only_for_hdr10 ... ok
+test renderer::d3d11::tests::renderer_stats_distinguish_direct_and_shared_zero_copy ... ok
+test renderer::d3d11::tests::software_device_invalidation_rebuilds_flutter_targets_and_preserves_pixels ... ok
+test renderer::d3d11::tests::software_p010_upload_preserves_odd_dimensions_and_sample_precision ... ok
+{"codec":"wmv2","event":"video_decoder","requestedThreads":0,"stage":"software_threads","threadType":"none","threads":1
+}
+test renderer::d3d11::tests::software_wmv_uploads_to_native_d3d11 ... ok
+test renderer::d3d11::tests::video_texture_format_maps_plane_srv_formats ... ok
+
+test result: ok. 34 passed; 0 failed; 1 ignored; 0 measured; 824 filtered out; finished in 4.55s
