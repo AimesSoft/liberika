@@ -19,7 +19,7 @@ use crate::renderer::pipeline::{
     DoviSourceMetadata, HdrMetadata, MasteringDisplayMetadata, MatrixCoefficients, RgbMatrix,
 };
 use crate::renderer::pipeline::{DOVI_MAX_MMR_ORDER, DOVI_MAX_PIECES};
-use crate::source::{ByteRange, MediaSource};
+use crate::source::{ByteRange, MediaSource, SourceError};
 use crate::subtitle::{
     AssTrackResources, DecodedSubtitleFrame, SubtitleBitmapPlane, SubtitleFontAttachment,
     SubtitleTextFormat, SubtitleTextSegment, SubtitleTrackConfig,
@@ -39,6 +39,7 @@ use crate::ohos::avcodec::{
 };
 
 const AVERROR_EOF: i32 = -541_478_725;
+const AVERROR_EXIT: i32 = -1_414_092_869;
 const MAX_SUBTITLE_FONT_ATTACHMENTS: usize = 256;
 const MAX_SUBTITLE_FONT_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SUBTITLE_FONT_TOTAL_BYTES: usize = 256 * 1024 * 1024;
@@ -89,6 +90,8 @@ pub enum FfmpegError {
     },
     #[error("source error: {0}")]
     Source(String),
+    #[error("source read cancelled")]
+    SourceCancelled,
 }
 
 impl FfmpegError {
@@ -415,6 +418,9 @@ impl Demuxer {
             let mut packet = Packet::alloc()?;
             let code =
                 unsafe { sys::av_read_frame(self.context.as_mut_ptr(), packet.as_mut_ptr()) };
+            // A demuxer may return a buffered packet or EOF after the AVIO
+            // callback was interrupted. Neither belongs to a completed read.
+            self.check_source_cancelled()?;
             if code == AVERROR_EOF {
                 return Ok(None);
             }
@@ -451,6 +457,12 @@ impl Demuxer {
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
+        if let Some(avio) = &mut self.context.avio {
+            // avio_seek clears EOF but can retain a previous callback error.
+            // Start the explicit seek with fresh AVIO state after the worker
+            // has resumed its source, including for seeks within the buffer.
+            avio.clear_terminal_error();
+        }
         let relative_target = position.as_micros().min(i64::MAX as u128) as i64;
         let absolute_target =
             absolute_seek_target_micros(relative_target, self.timeline_origin_micros);
@@ -497,6 +509,7 @@ impl Demuxer {
                 sys::AVSEEK_FLAG_BACKWARD as i32,
             )
         };
+        self.check_source_cancelled()?;
         if backward < 0 {
             // Queue-backed subtitle demuxers reject a backward seek before the
             // first cue (for example target 0 with the first SRT cue at 500 ms).
@@ -513,6 +526,7 @@ impl Demuxer {
                     0,
                 )
             };
+            self.check_source_cancelled()?;
             if fallback < 0 {
                 check(backward, "av_seek_frame")?;
             }
@@ -535,6 +549,19 @@ impl Demuxer {
             "avformat_flush",
         )?;
         Ok(())
+    }
+
+    fn check_source_cancelled(&self) -> Result<()> {
+        if self
+            .context
+            .avio
+            .as_ref()
+            .is_some_and(|avio| avio.read_cancelled)
+        {
+            Err(FfmpegError::SourceCancelled)
+        } else {
+            Ok(())
+        }
     }
 
     /// Media time of the last keyframe at or before `position` on the
@@ -4153,6 +4180,7 @@ struct CustomAvio {
     source: Box<dyn MediaSource>,
     offset: u64,
     last_error: Option<String>,
+    read_cancelled: bool,
     /// The most recent read that returned an I/O error, with its offset.
     /// `last_error` is cleared by the next successful read or seek, yet a
     /// demuxer can surface an earlier read failure only after those, so the
@@ -4179,6 +4207,7 @@ impl CustomAvio {
             source,
             offset: 0,
             last_error: None,
+            read_cancelled: false,
             last_read_failure: None,
         });
         let context = unsafe {
@@ -4202,6 +4231,16 @@ impl CustomAvio {
 
     fn context(&self) -> *mut sys::AVIOContext {
         self.context
+    }
+
+    fn clear_terminal_error(&mut self) {
+        self.last_error = None;
+        self.last_read_failure = None;
+        self.read_cancelled = false;
+        unsafe {
+            (*self.context).error = 0;
+            (*self.context).eof_reached = 0;
+        }
     }
 
     /// Source-side reason for a terminal FFmpeg failure: the freshest error
@@ -4248,6 +4287,13 @@ impl CustomAvio {
                 self.offset = self.offset.saturating_add(copy_len as u64);
                 copy_len as c_int
             }
+            Err(SourceError::Cancelled) => {
+                // Control-plane interruption is not an I/O failure. Keep its
+                // identity even when libavformat translates the return code,
+                // and let the demux owner process the pending seek or stop.
+                self.read_cancelled = true;
+                AVERROR_EXIT
+            }
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 self.last_read_failure = Some((self.offset, error.to_string()));
@@ -4269,6 +4315,10 @@ impl CustomAvio {
             return match self.source.len() {
                 Ok(Some(length)) => length.min(i64::MAX as u64) as i64,
                 Ok(None) => av_error(ESPIPE) as i64,
+                Err(SourceError::Cancelled) => {
+                    self.read_cancelled = true;
+                    AVERROR_EXIT as i64
+                }
                 Err(error) => {
                     self.last_error = Some(error.to_string());
                     av_error(EIO) as i64
@@ -4282,6 +4332,10 @@ impl CustomAvio {
             SEEK_END => match self.source.len() {
                 Ok(Some(length)) => length.min(i64::MAX as u64) as i64 + offset,
                 Ok(None) => return av_error(ESPIPE) as i64,
+                Err(SourceError::Cancelled) => {
+                    self.read_cancelled = true;
+                    return AVERROR_EXIT as i64;
+                }
                 Err(error) => {
                     self.last_error = Some(error.to_string());
                     return av_error(EIO) as i64;
@@ -5870,6 +5924,106 @@ mod tests {
             normalize_avio_seek_whence(forced_size),
             sys::AVSEEK_SIZE as c_int
         );
+    }
+
+    struct ControlledSource {
+        source: crate::source::LocalFileSource,
+        failure: Arc<AtomicU8>,
+    }
+
+    impl MediaSource for ControlledSource {
+        fn uri(&self) -> &str {
+            self.source.uri()
+        }
+
+        fn len(&mut self) -> crate::source::Result<Option<u64>> {
+            if self.failure.load(Ordering::SeqCst) == 3 {
+                Err(SourceError::Cancelled)
+            } else {
+                self.source.len()
+            }
+        }
+
+        fn read_range(&mut self, range: ByteRange) -> crate::source::Result<Vec<u8>> {
+            match self.failure.load(Ordering::SeqCst) {
+                1 => Err(SourceError::Cancelled),
+                2 => Err(SourceError::Io("controlled read failure".into())),
+                _ => self.source.read_range(range),
+            }
+        }
+    }
+
+    fn controlled_demuxer() -> (Demuxer, Arc<AtomicU8>) {
+        let failure = Arc::new(AtomicU8::new(0));
+        let source = ControlledSource {
+            source: crate::source::LocalFileSource::open(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("testdata/playback/playback-fixture.mkv"),
+            )
+            .unwrap(),
+            failure: failure.clone(),
+        };
+        (Demuxer::open_source(Box::new(source)).unwrap(), failure)
+    }
+
+    #[test]
+    fn cancelled_source_read_is_distinct_and_seek_clears_the_avio_latch() {
+        let (mut demuxer, failure) = controlled_demuxer();
+        failure.store(1, Ordering::SeqCst);
+        loop {
+            match demuxer.read_packet() {
+                Ok(Some(_)) => continue,
+                Err(FfmpegError::SourceCancelled) => break,
+                Err(error) => panic!("expected a cancelled read, got {error}"),
+                Ok(None) => panic!("cancelled read was reported as EOF"),
+            }
+        }
+        let avio = demuxer.context.avio.as_ref().unwrap();
+        assert!(avio.read_cancelled);
+        assert!(avio.last_read_failure.is_none());
+        assert_eq!(unsafe { (*avio.context).error }, AVERROR_EXIT);
+
+        failure.store(0, Ordering::SeqCst);
+        demuxer.seek(Duration::from_secs(1)).unwrap();
+        let avio = demuxer.context.avio.as_ref().unwrap();
+        assert!(!avio.read_cancelled);
+        assert_eq!(unsafe { (*avio.context).error }, 0);
+        let mut packets = 0;
+        while demuxer.read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(packets > 0);
+    }
+
+    #[test]
+    fn source_io_failure_remains_terminal_with_its_reason() {
+        let (mut demuxer, failure) = controlled_demuxer();
+        failure.store(2, Ordering::SeqCst);
+        loop {
+            match demuxer.read_packet() {
+                Ok(Some(_)) => continue,
+                Err(FfmpegError::Source(message)) => {
+                    assert!(message.contains("controlled read failure"), "{message}");
+                    break;
+                }
+                Err(error) => panic!("expected a terminal source failure, got {error}"),
+                Ok(None) => panic!("I/O failure was reported as EOF"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_source_length_query_preserves_cancellation_identity() {
+        let (mut demuxer, failure) = controlled_demuxer();
+        failure.store(3, Ordering::SeqCst);
+        let avio = demuxer.context.avio.as_mut().unwrap();
+        for whence in [sys::AVSEEK_SIZE as c_int, SEEK_END] {
+            avio.clear_terminal_error();
+            assert_eq!(avio.seek(0, whence), AVERROR_EXIT as i64);
+            assert!(avio.read_cancelled);
+            assert!(avio.last_error.is_none());
+            assert!(avio.last_read_failure.is_none());
+        }
     }
 
     #[test]
