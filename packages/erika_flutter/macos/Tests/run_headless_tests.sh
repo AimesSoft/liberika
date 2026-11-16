@@ -26,6 +26,7 @@ xcrun swiftc -emit-library -D DEBUG -module-name AppleOwnerTests \
   -Xlinker -rpath -Xlinker "$output_dir" \
   -Xlinker -rpath -Xlinker "$engine_dir" \
   "$package_dir/example/macos/RunnerTests/RunnerTests.swift" \
+  "$test_dir/DisplayTimingTests.swift" \
   -o "$output_dir/AppleOwnerTests.xctest/Contents/MacOS/AppleOwnerTests"
 ERIKA_CAPI_DYLIB="$output_dir/liberika_apple_stub.dylib" \
   ERIKA_FLUTTER_FRAME_TRACE="${ERIKA_FLUTTER_FRAME_TRACE:-1}" \
