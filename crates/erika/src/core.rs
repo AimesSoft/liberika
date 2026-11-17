@@ -1517,6 +1517,14 @@ impl Player {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_playback_snapshot_for_test(&self, snapshot: PlaybackSnapshot) {
+        let mut inner = self.inner.lock().expect("player mutex poisoned");
+        inner.playback_clock = snapshot.clock;
+        inner.playback_generation = snapshot.generation;
+        inner.state = snapshot.state;
+    }
+
     pub fn duration(&self) -> Option<Duration> {
         self.inner.lock().expect("player mutex poisoned").duration
     }
