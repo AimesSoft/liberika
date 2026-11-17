@@ -430,4 +430,7 @@ a `MethodChannel`; rendering never passes through Dart.
 Flutter after GPU readback. Wayland can use `ErikaWindowOverlayVideoView` as a
 native plane below transparent Flutter UI; this avoids per-frame texture
 readback but does not support Flutter clipping or color filters on the video.
-Build the runtime locally and set `ERIKA_LIBRARY_DIR`; see [Linux integration](linux.md).
+Download a v0.3.7 Linux x86_64 or ARM64 runtime archive (`bundled` or `system`),
+or build from source, then set `ERIKA_LIBRARY_DIR` to the absolute directory
+containing `liberika_capi.so` (`lib` in the archive). Linux runtimes are not downloaded
+automatically; see [Linux integration](linux.md).

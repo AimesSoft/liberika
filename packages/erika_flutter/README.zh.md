@@ -4,6 +4,15 @@
 
 liberika 媒体播放引擎的 Flutter plugin。
 
+[pub.dev](https://pub.dev/packages/erika_flutter) 当前公开版为 **0.3.7**（核验日期：
+2026-11-16）。请使用配套的原生运行库并重新构建应用。
+
+自 0.3.5 起，Windows 原生视频位于透明 Flutter 宿主下方，控件和菜单可正常显示；
+仅替换 DLL 无法应用插件的窗口层级修复。`addExternalSubtitle` 失败仍由该调用返回错误，
+但不再发出全局播放错误或中断已打开的视频。0.3.6 新增彩色 Emoji 弹幕和字体回退改进，
+字幕 Emoji 仍为单色。0.3.7 新增 Bilibili mode 7 的定位、直线运动、时长及透明度渐变，
+并提供下述 Linux 预编译包；mode 7 旋转、多行及 mode 8 / 9 尚不支持。
+
 插件让 Dart 不进入热路径：
 
 - Dart 只暴露低频播放器命令和事件流。
@@ -57,7 +66,12 @@ Windows 的 `ErikaVideoView` 同样使用原生 swapchain，支持 HDR10。需�
 
 ## Linux Setup
 
-按 [Linux 接入指南](https://github.com/AimesSoft/liberika/blob/main/docs/linux.zh.md) 构建 `liberika_capi.so`，将 `ERIKA_LIBRARY_DIR` 指向其所在目录，再运行 `flutter build linux`。
+从 [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) 下载匹配架构的
+Linux x64 或 ARM64 包，选择 `bundled`（内嵌 FFmpeg 与字体栈）或 `system`
+（依赖 ABI 兼容的 FFmpeg 8 共享库及系统字体库）。四个包均以 Ubuntu 22.04 / glibc 2.35
+为基线；bundled 仍需要系统音频、图形库及驱动，system 不能仅安装 `ffmpeg` 命令。
+将 `ERIKA_LIBRARY_DIR` 指向解压后的 `lib/`，再运行 `flutter build linux`。
+Linux 包目前不会自动下载。依赖列表和源码构建见 [Linux 指南](https://github.com/AimesSoft/liberika/blob/main/docs/linux.zh.md)。
 
 `ErikaTextureVideoView` 使用 GTK Flutter 纹理；Linux 上的 `ErikaVideoView` 也选择此路径。视频、字幕和弹幕在 GPU 合成后读回 RGBA，输出为 SDR。Wayland 下可用 `ErikaWindowOverlayVideoView` 把原生视频层放在透明 Flutter UI 下方，避免每帧读回；它要求 Wayland 会话，不适用于 X11。
 

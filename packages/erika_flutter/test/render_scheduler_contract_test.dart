@@ -34,11 +34,15 @@ void main() {
     expect(driverEnd, greaterThan(driverStart));
     final driver = plugin.substring(driverStart, driverEnd);
     expect(driver, contains('CVDisplayLinkSetOutputCallback'));
-    expect(driver, contains('onTick()'));
+    expect(driver, contains('onTick(presentationTime)'));
+    expect(driver, contains('erikaDisplayPresentationTime(outputTime.pointee)'));
     expect(driver, isNot(contains('DispatchQueue')));
 
     // The display link only wakes the presenter's owner; ticks coalesce there.
-    expect(plugin, contains('self.scheduleRenderTick()'));
+    expect(plugin, contains('self.scheduleRenderTick(presentationTime: presentationTime)'));
+    expect(plugin, contains('self.renderTick(presentationTime: presentationTime)'));
+    expect(plugin, contains('Self.loadOptional("erika_presenter_render_tick_with_timing"'));
+    expect(plugin, contains('var delay = target - CACurrentMediaTime()'));
     expect(plugin, contains('owner.requestFrame { [weak self] in'));
   });
 

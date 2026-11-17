@@ -2,11 +2,16 @@
 
 # liberika documentation
 
-The current integration guides use **0.3.4** as their baseline. Start with the
+The current integration guides use **0.3.7** as their baseline. Start with the
 installation and usage guide for your SDK, then use the references below when
 building a rendering host or developing the kernel.
 
 The browser / WASM backend is integrated into Erika Web and supports MKV ASS subtitles and attached fonts, libass, Rust danmaku, WebGL2 composition and WebCodecs decoding. See the [Web guide](web.md) to build or download the Release Web archive and deploy it; the package is not published to npm.
+
+The [changelog](../CHANGELOG.md) covers the Windows and external subtitle fixes
+in 0.3.5, fonts and color emoji in 0.3.6, and Linux archives, mode 7 and dma-buf
+output in 0.3.7. As of 2026-11-16, Flutter, the Swift SDK and OHPM have all
+published 0.3.7. Changes not yet released remain under Unreleased.
 
 ## Integration
 

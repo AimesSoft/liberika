@@ -1,0 +1,10 @@
+# Condensed execution log; repeated lifecycle/font diagnostics are omitted.
+{"activeBackend":"software","codec":"h264","event":"video_decoder_changed","fallbackCount":0,"lineSizes":null,"pixelFormat":null,"previousBackend":null,"reason":null,"requestedBackend":"software","stage":"open"}
+[erika-subtitle-diag] stage=update_overlay pts=0.000 gen=2 video=1920x1080 overlay=viewport=3840x2160 rgba_planes=0 alpha_planes=2 changed=true first_rgba=none first_alpha=x:1312 y:1916 w:1236 h:115 max_a:255 bytes:143508
+[erika-subtitle-diag] stage=clock_overlay player=0.040 gen=2 overlay_viewport=3840x2160 overlay=viewport=3840x2160 rgba_planes=0 alpha_planes=2 changed=false first_rgba=none first_alpha=x:1312 y:1916 w:1236 h:115 max_a:255 bytes:143508
+[erika-subtitle-diag] stage=update_overlay pts=0.033 gen=2 video=1920x1080 overlay=viewport=3840x2160 rgba_planes=0 alpha_planes=2 changed=true first_rgba=none first_alpha=x:1312 y:1916 w:1236 h:115 max_a:255 bytes:143508
+[erika-subtitle-diag] stage=clock_overlay player=0.108 gen=2 overlay_viewport=3840x2160 overlay=viewport=3840x2160 rgba_planes=0 alpha_planes=2 changed=false first_rgba=none first_alpha=x:1312 y:1916 w:1236 h:115 max_a:255 bytes:143508
+# Full-log counts: update_overlay=95, clock_overlay=95
+HEADLESS_ASS_RESULT {"backend":"wgpu/Metal","decodedFrames":95,"decodedSubtitleFrames":1,"decoder":{"activeBackend":"software","codec":"h264","fallbackCount":0,"fellBack":false,"hardware":false,"lineSizes":null,"pixelFormat":null,"previousBackend":null,"reason":null,"requestedBackend":"software","stage":"open"},"device":"Apple M5 Pro","expectRedundantOverlay":true,"exportSize":[640,360],"exportedFrames":95,"inspectedFrames":83,"mediaSeconds":3.970720417,"playbackOverlayFrames":95,"sourceSize":[1920,1080],"surfaceAttached":false,"wallSeconds":4.006611625,"whiteSubtitlePixelsMax":698,"whiteSubtitlePixelsMin":698}
+test real_1080p_ass_playback_exports_subtitles_without_a_surface_overlay ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.28s

@@ -197,8 +197,9 @@ MPRIS 系统媒体控制尚未实现。显式截图仍返回紧密排列的 RGBA
 
 ### GPU 帧导入与 HDR 的实际范围
 
-实验性 Vulkan 桥通过 FFmpeg 的 `AV_HWFRAME_MAP_DIRECT` 映射 VA-API 帧，
-直接采样导入的 NV12/P010 VkImage；解码帧到着色器之间不分配目标平面，
+实验性 Vulkan 桥通过 FFmpeg 的 `AV_HWFRAME_MAP_READ` 映射 VA-API 帧，
+采样导入的 NV12/P010 VkImage。0.3.7 起不再强制 `AV_HWFRAME_MAP_DIRECT`，
+避免部分 FFmpeg 8.1 / 9 驱动路径返回 `EINVAL`。解码帧到着色器之间不分配目标平面，
 也不执行 CPU/GPU 像素复制。映射持有解码帧引用直到 wgpu 完成使用，
 通过 timeline semaphore 和布局/所有权转换完成获取和释放；首次使用保留外部图像内容。
 需要外部显存/信号量、timeline semaphore、synchronization2 及兼容的设备/格式。
@@ -238,6 +239,43 @@ Rust 依赖需要启用 `erika` 的 `wgpu` feature，参考
 C 接入使用 [`erika.h`](../crates/erika_capi/include/erika.h)，默认 C ABI 构建已启用 wgpu。
 动态加载时需让加载器找到 `.so` 与包内 `DEPENDENCIES.txt` 所列系统依赖（system 模式另需 FFmpeg 8 和字体库）；
 可配置 rpath 或 `LD_LIBRARY_PATH`，并用 `ldd` 检查。
+
+**仓库外的 Cargo workspace** 还必须在自己的根 `Cargo.toml` 中添加 HAL 补丁。
+Cargo 不会继承依赖仓库里的 `[patch.crates-io]`。Vulkan 直接导入需要 liberika 的
+`wgpu-hal` fork 保留外部图像已初始化的内容，因此只开 `wgpu` 不够。
+依赖和补丁应固定到**同一 tag 或 commit**，例如：
+
+```toml
+[dependencies]
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7", features = ["wgpu"] }
+
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7" }
+```
+
+使用本地 checkout 时，把补丁替换为
+`wgpu-hal = { path = "/absolute/path/to/liberika/third_party/wgpu-hal" }`。
+它仍须位于消费者根 manifest 的 `[patch.crates-io]` 下，不要使用 Cargo `paths` 覆盖。
+如果已有锁文件仍选择 registry 的 HAL，运行
+`cargo update -p wgpu-hal --precise 29.0.3`，再用 `cargo tree -i wgpu-hal`
+确认来源是 liberika。提交更新后的 `Cargo.lock`；升级 liberika tag 时同步确认 HAL
+版本。workspace 中的其他依赖也必须接受这个 HAL 版本。预构建 C/Flutter 产物已包含
+补丁，消费者无需配置 Cargo。
+
+Linux Rust 消费者还需在自己的 `.cargo/config.toml` 中添加以下配置。
+内嵌的 `soundtouch-ffi` 默认关闭 PIC，而 erika 会构建共享库；Cargo 不会读取
+依赖仓库的 `.cargo` 设置：
+
+```toml
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CFLAGS_aarch64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-fPIC"
+```
+
+`bash scripts/check_linux_rust_consumer.sh` 会建立全新的独立消费者 workspace，
+显式添加本地补丁和 PIC 配置并验证编译、链接；Linux CI 在两种 CPU 架构和依赖模式中运行它。
 
 `erika_presenter_attach_wgpu_surface` 参数映射如下：
 

@@ -108,9 +108,10 @@ cargo run -p xtask -- deps build --profile lgpl
 cargo run -p xtask -- deps build --all --profile lgpl
 ```
 
-The examples above use the default `host` target. On Windows, use the explicit
-MSVC target instead: its Cargo build scripts infer that target-specific directory,
-whereas `host` stages dependencies under `dist/lgpl`. For example, on x64:
+The examples above use the default `host` target. On Windows x64 and ARM64,
+`host` resolves to the matching MSVC target and stages dependencies under
+`dist/<triple>/lgpl`, matching a plain `cargo build`. An explicit target still
+selects another architecture; for example, on x64:
 
 ```powershell
 cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc
@@ -229,6 +230,7 @@ to its own `<profile>-crt-static` directory, which `erika_ffmpeg_sys` and
 `erika` use when Rust links the C runtime statically.
 
 ```powershell
+# Only for Rust builds with -C target-feature=+crt-static; omit for the default DLL CRT.
 cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
 ```
 

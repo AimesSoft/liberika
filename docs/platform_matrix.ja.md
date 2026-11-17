@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-以下は 0.3.4 を基準としたプラットフォームです。ブラウザバックエンドは Erika Web に組み込まれ、Release には独立した Web アーカイブがあります。Linux の機能は実験的ですが、現在のリリースフローは x64 / ARM64 × bundled / system の 4 種類を Ubuntu 22.04 上でビルドします。
+以下は 0.3.7 を基準としたプラットフォームです。ブラウザバックエンドは Erika Web に組み込まれ、Release には独立した Web アーカイブがあります。Linux の機能は実験的ですが、0.3.7 Release は Ubuntu 22.04 で構築した x64 / ARM64 × bundled / system の 4 種類を提供します。
 
 | プラットフォーム | 最低バージョン | デコード / 描画 | 音声 | 配布とビルド |
 |---|---|---|---|---|
@@ -71,4 +71,4 @@ Fallback を使います。
 
 ネイティブビルドは 7 プラットフォームを対象とします。Linux workflow は両 CPU・両モードをネイティブビルドし、Xvfb・Mesa・PulseAudio でソースと展開済み Release の再生を確認し、クリーンな Ubuntu 22.04 で実行依存と ABI 基準を検証します。Flutter consumer workflow は従来の 6 プラットフォームを確認し、Linux は `ERIKA_LIBRARY_DIR` による手動組み込みです。HDR 出力とプラットフォームのライフサイクルに関する実機検証は [検証記録](investigations/README.md) にあります。
 
-Web workflow は完全な WASM パッケージをビルドし、独立プレーヤーの回帰テストを実行します。Erika Web は macOS の Chrome 155.0.8059.85 で H.264/AAC/ASS・添付フォント付き MKV、VP9/Opus WebM、2,000 件の弾幕、リアルタイム設定、チャプター、スクリーンショット、プレーヤーのライフサイクルを検証しました。Safari / Firefox は未検証です。
+Web workflow は完全な WASM パッケージをビルドし、独立プレーヤーの回帰テストを実行します。Erika Web は macOS の Chrome 155.0.8059.85 で H.264/AAC/ASS・添付フォント付き MKV、VP9/Opus WebM、2,000 件の弾幕、リアルタイム設定、チャプター、スクリーンショット、プレーヤーのライフサイクルを検証しました。Safari 27.0.1 の HEVC Main 10 / Opus / ASS 再生と seek も手動検証済みです。[ブラウザーガイド](web.ja.md)を参照してください。Firefox は未検証です。

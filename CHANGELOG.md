@@ -8,6 +8,13 @@
   danmaku, with HDR tone mapping and straight-alpha RGBA output. Capture leaves
   live output settings intact and uses bounded GPU readback; it does not apply
   super-resolution enhancement. Add pixel regressions and real 4K HEVC plugin checks.
+- Skip unused playback subtitle rasterization for hosts that only export frames;
+  attaching a surface restores the current subtitle overlay, including while paused (#197).
+- Keep seek-cancelled source reads distinct from I/O failures, wait for the next
+  demux command, and clear stale AVIO errors before seeking (#205).
+- Document the explicit `wgpu-hal` patch required by external Rust workspaces and
+  compile a separate consumer in Linux CI. Windows dependency builds now resolve
+  `host` to the MSVC target directory expected by Cargo (#213).
 
 ## 0.3.7 - 2026-11-13
 

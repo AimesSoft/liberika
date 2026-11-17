@@ -89,9 +89,10 @@ cargo run -p xtask -- deps build --profile lgpl
 cargo run -p xtask -- deps build --all --profile lgpl
 ```
 
-上の例は既定の `host` を使用します。Windows では明示的な MSVC ターゲットを使用してください。
-Cargo のビルドスクリプトはターゲット別ディレクトリを推定しますが、`host` は依存を
-`dist/lgpl` に配置します。x64 の例：
+上の例は既定の `host` を使用します。Windows x64 / ARM64 では、`host` は対応する
+MSVC ターゲットに解決され、依存を `dist/<triple>/lgpl` に配置します。これは
+`--target` なしの `cargo build` と一致します。別の CPU には明示的なターゲットを
+指定できます。x64 の例：
 
 ```powershell
 cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc
@@ -190,6 +191,7 @@ cargo build -p erika_capi --release --target aarch64-pc-windows-msvc
 Windows の native library は既定で C runtime の DLL（`/MD`）を link します（Rust の既定と同じ）。host が `-C target-feature=+crt-static` で C runtime を静的に link する場合は native library も静的にする必要があり、そうしないと link 時に `__imp_strtol` などが見つかりません：`--crt static` を付けてください。成果物は別の `<profile>-crt-static` directory に置かれ、Rust が C runtime を静的に link するとき `erika_ffmpeg_sys` と `erika` が自動的に使います。
 
 ```powershell
+# Rust の -C target-feature=+crt-static 使用時のみ。既定の DLL CRT では付けません。
 cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
 ```
 

@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-These platforms use 0.3.4 as their baseline. The browser backend is integrated into Erika Web and a separate Web archive is available in the Release. Linux remains experimental; the current release workflow adds x64 / ARM64 × bundled / system packages, all built on Ubuntu 22.04.
+These platforms use 0.3.7 as their baseline. The browser backend is integrated into Erika Web and a separate Web archive is available in the Release. Linux remains experimental; the 0.3.7 Release includes x64 / ARM64 × bundled / system packages, all built on Ubuntu 22.04.
 
 | Platform | Minimum | Decode / render | Audio | Distribution and builds |
 |---|---|---|---|---|
@@ -71,4 +71,4 @@ since libass only produces alpha bitmaps.
 
 Native builds cover seven prebuilt platforms. The Linux workflow builds both modes on both native architectures, using Xvfb, Mesa and PulseAudio for source and extracted-release playback checks, plus clean Ubuntu 22.04 runtime/ABI validation. The Flutter consumer workflow still checks its original six platforms; Linux uses `ERIKA_LIBRARY_DIR` for manual integration. Device experiments for HDR output and platform lifecycle are in the [validation archive](investigations/README.md).
 
-The Web workflow builds the complete WASM package and runs standalone player regressions. Erika Web was validated on macOS with Chrome 155.0.8059.85 using H.264/AAC/ASS and attached-font MKV, VP9/Opus WebM, 2,000 danmaku, live settings, chapters, screenshots and player lifecycle; Safari and Firefox remain unvalidated.
+The Web workflow builds the complete WASM package and runs standalone player regressions. Erika Web was validated on macOS with Chrome 155.0.8059.85 using H.264/AAC/ASS and attached-font MKV, VP9/Opus WebM, 2,000 danmaku, live settings, chapters, screenshots and player lifecycle; Safari 27.0.1 HEVC Main 10 / Opus / ASS playback and seeking were also manually verified; see the [browser guide](web.md). Firefox remains unvalidated.

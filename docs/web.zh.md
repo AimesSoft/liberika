@@ -7,9 +7,18 @@ libass、FreeType、HarfBuzz、FriBidi，以及负责解封装的精简 FFmpeg�
 和媒体源，统一通过 `Player` 操作，不需要分别接入弹幕或字幕组件。
 
 这一后端已接入 **Erika Web 应用**，包括播放控件、轨道选择、章节、截图和弹幕设置。
-0.3.4 Release 提供独立的 `liberika-web-0.3.4.zip`，包含完整浏览器运行时和
+0.3.7 Release 提供独立的 `liberika-web-0.3.7.zip`，包含完整浏览器运行时和
 `index.html` 演示页，校验值记录在 `SHA256SUMS`。解压整个归档后通过 HTTPS 或本机
 HTTP 服务访问；也可从源码构建。Web 包尚未发布到 npm。
+
+[0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) 还提供
+`liberika-web-nofont-0.3.7.zip`。此版本由宿主通过
+`Player.create({ canvas, fallbackFont: { data, index } })` 提供字体字节，WASM 字幕和文字路径不能自动读取
+设备上安装的系统字体文件；页面不提供回退字体时请选择完整包。
+
+0.3.6 起，弹幕通过浏览器自身的彩色字体和 Canvas 文字绘制显示 Emoji，libass 字幕 Emoji 仍为单色。
+0.3.7 新增 Bilibili mode 7 的定位、直线运动、自定义时长和透明度渐变，尚不支持
+旋转、多行、mode 8 代码弹幕或 mode 9 BAS。格式细节见[弹幕说明](danmaku_architecture.md)。
 
 ## 在浏览器保留 MKV 字幕和字体
 
@@ -60,7 +69,7 @@ python3 scripts/serve_web.py
 修改 shell 启动配置。可以用 `EMSDK` 指定现有 SDK。
 
 发布时保留整个产物目录中的 JS、WASM、Worker 与许可证；回退字体已内嵌在 Rust WASM 中。
-页面由自带字体的设备提供时，可用 `liberika-web-nofont` 包或 `web build
+宿主已有可提供的字体字节时，可用 `liberika-web-nofont` 包或 `web build
 --without-fallback-font` 省去约 6 MB，再把字体传给 `Player.create({ canvas, fallbackFont: { data, index } })`。
 浏览器需要 HTTPS 或 localhost；本实现不依赖 SharedArrayBuffer 或跨源隔离。
 `build-manifest.json` 记录产物的 SHA-256。示例支持 `?src=URL` 打开远程媒体。

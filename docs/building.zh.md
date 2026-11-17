@@ -93,8 +93,9 @@ cargo run -p xtask -- deps build --profile lgpl
 cargo run -p xtask -- deps build --all --profile lgpl
 ```
 
-上例默认使用 `host`。Windows 上应指定 MSVC 目标：Cargo 构建脚本会自动查找目标专用目录，
-而 `host` 将依赖放在 `dist/lgpl`。例如 x64：
+上例默认使用 `host`。Windows x64 和 ARM64 上，`host` 自动解析为对应的 MSVC 目标，
+将依赖放在 `dist/<triple>/lgpl`，与不带 `--target` 的 `cargo build` 一致。
+需要指定其他架构时仍可使用显式目标，例如 x64：
 
 ```powershell
 cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc
@@ -196,6 +197,7 @@ cargo build -p erika_capi --release --target aarch64-pc-windows-msvc
 Windows 原生库默认链接 C 运行库的 DLL（`/MD`），与 Rust 的默认相同。宿主用 `-C target-feature=+crt-static` 静态链接 C 运行库时，原生库也要静态链接，否则链接时缺 `__imp_strtol` 等符号：加 `--crt static`，产物放在单独的 `<profile>-crt-static` 目录，`erika_ffmpeg_sys` 与 `erika` 发现 Rust 静态链接 C 运行库时自动使用它。
 
 ```powershell
+# 仅用于 Rust 的 -C target-feature=+crt-static；默认 DLL CRT 不要加 --crt static。
 cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
 ```
 

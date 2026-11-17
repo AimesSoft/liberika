@@ -4,7 +4,17 @@
 
 liberika のブラウザービルドには、既存の Rust 弾幕エンジン、リポジトリでパッチを適用した libass と FreeType/HarfBuzz/FriBidi、コンテナーのデマルチプレックス用に絞った FFmpeg が含まれます。`Player` がパイプライン全体を管理し、アプリは Canvas とメディアソースを渡します。別の字幕・弾幕ライブラリは不要です。
 
-このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.4 の `liberika-web-0.3.4.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別で、npm では未公開です。ソースからのビルドも可能です。
+このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.7 の `liberika-web-0.3.7.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別で、npm では未公開です。ソースからのビルドも可能です。
+
+[0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) は
+`liberika-web-nofont-0.3.7.zip` も提供します。この版では
+`Player.create({ canvas, fallbackFont: { data, index } })` でホストからフォントの
+バイト列を渡します。WASM の字幕・文字処理は端末のフォントファイルを自動で読めないため、ページでフォントを
+提供しない場合は完全版を選んでください。
+
+0.3.6 以降、弾幕のカラー Emoji はブラウザー自身のフォントと Canvas の文字描画を使います。libass 字幕の Emoji は単色です。
+0.3.7 は Bilibili mode 7 の位置指定、直線移動、表示時間、alpha 変化を追加しました。
+回転、複数行、mode 8 コード弾幕、mode 9 BAS は非対応です。[弾幕形式](danmaku_architecture.ja.md)を参照してください。
 
 ## MKV 字幕と添付フォント
 
@@ -123,7 +133,7 @@ await player.configureSubtitles({ scale: 1, supersampling: true });
 2026-10-22 のリリースビルドでは再生ランタイムがファイル合計 **10.93 MiB**、各ファイルを gzip レベル 9 で圧縮した合計が **4.56 MiB** でした。両 WASM モジュール、JavaScript ランタイム、完全な組み込みフォールバックフォントを含み、ホスト UI、デモ、ドキュメント、メディアは含みません。重複したフォントコピーを削除する前はそれぞれ 17.00 MiB、7.30 MiB でした。サーバーが gzip を有効にすると転送量は圧縮サイズに近づきます。これらはパッケージサイズであり、実行時メモリ使用量ではありません。
 
 - HTTPS または localhost で配信し、JavaScript モジュールの MIME type と `.wasm` 用の `application/wasm` を設定します。JS、両 WASM モジュール、Worker、`licenses/` を一緒に配置します。生成された `index.html` は任意のデモです。
-- 独自のフォントを持つ端末が配信するページでは、`liberika-web-nofont` パッケージか `web build --without-fallback-font` で約 6 MB 削り、`Player.create({ canvas, fallbackFont: { data, index } })` でフォントを渡せます。
+- ホストが提供可能なフォントのバイト列を持っている場合は、`liberika-web-nofont` パッケージか `web build --without-fallback-font` で約 6 MB 削り、`Player.create({ canvas, fallbackFont: { data, index } })` でフォントを渡せます。
 - Canvas にゼロでない CSS 幅と高さを指定します。`Player` はサイズを監視し描画面を自動更新します。
 - リモートメディアはブラウザーからのリクエストを許可する必要があります。8 MiB を超えるファイルには、総サイズが既知の有効な HTTP `206` バイト範囲応答が必要です。クロスオリジンサーバーは `Access-Control-Expose-Headers` で `Content-Range` を公開します。`scripts/serve_web.py` はローカルテスト用に Range をサポートします。
 - ランタイムをバージョン付きディレクトリにデプロイするか、エントリーポイントとリソースをまとめて再検証し、キャッシュされた JS が別ビルドの WASM を読み込まないようにします。

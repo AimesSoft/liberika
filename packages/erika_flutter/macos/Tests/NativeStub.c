@@ -21,6 +21,7 @@ struct ErikaPresenterHandle {
   struct ErikaPresenterHandle *next;
 };
 static atomic_int creates, destroys, ticks, commands, entered, fail_detach;
+static atomic_int timed_ticks, last_delay_micros;
 static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t hold_ready = PTHREAD_COND_INITIALIZER;
 static bool held;
@@ -62,6 +63,8 @@ int erika_test_count(int which) {
     case 1: return atomic_load(&destroys);
     case 2: return atomic_load(&ticks);
     case 3: return atomic_load(&commands);
+    case 5: return atomic_load(&timed_ticks);
+    case 6: return atomic_load(&last_delay_micros);
     default: return atomic_load(&entered);
   }
 }
@@ -254,7 +257,13 @@ ErikaStatus erika_presenter_render_tick_with_timing(
     ErikaPresenterHandle *handle,
     double time_seconds,
     const double *presentation_delay_seconds,
-    ErikaPresenterStats *out_stats) { check_owner(handle); return ErikaStatus_Ok; }
+    ErikaPresenterStats *out_stats) {
+  check_owner(handle);
+  assert(presentation_delay_seconds);
+  atomic_store(&last_delay_micros, (int)(*presentation_delay_seconds * 1000000));
+  atomic_fetch_add(&timed_ticks, 1);
+  return erika_presenter_render_tick(handle, time_seconds, out_stats);
+}
 ErikaStatus erika_presenter_resize_surface(
     ErikaPresenterHandle *handle,
     uint32_t width,

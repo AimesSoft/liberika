@@ -17,6 +17,24 @@ liberika が decode・timing・audio・overlay・presentation を所有し、ホ
 [`examples/windows_native_demo`](../examples/windows_native_demo)（Win32 + `HWND`）。これらは
 Rust の `PresenterRuntime` を直接駆動します。以下の C ABI 呼び出しは 1:1 の等価物です。
 
+## 0.3.5–0.3.7 の移行要点
+
+- **外部字幕（0.3.5）**：先頭の重複 UTF-8 BOM を正規化します。追加失敗は呼び出し元に
+  エラーを返しますが、グローバルな再生エラーを発行せず、開いた動画の再生を続けられます。
+  字幕追加の操作でエラー表示と再試行を提供してください。Windows Flutter の表示順修正は
+  プラグイン側にあるため、ネイティブランタイムと一緒に更新します。
+- **フォントと弾幕（0.3.6）**：不足グリフはシステムフォント、組み込みフォントの順で
+  探します。弾幕はカラー Emoji に対応し、libass 字幕の Emoji は単色です。ソース構築では
+  `embedded-fallback-font` と `artcnn-r8f64` を省けますが、公式配布物は既定の機能を保持します。
+  iOS 18+ / tvOS は組み込みフォントか読み取り可能な代替が必要です。[構築設定](building.ja.md)を参照。
+- **Linux と mode 7（0.3.7）**：[Linux ガイド](linux.ja.md)で x64 / ARM64 と
+  bundled / system の 4 種のアーカイブを選べます。Rust の
+  `PresenterRuntime::export_frame_dmabuf(w, h, scale)` は同一 GPU 上の 1 回のコピーで
+  合成済み線形 RGBA8 dma-buf を出力し、C API は変更しません。stride、offset、バッファー再利用の
+  条件は[テクスチャ出力](external_textures.ja.md)を参照してください。Bilibili mode 7 は位置、直線移動、
+  表示時間、alpha 変化に対応し、回転、複数行、mode 8 / 9 は非対応です。通常の `DanmakuItem` を
+  Rust で直接生成する場合は `special: None` を追加します。XML / JSON パーサーは自動設定します。
+
 ## 1. handle ファミリーを選ぶ
 
 自分で描画する理由がなければ `ErikaPresenterHandle` を使います。プルモデルの

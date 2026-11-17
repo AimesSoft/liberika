@@ -18,6 +18,27 @@ Two runnable references accompany this guide:
 (Win32 + `HWND`). They drive the Rust `PresenterRuntime` directly; the C-ABI
 calls below are the 1:1 equivalents.
 
+## Upgrading through 0.3.5–0.3.7
+
+- **External subtitles (0.3.5):** repeated leading UTF-8 BOMs are normalized.
+  A failed add operation still returns an error, but no longer emits a global
+  playback error; the opened video remains usable. Handle the failure at the
+  subtitle action and offer retry. The Windows Flutter control-layering fix is
+  in the plugin, so upgrade the plugin together with its native runtime.
+- **Fonts and danmaku (0.3.6):** missing glyphs try system fonts before the embedded
+  fallback. Danmaku supports color emoji; libass subtitle emoji remain monochrome.
+  Source builds can omit `embedded-fallback-font` and `artcnn-r8f64`; official
+  archives retain the defaults. iOS 18+ / tvOS need the embedded font or a readable
+  replacement. See [build options](building.md).
+- **Linux and mode 7 (0.3.7):** the [Linux guide](linux.md) covers four archives:
+  x64 / ARM64 with bundled or system dependencies. Rust
+  `PresenterRuntime::export_frame_dmabuf(w, h, scale)` exports composited linear
+  RGBA8 dma-bufs using one same-device GPU copy; the C API is unchanged. Follow
+  the stride, offset and slot-reuse rules in [texture output](external_textures.md).
+  Bilibili mode 7 supports positioning, linear motion, duration and alpha fades,
+  but not rotation, multiline text or modes 8 / 9. Rust callers constructing
+  ordinary `DanmakuItem` values must add `special: None`; XML / JSON parsers fill it.
+
 ## 1. Choose a handle family
 
 Use `ErikaPresenterHandle` unless you have a reason to render yourself. The

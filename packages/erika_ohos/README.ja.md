@@ -14,9 +14,9 @@ liberika を利用するネイティブ ArkTS/HarmonyOS SDK です。Flutter と
 ohpm install erika
 ```
 
-2026-11-06 時点の OHPM 公開最新バージョンは 0.3.4 です。この文書は 0.3.4 SDK を説明します。
+2026-11-16 時点の [OHPM](https://ohpm.openharmony.cn/#/en/detail/erika) 公開最新バージョンは 0.3.7 です。この文書は 0.3.7 SDK を説明します。
 
-ネイティブ presenter の操作は専用スレッドで順次実行されます。下記の ArkTS ラッパーは同期メソッドのシグネチャを維持し、ネイティブブリッジは非同期エントリも提供します。0.3.4 の `ErikaOhosPlayerFromId` は null を返すため、生のプレイヤーポインタを保持せずブリッジを使ってください。
+ネイティブ presenter の操作は専用スレッドで順次実行されます。下記の ArkTS ラッパーは同期メソッドのシグネチャを維持し、ネイティブブリッジは非同期エントリも提供します。0.3.4 以降、`ErikaOhosPlayerFromId` は null を返すため、生のプレイヤーポインタを保持せずブリッジを使ってください。
 
 ## プレイヤー設定
 

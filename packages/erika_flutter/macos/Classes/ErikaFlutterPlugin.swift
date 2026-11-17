@@ -25,13 +25,13 @@ private func erikaWindowOverlayTrace(_ message: @autoclosure () -> String) {
 /// Display callbacks only forward coalesced frame requests to the presenter
 /// owner. Stopping the driver never waits for native rendering or main delivery.
 private final class ErikaDisplayLinkDriver {
-  private let onTick: () -> Void
+  private let onTick: (Double?) -> Void
   private let stateLock = NSLock()
   private var displayLink: CVDisplayLink?
   private var tickQueued = false
   private var invalidated = false
 
-  init?(displayID: CGDirectDisplayID, onTick: @escaping () -> Void) {
+  init?(displayID: CGDirectDisplayID, onTick: @escaping (Double?) -> Void) {
     self.onTick = onTick
 
     var link: CVDisplayLink?
@@ -43,14 +43,14 @@ private final class ErikaDisplayLinkDriver {
 
     let status = CVDisplayLinkSetOutputCallback(
       link,
-      { _, _, _, _, _, context in
+      { _, _, outputTime, _, _, context in
         guard let context else {
           return kCVReturnError
         }
         let driver = Unmanaged<ErikaDisplayLinkDriver>
           .fromOpaque(context)
           .takeUnretainedValue()
-        driver.displayDidRefresh()
+        driver.displayDidRefresh(presentationTime: erikaDisplayPresentationTime(outputTime.pointee))
         return kCVReturnSuccess
       },
       Unmanaged.passUnretained(self).toOpaque()
@@ -83,7 +83,7 @@ private final class ErikaDisplayLinkDriver {
     displayLink = nil
   }
 
-  private func displayDidRefresh() {
+  private func displayDidRefresh(presentationTime: Double?) {
     stateLock.lock()
     guard !invalidated, !tickQueued else {
       stateLock.unlock()
@@ -97,11 +97,11 @@ private final class ErikaDisplayLinkDriver {
     stateLock.unlock()
 
     if shouldRender {
-      onTick()
+      onTick(presentationTime)
     }
 
-    // Keep tickQueued set throughout onTick(). Any display refresh received
-    // while Metal is blocked is deliberately dropped rather than replayed.
+    // The owner coalesces pending requests together with their display targets.
+    // This guard only covers forwarding, never native rendering.
     stateLock.lock()
     tickQueued = false
     stateLock.unlock()
@@ -748,6 +748,7 @@ private final class ErikaNativeLibrary {
   ) -> Int32
   typealias ResizeSurfaceFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, Double) -> Int32
   typealias RenderTickFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafeMutableRawPointer?) -> Int32
+  typealias RenderTickWithTimingFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafePointer<Double>?, UnsafeMutableRawPointer?) -> Int32
   typealias SetOutputHeadroomFn = @convention(c) (UnsafeMutableRawPointer?, Float, Bool) -> Int32
   typealias CaptureFrameRgbaFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, UnsafeMutableRawPointer?, Int) -> Int32
   typealias ExportGifFn = @convention(c) (UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Int32
@@ -844,6 +845,7 @@ private final class ErikaNativeLibrary {
   let resizeSurface: ResizeSurfaceFn
   let detachSurface: CommandFn
   let renderTick: RenderTickFn
+  let renderTickWithTiming: RenderTickWithTimingFn?
   let captureFrameRgba: CaptureFrameRgbaFn?
   let exportGif: ExportGifFn?
   let exportFrame: ExportFrameFn?
@@ -929,6 +931,7 @@ private final class ErikaNativeLibrary {
     resizeSurface = try Self.load("erika_presenter_resize_surface", from: libraryHandle, as: ResizeSurfaceFn.self)
     detachSurface = try Self.load("erika_presenter_detach_surface", from: libraryHandle, as: CommandFn.self)
     renderTick = try Self.load("erika_presenter_render_tick", from: libraryHandle, as: RenderTickFn.self)
+    renderTickWithTiming = Self.loadOptional("erika_presenter_render_tick_with_timing", from: libraryHandle, as: RenderTickWithTimingFn.self)
     captureFrameRgba = Self.loadOptional("erika_presenter_capture_frame_rgba", from: libraryHandle, as: CaptureFrameRgbaFn.self)
     exportGif = Self.loadOptional("erika_export_gif", from: libraryHandle, as: ExportGifFn.self)
     exportFrame = Self.loadOptional("erika_export_frame", from: libraryHandle, as: ExportFrameFn.self)
@@ -2410,21 +2413,21 @@ private final class ErikaPlayerHost {
     startDisplayDriverIfNeeded(resetClock: false)
   }
 
-  private func scheduleRenderTick() {
+  private func scheduleRenderTick(presentationTime: Double? = nil) {
     owner.requestFrame { [weak self] in
       guard let self, self.handle != nil else { return }
-      self.renderTick()
+      self.renderTick(presentationTime: presentationTime)
     }
   }
 
-  func renderTick() {
+  func renderTick(presentationTime: Double? = nil) {
     if !loggedRenderThread {
       loggedRenderThread = true
       erikaWindowOverlayTrace(
         "render driver player=\(id) mainThread=\(Thread.isMainThread)"
       )
     }
-    let timeSeconds = CACurrentMediaTime() - startTimeSeconds
+    let timeSeconds = (presentationTime ?? CACurrentMediaTime()) - startTimeSeconds
     let textureSurface = nativeTexture
     let preparedFrame = textureSurface?.prepareFrame()
     if textureSurface != nil && preparedFrame == nil {
@@ -2432,6 +2435,7 @@ private final class ErikaPlayerHost {
     }
     let previousStats = latestPresenterStats
     var stats = ErikaPresenterStatsC()
+    var skippedTick = false
     let status = withNativeCall { () -> Int32 in
       if let preparedFrame {
         let rawTexture = UInt64(UInt(bitPattern: Unmanaged.passUnretained(
@@ -2448,13 +2452,26 @@ private final class ErikaPlayerHost {
         }
       }
       let status = withUnsafeMutablePointer(to: &stats) { pointer in
-        library.renderTick(handle, timeSeconds, UnsafeMutableRawPointer(pointer))
+        if let target = presentationTime, let renderAt = library.renderTickWithTiming {
+          // Convert at the native call, after owner queueing and texture work.
+          // The mailbox retains the newest target, never a stale relative delay.
+          var delay = target - CACurrentMediaTime()
+          guard delay.isFinite && abs(delay) <= 0.25 else {
+            skippedTick = true
+            return Int32(0)
+          }
+          return withUnsafePointer(to: &delay) { delayPointer in
+            renderAt(handle, timeSeconds, delayPointer, UnsafeMutableRawPointer(pointer))
+          }
+        }
+        return library.renderTick(handle, timeSeconds, UnsafeMutableRawPointer(pointer))
       }
-      if status == 0 {
+      if status == 0 && !skippedTick {
         latestPresenterStats = stats
       }
       return status
     }
+    if skippedTick { return }
     if status != 0 {
       NSLog("ErikaFlutterPlugin: render_tick failed with status \(status)")
     } else if let textureSurface, let preparedFrame {
@@ -2607,11 +2624,11 @@ private final class ErikaPlayerHost {
       }
 
       stopDisplayDriver()
-      let driver = ErikaDisplayLinkDriver(displayID: displayID) { [weak self] in
+      let driver = ErikaDisplayLinkDriver(displayID: displayID) { [weak self] presentationTime in
         guard let self else {
           return
         }
-        self.scheduleRenderTick()
+        self.scheduleRenderTick(presentationTime: presentationTime)
       }
       if let driver, driver.start() {
         displayLinkDriver = driver
@@ -3405,11 +3422,11 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     return view
   }
 
-  func requestFrameForTesting(playerId: Int64) {
+  func requestFrameForTesting(playerId: Int64, presentationTime: Double? = nil) {
     guard let host = players[playerId] else { return }
     host.owner.requestFrame { [weak host] in
       guard let host else { return }
-      host.renderTick()
+      host.renderTick(presentationTime: presentationTime)
     }
   }
 

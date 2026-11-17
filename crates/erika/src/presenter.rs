@@ -752,6 +752,26 @@ impl DanmakuTimeTrace {
     }
 }
 
+/// Keep the clock epoch as well as the sample instant: audio pumping can
+/// re-anchor the live clock after this instant, which cannot be extrapolated
+/// backwards by PlaybackClock. Commands still take precedence over this sample.
+struct RenderTickClockSample {
+    snapshot: PlaybackSnapshot,
+    sampled_at: Instant,
+}
+
+impl RenderTickClockSample {
+    fn after_pump(mut self, latest: PlaybackSnapshot) -> Self {
+        if self.snapshot.generation != latest.generation
+            || self.snapshot.state != latest.state
+            || self.snapshot.clock.rate() != latest.clock.rate()
+        {
+            self.snapshot = latest;
+        }
+        self
+    }
+}
+
 impl PresenterRuntime {
     pub fn new(mut config: PresenterConfig) -> Result<Self> {
         let renderer_preference = config.player.renderer;
@@ -857,12 +877,14 @@ impl PresenterRuntime {
             return Err(error);
         }
         self.current_surface_metrics = Some(metrics);
+        self.refresh_current_overlay();
         self.clear_current_danmaku_state();
         Ok(())
     }
 
     pub fn detach_surface(&mut self) -> Result<()> {
         self.current_surface_metrics = None;
+        self.current_overlay = None;
         self.clear_current_danmaku_state();
         self.player.detach_surface()?;
         self.renderer.detach_surface()
@@ -1604,6 +1626,9 @@ impl PresenterRuntime {
         self.player.track_selection()
     }
 
+    /// Render with a clock sample captured before pumping audio/video. Hosts
+    /// with a display target should prefer `render_tick_at` to account for
+    /// callback/queue latency and the time until the frame is displayed.
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
         self.render_tick_with_presentation_time(time_seconds, None)
     }
@@ -1624,6 +1649,14 @@ impl PresenterRuntime {
         time_seconds: f64,
         presentation_time: Option<Instant>,
     ) -> Result<PresenterStats> {
+        let tick_started = Instant::now();
+        let untimed_sample = presentation_time.is_none().then(|| {
+            let snapshot = self.player.playback_snapshot();
+            RenderTickClockSample {
+                snapshot,
+                sampled_at: Instant::now(),
+            }
+        });
         if self.audio_only_tick_active {
             if self.resume_pending {
                 self.try_resume_video_decode();
@@ -1649,12 +1682,16 @@ impl PresenterRuntime {
             self.resume_pending = false;
             self.video_decode_resume_attempts = 0;
         }
-        let tick_started = Instant::now();
-        self.presentation
-            .on_tick(presentation_time.unwrap_or(tick_started));
+        let frame_time = presentation_time.unwrap_or_else(|| {
+            untimed_sample
+                .as_ref()
+                .expect("untimed tick sample")
+                .sampled_at
+        });
+        self.presentation.on_tick(frame_time);
         self.commit_pending_playback_rate()?;
         let pump_started = Instant::now();
-        self.pump_frame_inputs(presentation_time);
+        self.pump_frame_inputs(Some(frame_time), untimed_sample);
 
         let plan_started = Instant::now();
         self.refresh_stale_danmaku_plan();
@@ -1746,7 +1783,7 @@ impl PresenterRuntime {
             Ok(true) => {
                 self.stats.rendered_video_frames += 1;
                 self.presentation.on_render(
-                    presentation_time.unwrap_or_else(Instant::now),
+                    frame_time,
                     true,
                     self.is_playing(),
                     self.playback_rate,
@@ -1818,9 +1855,13 @@ impl PresenterRuntime {
         Ok(self.stats)
     }
 
-    /// Pumps subtitles, video and audio, then samples the playback clock for
-    /// one host frame.
-    fn pump_frame_inputs(&mut self, presentation_time: Option<Instant>) {
+    /// Pumps subtitles, video and audio, then applies one clock sample. Plain
+    /// render ticks retain their pre-pump clock epoch; captures can sample now.
+    fn pump_frame_inputs(
+        &mut self,
+        presentation_time: Option<Instant>,
+        untimed_sample: Option<RenderTickClockSample>,
+    ) {
         self.refresh_video_decoder_status();
 
         let subtitle_started = Instant::now();
@@ -1840,7 +1881,15 @@ impl PresenterRuntime {
         self.last_audio_pump_duration = audio_started.elapsed();
 
         let sync_started = Instant::now();
-        let _snapshot = self.sync_media_time_from_player_at(presentation_time);
+        let latest = self.player.playback_snapshot();
+        let sample = match untimed_sample {
+            Some(sample) => sample.after_pump(latest),
+            None => RenderTickClockSample {
+                snapshot: latest,
+                sampled_at: presentation_time.unwrap_or_else(Instant::now),
+            },
+        };
+        self.apply_playback_snapshot(&sample.snapshot, Some(sample.sampled_at));
         self.last_clock_sync_duration = sync_started.elapsed();
     }
 
@@ -2225,7 +2274,7 @@ impl PresenterRuntime {
             surface_metrics_to_viewport(SurfaceMetrics::new(width, height, content_scale));
         self.export_danmaku_viewport = Some(viewport);
         let pump_started = Instant::now();
-        self.pump_frame_inputs(None);
+        self.pump_frame_inputs(None, None);
 
         let plan_started = Instant::now();
         if self.current_surface_metrics.is_none() && self.current_danmaku_viewport != Some(viewport)
@@ -2317,7 +2366,7 @@ impl PresenterRuntime {
             surface_metrics_to_viewport(SurfaceMetrics::new(width, height, content_scale));
         self.export_danmaku_viewport = Some(viewport);
         let pump_started = Instant::now();
-        self.pump_frame_inputs(None);
+        self.pump_frame_inputs(None, None);
 
         let plan_started = Instant::now();
         if self.current_surface_metrics.is_none() && self.current_danmaku_viewport != Some(viewport)
@@ -2820,21 +2869,28 @@ impl PresenterRuntime {
         );
         let source = OverlayViewport::new(viewport.width, viewport.height);
         self.subtitle_resolution.source = Some(source);
-        let overlay = self.render_playback_overlay(pts, source);
-        if subtitle_diag_enabled() {
-            eprintln!(
-                "[erika-subtitle-diag] stage=update_overlay pts={} gen={} video={}x{} overlay={}",
-                duration_label(Some(pts)),
-                generation,
-                viewport.width,
-                viewport.height,
-                overlay_debug_summary(&overlay),
-            );
+        // Export-only hosts rasterize through capture_overlay at the export
+        // size. Keep the source size for a later surface attachment, but do
+        // not render an unused playback overlay or disturb libass's viewport.
+        if self.current_surface_metrics.is_some() {
+            let overlay = self.render_playback_overlay(pts, source);
+            if subtitle_diag_enabled() {
+                eprintln!(
+                    "[erika-subtitle-diag] stage=update_overlay pts={} gen={} video={}x{} overlay={}",
+                    duration_label(Some(pts)),
+                    generation,
+                    viewport.width,
+                    viewport.height,
+                    overlay_debug_summary(&overlay),
+                );
+            }
+            if !overlay.is_empty() {
+                self.stats.overlay_frames += 1;
+            }
+            self.current_overlay = Some(overlay);
+        } else {
+            self.current_overlay = None;
         }
-        if !overlay.is_empty() {
-            self.stats.overlay_frames += 1;
-        }
-        self.current_overlay = Some(overlay);
         let generation = generation.max(self.danmaku_generation).max(1);
         let candidate_viewport = self
             .current_surface_metrics
@@ -3039,7 +3095,9 @@ impl PresenterRuntime {
             .max(1);
         if player_time != self.current_media_time {
             self.current_media_time = player_time;
-            if let Some(source) = self.subtitle_resolution.source {
+            if self.current_surface_metrics.is_some()
+                && let Some(source) = self.subtitle_resolution.source
+            {
                 let overlay = self.render_playback_overlay(player_time, source);
                 if subtitle_diag_enabled() {
                     eprintln!(
@@ -3067,6 +3125,10 @@ impl PresenterRuntime {
     }
 
     fn refresh_current_overlay(&mut self) {
+        if self.current_surface_metrics.is_none() {
+            self.current_overlay = None;
+            return;
+        }
         let Some(source) = self.subtitle_resolution.source else {
             return;
         };
@@ -4885,10 +4947,176 @@ fn append_text_subtitles_debug(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "ios")]
     #[test]
-    fn ios_display_target_samples_one_clock_for_visuals_and_preserves_commands() {
+    fn untimed_clock_sample_survives_pump_reanchors() {
+        use crate::core::PlayerState;
+        use crate::playback::{PlaybackClock, PlaybackClockSource};
+        let origin = Instant::now();
+        for delay_ms in [1, 9, 30] {
+            let snapshot = PlaybackSnapshot {
+                clock: PlaybackClock::running_at(Duration::from_secs(10), origin),
+                generation: 2,
+                state: PlayerState::Playing,
+            };
+            let target = origin + Duration::from_millis(16);
+            let mut latest = snapshot.clone();
+            latest.clock.sync_to(
+                Duration::from_secs(10) + Duration::from_millis(16 + delay_ms),
+                target + Duration::from_millis(delay_ms),
+                PlaybackClockSource::Wall,
+            );
+            let sample = RenderTickClockSample {
+                snapshot,
+                sampled_at: target,
+            }
+            .after_pump(latest);
+            assert_eq!(
+                sample.snapshot.media_time_at(sample.sampled_at),
+                Duration::from_millis(10016)
+            );
+        }
+    }
+
+    #[test]
+    fn untimed_clock_sample_observes_commands_during_pump() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+        let origin = Instant::now();
+        let initial = PlaybackSnapshot {
+            clock: PlaybackClock::running_at(Duration::from_secs(10), origin),
+            generation: 2,
+            state: PlayerState::Playing,
+        };
+        let mut paused = initial.clone();
+        paused.clock.pause(origin + Duration::from_millis(9));
+        paused.state = PlayerState::Paused;
+        let mut sought = initial.clone();
+        sought.generation += 1;
+        sought
+            .clock
+            .seek(Duration::from_secs(20), origin + Duration::from_millis(9));
+        let mut rated = initial.clone();
+        rated.clock.set_rate(2.0, origin + Duration::from_millis(9));
+        for latest in [paused, sought, rated] {
+            let sample = RenderTickClockSample {
+                snapshot: initial.clone(),
+                sampled_at: origin,
+            }
+            .after_pump(latest.clone());
+            assert_eq!(sample.snapshot, latest);
+        }
+    }
+
+    struct ClockReanchoringAudioProbe {
+        output: crate::audio::BufferedAudioOutput,
+        player: Player,
+        origin: Instant,
+        pump_interval: Arc<Mutex<Option<(Instant, Instant)>>>,
+    }
+
+    impl AudioOutputBackend for ClockReanchoringAudioProbe {
+        fn configure(&mut self, f: crate::ffmpeg::PcmFormat) -> crate::audio::Result<()> {
+            self.output.configure(f)
+        }
+        fn start(&mut self) -> crate::audio::Result<()> {
+            self.output.start()
+        }
+        fn pause(&mut self) -> crate::audio::Result<()> {
+            self.output.pause()
+        }
+        fn stop(&mut self) -> crate::audio::Result<()> {
+            self.output.stop()
+        }
+        fn set_volume(&mut self, v: f32) {
+            self.output.set_volume(v);
+        }
+        fn volume(&self) -> f32 {
+            self.output.volume()
+        }
+        fn push(
+            &mut self,
+            f: crate::ffmpeg::PcmAudioFrame,
+        ) -> crate::audio::Result<crate::audio::AudioPushResult> {
+            self.output.push(f)
+        }
+        fn state(&self) -> crate::audio::AudioOutputState {
+            self.output.state()
+        }
+        fn stats(&self) -> crate::audio::AudioRingBufferStats {
+            self.output.stats()
+        }
+        fn can_accept_audio_frame(&self) -> bool {
+            let started = Instant::now();
+            thread::sleep(Duration::from_millis(10));
+            let ended = Instant::now();
+            let mut latest = self.player.playback_snapshot();
+            latest.clock.sync_to(
+                Duration::from_secs(1) + ended.duration_since(self.origin),
+                ended,
+                crate::playback::PlaybackClockSource::Wall,
+            );
+            self.player.set_playback_snapshot_for_test(latest);
+            *self.pump_interval.lock().unwrap() = Some((started, ended));
+            false
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows", feature = "wgpu"))]
+    fn render_ticks_sample_before_pump_or_at_explicit_display_target() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+        for timed in [false, true] {
+            let mut p = live_danmaku_presenter();
+            let origin = Instant::now();
+            p.player.set_playback_snapshot_for_test(PlaybackSnapshot {
+                clock: PlaybackClock::running_at(Duration::from_secs(1), origin),
+                generation: 1,
+                state: PlayerState::Playing,
+            });
+            let pump_interval = Arc::new(Mutex::new(None));
+            p.audio_output = Box::new(ClockReanchoringAudioProbe {
+                output: crate::audio::BufferedAudioOutput::new(AudioRingBufferConfig::default()),
+                player: p.player.clone(),
+                origin,
+                pump_interval: pump_interval.clone(),
+            });
+            let entered = Instant::now();
+            let target = entered + Duration::from_secs(1);
+            if timed {
+                p.render_tick_at(0.0, target).unwrap();
+            } else {
+                p.render_tick(0.0).unwrap();
+            }
+            let (pump_started, pump_ended) = pump_interval.lock().unwrap().unwrap();
+            let sampled = origin + p.current_media_time - Duration::from_secs(1);
+            if timed {
+                assert_eq!(sampled, target);
+            } else {
+                assert!(sampled >= entered);
+                assert!(
+                    sampled <= pump_started,
+                    "pump latency leaked into the untimed frame"
+                );
+                assert!(sampled < pump_ended);
+            }
+            assert_eq!(
+                p.current_danmaku.as_ref().unwrap().media_time,
+                p.current_media_time
+            );
+            assert!(!p.current_danmaku.as_ref().unwrap().items.is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "ios",
+        target_os = "tvos",
+        feature = "wgpu"
+    ))]
+    fn display_target_samples_one_clock_for_visuals_and_preserves_commands() {
         use crate::core::PlayerState;
         use crate::playback::PlaybackClock;
 
@@ -4907,6 +5135,7 @@ mod tests {
             subtitle_changed: false,
         });
         presenter.subtitle_resolution.source = Some(OverlayViewport::new(640, 360));
+        presenter.current_surface_metrics = Some(SurfaceMetrics::new(640, 360, 1.0));
         // Replaying the same display target after other work must not move it.
         for hz in [60.0, 120.0] {
             for frame in 1..=6 {
@@ -5552,8 +5781,135 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
     #[test]
+    fn headless_subtitles_render_only_at_capture_size() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.current_media_time = Duration::from_millis(500);
+        presenter.export_danmaku_viewport = Some(DanmakuViewport::new(640, 360));
+        let resources = Arc::new(AssTrackResources::new(
+            2,
+            Arc::<[u8]>::from(ass_test_header().as_bytes()),
+            Arc::from([]),
+        ));
+        presenter.subtitles.push(ass_subtitle_frame(
+            2,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(3),
+            0,
+            resources,
+        ));
+        let first = presenter.capture_overlay(640, 360);
+        assert!(!first.subtitle_alpha_planes.is_empty());
+
+        for millis in [600, 700, 800] {
+            let pts = Duration::from_millis(millis);
+            presenter.update_overlay(pts, 1, 1920, 1080);
+            presenter.apply_playback_snapshot(
+                &PlaybackSnapshot {
+                    clock: PlaybackClock::paused_at(pts),
+                    generation: 1,
+                    state: PlayerState::Paused,
+                },
+                None,
+            );
+            presenter.refresh_current_overlay();
+            assert!(presenter.current_overlay.is_none());
+            assert_eq!(presenter.stats.overlay_frames, 0);
+            assert_eq!(
+                presenter.subtitle_resolution.source,
+                Some(OverlayViewport::new(1920, 1080))
+            );
+            assert_eq!(
+                presenter.current_danmaku_viewport,
+                presenter.export_danmaku_viewport
+            );
+            let capture = presenter.capture_overlay(640, 360);
+            assert!(!capture.subtitle_alpha_planes.is_empty());
+            assert!(
+                !capture.subtitle_changed,
+                "playback must not invalidate the export's libass canvas"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
+    fn subtitle_overlay_follows_surface_attachment_while_paused() {
+        use crate::core::{FlutterTextureHandle, FlutterTextureKind};
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::new(Mutex::new(None)),
+        });
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.subtitles.push(text_subtitle_frame(
+            2,
+            Duration::from_millis(500),
+            Some(Duration::from_secs(3)),
+            "Paused subtitle",
+        ));
+        presenter.update_overlay(Duration::from_secs(1), 1, 640, 360);
+        presenter.set_subtitle_scale(1.25);
+        assert!(presenter.current_overlay.is_none());
+        assert!(presenter.subtitles.text_renderer.renderer.is_none());
+
+        let surface = PlatformSurface::FlutterTexture(FlutterTextureHandle::new(
+            FlutterTextureKind::Unknown,
+            1,
+            640,
+            360,
+            1.0,
+        ));
+        presenter.attach_surface(surface).unwrap();
+        let overlay = presenter.current_overlay.as_ref().unwrap();
+        assert_eq!(overlay.pts, Duration::from_secs(1));
+        assert!(!overlay.subtitle_alpha_planes.is_empty());
+        presenter.resize_surface(1280, 720, 2.0).unwrap();
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+
+        presenter.detach_surface().unwrap();
+        assert!(presenter.current_overlay.is_none());
+        presenter.set_subtitle_delay(2_000_000);
+        assert!(presenter.current_overlay.is_none());
+        assert!(
+            presenter
+                .capture_overlay(320, 180)
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+        presenter.set_subtitle_delay(0);
+        assert!(
+            !presenter
+                .capture_overlay(320, 180)
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+        presenter.attach_surface(surface).unwrap();
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
     fn subtitle_quality_toggles_refresh_paused_frames_without_accumulating_scale() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.current_surface_metrics = Some(SurfaceMetrics::new(640, 360, 1.0));
         presenter.current_media_time = Duration::from_secs(1);
         presenter.subtitles.push(text_subtitle_frame(
             2,
@@ -6289,7 +6645,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         );
     }
 
-    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", feature = "wgpu"))]
     fn live_danmaku_presenter() -> PresenterRuntime {
         let viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
         let timeline = DanmakuTimeline::new(

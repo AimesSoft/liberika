@@ -1,0 +1,9 @@
+Test project D:/CodexWork/erika-issues-20261116/build-windows-tests
+    Start 1: presenter_worker
+1/2 Test #1: presenter_worker .................   Passed    0.04 sec
+    Start 2: texture_publication
+2/2 Test #2: texture_publication ..............   Passed    0.05 sec
+
+100% tests passed out of 2
+
+Total Test time (real) =   0.13 sec
