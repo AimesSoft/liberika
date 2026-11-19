@@ -854,6 +854,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
       ErikaStatus (*)(ErikaPresenterHandle*, uint32_t, uint32_t, double);
   using RenderTickFn =
       ErikaStatus (*)(ErikaPresenterHandle*, double, ErikaPresenterStats*);
+  using GetPresenterStatsFn = ErikaStatus (*)(ErikaPresenterHandle*, ErikaPresenterStats*);
   using PollEventFn = ErikaStatus (*)(ErikaPresenterHandle*, ErikaEvent*);
   using CaptureFrameFn = ErikaStatus (*)(ErikaPresenterHandle*, uint32_t,
                                         uint32_t, uint8_t*, uintptr_t);
@@ -971,6 +972,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   ResizeSurfaceFn resize_surface = nullptr;
   CommandFn detach_surface = nullptr;
   RenderTickFn render_tick = nullptr;
+  GetPresenterStatsFn get_presenter_stats = nullptr;
   PollEventFn poll_event = nullptr;
   CaptureFrameFn capture_frame = nullptr;
   LastErrorMessageFn last_error_message = nullptr;
@@ -1090,6 +1092,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
     detach_surface =
         LoadRequired<CommandFn>("erika_presenter_detach_surface");
     render_tick = LoadRequired<RenderTickFn>("erika_presenter_render_tick");
+    get_presenter_stats = LoadOptional<GetPresenterStatsFn>("erika_presenter_get_stats");
     poll_event = LoadRequired<PollEventFn>("erika_presenter_poll_event");
     capture_frame = LoadOptional<CaptureFrameFn>("erika_presenter_capture_frame_rgba");
     last_error_message =
@@ -2059,7 +2062,14 @@ struct ErikaFlutterPlugin::PlayerHost {
     return ResourceStatusToMap(status);
   }
 
-  EncodableValue GetPresenterStats() const {
+  EncodableValue GetPresenterStats() {
+    // Submitted on the presenter worker, like render_tick. A render failure
+    // leaves its output argument untouched; query the live snapshot so failed
+    // renders cannot freeze all counters at the last successful frame.
+    if (library->get_presenter_stats) {
+      CheckNative(library->get_presenter_stats(handle, &latest_presenter_stats),
+                  "get_presenter_stats");
+    }
     return PresenterStatsToMap(latest_presenter_stats);
   }
 
