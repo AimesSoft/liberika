@@ -1342,6 +1342,18 @@ fn open_stream_response_with_identity(
     }
 }
 
+/// Preserve lazy stripe growth, except when its next geometric allocation
+/// would exceed the bytes still allowed in this original logical stripe.
+fn append_stream_stripe(stripe: &mut Vec<u8>, bytes: &[u8], remaining: usize) {
+    if bytes.len() > stripe.capacity() - stripe.len() {
+        let limit = stripe.len() + remaining;
+        if stripe.capacity().saturating_mul(2).max(8) > limit {
+            stripe.reserve_exact(limit - stripe.len());
+        }
+    }
+    stripe.extend_from_slice(bytes);
+}
+
 /// Gate each stripe, including multiple stripes received in one body chunk.
 fn wait_for_stream_window(
     shared: &StreamShared,
@@ -1852,7 +1864,7 @@ fn stream_worker_main(
                     }
                     let available = HTTP_STREAM_STRIPE_BYTES as usize - stripe_received;
                     let take = available.min(received - consumed);
-                    stripe.extend_from_slice(&bytes[consumed..consumed + take]);
+                    append_stream_stripe(&mut stripe, &bytes[consumed..consumed + take], available);
                     consumed += take;
                     offset += take as u64;
                     stripe_received += take;
