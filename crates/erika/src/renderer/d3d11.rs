@@ -1038,7 +1038,7 @@ struct ImportedVideoFrame {
     constants: VideoUniforms,
 }
 
-struct FlutterTextureScene {
+struct PresentedScene {
     frame_token: u64,
     generation: u64,
     upscaler: LumaUpscalerMode,
@@ -1046,7 +1046,7 @@ struct FlutterTextureScene {
     danmaku: Option<DanmakuRenderPlan>,
 }
 
-impl FlutterTextureScene {
+impl PresentedScene {
     fn new(frame_token: u64, upscaler: LumaUpscalerMode, context: RenderFrameContext<'_>) -> Self {
         Self {
             frame_token,
@@ -1085,7 +1085,11 @@ impl FlutterTextureScene {
     fn danmaku_matches(&self, danmaku: Option<&DanmakuRenderPlan>) -> bool {
         match (self.danmaku.as_ref(), danmaku) {
             (Some(a), Some(b)) => {
-                a.viewport == b.viewport && a.atlas == b.atlas && a.items == b.items
+                a.viewport == b.viewport
+                    && a.atlas == b.atlas
+                    && a.items == b.items
+                    && a.color_atlas == b.color_atlas
+                    && a.color_glyphs == b.color_glyphs
             }
             (None, None) => true,
             _ => false,
@@ -1249,7 +1253,7 @@ pub struct D3d11Renderer {
     current_video_fence: Option<ID3D11Query>,
     /// `MetalRendererConfig::compositor_handoff_timeout`.
     handoff_timeout: Duration,
-    flutter_scene: Option<FlutterTextureScene>,
+    presented_scene: Option<PresentedScene>,
     subtitle_alpha_cache: Option<D3d11SubtitleAlphaCache>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
     danmaku_picture_cache: Option<(u64, D3d11OverlayTexture)>,
@@ -1321,7 +1325,7 @@ impl D3d11Renderer {
             current_video: None,
             current_video_fence: None,
             handoff_timeout: config.compositor_handoff_timeout,
-            flutter_scene: None,
+            presented_scene: None,
             subtitle_alpha_cache: None,
             danmaku_atlas_cache: None,
             danmaku_picture_cache: None,
@@ -1441,7 +1445,7 @@ impl D3d11Renderer {
         self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
-        self.flutter_scene = None;
+        self.presented_scene = None;
         self.state = None;
     }
 
@@ -1642,6 +1646,7 @@ impl D3d11Renderer {
     }
 
     fn recreate_surface_targets(&mut self) -> Result<()> {
+        self.presented_scene = None;
         let Some(surface) = self.surface.as_mut() else {
             return Ok(());
         };
@@ -2478,12 +2483,14 @@ impl D3d11Renderer {
         let upscaler_status = self.upscaler_backend_status();
         if upscaler_status != self.scene_upscaler_status {
             self.scene_upscaler_status = upscaler_status;
-            self.flutter_scene = None;
+            self.presented_scene = None;
         }
-        if flutter_texture
-            && self.surface.as_ref().unwrap().published_texture.is_some()
+        // Keep pumping clocks/ASS/danmaku at display cadence; only suppress
+        // draws whose complete visible scene already reached this surface.
+        // Pending LUT work must still be polled on a paused frame.
+        if self.gamut_lut_job.is_none()
             && self
-                .flutter_scene
+                .presented_scene
                 .as_ref()
                 .is_some_and(|scene| scene.matches(frame_token, self.upscaler_mode, context))
         {
@@ -2601,9 +2608,10 @@ impl D3d11Renderer {
                 video.constants,
             )?;
         }
-        if let Some(swapchain) = surface.swapchain.as_ref() {
-            present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
-        }
+        let submitted = match surface.swapchain.as_ref() {
+            Some(swapchain) => present_swapchain(swapchain, "IDXGISwapChain1::Present1")?,
+            None => true,
+        };
         // What retiring this frame waits for.
         let fence = if surface.composition || flutter_texture {
             let fence = create_d3d11_event_query(&state.device)?;
@@ -2617,17 +2625,21 @@ impl D3d11Renderer {
         }
         if flutter_texture {
             self.publish_flutter_texture()?;
-            if let Some(scene) = self.flutter_scene.as_mut() {
+        }
+        // A full/occluded DXGI queue is not a successful presentation. Keep
+        // the scene dirty and retry on the next tick, including while paused.
+        if submitted {
+            if let Some(scene) = self.presented_scene.as_mut() {
                 scene.update(frame_token, self.upscaler_mode, context);
             } else {
-                self.flutter_scene = Some(FlutterTextureScene::new(
+                self.presented_scene = Some(PresentedScene::new(
                     frame_token,
                     self.upscaler_mode,
                     context,
                 ));
             }
+            self.stats.rendered_frames += 1;
         }
-        self.stats.rendered_frames += 1;
         if !danmaku_draws.is_empty() {
             self.stats.danmaku_passes += 1;
             self.stats.danmaku_items += danmaku_draws.len() as u64;
@@ -2660,7 +2672,7 @@ impl D3d11Renderer {
             .surface
             .as_ref()
             .is_some_and(|surface| surface.flutter_texture && surface.published_texture.is_some())
-            && self.flutter_scene.is_none()
+            && self.presented_scene.is_none()
         {
             return Ok(());
         }
@@ -2690,7 +2702,7 @@ impl D3d11Renderer {
             }
         }
         self.publish_flutter_texture()?;
-        self.flutter_scene = None;
+        self.presented_scene = None;
         trace("render_clear: done");
         self.stats.rendered_frames += 1;
         Ok(())
@@ -2758,6 +2770,7 @@ impl RendererBackend for D3d11Renderer {
 
     fn detach_surface(&mut self) -> Result<()> {
         self.retire_current_video()?;
+        self.presented_scene = None;
         self.surface = None;
         self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
@@ -2957,6 +2970,7 @@ impl RendererBackend for D3d11Renderer {
         &mut self,
         model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
     ) {
+        self.presented_scene = None;
         match self.state.as_ref() {
             Some(state) => self.upscaler.set_custom_model(&state.device, model),
             None => self.upscaler.store_custom_model(model),
@@ -3749,7 +3763,7 @@ fn create_linear_render_target(
     ))
 }
 
-fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<()> {
+fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<bool> {
     let params = DXGI_PRESENT_PARAMETERS {
         DirtyRectsCount: 0,
         pDirtyRects: ptr::null_mut(),
@@ -3761,9 +3775,10 @@ fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Re
     // for a full DXGI queue here: dropping one presentation keeps window
     // interaction responsive while decode/audio continue normally.
     if status == DXGI_ERROR_WAS_STILL_DRAWING {
-        return Ok(());
+        return Ok(false);
     }
-    status.ok().map_err(|error| d3d_error(operation, error))
+    status.ok().map_err(|error| d3d_error(operation, error))?;
+    Ok(status.0 == 0) // S_OK; retry occluded/status-only presentations.
 }
 
 fn create_plane_srv(
@@ -4538,7 +4553,7 @@ mod tests {
     }
 
     #[test]
-    fn flutter_scene_ignores_clock_ticks_but_detects_output_changes() {
+    fn presented_scene_ignores_clock_ticks_but_detects_output_changes() {
         use crate::overlay::OverlayViewport;
         use crate::subtitle::SubtitleBitmapPlane;
         let mut overlay = OverlayFrame {
@@ -4548,7 +4563,7 @@ mod tests {
             subtitle_alpha_planes: vec![],
             subtitle_changed: true,
         };
-        let scene = FlutterTextureScene::new(
+        let scene = PresentedScene::new(
             7,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay)),
@@ -4578,7 +4593,7 @@ mod tests {
     }
 
     #[test]
-    fn flutter_scene_reuses_unchanged_cpu_buffers_across_video_frames() {
+    fn presented_scene_reuses_unchanged_cpu_buffers_across_video_frames() {
         use crate::danmaku::DanmakuViewport;
         use crate::overlay::OverlayViewport;
         use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
@@ -4610,7 +4625,7 @@ mod tests {
             shadow_rgba: [0.0; 4],
             shadow_offset: [0.0; 2],
         });
-        let mut scene = FlutterTextureScene::new(
+        let mut scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1)
@@ -4882,7 +4897,7 @@ mod tests {
     }
 
     #[test]
-    fn flutter_scene_detects_danmaku_motion_and_visibility_changes() {
+    fn presented_scene_detects_danmaku_motion_and_visibility_changes() {
         use crate::danmaku::DanmakuViewport;
         let mut plan = DanmakuRenderPlan::empty(Duration::ZERO, 1, DanmakuViewport::new(8, 8));
         plan.items.push(DanmakuGlyphInstance {
@@ -4894,7 +4909,7 @@ mod tests {
             shadow_rgba: [0.0; 4],
             shadow_offset: [0.0; 2],
         });
-        let scene = FlutterTextureScene::new(
+        let scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan)),
