@@ -1862,6 +1862,9 @@ async fn fetch_http_range_async(
         }
         let received = bytes.len() as u64;
         if received == 0 {
+            // No retained bytes bind us to the previous response's entity.
+            // Rebind its length together with the validator on the next body.
+            total_length = None;
             validator = None;
         }
         if range.length.is_some_and(|length| received >= length) {
