@@ -43,11 +43,14 @@ const LIBASS_URLS: &[&str] = &[
     "https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.xz",
     "https://codeload.github.com/libass/libass/tar.gz/refs/tags/0.17.5",
 ];
-const LIBASS_PATCHSET_VERSION: &str = "erika-ordered-font-fallback-v2";
+const LIBASS_PATCHSET_VERSION: &str = "erika-ordered-font-fallback-v2-windows-sse-v1";
 const LIBASS_BUILD_VERSION: &str = "0.17.5+erika-ordered-font-fallback-v2";
+const LIBASS_WINDOWS_X64_BUILD_VERSION: &str =
+    "0.17.5+erika-ordered-font-fallback-v2-windows-sse-v1";
 const LIBASS_PATCHES: &[&str] = &[
     "third_party/patches/libass-0.17.5/0001-erika-ordered-default-font-families.patch",
     "third_party/patches/libass-0.17.5/0002-erika-default-font-face.patch",
+    "third_party/patches/libass-0.17.5/0003-erika-windows-x64-sse-layout.patch",
 ];
 
 const HARFBUZZ_ARCHIVE: &str = "harfbuzz-14.2.1.tar.xz";
@@ -1251,11 +1254,14 @@ fn ensure_required_tools(options: DepsOptions, layout: &WorkspaceLayout) -> Resu
         if ((ffmpeg_requires_nasm(options.target)
             && !ffmpeg_build_marker_is_current(layout, options))
             || (dav1d_requires_nasm(options.target)
-                && !dav1d_build_marker_is_current(layout, options)))
+                && !dav1d_build_marker_is_current(layout, options))
+            || (options.all
+                && libass_asm_enabled(options.target)
+                && (options.force || !libass_build_marker_is_current(layout, options.target))))
             && which("nasm").is_none()
         {
             bail!(
-                "required build tool `nasm` was not found for Windows x86_64 FFmpeg/dav1d assembly"
+                "required build tool `nasm` was not found in PATH for Windows x86_64 FFmpeg/dav1d/libass assembly"
             );
         }
         if cmake_tool().is_none() {
@@ -1743,13 +1749,7 @@ fn patch_fribidi_meson_native_compiler(layout: &WorkspaceLayout) -> Result<()> {
 }
 
 fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
-    if marker_has_version(
-        &layout.libass_build_marker,
-        "libass",
-        LIBASS_BUILD_VERSION,
-        options.target,
-    ) && !options.force
-    {
+    if libass_build_marker_is_current(layout, options.target) && !options.force {
         println!(
             "reuse libass build marker {}",
             layout.libass_build_marker.display()
@@ -1772,7 +1772,8 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         &layout.fribidi_prefix,
     ]);
     let pkg_config = ensure_pkg_config_shim(layout)?;
-    println!("configure libass");
+    let asm_enabled = libass_asm_enabled(options.target);
+    println!("configure libass (asm={asm_enabled})");
     let mut setup = meson_command(&meson);
     setup
         .arg("setup")
@@ -1788,7 +1789,11 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         } else {
             "-Dfontconfig=disabled"
         })
-        .arg("-Dasm=disabled")
+        .arg(if asm_enabled {
+            "-Dasm=enabled"
+        } else {
+            "-Dasm=disabled"
+        })
         .arg("-Dlibunibreak=disabled")
         .env("PKG_CONFIG_PATH", &pkg_config_path)
         .env("PKG_CONFIG", &pkg_config)
@@ -1797,6 +1802,11 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         setup
             .arg("-Dcoretext=disabled")
             .arg("-Ddirectwrite=enabled");
+        if asm_enabled {
+            // The SSE2/SSSE3 renderer preserves the existing C bitmap layout.
+            // The source patch excludes AVX2 selection (32-byte alignment).
+            setup.arg("-Dlarge-tiles=false");
+        }
     } else if options.target.is_apple() {
         setup
             .arg("-Dcoretext=enabled")
@@ -1851,9 +1861,30 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     write_marker(
         &layout.libass_build_marker,
         "libass",
-        LIBASS_BUILD_VERSION,
+        libass_build_version(options.target),
         &layout.libass_prefix,
         options.target,
+    )
+}
+
+fn libass_asm_enabled(target: NativeTarget) -> bool {
+    matches!(target, NativeTarget::X86_64WindowsMsvc)
+}
+
+fn libass_build_version(target: NativeTarget) -> &'static str {
+    if libass_asm_enabled(target) {
+        LIBASS_WINDOWS_X64_BUILD_VERSION
+    } else {
+        LIBASS_BUILD_VERSION
+    }
+}
+
+fn libass_build_marker_is_current(layout: &WorkspaceLayout, target: NativeTarget) -> bool {
+    marker_has_version(
+        &layout.libass_build_marker,
+        "libass",
+        libass_build_version(target),
+        target,
     )
 }
 
