@@ -1211,16 +1211,22 @@ enum StreamOpened {
     Eof,
 }
 
-/// Only unambiguous positive delta-seconds are supported. Dates, duplicates,
-/// malformed values and overflow retain the original status-error behavior.
+/// Accept one positive delta-seconds value or a future HTTP-date.
+/// Absolute dates use only the local reception clock; Date/Age are not clock
+/// synchronization. Skew may reject a hint, but cannot extend the stall budget.
 fn stream_retry_after(response: &reqwest::Response) -> Option<Duration> {
     let mut values = response.headers().get_all("retry-after").iter();
     let value = values.next()?.to_str().ok()?.trim();
-    if values.next().is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+    if values.next().is_some() || value.is_empty() {
         return None;
     }
-    let seconds = value.parse::<u64>().ok()?;
-    (seconds > 0).then(|| Duration::from_secs(seconds))
+    if value.bytes().all(|b| b.is_ascii_digit()) {
+        let seconds = value.parse::<u64>().ok()?;
+        return (seconds > 0).then(|| Duration::from_secs(seconds));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    let delay = date.duration_since(std::time::SystemTime::now()).ok()?;
+    (!delay.is_zero()).then_some(delay)
 }
 
 /// Opens a worker's persistent GET: open-ended (`bytes=offset-`), so the
