@@ -431,6 +431,12 @@ impl MetalRendererImpl {
                 total.saturating_add(page.texture.allocatedSize() as u64)
             })
         });
+        let overlay_key_bytes = self.overlay_alpha_atlas_cache.as_ref().map_or(0, |cache| {
+            cache
+                .signature
+                .as_ref()
+                .map_or(0, OverlayAlphaAtlasKey::retained_bytes) as u64
+        });
         let danmaku_atlas_bytes = self.danmaku_alpha_atlas_cache.as_ref().map_or(0, |cache| {
             (cache.fill_texture.allocatedSize() as u64)
                 .saturating_add(cache.outline_texture.allocatedSize() as u64)
@@ -448,6 +454,7 @@ impl MetalRendererImpl {
         let upscaler_bytes = self.upscaler.allocated_bytes();
         let renderer_tracked_bytes = drawable_estimated_bytes
             .saturating_add(overlay_atlas_bytes)
+            .saturating_add(overlay_key_bytes)
             .saturating_add(danmaku_atlas_bytes)
             .saturating_add(danmaku_vertex_buffer_bytes)
             .saturating_add(upscaler_bytes);
@@ -1614,6 +1621,11 @@ impl MetalRendererImpl {
         let viewport_width = overlay.frame.viewport.width;
         let viewport_height = overlay.frame.viewport.height;
         let layout = layout.with_source_size(viewport_width, viewport_height);
+        let edr = self.output_mode.is_edr();
+        unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+        }
         for plane in &overlay.frame.subtitle_planes {
             let texture = self.create_overlay_texture(
                 plane.width as usize,
@@ -1621,19 +1633,9 @@ impl MetalRendererImpl {
                 &plane.rgba,
             )?;
             let (x, y, width, height) = plane.scaled_rect(viewport_width, viewport_height);
-            let uniforms = OverlayUniforms::from_plane(
-                x,
-                y,
-                width,
-                height,
-                layout,
-                target,
-                self.output_mode.is_edr(),
-            );
+            let uniforms = OverlayUniforms::from_plane(x, y, width, height, layout, target, edr);
             unsafe {
-                encoder.setRenderPipelineState(&pipeline);
                 encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
-                encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
                 encoder.setVertexBytes_length_atIndex(
                     overlay_uniform_pointer(&uniforms),
                     mem::size_of::<OverlayUniforms>(),
@@ -1660,11 +1662,10 @@ impl MetalRendererImpl {
             else {
                 return Ok(());
             };
-            let pages = atlas.pages.clone();
-            let placements = atlas.placements.clone();
-            for placement in &placements {
+            let mut bound_page = None;
+            for placement in &atlas.placements {
                 let bitmap = &overlay.frame.subtitle_alpha_planes[placement.bitmap_index];
-                let page = &pages[placement.page];
+                let page = &atlas.pages[placement.page];
                 let uniforms = OverlayUniforms::from_alpha_atlas_bitmap(
                     bitmap,
                     placement,
@@ -1672,12 +1673,13 @@ impl MetalRendererImpl {
                     page.height,
                     layout,
                     target,
-                    self.output_mode.is_edr(),
+                    edr,
                 );
                 unsafe {
-                    encoder.setRenderPipelineState(&pipeline);
-                    encoder.setFragmentTexture_atIndex(Some(&*page.texture), 0);
-                    encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                    if bound_page != Some(placement.page) {
+                        encoder.setFragmentTexture_atIndex(Some(&*page.texture), 0);
+                        bound_page = Some(placement.page);
+                    }
                     encoder.setVertexBytes_length_atIndex(
                         overlay_uniform_pointer(&uniforms),
                         mem::size_of::<OverlayUniforms>(),
@@ -2046,8 +2048,13 @@ impl MetalRendererImpl {
         viewport: OverlayViewport,
         changed: bool,
     ) -> Result<Option<&OverlayAlphaAtlasCache>> {
+        let previous_changed = self
+            .overlay_alpha_atlas_cache
+            .as_ref()
+            .is_some_and(|cache| cache.previous_call_changed && cache.viewport == viewport);
         if !changed {
-            if let Some(cache) = &self.overlay_alpha_atlas_cache {
+            if let Some(cache) = &mut self.overlay_alpha_atlas_cache {
+                cache.previous_call_changed = false;
                 if cache.can_reuse_for(bitmaps, viewport) {
                     self.stats.overlay_alpha_atlas_reuses += 1;
                     return Ok(self.overlay_alpha_atlas_cache.as_ref());
@@ -2082,6 +2089,8 @@ impl MetalRendererImpl {
             plan.placements,
             bitmaps,
             viewport,
+            changed,
+            previous_changed,
         ));
         self.stats.overlay_alpha_atlas_uploads += 1;
         Ok(self.overlay_alpha_atlas_cache.as_ref())
@@ -2966,7 +2975,8 @@ struct OverlayAlphaAtlasCache {
     pages: Vec<OverlayAlphaAtlasTexture>,
     placements: Vec<OverlayAlphaAtlasPlacement>,
     viewport: OverlayViewport,
-    signature: OverlayAlphaAtlasSignature,
+    signature: Option<OverlayAlphaAtlasKey>,
+    previous_call_changed: bool,
 }
 
 struct DanmakuAlphaAtlasCache {
@@ -3046,18 +3056,146 @@ impl OverlayAlphaAtlasCache {
         placements: Vec<OverlayAlphaAtlasPlacement>,
         bitmaps: &[SubtitleAlphaBitmap],
         viewport: OverlayViewport,
+        changed: bool,
+        previous_changed: bool,
     ) -> Self {
         Self {
             pages,
             placements,
             viewport,
-            signature: OverlayAlphaAtlasSignature::from_bitmaps(bitmaps),
+            // Consecutive dirty calls must upload anyway. Defer the full alpha
+            // scan until a later rebuild can establish a reusable signature.
+            signature: (!(changed && previous_changed))
+                .then(|| OverlayAlphaAtlasKey::from_bitmaps(bitmaps)),
+            previous_call_changed: changed,
         }
     }
 
     fn can_reuse_for(&self, bitmaps: &[SubtitleAlphaBitmap], viewport: OverlayViewport) -> bool {
         self.viewport == viewport
-            && self.signature == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)
+            && self
+                .signature
+                .as_ref()
+                .is_some_and(|signature| signature.matches(bitmaps))
+    }
+}
+
+// Static subtitles are checked each display tick. A bounded snapshot lets the
+// platform's byte comparison replace the scalar hash without trusting `changed`
+// or public Vec identity. Larger overlays retain the existing hash policy.
+const OVERLAY_ALPHA_EXACT_KEY_BUDGET: usize = 2 * 1024 * 1024;
+
+enum OverlayAlphaAtlasKey {
+    Exact(OverlayAlphaExactKey),
+    Hashed(OverlayAlphaAtlasSignature),
+}
+
+impl OverlayAlphaAtlasKey {
+    fn from_bitmaps(bitmaps: &[SubtitleAlphaBitmap]) -> Self {
+        Self::with_budget(bitmaps, OVERLAY_ALPHA_EXACT_KEY_BUDGET)
+    }
+
+    fn with_budget(bitmaps: &[SubtitleAlphaBitmap], budget: usize) -> Self {
+        OverlayAlphaExactKey::new(bitmaps, budget)
+            .map(Self::Exact)
+            .unwrap_or_else(|| Self::Hashed(OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)))
+    }
+
+    fn matches(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
+        match self {
+            Self::Exact(key) => key.matches(bitmaps),
+            Self::Hashed(key) => *key == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Exact(key) => {
+                key.layouts.len() * std::mem::size_of::<OverlayAlphaBitmapLayout>()
+                    + key.pixels.len()
+            }
+            Self::Hashed(key) => {
+                key.bitmaps.capacity() * std::mem::size_of::<OverlayAlphaBitmapSignature>()
+            }
+        }
+    }
+}
+
+struct OverlayAlphaExactKey {
+    layouts: Box<[OverlayAlphaBitmapLayout]>,
+    // Visible rows only: stride padding may be uninitialized in native images.
+    pixels: Box<[u8]>,
+}
+
+impl OverlayAlphaExactKey {
+    fn new(bitmaps: &[SubtitleAlphaBitmap], budget: usize) -> Option<Self> {
+        let layout_bytes = bitmaps
+            .len()
+            .checked_mul(std::mem::size_of::<OverlayAlphaBitmapLayout>())?;
+        let mut total = layout_bytes.checked_add(std::mem::size_of::<Self>())?;
+        for bitmap in bitmaps {
+            if !bitmap.is_valid() {
+                return None;
+            }
+            total = total.checked_add(
+                (bitmap.placement.width as usize).checked_mul(bitmap.placement.height as usize)?,
+            )?;
+            if total > budget {
+                return None;
+            }
+        }
+        if total > budget {
+            return None;
+        }
+        let layouts = bitmaps
+            .iter()
+            .map(OverlayAlphaBitmapLayout::from_bitmap)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut pixels = Vec::with_capacity(total - layout_bytes - std::mem::size_of::<Self>());
+        for bitmap in bitmaps {
+            let width = bitmap.placement.width as usize;
+            if width == 0 {
+                continue;
+            }
+            for row in 0..bitmap.placement.height as usize {
+                let start = row.checked_mul(bitmap.stride)?;
+                pixels.extend_from_slice(bitmap.alpha.get(start..start.checked_add(width)?)?);
+            }
+        }
+        Some(Self {
+            layouts,
+            pixels: pixels.into_boxed_slice(),
+        })
+    }
+
+    fn matches(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
+        if self.layouts.len() != bitmaps.len() {
+            return false;
+        }
+        let mut offset = 0;
+        for (layout, bitmap) in self.layouts.iter().zip(bitmaps) {
+            if *layout != OverlayAlphaBitmapLayout::from_bitmap(bitmap) || !bitmap.is_valid() {
+                return false;
+            }
+            let width = bitmap.placement.width as usize;
+            if width == 0 {
+                continue;
+            }
+            for row in 0..bitmap.placement.height as usize {
+                let Some(start) = row.checked_mul(bitmap.stride) else {
+                    return false;
+                };
+                let Some(end) = start.checked_add(width) else {
+                    return false;
+                };
+                if bitmap.alpha.get(start..end) != self.pixels.get(offset..offset + width) {
+                    return false;
+                }
+                offset += width;
+            }
+        }
+        offset == self.pixels.len()
     }
 }
 
@@ -3079,6 +3217,21 @@ impl OverlayAlphaAtlasSignature {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OverlayAlphaBitmapSignature {
+    layout: OverlayAlphaBitmapLayout,
+    alpha_hash: u64,
+}
+
+impl OverlayAlphaBitmapSignature {
+    fn from_bitmap(bitmap: &SubtitleAlphaBitmap) -> Self {
+        Self {
+            layout: OverlayAlphaBitmapLayout::from_bitmap(bitmap),
+            alpha_hash: hash_alpha_bitmap(bitmap),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayAlphaBitmapLayout {
     x: i32,
     y: i32,
     width: u32,
@@ -3086,10 +3239,9 @@ struct OverlayAlphaBitmapSignature {
     stride: usize,
     color_rgba: u32,
     alpha_len: usize,
-    alpha_hash: u64,
 }
 
-impl OverlayAlphaBitmapSignature {
+impl OverlayAlphaBitmapLayout {
     fn from_bitmap(bitmap: &SubtitleAlphaBitmap) -> Self {
         Self {
             x: bitmap.placement.x,
@@ -3099,7 +3251,6 @@ impl OverlayAlphaBitmapSignature {
             stride: bitmap.stride,
             color_rgba: bitmap.color_rgba,
             alpha_len: bitmap.alpha.len(),
-            alpha_hash: hash_alpha_bitmap(bitmap),
         }
     }
 }
@@ -3111,6 +3262,9 @@ fn hash_alpha_bitmap(bitmap: &SubtitleAlphaBitmap) -> u64 {
     let mut hash = FNV_OFFSET;
     let width = bitmap.placement.width as usize;
     let height = bitmap.placement.height as usize;
+    if width == 0 {
+        return hash;
+    }
     for row in 0..height {
         let row_start = row.saturating_mul(bitmap.stride);
         let row_end = row_start.saturating_add(width);
