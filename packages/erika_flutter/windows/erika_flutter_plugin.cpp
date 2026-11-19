@@ -3903,7 +3903,9 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
         SetActivePlayer(id);
       platform_result->Success(value);
     }
-    OnFrameTimer();
+    if (method != "getPresenterStats") {
+      OnFrameTimer();
+    }
   });
 }
 
