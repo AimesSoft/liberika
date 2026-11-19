@@ -2122,6 +2122,11 @@ fn http_retry_backoff(attempt: u32) -> Duration {
 enum HttpRequestError {
     #[error("{0}")]
     Request(#[from] reqwest::Error),
+    #[error("{error}; Retry-After: {retry_after_seconds}s")]
+    RateLimited {
+        error: reqwest::Error,
+        retry_after_seconds: u64,
+    },
     #[error("HTTP phase timed out")]
     Timeout(#[from] tokio::time::error::Elapsed),
 }
@@ -2130,6 +2135,7 @@ enum HttpRequestError {
 fn http_error_is_retryable(error: &HttpRequestError) -> bool {
     match error {
         HttpRequestError::Timeout(_) => true,
+        HttpRequestError::RateLimited { .. } => false,
         HttpRequestError::Request(error) => {
             error.status().is_none_or(|status| status.is_server_error())
         }
@@ -2144,12 +2150,25 @@ async fn send_http_request(
     remaining: Duration,
     response_timeout: Duration,
 ) -> std::result::Result<reqwest::Response, HttpRequestError> {
-    Ok(
-        tokio::time::timeout(response_timeout, request.timeout(remaining).send())
-            .await?
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(reqwest::Error::without_url)?,
-    )
+    let response = tokio::time::timeout(response_timeout, request.timeout(remaining).send())
+        .await?
+        .map_err(reqwest::Error::without_url)?;
+    // Preserve only a parsed hint; never read the body or report raw headers.
+    let retry_after = (response.status().as_u16() == 429)
+        .then(|| stream_retry_after(&response))
+        .flatten();
+    response.error_for_status().map_err(|error| {
+        let error = error.without_url();
+        match retry_after {
+            Some(delay) => HttpRequestError::RateLimited {
+                error,
+                retry_after_seconds: delay
+                    .as_secs()
+                    .saturating_add(u64::from(delay.subsec_nanos() != 0)),
+            },
+            None => HttpRequestError::Request(error),
+        }
+    })
 }
 
 /// Parses the `total` out of a `Content-Range: bytes start-end/total` header.
