@@ -1213,6 +1213,7 @@ fn stream_worker_main(
     let mut skip_remaining = 0;
     let mut response_start = start;
     let mut resumes_since_progress: u32 = 0;
+    let mut fast_body_retry_used = false;
 
     loop {
         // Finish a partial final stripe without needing another socket read or
@@ -1368,6 +1369,15 @@ fn stream_worker_main(
                 if resumes_since_progress > HTTP_STREAM_MAX_RESUMES {
                     mark_worker_done(&shared, true);
                     return;
+                }
+                // Once per worker, resume immediately after this response has
+                // delivered a full stripe. The loop rechecks cancellation and
+                // the stream epoch before opening the replacement response.
+                if !fast_body_retry_used
+                    && offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES
+                {
+                    fast_body_retry_used = true;
+                    continue;
                 }
                 if io.wait_cancelled(Duration::from_millis(300)) {
                     return;
