@@ -1203,7 +1203,10 @@ fn mark_worker_done(shared: &StreamShared, failed: bool) {
 }
 
 enum StreamOpened {
-    RetryAfter(Duration),
+    RetryAfter {
+        delay: Duration,
+        status: u16,
+    },
     Body {
         response: reqwest::Response,
         skip_bytes: u64,
@@ -1310,10 +1313,12 @@ fn open_stream_response_with_identity(
                 skip_bytes: 0,
             })
         }
-        503 => stream_retry_after(&response)
-            .map(StreamOpened::RetryAfter)
+        status @ (429 | 503) => stream_retry_after(&response)
+            .map(|delay| StreamOpened::RetryAfter { delay, status })
             .ok_or_else(|| {
-                SourceError::Http("unexpected HTTP status 503 for stream request".to_string())
+                SourceError::Http(format!(
+                    "unexpected HTTP status {status} for stream request"
+                ))
             }),
         416 => Ok(StreamOpened::Eof),
         200 => {
@@ -1414,7 +1419,7 @@ async fn open_idle_race_candidate(
 #[derive(Clone, Copy)]
 enum StreamPartialRelease {
     FastReconnect,
-    AfterHonored503,
+    AfterHonoredRetryAfter,
 }
 
 /// One persistent open-ended GET, delivering fixed-size stripes. Seeks,
@@ -1500,7 +1505,7 @@ fn stream_worker_main(
                 validator = None;
             }
             // Consume on every open. Only FastReconnect may cross one honored
-            // 503 below; the deferred permission can never be extended again.
+            // Retry-After hint below; the deferred permission cannot extend again.
             let release_partial = std::mem::take(&mut release_partial_on_reconnect);
             match open_stream_response_with_identity(
                 &io,
@@ -1538,8 +1543,10 @@ fn stream_worker_main(
                     if release_partial.is_some()
                         && response.status().as_u16() == 206
                         && response_has_bound_strong_etag
-                        && (!matches!(release_partial, Some(StreamPartialRelease::AfterHonored503))
-                            || response_total_verified)
+                        && (!matches!(
+                            release_partial,
+                            Some(StreamPartialRelease::AfterHonoredRetryAfter)
+                        ) || response_total_verified)
                     {
                         if io.is_cancelled() {
                             return;
@@ -1568,8 +1575,11 @@ fn stream_worker_main(
                     skip_remaining = skip_bytes;
                     live = Some(response);
                 }
-                Ok(StreamOpened::RetryAfter(requested_delay)) => {
-                    // A 503 still spends one ordinary resume attempt. Do not
+                Ok(StreamOpened::RetryAfter {
+                    delay: requested_delay,
+                    status,
+                }) => {
+                    // A hinted response still spends one ordinary resume attempt. Do not
                     // turn a server hint into progress or a new retry budget.
                     resumes_since_progress += 1;
                     if resumes_since_progress > HTTP_STREAM_MAX_RESUMES {
@@ -1595,7 +1605,8 @@ fn stream_worker_main(
                         }
                     };
                     http_trace_log(format!(
-                        "{{\"event\":\"http_stream_retry_after\",\"offset\":{},\"attempt\":{},\"requested_seconds\":{},\"wait_ms\":{}}}",
+                        "{{\"event\":\"http_stream_retry_after\",\"status\":{},\"offset\":{},\"attempt\":{},\"requested_seconds\":{},\"wait_ms\":{}}}",
+                        status,
                         offset,
                         resumes_since_progress,
                         requested_delay.as_secs(),
@@ -1609,7 +1620,8 @@ fn stream_worker_main(
                     if honored
                         && matches!(release_partial, Some(StreamPartialRelease::FastReconnect))
                     {
-                        release_partial_on_reconnect = Some(StreamPartialRelease::AfterHonored503);
+                        release_partial_on_reconnect =
+                            Some(StreamPartialRelease::AfterHonoredRetryAfter);
                     }
                     continue;
                 }
