@@ -67,6 +67,7 @@ use crate::renderer::presentation::PresentationLayout;
 use crate::renderer::sr::reference::LumaRange;
 use crate::subtitle::AssColor;
 
+mod alpha_atlas;
 mod danmaku;
 use danmaku::{D3d11DanmakuBatch, D3d11DanmakuDraws, D3d11DanmakuPipeline};
 
@@ -1037,21 +1038,114 @@ struct ImportedVideoFrame {
     constants: VideoUniforms,
 }
 
-struct FlutterTextureScene {
+struct PresentedAlphaPlacement {
+    x: i32,
+    y: i32,
+    color: u32,
+}
+
+struct PresentedOverlay {
+    viewport: crate::overlay::OverlayViewport,
+    subtitle_planes: Vec<crate::subtitle::SubtitleBitmapPlane>,
+    placements: Box<[PresentedAlphaPlacement]>,
+    alpha: std::sync::Arc<alpha_atlas::AlphaSnapshot>,
+}
+
+impl PresentedOverlay {
+    fn new(
+        frame: &OverlayFrame,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) -> Self {
+        Self {
+            viewport: frame.viewport,
+            subtitle_planes: frame.subtitle_planes.clone(),
+            placements: frame
+                .subtitle_alpha_planes
+                .iter()
+                .map(|b| PresentedAlphaPlacement {
+                    x: b.placement.x,
+                    y: b.placement.y,
+                    color: b.color_rgba,
+                })
+                .collect(),
+            alpha: alpha
+                .cloned()
+                .unwrap_or_else(|| alpha_atlas::AlphaSnapshot::new(&frame.subtitle_alpha_planes)),
+        }
+    }
+
+    fn update(
+        &mut self,
+        frame: &OverlayFrame,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) {
+        self.viewport = frame.viewport;
+        if self.subtitle_planes != frame.subtitle_planes {
+            self.subtitle_planes = frame.subtitle_planes.clone();
+        }
+        if self.placements.len() != frame.subtitle_alpha_planes.len()
+            || !self
+                .placements
+                .iter()
+                .zip(&frame.subtitle_alpha_planes)
+                .all(|(a, b)| {
+                    a.x == b.placement.x && a.y == b.placement.y && a.color == b.color_rgba
+                })
+        {
+            self.placements = frame
+                .subtitle_alpha_planes
+                .iter()
+                .map(|b| PresentedAlphaPlacement {
+                    x: b.placement.x,
+                    y: b.placement.y,
+                    color: b.color_rgba,
+                })
+                .collect();
+        }
+        if let Some(alpha) = alpha {
+            self.alpha = alpha.clone();
+        } else if !self.alpha.matches(&frame.subtitle_alpha_planes) {
+            self.alpha = alpha_atlas::AlphaSnapshot::new(&frame.subtitle_alpha_planes);
+        }
+    }
+
+    fn matches(&self, frame: &OverlayFrame) -> bool {
+        self.viewport == frame.viewport
+            && self.subtitle_planes == frame.subtitle_planes
+            && self.placements.len() == frame.subtitle_alpha_planes.len()
+            && self
+                .placements
+                .iter()
+                .zip(&frame.subtitle_alpha_planes)
+                .all(|(a, b)| {
+                    a.x == b.placement.x && a.y == b.placement.y && a.color == b.color_rgba
+                })
+            && self.alpha.matches(&frame.subtitle_alpha_planes)
+    }
+}
+
+struct PresentedScene {
     frame_token: u64,
     generation: u64,
     upscaler: LumaUpscalerMode,
-    overlay: Option<OverlayFrame>,
+    overlay: Option<PresentedOverlay>,
     danmaku: Option<DanmakuRenderPlan>,
 }
 
-impl FlutterTextureScene {
-    fn new(frame_token: u64, upscaler: LumaUpscalerMode, context: RenderFrameContext<'_>) -> Self {
+impl PresentedScene {
+    fn new(
+        frame_token: u64,
+        upscaler: LumaUpscalerMode,
+        context: RenderFrameContext<'_>,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) -> Self {
         Self {
             frame_token,
             generation: context.generation,
             upscaler,
-            overlay: context.overlay.cloned(),
+            overlay: context
+                .overlay
+                .map(|frame| PresentedOverlay::new(frame, alpha)),
             danmaku: context.danmaku.cloned(),
         }
     }
@@ -1071,11 +1165,7 @@ impl FlutterTextureScene {
 
     fn overlay_matches(&self, overlay: Option<&OverlayFrame>) -> bool {
         match (self.overlay.as_ref(), overlay) {
-            (Some(a), Some(b)) => {
-                a.viewport == b.viewport
-                    && a.subtitle_planes == b.subtitle_planes
-                    && a.subtitle_alpha_planes == b.subtitle_alpha_planes
-            }
+            (Some(a), Some(b)) => a.matches(b),
             (None, None) => true,
             _ => false,
         }
@@ -1084,7 +1174,11 @@ impl FlutterTextureScene {
     fn danmaku_matches(&self, danmaku: Option<&DanmakuRenderPlan>) -> bool {
         match (self.danmaku.as_ref(), danmaku) {
             (Some(a), Some(b)) => {
-                a.viewport == b.viewport && a.atlas == b.atlas && a.items == b.items
+                a.viewport == b.viewport
+                    && a.atlas == b.atlas
+                    && a.items == b.items
+                    && a.color_atlas == b.color_atlas
+                    && a.color_glyphs == b.color_glyphs
             }
             (None, None) => true,
             _ => false,
@@ -1096,12 +1190,15 @@ impl FlutterTextureScene {
         frame_token: u64,
         upscaler: LumaUpscalerMode,
         context: RenderFrameContext<'_>,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
     ) {
         // A new video frame need not copy unchanged subtitle/HUD pixels or
         // danmaku instances. Retain each cached buffer until its own content
         // changes; keep exact comparisons rather than lossy fingerprints.
-        if !self.overlay_matches(context.overlay) {
-            self.overlay = context.overlay.cloned();
+        match (self.overlay.as_mut(), context.overlay) {
+            (Some(previous), Some(frame)) => previous.update(frame, alpha),
+            (None, Some(frame)) => self.overlay = Some(PresentedOverlay::new(frame, alpha)),
+            (_, None) => self.overlay = None,
         }
         if !self.danmaku_matches(context.danmaku) {
             self.danmaku = context.danmaku.cloned();
@@ -1211,6 +1308,16 @@ struct D3d11OverlayDraw {
     constants: OverlayUniforms,
 }
 
+struct D3d11SubtitleAlphaPage {
+    layout: alpha_atlas::Page,
+    texture: D3d11OverlayTexture,
+}
+
+struct D3d11SubtitleAlphaCache {
+    key: alpha_atlas::ContentKey,
+    pages: Box<[D3d11SubtitleAlphaPage]>,
+}
+
 struct D3d11DanmakuAtlasCache {
     version: u64,
     width: u32,
@@ -1238,7 +1345,8 @@ pub struct D3d11Renderer {
     current_video_fence: Option<ID3D11Query>,
     /// `MetalRendererConfig::compositor_handoff_timeout`.
     handoff_timeout: Duration,
-    flutter_scene: Option<FlutterTextureScene>,
+    presented_scene: Option<PresentedScene>,
+    subtitle_alpha_cache: Option<D3d11SubtitleAlphaCache>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
     danmaku_picture_cache: Option<(u64, D3d11OverlayTexture)>,
     requested_output_mode: crate::renderer::output::OutputMode,
@@ -1309,7 +1417,8 @@ impl D3d11Renderer {
             current_video: None,
             current_video_fence: None,
             handoff_timeout: config.compositor_handoff_timeout,
-            flutter_scene: None,
+            presented_scene: None,
+            subtitle_alpha_cache: None,
             danmaku_atlas_cache: None,
             danmaku_picture_cache: None,
             requested_output_mode: config.output_mode,
@@ -1396,6 +1505,7 @@ impl D3d11Renderer {
         let context = unsafe { frame_device.GetImmediateContext() }
             .map_err(|error| d3d_error("ID3D11Device::GetImmediateContext", error))?;
         self.retire_current_video()?;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         self.set_device(frame_device, context)
@@ -1424,9 +1534,10 @@ impl D3d11Renderer {
     fn invalidate_device(&mut self) {
         self.current_video = None;
         self.current_video_fence = None;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
-        self.flutter_scene = None;
+        self.presented_scene = None;
         self.state = None;
     }
 
@@ -1620,12 +1731,14 @@ impl D3d11Renderer {
         // unchanged: the CPU-side `gamut_lut_job` only holds parameters, so a
         // later frame regenerates the texture on the new device and reuses it.
         self.gamut_lut = None;
+        self.subtitle_alpha_cache = None;
         self.state = Some(state);
         self.recreate_surface_targets()?;
         Ok(())
     }
 
     fn recreate_surface_targets(&mut self) -> Result<()> {
+        self.presented_scene = None;
         let Some(surface) = self.surface.as_mut() else {
             return Ok(());
         };
@@ -1991,14 +2104,25 @@ impl D3d11Renderer {
             .target_color()
     }
 
+    #[cfg(test)]
     fn prepare_overlay_draws(
         &mut self,
         frame: Option<&OverlayFrame>,
     ) -> Result<Vec<D3d11OverlayDraw>> {
+        self.prepare_overlay_draws_shared(frame, None)
+    }
+
+    fn prepare_overlay_draws_shared(
+        &mut self,
+        frame: Option<&OverlayFrame>,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+    ) -> Result<Vec<D3d11OverlayDraw>> {
         let Some(frame) = frame else {
+            self.subtitle_alpha_cache = None;
             return Ok(Vec::new());
         };
         if frame.is_empty() {
+            self.subtitle_alpha_cache = None;
             return Ok(Vec::new());
         }
         self.ensure_default_device()?;
@@ -2046,7 +2170,7 @@ impl D3d11Renderer {
             });
         }
 
-        self.append_alpha_atlas_draws(frame, viewport_w, viewport_h, target, &mut draws)?;
+        self.append_alpha_atlas_draws(frame, owner, viewport_w, viewport_h, target, &mut draws)?;
         Ok(draws)
     }
 
@@ -2236,85 +2360,144 @@ impl D3d11Renderer {
     fn append_alpha_atlas_draws(
         &mut self,
         frame: &OverlayFrame,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
         viewport_w: u32,
         viewport_h: u32,
         target: TargetColorState,
         draws: &mut Vec<D3d11OverlayDraw>,
     ) -> Result<()> {
+        let state = self.state.as_ref().expect("device ensured");
+        let limit = if unsafe { state.device.GetFeatureLevel() }.0 >= D3D_FEATURE_LEVEL_11_0.0 {
+            16384
+        } else {
+            8192 // Device creation accepts feature levels 10.0 and above.
+        };
+        self.append_alpha_pages_shared(frame, owner, viewport_w, viewport_h, target, draws, limit)
+    }
+
+    #[cfg(test)]
+    fn append_alpha_pages(
+        &mut self,
+        frame: &OverlayFrame,
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+        limit: u32,
+    ) -> Result<()> {
+        self.append_alpha_pages_shared(frame, None, viewport_w, viewport_h, target, draws, limit)
+    }
+
+    fn append_alpha_pages_shared(
+        &mut self,
+        frame: &OverlayFrame,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+        limit: u32,
+    ) -> Result<()> {
         let bitmaps = &frame.subtitle_alpha_planes;
-        let mut atlas_width = 0usize;
-        let mut atlas_height = 0usize;
-        for bitmap in bitmaps {
-            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
-                continue;
-            }
-            atlas_width += bitmap.placement.width as usize;
-            atlas_height = atlas_height.max(bitmap.placement.height as usize);
+        if bitmaps.is_empty() {
+            self.subtitle_alpha_cache = None;
+            return Ok(());
         }
-        if atlas_width == 0 || atlas_height == 0 {
+        if let Some(cache) = &self.subtitle_alpha_cache
+            && cache.key.matches(bitmaps, limit)
+        {
+            self.stats.overlay_alpha_atlas_reuses += cache.pages.len() as u64;
+            Self::append_subtitle_alpha_draws(
+                bitmaps,
+                &cache.pages,
+                viewport_w,
+                viewport_h,
+                target,
+                draws,
+            );
             return Ok(());
         }
 
-        let mut pixels = vec![0u8; atlas_width * atlas_height];
-        let mut cursor_x = 0usize;
-        let mut placements = Vec::new();
-        for (index, bitmap) in bitmaps.iter().enumerate() {
-            let bw = bitmap.placement.width as usize;
-            let bh = bitmap.placement.height as usize;
-            if bw == 0 || bh == 0 {
-                continue;
-            }
-            if !bitmap.is_valid() {
-                return Err(PlayerError::Renderer(format!(
-                    "d3d11: overlay alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
-                    bitmap.alpha.len(),
-                    bitmap.required_len(),
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    bitmap.stride
-                )));
-            }
-            for row in 0..bh {
-                let src = row * bitmap.stride;
-                let dst = row * atlas_width + cursor_x;
-                pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
-            }
-            placements.push((index, cursor_x));
-            cursor_x += bw;
+        let layouts = alpha_atlas::layout(bitmaps, limit)?;
+        if layouts.is_empty() {
+            self.subtitle_alpha_cache = None;
+            return Ok(());
         }
-
-        let texture = {
-            let state = self.state.as_ref().expect("device ensured");
-            create_cpu_texture(
-                state,
-                atlas_width as u32,
-                atlas_height as u32,
+        let key = alpha_atlas::ContentKey::new_for_overlay(frame, owner, limit, &layouts);
+        let mut pages = Vec::with_capacity(layouts.len());
+        let pixel_capacity = layouts.iter().try_fold(0usize, |capacity, page| {
+            page.pixel_len().map(|len| capacity.max(len))
+        })?;
+        // Allocate the largest page exactly once; geometric growth on later
+        // pages could otherwise double this transient buffer for large atlases.
+        let mut pixels = Vec::with_capacity(pixel_capacity);
+        for page in layouts {
+            page.write_pixels(bitmaps, &mut pixels)?;
+            let texture = create_cpu_texture(
+                self.state.as_ref().expect("device ensured"),
+                page.width,
+                page.height,
                 DXGI_FORMAT_R8_UNORM,
                 &pixels,
-                atlas_width as u32,
-            )?
-        };
-        self.stats.overlay_alpha_atlas_uploads += 1;
-        for (index, atlas_x) in placements {
-            let bitmap = &bitmaps[index];
-            draws.push(D3d11OverlayDraw {
-                texture: texture.clone(),
-                constants: OverlayUniforms::alpha_atlas(
+                page.width,
+            )?;
+            // CreateTexture2D has copied initial data before returning, just
+            // as when the old per-page Vec was dropped here. Only this CPU
+            // scratch is reused; every GPU page remains immutable.
+            self.stats.overlay_alpha_atlas_uploads += 1;
+            pages.push(D3d11SubtitleAlphaPage {
+                layout: page,
+                texture,
+            });
+        }
+        // Build every page before replacing the previous entry. On error the
+        // old cache remains valid but is never drawn for different alpha data.
+        Self::append_subtitle_alpha_draws(bitmaps, &pages, viewport_w, viewport_h, target, draws);
+        self.subtitle_alpha_cache = key.map(|key| D3d11SubtitleAlphaCache {
+            key,
+            pages: pages.into_boxed_slice(),
+        });
+        Ok(())
+    }
+
+    fn append_subtitle_alpha_draws(
+        bitmaps: &[crate::subtitle::SubtitleAlphaBitmap],
+        pages: &[D3d11SubtitleAlphaPage],
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+    ) {
+        for cached in pages {
+            let page = &cached.layout;
+            // Pages and tiles retain libass painter order, including overlapping
+            // outline/shadow/fill layers. Never sort by size or color.
+            for tile in &page.tiles {
+                let bitmap = &bitmaps[tile.bitmap];
+                let mut constants = OverlayUniforms::alpha_atlas(
                     bitmap.color_rgba,
                     bitmap.placement.x,
                     bitmap.placement.y,
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    atlas_x as u32,
-                    atlas_width as u32,
-                    atlas_height as u32,
+                    tile.width,
+                    tile.height,
+                    tile.atlas_x,
+                    page.width,
+                    page.height,
                     viewport_w,
                     viewport_h,
                     target,
-                ),
-            });
+                );
+                constants.rect[0] += tile.x as f32;
+                constants.rect[1] += tile.y as f32;
+                constants.tex_rect[1] = 1.0 / page.height as f32;
+                draws.push(D3d11OverlayDraw {
+                    // Draws own COM clones: evicting the cache never mutates or
+                    // releases resources still referenced by pending draws.
+                    texture: cached.texture.clone(),
+                    constants,
+                });
+            }
         }
-        Ok(())
     }
 
     /// Return a cached (or freshly generated) perceptual gamut LUT SRV for
@@ -2407,6 +2590,14 @@ impl D3d11Renderer {
     }
 
     fn render_video(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        self.render_video_shared(context, None)
+    }
+
+    fn render_video_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+    ) -> Result<bool> {
         if self.current_video.is_none() {
             return Ok(false);
         }
@@ -2428,18 +2619,20 @@ impl D3d11Renderer {
         let upscaler_status = self.upscaler_backend_status();
         if upscaler_status != self.scene_upscaler_status {
             self.scene_upscaler_status = upscaler_status;
-            self.flutter_scene = None;
+            self.presented_scene = None;
         }
-        if flutter_texture
-            && self.surface.as_ref().unwrap().published_texture.is_some()
+        // Keep pumping clocks/ASS/danmaku at display cadence; only suppress
+        // draws whose complete visible scene already reached this surface.
+        // Pending LUT work must still be polled on a paused frame.
+        if self.gamut_lut_job.is_none()
             && self
-                .flutter_scene
+                .presented_scene
                 .as_ref()
                 .is_some_and(|scene| scene.matches(frame_token, self.upscaler_mode, context))
         {
             return Ok(true);
         }
-        let overlay_draws = self.prepare_overlay_draws(context.overlay)?;
+        let overlay_draws = self.prepare_overlay_draws_shared(context.overlay, owner)?;
         let danmaku_draws = self.prepare_danmaku_draws(context.danmaku)?;
         let (video_width, video_height, frame_token, native_luma) = {
             let video = self.current_video.as_ref().expect("video checked");
@@ -2551,9 +2744,10 @@ impl D3d11Renderer {
                 video.constants,
             )?;
         }
-        if let Some(swapchain) = surface.swapchain.as_ref() {
-            present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
-        }
+        let submitted = match surface.swapchain.as_ref() {
+            Some(swapchain) => present_swapchain(swapchain, "IDXGISwapChain1::Present1")?,
+            None => true,
+        };
         // What retiring this frame waits for.
         let fence = if surface.composition || flutter_texture {
             let fence = create_d3d11_event_query(&state.device)?;
@@ -2567,17 +2761,29 @@ impl D3d11Renderer {
         }
         if flutter_texture {
             self.publish_flutter_texture()?;
-            if let Some(scene) = self.flutter_scene.as_mut() {
-                scene.update(frame_token, self.upscaler_mode, context);
+        }
+        // A full/occluded DXGI queue is not a successful presentation. Keep
+        // the scene dirty and retry on the next tick, including while paused.
+        if submitted {
+            // Preparation built or verified the cache for this input. Share
+            // its immutable alpha-only owner or mask snapshot, and only after
+            // publication succeeds. An over-budget scene keeps the owned path.
+            let alpha = self
+                .subtitle_alpha_cache
+                .as_ref()
+                .map(|cache| &cache.key.snapshot);
+            if let Some(scene) = self.presented_scene.as_mut() {
+                scene.update(frame_token, self.upscaler_mode, context, alpha);
             } else {
-                self.flutter_scene = Some(FlutterTextureScene::new(
+                self.presented_scene = Some(PresentedScene::new(
                     frame_token,
                     self.upscaler_mode,
                     context,
+                    alpha,
                 ));
             }
+            self.stats.rendered_frames += 1;
         }
-        self.stats.rendered_frames += 1;
         if !danmaku_draws.is_empty() {
             self.stats.danmaku_passes += 1;
             self.stats.danmaku_items += danmaku_draws.len() as u64;
@@ -2610,7 +2816,7 @@ impl D3d11Renderer {
             .surface
             .as_ref()
             .is_some_and(|surface| surface.flutter_texture && surface.published_texture.is_some())
-            && self.flutter_scene.is_none()
+            && self.presented_scene.is_none()
         {
             return Ok(());
         }
@@ -2640,7 +2846,7 @@ impl D3d11Renderer {
             }
         }
         self.publish_flutter_texture()?;
-        self.flutter_scene = None;
+        self.presented_scene = None;
         trace("render_clear: done");
         self.stats.rendered_frames += 1;
         Ok(())
@@ -2708,7 +2914,9 @@ impl RendererBackend for D3d11Renderer {
 
     fn detach_surface(&mut self) -> Result<()> {
         self.retire_current_video()?;
+        self.presented_scene = None;
         self.surface = None;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         self.stats.attached = false;
@@ -2763,6 +2971,7 @@ impl RendererBackend for D3d11Renderer {
 
     fn clear_current_frame(&mut self) -> Result<()> {
         self.retire_current_video()?;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         if self.surface.is_some() {
@@ -2778,6 +2987,19 @@ impl RendererBackend for D3d11Renderer {
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         self.drop_device_if_removed();
         self.render_video(context)
+    }
+
+    fn prefers_shared_overlay(&self) -> bool {
+        true
+    }
+
+    fn render_current_frame_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        owner: &std::sync::Arc<OverlayFrame>,
+    ) -> Result<bool> {
+        self.drop_device_if_removed();
+        self.render_video_shared(context, Some(owner))
     }
 
     fn resource_stats(&self) -> RendererResourceStats {
@@ -2905,6 +3127,7 @@ impl RendererBackend for D3d11Renderer {
         &mut self,
         model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
     ) {
+        self.presented_scene = None;
         match self.state.as_ref() {
             Some(state) => self.upscaler.set_custom_model(&state.device, model),
             None => self.upscaler.store_custom_model(model),
@@ -3697,7 +3920,7 @@ fn create_linear_render_target(
     ))
 }
 
-fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<()> {
+fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<bool> {
     let params = DXGI_PRESENT_PARAMETERS {
         DirtyRectsCount: 0,
         pDirtyRects: ptr::null_mut(),
@@ -3709,9 +3932,10 @@ fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Re
     // for a full DXGI queue here: dropping one presentation keeps window
     // interaction responsive while decode/audio continue normally.
     if status == DXGI_ERROR_WAS_STILL_DRAWING {
-        return Ok(());
+        return Ok(false);
     }
-    status.ok().map_err(|error| d3d_error(operation, error))
+    status.ok().map_err(|error| d3d_error(operation, error))?;
+    Ok(status.0 == 0) // S_OK; retry occluded/status-only presentations.
 }
 
 fn create_plane_srv(
@@ -4486,7 +4710,7 @@ mod tests {
     }
 
     #[test]
-    fn flutter_scene_ignores_clock_ticks_but_detects_output_changes() {
+    fn presented_scene_ignores_clock_ticks_but_detects_output_changes() {
         use crate::overlay::OverlayViewport;
         use crate::subtitle::SubtitleBitmapPlane;
         let mut overlay = OverlayFrame {
@@ -4496,10 +4720,11 @@ mod tests {
             subtitle_alpha_planes: vec![],
             subtitle_changed: true,
         };
-        let scene = FlutterTextureScene::new(
+        let scene = PresentedScene::new(
             7,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay)),
+            None,
         );
         overlay.pts = Duration::from_secs(2);
         overlay.subtitle_changed = false;
@@ -4526,7 +4751,7 @@ mod tests {
     }
 
     #[test]
-    fn flutter_scene_reuses_unchanged_cpu_buffers_across_video_frames() {
+    fn presented_scene_reuses_unchanged_cpu_buffers_across_video_frames() {
         use crate::danmaku::DanmakuViewport;
         use crate::overlay::OverlayViewport;
         use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
@@ -4558,19 +4783,18 @@ mod tests {
             shadow_rgba: [0.0; 4],
             shadow_offset: [0.0; 2],
         });
-        let mut scene = FlutterTextureScene::new(
+        let mut scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan)),
+            None,
         );
         let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
             .rgba
             .as_ptr();
-        let alpha = scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
-            .alpha
-            .as_ptr();
+        let alpha = scene.overlay.as_ref().unwrap().alpha.alpha(0).as_ptr();
         let items = scene.danmaku.as_ref().unwrap().items.as_ptr();
         for token in 2..=121 {
             overlay.pts = Duration::from_millis(token * 10);
@@ -4580,7 +4804,7 @@ mod tests {
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan));
             assert!(!scene.matches(token, LumaUpscalerMode::Off, context));
-            scene.update(token, LumaUpscalerMode::Off, context);
+            scene.update(token, LumaUpscalerMode::Off, context, None);
             assert!(scene.matches(token, LumaUpscalerMode::Off, context));
             assert_eq!(
                 scene.overlay.as_ref().unwrap().subtitle_planes[0]
@@ -4589,9 +4813,7 @@ mod tests {
                 rgba
             );
             assert_eq!(
-                scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
-                    .alpha
-                    .as_ptr(),
+                scene.overlay.as_ref().unwrap().alpha.alpha(0).as_ptr(),
                 alpha
             );
             assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
@@ -4605,16 +4827,13 @@ mod tests {
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
         assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context);
+        scene.update(121, LumaUpscalerMode::Off, context, None);
         assert!(scene.matches(121, LumaUpscalerMode::Off, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0].rgba[0],
             17
         );
-        assert_eq!(
-            scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0].alpha[0],
-            23
-        );
+        assert_eq!(scene.overlay.as_ref().unwrap().alpha.alpha(0)[0], 23);
         assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
 
         let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
@@ -4625,7 +4844,7 @@ mod tests {
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
         assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context);
+        scene.update(121, LumaUpscalerMode::Off, context, None);
         assert!(scene.matches(121, LumaUpscalerMode::Off, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0]
@@ -4639,6 +4858,7 @@ mod tests {
             121,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 2),
+            None,
         );
         assert!(scene.overlay.is_none() && scene.danmaku.is_none());
         assert!(scene.matches(
@@ -4830,7 +5050,7 @@ mod tests {
     }
 
     #[test]
-    fn flutter_scene_detects_danmaku_motion_and_visibility_changes() {
+    fn presented_scene_detects_danmaku_motion_and_visibility_changes() {
         use crate::danmaku::DanmakuViewport;
         let mut plan = DanmakuRenderPlan::empty(Duration::ZERO, 1, DanmakuViewport::new(8, 8));
         plan.items.push(DanmakuGlyphInstance {
@@ -4842,10 +5062,11 @@ mod tests {
             shadow_rgba: [0.0; 4],
             shadow_offset: [0.0; 2],
         });
-        let scene = FlutterTextureScene::new(
+        let scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan)),
+            None,
         );
         plan.media_time = Duration::from_secs(1);
         assert!(scene.matches(
