@@ -3146,6 +3146,8 @@ impl PresenterRuntime {
             if self.current_surface_metrics.is_some()
                 && let Some(source) = self.subtitle_resolution.source
             {
+                // Release the superseded overlay before allocating its replacement.
+                self.current_overlay = None;
                 let overlay = self.render_playback_overlay(player_time, source);
                 if subtitle_diag_enabled() {
                     eprintln!(
