@@ -3114,23 +3114,15 @@ impl Frame {
         unsafe {
             let frame = &*self.ptr;
             if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
-                let luma =
-                    read_10bit_plane_as_p010(frame.data[0], frame.linesize[0], width, height)?;
-                let chroma = read_10bit_chroma_as_p010(
-                    frame.data[1],
-                    frame.linesize[1],
-                    frame.data[2],
-                    frame.linesize[2],
-                    chroma_width,
-                    chroma_height,
-                )?;
-                Some(PlanarFrame {
+                let mut output = PlanarFrame {
                     format: PlanarPixelFormat::P010,
                     width: width as u32,
                     height: height as u32,
-                    luma,
-                    chroma,
-                })
+                    luma: Vec::new(),
+                    chroma: Vec::new(),
+                };
+                self.write_planar_frame(&mut output)?;
+                Some(output)
             } else if format == sys::AVPixelFormat_AV_PIX_FMT_P010LE {
                 let luma = copy_16bit_rows(frame.data[0], frame.linesize[0], width, height)?;
                 let chroma = copy_16bit_rows(
@@ -3150,6 +3142,45 @@ impl Frame {
                 self.to_nv12_with_swscale()
             }
         }
+    }
+
+    /// Reuses renderer-owned CPU storage for the 10-bit planar software path.
+    /// Other pixel formats retain the existing conversion behavior. No AVFrame
+    /// pointers escape: CreateTexture2D consumes the copied planes synchronously.
+    pub(crate) fn write_planar_frame(&self, output: &mut PlanarFrame) -> Option<()> {
+        if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+            *output = self.to_planar_frame()?;
+            return Some(());
+        }
+        let (width, height) = (self.width() as usize, self.height() as usize);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // SAFETY: the AVFrame owns these strided 16-bit LE planes. Helpers
+        // validate visible row sizes and write only initialized output storage.
+        unsafe {
+            let frame = &*self.ptr;
+            read_10bit_plane_as_p010(
+                frame.data[0],
+                frame.linesize[0],
+                width,
+                height,
+                &mut output.luma,
+            )?;
+            read_10bit_chroma_as_p010(
+                frame.data[1],
+                frame.linesize[1],
+                frame.data[2],
+                frame.linesize[2],
+                width.div_ceil(2),
+                height.div_ceil(2),
+                &mut output.chroma,
+            )?;
+        }
+        output.format = PlanarPixelFormat::P010;
+        output.width = width as u32;
+        output.height = height as u32;
+        Some(())
     }
 
     fn to_nv12_with_swscale(&self) -> Option<PlanarFrame> {
@@ -3526,26 +3557,24 @@ unsafe fn read_10bit_plane_as_p010(
     stride: i32,
     width: usize,
     height: usize,
-) -> Option<Vec<u8>> {
-    let ptr = ptr as *const u8;
-    if ptr.is_null() {
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let row_bytes = width.checked_mul(2)?;
+    let len = row_bytes.checked_mul(height)?;
+    let stride = usize::try_from(stride).ok()?;
+    if ptr.is_null() || row_bytes == 0 || stride < row_bytes {
         return None;
     }
-    let stride = stride.max(0) as usize;
-    if stride < width * 2 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(width * height * 2);
-    for row in 0..height {
-        let row_ptr = unsafe { ptr.add(row * stride) };
-        for col in 0..width {
-            let lo = unsafe { *row_ptr.add(col * 2) };
-            let hi = unsafe { *row_ptr.add(col * 2 + 1) };
-            let sample = (u16::from_le_bytes([lo, hi]) & 0x03FF) << 6;
-            out.extend_from_slice(&sample.to_le_bytes());
+    stride.checked_mul(height)?;
+    out.resize(len, 0);
+    for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+        let src = unsafe { std::slice::from_raw_parts(ptr.add(row * stride), row_bytes) };
+        for (sample, dest) in src.chunks_exact(2).zip(dst.chunks_exact_mut(2)) {
+            let value = (u16::from_le_bytes([sample[0], sample[1]]) & 0x03ff) << 6;
+            dest.copy_from_slice(&value.to_le_bytes());
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Interleaves two 10-bit LE chroma planes (Cb, Cr) into P010 (`value << 6`) order.
@@ -3560,35 +3589,39 @@ unsafe fn read_10bit_chroma_as_p010(
     v_stride: i32,
     cw: usize,
     ch: usize,
-) -> Option<Vec<u8>> {
-    let u_ptr = u_ptr as *const u8;
-    let v_ptr = v_ptr as *const u8;
-    if u_ptr.is_null() || v_ptr.is_null() {
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let source_row_bytes = cw.checked_mul(2)?;
+    let row_bytes = cw.checked_mul(4)?;
+    let len = row_bytes.checked_mul(ch)?;
+    let u_stride = usize::try_from(u_stride).ok()?;
+    let v_stride = usize::try_from(v_stride).ok()?;
+    if u_ptr.is_null()
+        || v_ptr.is_null()
+        || row_bytes == 0
+        || u_stride < source_row_bytes
+        || v_stride < source_row_bytes
+    {
         return None;
     }
-    let u_stride = u_stride.max(0) as usize;
-    let v_stride = v_stride.max(0) as usize;
-    if u_stride < cw * 2 || v_stride < cw * 2 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(cw * ch * 4);
-    for row in 0..ch {
-        let u_row = unsafe { u_ptr.add(row * u_stride) };
-        let v_row = unsafe { v_ptr.add(row * v_stride) };
-        for col in 0..cw {
-            let u = (u16::from_le_bytes([unsafe { *u_row.add(col * 2) }, unsafe {
-                *u_row.add(col * 2 + 1)
-            }]) & 0x03FF)
-                << 6;
-            let v = (u16::from_le_bytes([unsafe { *v_row.add(col * 2) }, unsafe {
-                *v_row.add(col * 2 + 1)
-            }]) & 0x03FF)
-                << 6;
-            out.extend_from_slice(&u.to_le_bytes());
-            out.extend_from_slice(&v.to_le_bytes());
+    u_stride.checked_mul(ch)?;
+    v_stride.checked_mul(ch)?;
+    out.resize(len, 0);
+    for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+        let u = unsafe { std::slice::from_raw_parts(u_ptr.add(row * u_stride), source_row_bytes) };
+        let v = unsafe { std::slice::from_raw_parts(v_ptr.add(row * v_stride), source_row_bytes) };
+        for ((u, v), dest) in u
+            .chunks_exact(2)
+            .zip(v.chunks_exact(2))
+            .zip(dst.chunks_exact_mut(4))
+        {
+            let u = (u16::from_le_bytes([u[0], u[1]]) & 0x03ff) << 6;
+            let v = (u16::from_le_bytes([v[0], v[1]]) & 0x03ff) << 6;
+            dest[..2].copy_from_slice(&u.to_le_bytes());
+            dest[2..].copy_from_slice(&v.to_le_bytes());
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Copies `samples_per_row` 16-bit samples per row for `rows` rows, resolving stride.
