@@ -416,6 +416,7 @@ pub struct HttpRangeSource {
 struct StreamShared {
     inner: Mutex<StreamInner>,
     signal: Condvar,
+    demand: tokio::sync::Notify,
     entity_changed: Arc<AtomicBool>,
 }
 
@@ -463,6 +464,7 @@ struct StreamInner {
     uncovered_read_end: u64,
     /// Exclusive ownership of the partial stripe during the current body read.
     reading_partial: Option<StreamReadPartial>,
+    idle_race_read: Option<(u64, Instant)>,
     /// Set when the source is dropped: every worker exits.
     stopped: bool,
 }
@@ -488,6 +490,7 @@ struct StreamReadPartial {
 // A healthy response chunk disarms this by completing the existing read. No
 // timer or extra wakeup is installed: blocked readers already recheck coverage.
 const HTTP_IDLE_PREFIX_GRACE: Duration = Duration::from_secs(1);
+const HTTP_IDLE_RACE_GRACE: Duration = Duration::from_secs(5);
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
 /// by the server (`Content-Range` on 206, `Content-Length` on a whole-file
@@ -867,9 +870,11 @@ impl HttpRangeSource {
                     0
                 },
                 reading_partial: None,
+                idle_race_read: None,
                 stopped: false,
             }),
             signal: Condvar::new(),
+            demand: tokio::sync::Notify::new(),
             entity_changed: Arc::clone(&self.entity_changed),
         });
         let epoch = lock_stream(&shared).epoch;
@@ -940,6 +945,11 @@ impl HttpRangeSource {
                 || started.elapsed() >= HTTP_STREAM_WAIT_BUDGET
             {
                 return false;
+            }
+            if inner.idle_race_read.is_some_and(|(offset, read_started)| {
+                inner.uncovered_read_end > offset && read_started.elapsed() >= HTTP_IDLE_RACE_GRACE
+            }) {
+                shared.demand.notify_one();
             }
             let _ = shared
                 .signal
@@ -1243,6 +1253,66 @@ fn wait_for_stream_window(
     }
 }
 
+async fn wait_for_idle_race_demand(shared: &StreamShared, epoch: u64, offset: u64) {
+    loop {
+        // Notifications retain a permit across registration. Only
+        // inspect shared demand after the foreground observes a stall.
+        let notified = shared.demand.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        notified.await;
+        let needed = {
+            let inner = lock_stream(&shared);
+            !inner.stopped
+                && inner.epoch == epoch
+                && inner.uncovered_read_end > offset
+                && inner.idle_race_read.is_some_and(|(position, began)| {
+                    position == offset && began.elapsed() >= HTTP_IDLE_RACE_GRACE
+                })
+        };
+        if needed {
+            break;
+        }
+    }
+}
+
+/// Cold path: request and strictly verify one foreground-demanded standby.
+/// The caller keeps polling the original body and owns its unchanged deadline.
+async fn open_idle_race_candidate(
+    request_context: &(reqwest::Client, String, Vec<(String, String)>),
+    validator: &str,
+    attempted: &AtomicBool,
+    offset: u64,
+    total: u64,
+) -> Option<reqwest::Response> {
+    attempted.store(true, Ordering::Relaxed);
+    let (client, uri, headers) = request_context;
+    let mut request = client.get(uri).header(
+        "Range",
+        http_range_header(ByteRange {
+            start: offset,
+            length: None,
+        }),
+    );
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.header("If-Range", validator).send().await.ok()?;
+    let range = response.headers().get("content-range")?.to_str().ok()?;
+    if response.status().as_u16() != 206
+        || parse_content_range_start(range) != Some(offset)
+        || parse_content_range_total(range) != Some(total)
+        || response
+            .headers()
+            .get("etag")
+            .and_then(|v| strong_etag(v.as_bytes()))
+            != strong_etag(validator.as_bytes())
+    {
+        return None;
+    }
+    Some(response)
+}
+
 /// One persistent open-ended GET, delivering fixed-size stripes. Seeks,
 /// cancellation and backpressure are checked before starting each stripe.
 /// Body errors reconnect at the reached offset with the entity validator.
@@ -1275,6 +1345,14 @@ fn stream_worker_main(
     let mut idle_partial_delivered = false;
     let mut resumes_since_progress: u32 = 0;
     let mut fast_body_retry_used = false;
+    // Caller-supplied range headers keep their original request semantics.
+    let mut idle_race_used = http_headers.iter().any(|(name, _)| {
+        name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+    });
+    let race_request = Arc::new((io.client().clone(), uri.clone(), http_headers.clone()));
+    let race_attempted = Arc::new(AtomicBool::new(false));
+    let mut race_validator: Option<Arc<String>> = None;
+    let mut response_total_verified = false;
     let mut release_partial_on_reconnect = false;
 
     loop {
@@ -1343,6 +1421,13 @@ fn stream_worker_main(
                             stripe_start = offset;
                         }
                     }
+                    response_total_verified = response
+                        .headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_total)
+                        == Some(total);
+                    race_validator = validator.as_ref().map(|value| Arc::new(value.clone()));
                     response_start = offset;
                     skip_remaining = skip_bytes;
                     live = Some(response);
@@ -1382,35 +1467,107 @@ fn stream_worker_main(
             && stream_history_verified
             && response.status().as_u16() == 206
             && response_has_bound_strong_etag;
-        if offered_partial {
+        // Only an established, strongly bound 206 may speculate. Healthy reads
+        // create no timer or request; this one-shot gate is worker scoped.
+        let may_race = !idle_race_used
+            && stream_history_verified
+            && response.status().as_u16() == 206
+            && response_has_bound_strong_etag
+            && offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES
+            && response_total_verified;
+        let race_context = may_race.then(|| {
+            (
+                Arc::clone(&shared),
+                Arc::clone(&race_request),
+                Arc::clone(race_validator.as_ref().expect("bound strong ETag")),
+                Arc::clone(&race_attempted),
+            )
+        });
+        if offered_partial || may_race {
             let mut inner = lock_stream(&shared);
             if inner.stopped || inner.epoch != epoch || io.is_cancelled() {
                 return;
             }
-            debug_assert!(inner.reading_partial.is_none());
-            inner.reading_partial = Some(StreamReadPartial {
-                epoch,
-                index: stripe_index,
-                end: offset,
-                read_started: Instant::now(),
-                idle_recovery: idle_partial_delivered,
-                handoff: Some(StripeHandoff {
-                    start: stripe_start,
-                    bytes: std::mem::take(&mut stripe),
-                }),
-            });
+            let read_started = Instant::now();
+            inner.idle_race_read = may_race.then_some((offset, read_started));
+            if offered_partial {
+                debug_assert!(inner.reading_partial.is_none());
+                inner.reading_partial = Some(StreamReadPartial {
+                    epoch,
+                    index: stripe_index,
+                    end: offset,
+                    read_started,
+                    idle_recovery: idle_partial_delivered,
+                    handoff: Some(StripeHandoff {
+                        start: stripe_start,
+                        bytes: std::mem::take(&mut stripe),
+                    }),
+                });
+            }
         }
         let body = io.run(async move {
-            let chunk = tokio::time::timeout(HTTP_STREAM_BODY_TIMEOUT, response.chunk())
-                .await
-                .map_err(|_| SourceError::Http("HTTP stream body timed out".to_string()))?
-                .map_err(|error| SourceError::Http(error.without_url().to_string()))?;
-            Ok((response, chunk))
+            let original = async move {
+                let chunk = tokio::time::timeout(HTTP_STREAM_BODY_TIMEOUT, response.chunk())
+                    .await
+                    .map_err(|_| SourceError::Http("HTTP stream body timed out".to_string()))?
+                    .map_err(|error| SourceError::Http(error.without_url().to_string()))?;
+                Ok((response, chunk))
+            };
+            tokio::pin!(original);
+            if let Some((shared, request_context, validator, attempted)) = race_context {
+                let attempted_request = Arc::clone(&attempted);
+                let replacement = async move {
+                    wait_for_idle_race_demand(&shared, epoch, offset).await;
+                    let candidate = async {
+                        let mut response = open_idle_race_candidate(
+                            &request_context,
+                            validator.as_str(),
+                            &attempted_request,
+                            offset,
+                            total,
+                        )
+                        .await?;
+                        let first = response.chunk().await.ok()??;
+                        if first.is_empty() {
+                            return None;
+                        }
+                        Some((response, Some(first)))
+                    };
+                    if let Ok(Some(result)) =
+                        tokio::time::timeout(HTTP_STREAM_RESPONSE_TIMEOUT, candidate).await
+                    {
+                        return result;
+                    }
+                    // Failed speculation must neither poison identity nor end
+                    // or restart the original body read and its existing timeout.
+                    std::future::pending().await
+                };
+                tokio::pin!(replacement);
+                let result = tokio::select! {
+                    biased;
+                    result = &mut original => (result, false),
+                    result = &mut replacement => (Ok(result), true),
+                };
+                Ok((result.0, attempted.load(Ordering::Relaxed), result.1))
+            } else {
+                Ok((original.await, false, false))
+            }
         });
+        let body = match body {
+            Ok((result, attempted, switched)) => {
+                if switched {
+                    response_start = offset;
+                }
+                idle_race_used |= attempted;
+                result
+            }
+            Err(error) => Err(error),
+        };
         {
             // Reuse the existing per-chunk progress lock for reclamation. The
             // socket future and its body timeout above are completely unchanged.
             let mut inner = lock_stream(&shared);
+            inner.idle_race_read = None;
             if offered_partial {
                 let partial = inner
                     .reading_partial
@@ -5119,9 +5276,11 @@ mod tests {
                     window_end: total,
                     uncovered_read_end: 0,
                     reading_partial: None,
+                    idle_race_read: None,
                     stopped: false,
                 }),
                 signal: Condvar::new(),
+                demand: tokio::sync::Notify::new(),
                 entity_changed: Arc::clone(&source.entity_changed),
             }),
             io: HttpIo::new(),
