@@ -3144,11 +3144,83 @@ impl Frame {
         }
     }
 
-    /// Reuses renderer-owned CPU storage for the 10-bit planar software path.
-    /// Other pixel formats retain the existing conversion behavior. No AVFrame
-    /// pointers escape: CreateTexture2D consumes the copied planes synchronously.
+    /// Reuses renderer-owned CPU storage for 10-bit planar software frames and
+    /// exact-layout 8-bit NV12 output. Other layouts retain the allocating path.
+    /// No AVFrame pointers escape: CreateTexture2D copies the planes synchronously.
     pub(crate) fn write_planar_frame(&self, output: &mut PlanarFrame) -> Option<()> {
-        if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+        let format = self.raw_pixel_format();
+        if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P
+            || format == sys::AVPixelFormat_AV_PIX_FMT_NV12
+        {
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            if width != 0
+                && height != 0
+                && output.format == PlanarPixelFormat::Nv12
+                && output.width as usize == width
+                && output.height as usize == height
+                && width.checked_mul(height) == Some(output.luma.len())
+                && cw.checked_mul(ch).and_then(|len| len.checked_mul(2))
+                    == Some(output.chroma.len())
+            {
+                // Validate ALL source planes before changing either output.
+                // A failed source validation leaves bytes and metadata intact.
+                let validate_plane =
+                    |data: *const u8, stride: i32, row_bytes: usize, rows: usize| {
+                        let stride = usize::try_from(stride).ok()?;
+                        let span = rows
+                            .checked_sub(1)?
+                            .checked_mul(stride)?
+                            .checked_add(row_bytes)?;
+                        if data.is_null() || stride < row_bytes || span > isize::MAX as usize {
+                            return None;
+                        }
+                        (data as usize).checked_add(span)?;
+                        Some(stride)
+                    };
+                // SAFETY: the Frame owns each software plane. The checks above
+                // bound the visible layout; checked spans below bound every row
+                // offset. No borrowed source pointer survives this synchronous copy.
+                unsafe {
+                    let frame = &*self.ptr;
+                    let y_stride = validate_plane(frame.data[0], frame.linesize[0], width, height)?;
+                    let uv_row_bytes = cw.checked_mul(2)?;
+                    let source_chroma_bytes = if format == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                        uv_row_bytes
+                    } else {
+                        cw
+                    };
+                    let u_stride =
+                        validate_plane(frame.data[1], frame.linesize[1], source_chroma_bytes, ch)?;
+                    let v_stride = if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+                        validate_plane(frame.data[2], frame.linesize[2], cw, ch)?
+                    } else {
+                        0
+                    };
+                    for (row, dst) in output.luma.chunks_exact_mut(width).enumerate() {
+                        let src = slice::from_raw_parts(frame.data[0].add(row * y_stride), width);
+                        dst.copy_from_slice(src);
+                    }
+                    for (row, dst) in output.chroma.chunks_exact_mut(uv_row_bytes).enumerate() {
+                        let u = slice::from_raw_parts(
+                            frame.data[1].add(row * u_stride),
+                            source_chroma_bytes,
+                        );
+                        if format == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                            dst.copy_from_slice(u);
+                        } else {
+                            let v = slice::from_raw_parts(frame.data[2].add(row * v_stride), cw);
+                            for col in 0..cw {
+                                dst[col * 2] = u[col];
+                                dst[col * 2 + 1] = v[col];
+                            }
+                        }
+                    }
+                }
+                return Some(());
+            }
+        }
+        if format != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
             *output = self.to_planar_frame()?;
             return Some(());
         }
