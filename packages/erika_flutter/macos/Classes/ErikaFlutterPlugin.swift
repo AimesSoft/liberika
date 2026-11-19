@@ -3020,7 +3020,7 @@ final class ErikaVideoPlatformView: NSView, ErikaMetalSurfaceView {
     metalLayer.pixelFormat = .bgra8Unorm
     metalLayer.framebufferOnly = true
     let params = arguments as? [String: Any]
-    let alphaVideo = (params?["videoAlphaMode"] as? NSNumber)?.intValue != 0
+    let alphaVideo = ((params?["videoAlphaMode"] as? NSNumber)?.intValue ?? 0) != 0
     metalLayer.isOpaque = !alphaVideo
     metalLayer.backgroundColor = alphaVideo
       ? NSColor.clear.cgColor
