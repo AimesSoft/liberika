@@ -1,3 +1,5 @@
+mod p010;
+
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomData;
@@ -3569,10 +3571,7 @@ unsafe fn read_10bit_plane_as_p010(
     out.resize(len, 0);
     for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
         let src = unsafe { std::slice::from_raw_parts(ptr.add(row * stride), row_bytes) };
-        for (sample, dest) in src.chunks_exact(2).zip(dst.chunks_exact_mut(2)) {
-            let value = (u16::from_le_bytes([sample[0], sample[1]]) & 0x03ff) << 6;
-            dest.copy_from_slice(&value.to_le_bytes());
-        }
+        p010::luma_row(src, dst);
     }
     Some(())
 }
@@ -3610,16 +3609,7 @@ unsafe fn read_10bit_chroma_as_p010(
     for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
         let u = unsafe { std::slice::from_raw_parts(u_ptr.add(row * u_stride), source_row_bytes) };
         let v = unsafe { std::slice::from_raw_parts(v_ptr.add(row * v_stride), source_row_bytes) };
-        for ((u, v), dest) in u
-            .chunks_exact(2)
-            .zip(v.chunks_exact(2))
-            .zip(dst.chunks_exact_mut(4))
-        {
-            let u = (u16::from_le_bytes([u[0], u[1]]) & 0x03ff) << 6;
-            let v = (u16::from_le_bytes([v[0], v[1]]) & 0x03ff) << 6;
-            dest[..2].copy_from_slice(&u.to_le_bytes());
-            dest[2..].copy_from_slice(&v.to_le_bytes());
-        }
+        p010::chroma_row(u, v, dst);
     }
     Some(())
 }
