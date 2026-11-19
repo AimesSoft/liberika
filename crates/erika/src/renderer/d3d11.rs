@@ -67,6 +67,7 @@ use crate::renderer::presentation::PresentationLayout;
 use crate::renderer::sr::reference::LumaRange;
 use crate::subtitle::AssColor;
 
+mod alpha_atlas;
 mod danmaku;
 use danmaku::{D3d11DanmakuBatch, D3d11DanmakuDraws, D3d11DanmakuPipeline};
 
@@ -2241,78 +2242,61 @@ impl D3d11Renderer {
         target: TargetColorState,
         draws: &mut Vec<D3d11OverlayDraw>,
     ) -> Result<()> {
+        let state = self.state.as_ref().expect("device ensured");
+        let limit = if unsafe { state.device.GetFeatureLevel() }.0 >= D3D_FEATURE_LEVEL_11_0.0 {
+            16384
+        } else {
+            8192 // Device creation accepts feature levels 10.0 and above.
+        };
+        self.append_alpha_pages(frame, viewport_w, viewport_h, target, draws, limit)
+    }
+
+    fn append_alpha_pages(
+        &mut self,
+        frame: &OverlayFrame,
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+        limit: u32,
+    ) -> Result<()> {
         let bitmaps = &frame.subtitle_alpha_planes;
-        let mut atlas_width = 0usize;
-        let mut atlas_height = 0usize;
-        for bitmap in bitmaps {
-            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
-                continue;
-            }
-            atlas_width += bitmap.placement.width as usize;
-            atlas_height = atlas_height.max(bitmap.placement.height as usize);
-        }
-        if atlas_width == 0 || atlas_height == 0 {
-            return Ok(());
-        }
-
-        let mut pixels = vec![0u8; atlas_width * atlas_height];
-        let mut cursor_x = 0usize;
-        let mut placements = Vec::new();
-        for (index, bitmap) in bitmaps.iter().enumerate() {
-            let bw = bitmap.placement.width as usize;
-            let bh = bitmap.placement.height as usize;
-            if bw == 0 || bh == 0 {
-                continue;
-            }
-            if !bitmap.is_valid() {
-                return Err(PlayerError::Renderer(format!(
-                    "d3d11: overlay alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
-                    bitmap.alpha.len(),
-                    bitmap.required_len(),
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    bitmap.stride
-                )));
-            }
-            for row in 0..bh {
-                let src = row * bitmap.stride;
-                let dst = row * atlas_width + cursor_x;
-                pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
-            }
-            placements.push((index, cursor_x));
-            cursor_x += bw;
-        }
-
-        let texture = {
-            let state = self.state.as_ref().expect("device ensured");
-            create_cpu_texture(
-                state,
-                atlas_width as u32,
-                atlas_height as u32,
+        for page in alpha_atlas::layout(bitmaps, limit)? {
+            let pixels = page.pixels(bitmaps)?;
+            let texture = create_cpu_texture(
+                self.state.as_ref().expect("device ensured"),
+                page.width,
+                page.height,
                 DXGI_FORMAT_R8_UNORM,
                 &pixels,
-                atlas_width as u32,
-            )?
-        };
-        self.stats.overlay_alpha_atlas_uploads += 1;
-        for (index, atlas_x) in placements {
-            let bitmap = &bitmaps[index];
-            draws.push(D3d11OverlayDraw {
-                texture: texture.clone(),
-                constants: OverlayUniforms::alpha_atlas(
+                page.width,
+            )?;
+            self.stats.overlay_alpha_atlas_uploads += 1;
+            // Pages and tiles retain libass painter order, including overlapping
+            // outline/shadow/fill layers. Never sort by size or color.
+            for tile in page.tiles {
+                let bitmap = &bitmaps[tile.bitmap];
+                let mut constants = OverlayUniforms::alpha_atlas(
                     bitmap.color_rgba,
                     bitmap.placement.x,
                     bitmap.placement.y,
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    atlas_x as u32,
-                    atlas_width as u32,
-                    atlas_height as u32,
+                    tile.width,
+                    tile.height,
+                    tile.atlas_x,
+                    page.width,
+                    page.height,
                     viewport_w,
                     viewport_h,
                     target,
-                ),
-            });
+                );
+                constants.rect[0] += tile.x as f32;
+                constants.rect[1] += tile.y as f32;
+                constants.tex_rect[1] = 1.0 / page.height as f32;
+                draws.push(D3d11OverlayDraw {
+                    texture: texture.clone(),
+                    constants,
+                });
+            }
         }
         Ok(())
     }
