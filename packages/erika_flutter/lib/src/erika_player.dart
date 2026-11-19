@@ -1264,7 +1264,42 @@ class ErikaPlayer {
       );
     }
     final playerId = await ensureCreated();
+    final arguments = <String, Object?>{
+      'playerId': playerId,
+      'uri': uri,
+      if (httpHeaders != null && httpHeaders.isNotEmpty)
+        'httpHeaders': httpHeaders,
+      if (httpReadAheadBytes != null && httpReadAheadBytes > 0)
+        'httpReadAheadBytes': httpReadAheadBytes,
+      if (httpBackBufferBytes != null && httpBackBufferBytes > 0)
+        'httpBackBufferBytes': httpBackBufferBytes,
+      'metadata': metadata?.toMap(),
+    };
     var startTaken = startPosition == null || startPosition <= Duration.zero;
+    final atomicStart =
+        !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.windows) &&
+        !startTaken;
+    if (atomicStart) {
+      try {
+        final taken = await _channel.invokeMethod<bool>(
+          'openWithStartPosition',
+          <String, Object?>{
+            ...arguments,
+            'startPositionMicros': startPosition.inMicroseconds,
+          },
+        );
+        if (_disposed) {
+          throw StateError('ErikaPlayer has been disposed.');
+        }
+        return taken ?? false;
+      } on MissingPluginException {
+        if (_disposed) {
+          throw StateError('ErikaPlayer has been disposed.');
+        }
+      }
+    }
     if (!startTaken) {
       try {
         final reply = await invokeJson('setOpenStartPosition', {
@@ -1275,17 +1310,10 @@ class ErikaPlayer {
         startTaken = false;
       }
     }
-    await _invoke('open', <String, Object?>{
-      'playerId': playerId,
-      'uri': uri,
-      if (httpHeaders != null && httpHeaders.isNotEmpty)
-        'httpHeaders': httpHeaders,
-      if (httpReadAheadBytes != null && httpReadAheadBytes > 0)
-        'httpReadAheadBytes': httpReadAheadBytes,
-      if (httpBackBufferBytes != null && httpBackBufferBytes > 0)
-        'httpBackBufferBytes': httpBackBufferBytes,
-      'metadata': metadata?.toMap(),
-    });
+    if (atomicStart && _disposed) {
+      throw StateError('ErikaPlayer has been disposed.');
+    }
+    await _invoke('open', arguments);
     return startTaken;
   }
 

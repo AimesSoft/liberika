@@ -124,6 +124,56 @@ pub struct ErikaHttpHeader {
     pub value: *const c_char,
 }
 
+/// Independent, one-shot cold-open retry capability. No presenter pointer is
+/// retained. Cancel may run on any thread; release only after all users finish.
+pub struct ErikaColdOpenCancellation(erika::source::ColdOpenCancellation);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_cold_open_cancellation_create() -> *mut ErikaColdOpenCancellation {
+    Box::into_raw(Box::new(ErikaColdOpenCancellation(Default::default())))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_cold_open_cancellation_cancel(
+    ticket: *const ErikaColdOpenCancellation,
+) {
+    if let Some(ticket) = unsafe { ticket.as_ref() } {
+        ticket.0.cancel();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_cold_open_cancellation_release(
+    ticket: *mut ErikaColdOpenCancellation,
+) {
+    if !ticket.is_null() {
+        drop(unsafe { Box::from_raw(ticket) });
+    }
+}
+
+/// Validate an open before replacing a pending operation. This does not borrow
+/// a presenter or consume a cancellation capability. Strings must be valid,
+/// NUL-terminated C strings; hosts must reject embedded NUL before encoding.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_open_validate(
+    uri: *const c_char,
+    options: *const ErikaOpenOptions,
+) -> ErikaStatus {
+    let uri = match c_string(uri) {
+        Ok(uri) if !uri.is_empty() => uri,
+        Ok(_) => {
+            set_last_error("media URI must not be empty");
+            return ErikaStatus::PlayerError;
+        }
+        Err(status) => return status,
+    };
+    let _ = uri;
+    match c_open_options(options) {
+        Ok(_) => ErikaStatus::Ok,
+        Err(status) => status,
+    }
+}
+
 /// Extended open parameters mirroring the C header's `ErikaOpenOptions`.
 /// `http_read_ahead_bytes` of 0 uses the environment override when set,
 /// otherwise the 2 MiB default. `http_back_buffer_bytes` of 0 uses the
@@ -2461,6 +2511,38 @@ pub unsafe extern "C" fn erika_presenter_open_with_options(
     uri: *const c_char,
     options: *const ErikaOpenOptions,
 ) -> ErikaStatus {
+    unsafe { erika_presenter_open_with_options_cancellable(handle, uri, options, std::ptr::null()) }
+}
+
+/// `ticket` must remain allocated during this call; the core owns a clone.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "linux",
+    target_env = "ohos"
+))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_open_with_options_cancellable(
+    handle: *mut ErikaPresenterHandle,
+    uri: *const c_char,
+    options: *const ErikaOpenOptions,
+    ticket: *const ErikaColdOpenCancellation,
+) -> ErikaStatus {
+    // Reserve before borrowing even the raw presenter: a concurrent duplicate
+    // ticket must fail without creating a second mutable presenter reference.
+    let cancellation = match unsafe { ticket.as_ref() } {
+        Some(ticket) => match ticket.0.claim() {
+            Some(capability) => Some(capability),
+            None => {
+                set_last_error("cold-open cancellation capability has already been used");
+                return ErikaStatus::PlayerError;
+            }
+        },
+        None => None,
+    };
     with_presenter_mut(handle, |handle| {
         let uri = match c_string(uri) {
             Ok(uri) => uri,
@@ -2482,7 +2564,11 @@ pub unsafe extern "C" fn erika_presenter_open_with_options(
             .with_start_position(
                 c_open_start_position(options).or(handle.pending_start_position.take()),
             );
-        let status = status_from_player_result(handle.presenter.open(request));
+        let status = status_from_player_result(
+            handle
+                .presenter
+                .open_with_cold_open_cancellation(request, cancellation),
+        );
         retain_presenter_events_from_latest_open(handle);
         capi_trace(format!(
             "fn=erika_presenter_open.done handle={handle:p} status={status:?}"

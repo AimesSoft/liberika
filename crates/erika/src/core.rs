@@ -1251,6 +1251,7 @@ pub struct RendererResourceStats {
 }
 
 struct PlayerInner {
+    cancelled_cold_open: bool,
     state: PlayerState,
     ended: bool,
     media: Option<MediaRequest>,
@@ -1443,6 +1444,7 @@ impl Player {
             config,
             decoder_resources: PlaybackDecoderResources::default(),
             inner: Arc::new(Mutex::new(PlayerInner {
+                cancelled_cold_open: false,
                 state: PlayerState::Idle,
                 ended: false,
                 media: None,
@@ -1616,6 +1618,16 @@ impl Player {
     }
 
     pub fn open(&self, media: MediaRequest) -> Result<()> {
+        self.open_with_cold_open_cancellation(media, None)
+    }
+
+    pub fn open_with_cold_open_cancellation(
+        &self,
+        media: MediaRequest,
+        cold_open_cancellation: Option<crate::source::ClaimedColdOpenCancellation>,
+    ) -> Result<()> {
+        let cold_open_cancellation =
+            cold_open_cancellation.map(|capability| capability.into_inner());
         let epoch = {
             let mut lifecycle = self
                 .lifecycle
@@ -1635,13 +1647,18 @@ impl Player {
             self.emit(PlayerEvent::BufferingChanged(false));
             epoch
         };
-        let mut engine = match VideoPlaybackEngine::open_with_decoder_resources(
+        let mut engine = match VideoPlaybackEngine::open_with_cold_open_cancellation(
             &media,
             self.config.playback,
             self.decoder_resources.clone(),
+            cold_open_cancellation.clone(),
         ) {
             Ok(engine) => engine,
             Err(error) => {
+                if cold_open_cancellation.as_ref().is_some_and(|c| !c.finish()) {
+                    self.finish_cancelled_cold_open(epoch);
+                    return Err(self.superseded_open_error());
+                }
                 let error = PlayerError::Playback(error.to_string());
                 let lifecycle = self
                     .lifecycle
@@ -1675,6 +1692,10 @@ impl Player {
             }
         }
         let start = start.unwrap_or(Duration::ZERO);
+        if cold_open_cancellation.as_ref().is_some_and(|c| !c.finish()) {
+            self.finish_cancelled_cold_open(epoch);
+            return Err(self.superseded_open_error());
+        }
         let decoder_events = engine.take_video_decoder_events();
         let mut lifecycle = self
             .lifecycle
@@ -1944,6 +1965,16 @@ impl Player {
 
     pub fn stop(&self) -> Result<()> {
         self.ensure_not_closed()?;
+        // Cancellation can finish before any playback worker exists. Stopping
+        // that already-stopped empty generation is a successful no-op.
+        if self
+            .inner
+            .lock()
+            .expect("player mutex poisoned")
+            .cancelled_cold_open
+        {
+            return Ok(());
+        }
         let commands = self.playback_commands()?;
         let (
             previous_clock,
@@ -2230,6 +2261,7 @@ impl Player {
         drop(previous);
         {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.cancelled_cold_open = false;
             inner.media = None;
             inner.tracks.clear();
             inner.chapters.clear();
@@ -2307,6 +2339,31 @@ impl Player {
             .map(|runtime| runtime.commands.clone())
     }
 
+    fn finish_cancelled_cold_open(&self, epoch: u64) {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("player lifecycle mutex poisoned");
+        if lifecycle.epoch != epoch {
+            return;
+        }
+        {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.cancelled_cold_open = true;
+            inner.media = None;
+            inner.tracks.clear();
+            inner.chapters.clear();
+            inner.container = ContainerInfo::default();
+            inner.track_selection = TrackSelection::default();
+            inner.duration = None;
+            inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
+            inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
+            inner.ended = false;
+            inner.pending_play_sequence = None;
+        }
+        let _ = self.transition(PlayerState::Stopped);
+    }
+
     fn superseded_open_error(&self) -> PlayerError {
         if self.state() == PlayerState::Closed {
             PlayerError::Closed
@@ -2331,6 +2388,7 @@ impl Player {
     fn transition_to_opening(&self) {
         let previous = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.cancelled_cold_open = false;
             inner.chapters.clear();
             inner.container = ContainerInfo::default();
             // A racing Play may have cloned the old worker sender before this

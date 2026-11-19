@@ -71,6 +71,7 @@ class ErikaFlutterPlugin : public flutter::Plugin {
 
  private:
   struct ErikaNativeLibrary;
+  struct ColdOpenTicket;
   struct ErikaOverlayWindow;
   struct ErikaFlutterTexture;
   struct PlayerHost;
@@ -100,7 +101,8 @@ class ErikaFlutterPlugin : public flutter::Plugin {
   void DrainCompletions();
   void DispatchNativeMethod(PlayerHost& host, std::string method,
                             flutter::EncodableMap args,
-                            std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+                            std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> result,
+                            std::shared_ptr<ColdOpenTicket> cold_open_ticket = {});
   std::optional<LRESULT> OnTopLevelWindowProc(HWND hwnd,
                                               UINT message,
                                               WPARAM wparam,
