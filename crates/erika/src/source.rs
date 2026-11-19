@@ -19,7 +19,7 @@ use thiserror::Error;
 mod http;
 
 use http::HttpIo;
-pub use http::SourceCancellation;
+pub use http::{ClaimedColdOpenCancellation, ColdOpenCancellation, SourceCancellation};
 
 use crate::core::MediaSourceHint;
 use crate::trace;
@@ -65,6 +65,7 @@ impl ByteRange {
 }
 
 pub trait MediaSource: Send {
+    fn set_cold_open_cancellation(&mut self, _: Option<ColdOpenCancellation>) {}
     fn uri(&self) -> &str;
     fn len(&mut self) -> Result<Option<u64>>;
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
@@ -620,9 +621,15 @@ impl HttpRangeSource {
 
     fn fetch_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
         self.check_entity()?;
+        let first_io = self.agent.cold_open.take().map(|ticket| {
+            let mut io = self.agent.clone();
+            io.cold_open = Some(ticket);
+            io
+        });
+        let fetch_io = first_io.as_ref().unwrap_or(&self.agent);
         let response = if range.length.is_none() {
             fetch_http_to_end(
-                &self.agent,
+                fetch_io,
                 &self.uri,
                 &self.http_headers,
                 range.start,
@@ -631,7 +638,7 @@ impl HttpRangeSource {
             )
         } else {
             fetch_http_range_with_validator(
-                &self.agent,
+                fetch_io,
                 &self.uri,
                 &self.http_headers,
                 range,
@@ -2123,9 +2130,10 @@ enum HttpRequestError {
     #[error("{0}")]
     Request(#[from] reqwest::Error),
     #[error("{error}; Retry-After: {retry_after_seconds}s")]
-    RateLimited {
+    RetryAfter {
         error: reqwest::Error,
         retry_after_seconds: u64,
+        retry_after: Duration,
     },
     #[error("HTTP phase timed out")]
     Timeout(#[from] tokio::time::error::Elapsed),
@@ -2135,8 +2143,7 @@ enum HttpRequestError {
 fn http_error_is_retryable(error: &HttpRequestError) -> bool {
     match error {
         HttpRequestError::Timeout(_) => true,
-        HttpRequestError::RateLimited { .. } => false,
-        HttpRequestError::Request(error) => {
+        HttpRequestError::RetryAfter { error, .. } | HttpRequestError::Request(error) => {
             error.status().is_none_or(|status| status.is_server_error())
         }
     }
@@ -2154,14 +2161,15 @@ async fn send_http_request(
         .await?
         .map_err(reqwest::Error::without_url)?;
     // Preserve only a parsed hint; never read the body or report raw headers.
-    let retry_after = (response.status().as_u16() == 429)
+    let retry_after = matches!(response.status().as_u16(), 429 | 503)
         .then(|| stream_retry_after(&response))
         .flatten();
     response.error_for_status().map_err(|error| {
         let error = error.without_url();
         match retry_after {
-            Some(delay) => HttpRequestError::RateLimited {
+            Some(delay) => HttpRequestError::RetryAfter {
                 error,
+                retry_after: delay,
                 retry_after_seconds: delay
                     .as_secs()
                     .saturating_add(u64::from(delay.subsec_nanos() != 0)),
@@ -2377,6 +2385,7 @@ fn fetch_http_range_with_validator(
     validator: Option<String>,
 ) -> Result<HttpRangeResponse> {
     let client = agent.client.clone();
+    let cold_open = agent.cold_open.clone();
     let uri = uri.to_owned();
     let http_headers = http_headers.to_vec();
     let event = event.to_owned();
@@ -2388,6 +2397,7 @@ fn fetch_http_range_with_validator(
             range,
             &event,
             HttpFetchTimeouts::default(),
+            cold_open,
             validator.as_deref().map(|validator| HttpRangeHistory {
                 start: range.start,
                 prefix: &[],
@@ -2409,6 +2419,7 @@ fn fetch_http_to_end(
     mut strong_etag: Option<String>,
 ) -> Result<HttpRangeResponse> {
     let client = agent.client.clone();
+    let mut cold_open = agent.cold_open.clone();
     let uri = uri.to_owned();
     let http_headers = http_headers.to_vec();
     agent.run(async move {
@@ -2447,6 +2458,7 @@ fn fetch_http_to_end(
                 },
                 "http_range",
                 HttpFetchTimeouts::default(),
+                cold_open.take(),
                 Some(HttpRangeHistory {
                     start,
                     prefix: &bytes,
@@ -2532,8 +2544,17 @@ async fn fetch_http_range_async(
     event: &str,
     timeouts: HttpFetchTimeouts,
 ) -> Result<HttpRangeResponse> {
-    fetch_http_range_with_history_async(client, uri, http_headers, range, event, timeouts, None)
-        .await
+    fetch_http_range_with_history_async(
+        client,
+        uri,
+        http_headers,
+        range,
+        event,
+        timeouts,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn fetch_http_range_with_history_async(
@@ -2543,6 +2564,7 @@ async fn fetch_http_range_with_history_async(
     range: ByteRange,
     event: &str,
     timeouts: HttpFetchTimeouts,
+    cold_open: Option<ColdOpenCancellation>,
     history: Option<HttpRangeHistory<'_>>,
 ) -> Result<HttpRangeResponse> {
     let mut bytes = Vec::new();
@@ -2558,6 +2580,7 @@ async fn fetch_http_range_with_history_async(
         .as_ref()
         .and_then(|history| history.strong_etag.map(str::to_owned));
     let mut gate = HttpRetryGate::new(timeouts.total);
+    let mut honored_cold_hint = false;
     loop {
         let attempt = gate.begin_attempt();
         if gate.expired() {
@@ -2627,6 +2650,23 @@ async fn fetch_http_range_with_history_async(
         let mut response = match send_http_request(request, remaining, timeouts.response).await {
             Ok(response) => response,
             Err(error) => {
+                if let (Some(ticket), HttpRequestError::RetryAfter { retry_after, .. }) =
+                    (cold_open.as_ref(), &error)
+                    && attempt == 1
+                    && !honored_cold_hint
+                    && received == 0
+                    && !prior_bytes
+                    && !http_headers.iter().any(|(name, _)| {
+                        name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+                    })
+                    && gate.elapsed().saturating_add(*retry_after) < timeouts.total
+                    && gate.fail(0).is_some()
+                {
+                    honored_cold_hint = true;
+                    ticket.wait(*retry_after).await?;
+                    continue;
+                }
+
                 http_trace_log(format!(
                     "{{\"event\":\"{}_error\",\"phase\":\"request\",\"attempt\":{},\"start\":{},\"length\":{},\"elapsed_ms\":{:.3},\"error\":\"{}\"}}",
                     event,
@@ -2638,7 +2678,10 @@ async fn fetch_http_range_with_history_async(
                     started.elapsed().as_secs_f64() * 1000.0,
                     json_escape(&error.to_string()),
                 ));
-                if http_error_is_retryable(&error)
+                // A second explicit hint after the one permitted cold-open wait
+                // must not fall through to an earlier generic retry.
+                if !(honored_cold_hint && matches!(&error, HttpRequestError::RetryAfter { .. }))
+                    && http_error_is_retryable(&error)
                     && let Some(backoff) = gate.fail(received)
                 {
                     http_trace_log(format!(
@@ -2865,6 +2908,7 @@ async fn fetch_http_length(
     http_headers: &[(String, String)],
     started: Instant,
     timeouts: HttpFetchTimeouts,
+    cold_open: Option<&ColdOpenCancellation>,
 ) -> Result<Option<u64>> {
     let mut gate = HttpRetryGate::new(timeouts.total);
     let head_error = loop {
@@ -2932,7 +2976,19 @@ async fn fetch_http_length(
                         attempt,
                         backoff.as_millis(),
                     ));
-                    tokio::time::sleep(backoff).await;
+                    if let (
+                        Some(ticket),
+                        HttpRequestError::RetryAfter {
+                            error, retry_after, ..
+                        },
+                    ) = (cold_open, &error)
+                        && error.status().is_some_and(|status| status.as_u16() == 503)
+                        && gate.elapsed().saturating_add(*retry_after) < timeouts.total
+                    {
+                        ticket.metadata_backoff(backoff).await?;
+                    } else {
+                        tokio::time::sleep(backoff).await;
+                    }
                     continue;
                 }
                 break error;
@@ -2979,6 +3035,12 @@ impl Drop for HttpRangeSource {
 }
 
 impl MediaSource for HttpRangeSource {
+    fn set_cold_open_cancellation(&mut self, cancellation: Option<ColdOpenCancellation>) {
+        if let Some(ticket) = &cancellation {
+            ticket.bind_source(self.agent.cancellation.clone());
+        }
+        self.agent.cold_open = cancellation;
+    }
     fn uri(&self) -> &str {
         &self.uri
     }
@@ -3013,6 +3075,7 @@ impl MediaSource for HttpRangeSource {
             self.cache_end(),
             self.read_ahead_bytes,
         ));
+        let cold_open = self.agent.cold_open.clone();
         let client = self.agent.client.clone();
         let uri = self.uri.clone();
         let http_headers = self.http_headers.clone();
@@ -3023,6 +3086,7 @@ impl MediaSource for HttpRangeSource {
                 &http_headers,
                 started,
                 HttpFetchTimeouts::default(),
+                cold_open.as_ref(),
             )
             .await
         })?;
@@ -5940,7 +6004,7 @@ mod tests {
                 // would still exceed this watchdog (1.2 + 2 > 3).
                 Ok(tokio::time::timeout(
                     Duration::from_secs(3),
-                    fetch_http_length(&client, &uri, &[], Instant::now(), timeouts),
+                    fetch_http_length(&client, &uri, &[], Instant::now(), timeouts, None),
                 )
                 .await)
             })
@@ -5975,7 +6039,15 @@ mod tests {
         let client = io.client.clone();
         let length = io
             .run(async move {
-                fetch_http_length(&client, &uri, &[], Instant::now(), short_http_timeouts()).await
+                fetch_http_length(
+                    &client,
+                    &uri,
+                    &[],
+                    Instant::now(),
+                    short_http_timeouts(),
+                    None,
+                )
+                .await
             })
             .unwrap();
         assert_eq!(length, Some(4));

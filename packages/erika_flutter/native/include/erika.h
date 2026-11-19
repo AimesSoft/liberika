@@ -1151,6 +1151,16 @@ ErikaStatus erika_texture_frame_get_info(
     const ErikaTextureFrame *frame, ErikaExternalTextureInfo *out_info);
 void erika_texture_frame_release(ErikaTextureFrame *frame);
 
+/* Experimental per-open capability. Never shares a presenter across threads.
+ * Release after cancel callers and the synchronous open have finished. */
+typedef struct ErikaColdOpenCancellation ErikaColdOpenCancellation;
+ErikaStatus erika_open_validate(const char *uri, const ErikaOpenOptions *options);
+ErikaColdOpenCancellation *erika_cold_open_cancellation_create(void);
+void erika_cold_open_cancellation_cancel(const ErikaColdOpenCancellation *ticket);
+void erika_cold_open_cancellation_release(ErikaColdOpenCancellation *ticket);
+ErikaStatus erika_presenter_open_with_options_cancellable(ErikaPresenterHandle *presenter,
+    const char *uri, const ErikaOpenOptions *options, const ErikaColdOpenCancellation *ticket);
+
 #ifdef __cplusplus
 }
 #endif

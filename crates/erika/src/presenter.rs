@@ -983,6 +983,14 @@ impl PresenterRuntime {
     }
 
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {
+        self.open_with_cold_open_cancellation(media, None)
+    }
+
+    pub fn open_with_cold_open_cancellation(
+        &mut self,
+        media: MediaRequest,
+        cancellation: Option<crate::source::ClaimedColdOpenCancellation>,
+    ) -> Result<()> {
         self.subtitle_resolution.reset_budget();
         self.quiesce_frame_output("open")?;
         self.reset_video_decode_resume_state();
@@ -992,7 +1000,9 @@ impl PresenterRuntime {
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;
         self.presentation.reset();
-        let result = self.player.open(media);
+        let result = self
+            .player
+            .open_with_cold_open_cancellation(media, cancellation);
         let rate_result = if result.is_ok() && !playback_rate_matches(self.playback_rate, 1.0) {
             self.player.set_playback_rate(self.playback_rate)
         } else {

@@ -1014,14 +1014,24 @@ impl PlaybackSession {
         config: PlaybackSessionConfig,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
+        Self::open_with_cold_open_cancellation(request, config, decoder_resources, None)
+    }
+
+    pub(crate) fn open_with_cold_open_cancellation(
+        request: &MediaRequest,
+        config: PlaybackSessionConfig,
+        decoder_resources: PlaybackDecoderResources,
+        cancellation: Option<crate::source::ColdOpenCancellation>,
+    ) -> Result<Self> {
         let queue_limits = PlaybackQueueLimits::for_request(request);
-        let source = source_from_uri_with_options(
+        let mut source = source_from_uri_with_options(
             &request.uri,
             request.source_hint,
             request.http_headers.clone(),
             request.http_read_ahead_bytes,
             request.http_back_buffer_bytes,
         )?;
+        source.set_cold_open_cancellation(cancellation);
         let mut demuxer = Demuxer::open_source(source)?;
         let mut probe = demuxer.probe().clone();
         let subtitle_fonts = probe.subtitle_fonts.clone();
@@ -4906,9 +4916,23 @@ impl VideoPlaybackEngine {
         config: PlaybackSessionConfig,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
+        Self::open_with_cold_open_cancellation(request, config, decoder_resources, None)
+    }
+
+    pub(crate) fn open_with_cold_open_cancellation(
+        request: &MediaRequest,
+        config: PlaybackSessionConfig,
+        decoder_resources: PlaybackDecoderResources,
+        cancellation: Option<crate::source::ColdOpenCancellation>,
+    ) -> Result<Self> {
         let timing = playback_timing_for_request(request, config.timing);
         Ok(Self::from_session_with_timing(
-            PlaybackSession::open_with_decoder_resources(request, config, decoder_resources)?,
+            PlaybackSession::open_with_cold_open_cancellation(
+                request,
+                config,
+                decoder_resources,
+                cancellation,
+            )?,
             timing,
         ))
     }
