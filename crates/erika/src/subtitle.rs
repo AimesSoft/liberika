@@ -1580,6 +1580,17 @@ impl LibassSubtitleRenderer {
         if chunk.is_empty() {
             return Ok(());
         }
+        self.process_chunk_data(chunk, start, end)?;
+        self.chunks.push((chunk.to_string(), start, end));
+        Ok(())
+    }
+
+    fn process_chunk_data(
+        &mut self,
+        chunk: &str,
+        start: Duration,
+        end: Option<Duration>,
+    ) -> Result<()> {
         let chunk_size = i32::try_from(chunk.len()).map_err(|_| {
             SubtitleError::Libass("ASS event chunk exceeds libass integer range".to_string())
         })?;
@@ -1595,7 +1606,23 @@ impl LibassSubtitleRenderer {
                 duration_ms,
             );
         }
-        self.chunks.push((chunk.to_string(), start, end));
+        Ok(())
+    }
+
+    fn replay_chunk_data_into(&self, replacement: &mut Self) -> Result<()> {
+        debug_assert!(replacement.chunks.is_empty());
+        for (chunk, start, end) in &self.chunks {
+            replacement.process_chunk_data(chunk, *start, *end)?;
+        }
+        Ok(())
+    }
+
+    /// Replays into an uncommitted replacement, preserving the original on error.
+    /// After replay succeeds, transfers the log without reallocating its strings;
+    /// callers must immediately replace this renderer, whose log is now empty.
+    pub(crate) fn transfer_chunks_to(&mut self, replacement: &mut Self) -> Result<()> {
+        self.replay_chunk_data_into(replacement)?;
+        replacement.chunks = std::mem::take(&mut self.chunks);
         Ok(())
     }
 
@@ -1705,9 +1732,7 @@ impl LibassSubtitleRenderer {
                 self.memory_fonts.clone(),
             )?,
         };
-        for (chunk, start, end) in &self.chunks {
-            replacement.process_chunk(chunk, *start, *end)?;
-        }
+        self.replay_chunk_data_into(&mut replacement)?;
         replacement.font_scale = self.font_scale;
         replacement.override_font_scale = self.override_font_scale;
         replacement.play_res_height = self.play_res_height;
@@ -1717,6 +1742,7 @@ impl LibassSubtitleRenderer {
             replacement.override_font_scale,
             replacement.play_res_height,
         );
+        replacement.chunks = std::mem::take(&mut self.chunks);
         *self = replacement;
         Ok(())
     }

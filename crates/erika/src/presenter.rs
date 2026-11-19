@@ -4751,7 +4751,6 @@ struct CachedAssTrackRenderer {
     renderer: Option<LibassSubtitleRenderer>,
     style: SubtitleStyleConfig,
     memory_font_revision: u64,
-    chunks: Vec<(String, Duration, Option<Duration>)>,
 }
 
 #[cfg(feature = "libass")]
@@ -4765,7 +4764,6 @@ impl CachedAssTrackRenderer {
         self.resources = None;
         self.renderer = None;
         self.memory_font_revision = 0;
-        self.chunks.clear();
     }
 
     fn clear_track(&mut self, track_id: i64) {
@@ -4815,7 +4813,6 @@ impl CachedAssTrackRenderer {
             .filter(|segment| segment.format == crate::subtitle::SubtitleTextFormat::Ass)
         {
             renderer.process_chunk(&segment.text, start, frame.end)?;
-            self.chunks.push((segment.text.clone(), start, frame.end));
         }
         Ok(true)
     }
@@ -4835,8 +4832,8 @@ impl CachedAssTrackRenderer {
                     &style.style,
                     style.memory_fonts.clone(),
                 )?;
-                for (chunk, start, end) in &self.chunks {
-                    renderer.process_chunk(chunk, *start, *end)?;
+                if let Some(current) = self.renderer.as_mut() {
+                    current.transfer_chunks_to(&mut renderer)?;
                 }
                 self.renderer = Some(renderer);
             }
