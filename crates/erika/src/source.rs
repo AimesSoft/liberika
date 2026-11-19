@@ -459,6 +459,8 @@ struct StreamInner {
     /// parked on a full packet queue would otherwise leave the workers
     /// unbounded, and a fast origin then prefetches the whole resource.
     window_end: u64,
+    /// Current requested read end if cache coverage is insufficient, else zero.
+    uncovered_read_end: u64,
     /// Set when the source is dropped: every worker exits.
     stopped: bool,
 }
@@ -738,6 +740,11 @@ impl HttpRangeSource {
         };
         let window_end = self.stream_reader_end.saturating_add(self.read_ahead_bytes);
         let mut inner = lock_stream(&shared);
+        inner.uncovered_read_end = if self.cache_end() < self.stream_reader_end {
+            self.stream_reader_end
+        } else {
+            0
+        };
         if inner.window_end != window_end {
             inner.window_end = window_end;
             shared.signal.notify_all();
@@ -815,6 +822,11 @@ impl HttpRangeSource {
                 progress_bytes: 0,
                 last_progress: Instant::now(),
                 window_end: anchor.saturating_add(self.read_ahead_bytes),
+                uncovered_read_end: if anchor < self.stream_reader_end {
+                    self.stream_reader_end
+                } else {
+                    0
+                },
                 stopped: false,
             }),
             signal: Condvar::new(),
@@ -1207,13 +1219,17 @@ fn stream_worker_main(
     let mut stripe_index = 0;
     let mut stripe_start = start;
     let mut stripe: Vec<u8> = Vec::new();
+    // Includes any prefix handed off early; reset only at the original boundary.
+    let mut stripe_received = 0usize;
     let mut stripe_opened: Option<Instant> = None;
     let mut validator: Option<String> = None;
     let mut live: Option<reqwest::Response> = None;
     let mut skip_remaining = 0;
     let mut response_start = start;
+    let mut response_has_bound_strong_etag = false;
     let mut resumes_since_progress: u32 = 0;
     let mut fast_body_retry_used = false;
+    let mut release_partial_on_reconnect = false;
 
     loop {
         // Finish a partial final stripe without needing another socket read or
@@ -1223,7 +1239,7 @@ fn stream_worker_main(
             mark_worker_done(&shared, false);
             return;
         }
-        if !wait_for_stream_window(&shared, &io, epoch, offset, !stripe.is_empty()) {
+        if !wait_for_stream_window(&shared, &io, epoch, offset, stripe_received != 0) {
             return;
         }
         if live.is_none() {
@@ -1232,6 +1248,8 @@ fn stream_worker_main(
             if offset == start {
                 validator = None;
             }
+            // This permission belongs to this open attempt only, even on error.
+            let release_partial = std::mem::take(&mut release_partial_on_reconnect);
             match open_stream_response(&io, &uri, &http_headers, offset, validator.clone()) {
                 Ok(StreamOpened::Body {
                     response,
@@ -1239,6 +1257,45 @@ fn stream_worker_main(
                 }) => {
                     if validator.is_none() {
                         validator = response_entity_validator(&response);
+                    }
+                    response_has_bound_strong_etag = validator
+                        .as_deref()
+                        .and_then(|value| strong_etag(value.as_bytes()))
+                        .is_some_and(|expected| {
+                            response
+                                .headers()
+                                .get("etag")
+                                .and_then(|value| strong_etag(value.as_bytes()))
+                                == Some(expected)
+                        });
+                    // open_stream_response has already checked the 206 start.
+                    // Both the interrupted response and this response must have
+                    // explicitly supplied the same bound strong ETag. A 200 or
+                    // weak/missing tag keeps the original buffering path.
+                    if release_partial
+                        && response.status().as_u16() == 206
+                        && response_has_bound_strong_etag
+                    {
+                        if io.is_cancelled() {
+                            return;
+                        }
+                        let mut inner = lock_stream(&shared);
+                        if !inner.stopped
+                            && inner.epoch == epoch
+                            && stripe_start < inner.uncovered_read_end
+                            && inner.uncovered_read_end <= offset
+                        {
+                            inner.pending.insert(
+                                stripe_index,
+                                StripeHandoff {
+                                    start: stripe_start,
+                                    bytes: std::mem::take(&mut stripe),
+                                },
+                            );
+                            shared.signal.notify_all();
+                            stripe_index += 1;
+                            stripe_start = offset;
+                        }
                     }
                     response_start = offset;
                     skip_remaining = skip_bytes;
@@ -1325,15 +1382,16 @@ fn stream_worker_main(
                     // A single HTTP body chunk can contain several stripes.
                     // Apply backpressure at every stripe boundary, including
                     // boundaries inside that chunk, before publishing more.
-                    if !wait_for_stream_window(&shared, &io, epoch, offset, !stripe.is_empty()) {
+                    if !wait_for_stream_window(&shared, &io, epoch, offset, stripe_received != 0) {
                         return;
                     }
-                    let available = HTTP_STREAM_STRIPE_BYTES as usize - stripe.len();
+                    let available = HTTP_STREAM_STRIPE_BYTES as usize - stripe_received;
                     let take = available.min(received - consumed);
                     stripe.extend_from_slice(&bytes[consumed..consumed + take]);
                     consumed += take;
                     offset += take as u64;
-                    if stripe.len() as u64 == HTTP_STREAM_STRIPE_BYTES {
+                    stripe_received += take;
+                    if stripe_received as u64 == HTTP_STREAM_STRIPE_BYTES {
                         let elapsed = stripe_opened
                             .take()
                             .map_or(0.0, |opened| opened.elapsed().as_secs_f64() * 1000.0);
@@ -1351,6 +1409,7 @@ fn stream_worker_main(
                         );
                         stripe_index += 1;
                         stripe_start = offset;
+                        stripe_received = 0;
                         if consumed < received {
                             stripe_opened = Some(Instant::now());
                         }
@@ -1377,6 +1436,8 @@ fn stream_worker_main(
                     && offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES
                 {
                     fast_body_retry_used = true;
+                    release_partial_on_reconnect =
+                        !stripe.is_empty() && response_has_bound_strong_etag;
                     continue;
                 }
                 if io.wait_cancelled(Duration::from_millis(300)) {
@@ -4940,6 +5001,7 @@ mod tests {
                     progress_bytes: 64 * 1024,
                     last_progress: Instant::now(),
                     window_end: total,
+                    uncovered_read_end: 0,
                     stopped: false,
                 }),
                 signal: Condvar::new(),
