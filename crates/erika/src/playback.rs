@@ -479,8 +479,11 @@ fn send_demux_message(
             Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
                 message = returned;
-                match commands.recv_timeout(Duration::from_millis(5)) {
-                    Ok(command) => {
+                // A full packet queue needs either consumer progress or a
+                // control command. Prefer a ready command without polling.
+                crossbeam_channel::select_biased! {
+                    recv(commands) -> command => {
+                        let Ok(command) = command else { return false; };
                         trace_demux_send_wait(started, packets.len(), "command_after_full");
                         if !handle_demux_command(
                             demuxer,
@@ -497,8 +500,13 @@ fn send_demux_message(
                             return true;
                         }
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return false,
+                    send(packets, message) -> result => {
+                        if result.is_err() {
+                            return false;
+                        }
+                        trace_demux_send_wait(started, packets.len(), "sent");
+                        return true;
+                    }
                 }
             }
         }
