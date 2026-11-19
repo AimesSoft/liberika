@@ -3257,9 +3257,15 @@ impl Frame {
     }
 }
 
-// Views internal to Apple uploads. Public packed conversion APIs, the reusable
-// D3D11 writer, and fallback formats remain independent.
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+// Views internal to native uploads. Public packed conversion APIs and fallback
+// formats remain independent.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows",
+    test
+))]
 mod software_planar_upload {
     use super::{Frame, PhantomData, slice, sys};
 
@@ -3318,7 +3324,10 @@ mod software_planar_upload {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     pub(crate) struct SoftwareYuv420pUpload<'a> {
         width: usize,
         height: usize,
@@ -3327,7 +3336,10 @@ mod software_planar_upload {
         v: StridedPlane<'a>,
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     impl SoftwareYuv420pUpload<'_> {
         pub(crate) fn dimensions(&self) -> (usize, usize) {
             (self.width, self.height)
@@ -3357,7 +3369,10 @@ mod software_planar_upload {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     impl Frame {
         pub(crate) fn software_yuv420p_upload(&self) -> Option<SoftwareYuv420pUpload<'_>> {
             if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
@@ -3455,11 +3470,13 @@ mod software_planar_upload {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
     enum Chroma<'a> {
         Borrowed(StridedPlane<'a>),
         Packed(Vec<u8>),
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
     pub(crate) struct SoftwareNv12Upload<'a> {
         width: usize,
         height: usize,
@@ -3467,6 +3484,7 @@ mod software_planar_upload {
         chroma: Chroma<'a>,
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
     impl SoftwareNv12Upload<'_> {
         pub(crate) fn dimensions(&self) -> (usize, usize) {
             (self.width, self.height)
@@ -3482,6 +3500,7 @@ mod software_planar_upload {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
     impl Frame {
         pub(crate) fn is_8bit_420_software(&self) -> bool {
             matches!(
@@ -3544,7 +3563,13 @@ mod software_planar_upload {
 pub(crate) use software_planar_upload::SoftwareNv12Upload;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use software_planar_upload::{SoftwareP010Upload, SoftwareYuv420pUpload};
+pub(crate) use software_planar_upload::SoftwareP010Upload;
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) use software_planar_upload::SoftwareYuv420pUpload;
 
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
 /// (`width * height`) and an interleaved Cb/Cr plane at half resolution
