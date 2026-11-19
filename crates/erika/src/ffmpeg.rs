@@ -3468,7 +3468,10 @@ mod software_planar_upload {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     pub(crate) struct SoftwareP010Upload<'a> {
         width: usize,
         height: usize,
@@ -3477,12 +3480,39 @@ mod software_planar_upload {
         v: StridedPlane<'a>,
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     impl SoftwareP010Upload<'_> {
         pub(crate) fn dimensions(&self) -> (usize, usize) {
             (self.width, self.height)
         }
 
+        #[cfg(target_os = "windows")]
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.y
+        }
+
+        #[cfg(target_os = "windows")]
+        pub(crate) fn write_d3d11_chroma(&self, output: &mut Vec<u8>) -> Option<()> {
+            // SAFETY: These strided planes borrow the software AVFrame, and
+            // their visible layout has been checked. The CPU helper accesses
+            // only visible U/V bytes and accepts different source pitches.
+            unsafe {
+                super::read_10bit_chroma_as_p010(
+                    self.u.as_ptr().cast_mut(),
+                    self.u.stride() as i32,
+                    self.v.as_ptr().cast_mut(),
+                    self.v.stride() as i32,
+                    self.width.div_ceil(2),
+                    self.height.div_ceil(2),
+                    output,
+                )
+            }
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         pub(crate) fn write_into(
             &self,
             y: &mut [u8],
@@ -3516,7 +3546,10 @@ mod software_planar_upload {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     impl Frame {
         pub(crate) fn software_p010_upload(&self) -> Option<SoftwareP010Upload<'_>> {
             if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
@@ -3527,7 +3560,7 @@ mod software_planar_upload {
                 return None;
             }
             let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-            // All three source planes are checked before any Metal allocation
+            // All three source planes are checked before any GPU allocation
             // or destination write; each slice later covers visible bytes only.
             let y = StridedPlane::from_frame(self, 0, width.checked_mul(2)?, height)?;
             let u = StridedPlane::from_frame(self, 1, cw.checked_mul(2)?, ch)?;
@@ -3637,10 +3670,7 @@ pub(crate) use software_planar_upload::SoftwareNv12Upload;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use software_planar_upload::SoftwareP010Upload;
 
-#[cfg(any(
-    target_os = "windows",
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use software_planar_upload::SoftwareYuv420pUpload;
 
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
