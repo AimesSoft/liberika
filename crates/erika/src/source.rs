@@ -1203,11 +1203,24 @@ fn mark_worker_done(shared: &StreamShared, failed: bool) {
 }
 
 enum StreamOpened {
+    RetryAfter(Duration),
     Body {
         response: reqwest::Response,
         skip_bytes: u64,
     },
     Eof,
+}
+
+/// Only unambiguous positive delta-seconds are supported. Dates, duplicates,
+/// malformed values and overflow retain the original status-error behavior.
+fn stream_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let mut values = response.headers().get_all("retry-after").iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if values.next().is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = value.parse::<u64>().ok()?;
+    (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
 /// Opens a worker's persistent GET: open-ended (`bytes=offset-`), so the
@@ -1291,6 +1304,11 @@ fn open_stream_response_with_identity(
                 skip_bytes: 0,
             })
         }
+        503 => stream_retry_after(&response)
+            .map(StreamOpened::RetryAfter)
+            .ok_or_else(|| {
+                SourceError::Http("unexpected HTTP status 503 for stream request".to_string())
+            }),
         416 => Ok(StreamOpened::Eof),
         200 => {
             validate_partial_response_etag(&response, identity.as_deref())?;
@@ -1387,6 +1405,12 @@ async fn open_idle_race_candidate(
     Some(response)
 }
 
+#[derive(Clone, Copy)]
+enum StreamPartialRelease {
+    FastReconnect,
+    AfterHonored503,
+}
+
 /// One persistent open-ended GET, delivering fixed-size stripes. Seeks,
 /// cancellation and backpressure are checked before starting each stripe.
 /// Body errors reconnect at the reached offset with the entity validator.
@@ -1432,7 +1456,7 @@ fn stream_worker_main(
     // A winning standby can earn one new opportunity from its own body bytes.
     let mut idle_race_earning = false;
     let mut response_total_verified = false;
-    let mut release_partial_on_reconnect = false;
+    let mut release_partial_on_reconnect: Option<StreamPartialRelease> = None;
 
     loop {
         // Account before an ordinary reconnect can replace response_start. Only
@@ -1469,7 +1493,8 @@ fn stream_worker_main(
             if offset == start {
                 validator = None;
             }
-            // This permission belongs to this open attempt only, even on error.
+            // Consume on every open. Only FastReconnect may cross one honored
+            // 503 below; the deferred permission can never be extended again.
             let release_partial = std::mem::take(&mut release_partial_on_reconnect);
             match open_stream_response_with_identity(
                 &io,
@@ -1494,13 +1519,21 @@ fn stream_worker_main(
                                 .as_deref()
                                 .is_none_or(|expected| actual == expected)
                         });
+                    response_total_verified = response
+                        .headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_total)
+                        == Some(total);
                     // open_stream_response has already checked the 206 start.
                     // Both the interrupted response and this response must have
                     // explicitly supplied the same bound strong ETag. A 200 or
                     // weak/missing tag keeps the original buffering path.
-                    if release_partial
+                    if release_partial.is_some()
                         && response.status().as_u16() == 206
                         && response_has_bound_strong_etag
+                        && (!matches!(release_partial, Some(StreamPartialRelease::AfterHonored503))
+                            || response_total_verified)
                     {
                         if io.is_cancelled() {
                             return;
@@ -1524,16 +1557,55 @@ fn stream_worker_main(
                             stripe_start = offset;
                         }
                     }
-                    response_total_verified = response
-                        .headers()
-                        .get("content-range")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(parse_content_range_total)
-                        == Some(total);
                     response_start = offset;
                     response_supplied_stripe = false;
                     skip_remaining = skip_bytes;
                     live = Some(response);
+                }
+                Ok(StreamOpened::RetryAfter(requested_delay)) => {
+                    // A 503 still spends one ordinary resume attempt. Do not
+                    // turn a server hint into progress or a new retry budget.
+                    resumes_since_progress += 1;
+                    if resumes_since_progress > HTTP_STREAM_MAX_RESUMES {
+                        mark_worker_done(&shared, true);
+                        return;
+                    }
+                    let (delay, honored) = {
+                        let inner = lock_stream(&shared);
+                        if inner.stopped || inner.epoch != epoch || io.is_cancelled() {
+                            return;
+                        }
+                        let established = idle_race_allowed
+                            && offset > start
+                            && stream_history_verified
+                            && response_has_bound_strong_etag;
+                        let fits_stall = HTTP_STREAM_STALL
+                            .checked_sub(inner.last_progress.elapsed())
+                            .is_some_and(|remaining| requested_delay < remaining);
+                        if established && fits_stall {
+                            (requested_delay, true)
+                        } else {
+                            (Duration::from_millis(300), false)
+                        }
+                    };
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_stream_retry_after\",\"offset\":{},\"attempt\":{},\"requested_seconds\":{},\"wait_ms\":{}}}",
+                        offset,
+                        resumes_since_progress,
+                        requested_delay.as_secs(),
+                        delay.as_millis(),
+                    ));
+                    // No shared guard is held. Seek/drop cancel this same I/O;
+                    // the next loop rechecks epoch/window before another open.
+                    if io.wait_cancelled(delay) {
+                        return;
+                    }
+                    if honored
+                        && matches!(release_partial, Some(StreamPartialRelease::FastReconnect))
+                    {
+                        release_partial_on_reconnect = Some(StreamPartialRelease::AfterHonored503);
+                    }
+                    continue;
                 }
                 Ok(StreamOpened::Eof) => {
                     // We still owe bytes below the known total. A premature
@@ -1832,8 +1904,9 @@ fn stream_worker_main(
                     && offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES
                 {
                     fast_body_retry_used = true;
-                    release_partial_on_reconnect =
-                        !stripe.is_empty() && response_has_bound_strong_etag;
+                    release_partial_on_reconnect = (!stripe.is_empty()
+                        && response_has_bound_strong_etag)
+                        .then_some(StreamPartialRelease::FastReconnect);
                     continue;
                 }
                 if io.wait_cancelled(Duration::from_millis(300)) {
