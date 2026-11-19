@@ -1733,7 +1733,8 @@ struct ErikaFlutterPlugin::PlayerHost {
     const uint64_t back_buffer_bytes = OpenByteCountArg(args, "httpBackBufferBytes");
     const bool wants_headers = headers != nullptr && !headers->empty();
     if (!wants_headers && read_ahead_bytes == 0 && back_buffer_bytes == 0) {
-      Check(library->open(handle, uri.c_str()), "open", library->TakeLastError());
+      const auto status = library->open(handle, uri.c_str());
+      CheckNative(status, "open");
       return;
     }
     // Never silently drop the headers or the HTTP tuning request: falling back
@@ -1765,8 +1766,8 @@ struct ErikaFlutterPlugin::PlayerHost {
       options.header_count = native_headers.size();
       options.http_read_ahead_bytes = read_ahead_bytes;
       options.http_back_buffer_bytes = back_buffer_bytes;
-      Check(library->open_with_options(handle, uri.c_str(), &options), "open",
-            library->TakeLastError());
+      const auto status = library->open_with_options(handle, uri.c_str(), &options);
+      CheckNative(status, "open");
       return;
     }
     if (read_ahead_bytes > 0 || back_buffer_bytes > 0) {
@@ -1804,9 +1805,9 @@ struct ErikaFlutterPlugin::PlayerHost {
     for (size_t index = 0; index < names.size(); ++index) {
       native_headers.push_back({names[index].c_str(), values[index].c_str()});
     }
-    Check(library->open_with_headers(handle, uri.c_str(), native_headers.data(),
-                                     native_headers.size()), "open",
-          library->TakeLastError());
+    const auto status = library->open_with_headers(
+        handle, uri.c_str(), native_headers.data(), native_headers.size());
+    CheckNative(status, "open");
   }
 
   void SetMediaMetadata(const EncodableMap& metadata) {
