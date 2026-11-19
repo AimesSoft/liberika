@@ -475,6 +475,7 @@ struct StripeHandoff {
 struct HttpRangeResponse {
     bytes: Vec<u8>,
     total_length: Option<u64>,
+    validator: Option<String>,
 }
 
 impl HttpRangeSource {
@@ -588,13 +589,23 @@ impl HttpRangeSource {
 
     fn fetch_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
         self.check_entity()?;
-        let response = fetch_http_range(
-            &self.agent,
-            &self.uri,
-            &self.http_headers,
-            range,
-            "http_range",
-        )
+        let response = if range.length.is_none() {
+            fetch_http_to_end(
+                &self.agent,
+                &self.uri,
+                &self.http_headers,
+                range.start,
+                self.content_length,
+            )
+        } else {
+            fetch_http_range(
+                &self.agent,
+                &self.uri,
+                &self.http_headers,
+                range,
+                "http_range",
+            )
+        }
         .inspect_err(|error| {
             if matches!(error, SourceError::HttpEntityChanged) {
                 self.entity_changed.store(true, Ordering::Release);
@@ -1035,52 +1046,12 @@ impl HttpRangeSource {
         Ok(())
     }
 
-    /// Read from `start` to EOF in capped pieces.
-    ///
-    /// The loop ends at the resource total when it is known, at a short answer
-    /// (EOF) otherwise, and at `HTTP_STREAM_TO_EOF_BYTE_LIMIT` as a hard stop so
-    /// an origin that keeps answering full pieces cannot grow the cache without
-    /// bound. It deliberately has no attempt cap: a sidecar larger than a few
-    /// pieces must not be truncated (the old shape read the entire tail in one
-    /// request, which is unbounded in the other direction). Hitting the hard
-    /// stop is reported as an error, never a silent short read.
+    /// Read a sidecar to EOF with one entity history across capped requests.
     fn stream_to_eof(&mut self, start: u64) -> Result<()> {
         self.kill_streams();
         self.cache_start = start;
-        self.cache_bytes.clear();
-        loop {
-            let chunk_start = self.cache_end();
-            if let Some(total) = self.content_length
-                && chunk_start >= total
-            {
-                break;
-            }
-            // EOF first so a read that has reached the declared total is a
-            // clean end even when that total exceeds the limit (a final full
-            // piece can land the cache exactly on such a total). With the EOF
-            // check ahead, the hard stop only rejects a read that still owes
-            // bytes beyond the limit: an origin with no known length that
-            // keeps answering full pieces, or a resource genuinely larger
-            // than the limit.
-            if self.cache_bytes.len() as u64 > HTTP_STREAM_TO_EOF_BYTE_LIMIT {
-                return Err(SourceError::Http(format!(
-                    "open-ended read exceeded the {HTTP_STREAM_TO_EOF_BYTE_LIMIT}-byte limit at {}",
-                    self.cache_end(),
-                )));
-            }
-            let fetched = self.fetch_range(ByteRange {
-                start: chunk_start,
-                length: Some(HTTP_REQUEST_MAX_BYTES),
-            })?;
-            if fetched.is_empty() {
-                break;
-            }
-            let short = (fetched.len() as u64) < HTTP_REQUEST_MAX_BYTES;
-            self.cache_bytes.extend_from_slice(&fetched);
-            if short {
-                break;
-            }
-        }
+        self.cache_bytes = Vec::new();
+        self.cache_bytes = self.fetch_range(ByteRange::suffix_from(start))?;
         Ok(())
     }
 }
@@ -1833,6 +1804,122 @@ fn fetch_http_range(
     })
 }
 
+fn fetch_http_to_end(
+    agent: &HttpIo,
+    uri: &str,
+    http_headers: &[(String, String)],
+    start: u64,
+    mut total_length: Option<u64>,
+) -> Result<HttpRangeResponse> {
+    let client = agent.client.clone();
+    let uri = uri.to_owned();
+    let http_headers = http_headers.to_vec();
+    agent.run(async move {
+        let mut bytes = Vec::new();
+        let mut validator = None;
+        let mut pieces = 0;
+        let mut progress_start = 0;
+        loop {
+            let end = start.saturating_add(bytes.len() as u64);
+            // Preserve known EOF before the byte ceiling (including the final
+            // full piece just past it) and before the small-progress bound.
+            if total_length.is_some_and(|total| end >= total) {
+                break;
+            }
+            if bytes.len() as u64 > HTTP_STREAM_TO_EOF_BYTE_LIMIT {
+                return Err(SourceError::Http(format!(
+                    "open-ended read exceeded the {HTTP_STREAM_TO_EOF_BYTE_LIMIT}-byte limit at {end}",
+                )));
+            }
+            if bytes.len().saturating_sub(progress_start) as u64 >= HTTP_REQUEST_MAX_BYTES {
+                progress_start = bytes.len();
+                pieces = 0;
+            }
+            if pieces >= HTTP_FETCH_MAX_PIECES_PER_READ {
+                return Err(SourceError::Http(format!(
+                    "open-ended read made less than {HTTP_REQUEST_MAX_BYTES} bytes of progress in {pieces} short responses",
+                )));
+            }
+            let response = fetch_http_range_with_history_async(
+                &client,
+                &uri,
+                &http_headers,
+                ByteRange {
+                    start: end,
+                    length: Some(HTTP_REQUEST_MAX_BYTES),
+                },
+                "http_range",
+                HttpFetchTimeouts::default(),
+                Some(HttpRangeHistory {
+                    start,
+                    prefix: &bytes,
+                    validator: validator.as_deref(),
+                    total_length,
+                }),
+            )
+            .await?;
+            total_length = response.total_length;
+            if response.bytes.is_empty() {
+                if total_length.is_some_and(|total| end < total) {
+                    return Err(SourceError::Http(
+                        "origin returned an empty sidecar body before the known end".to_string(),
+                    ));
+                }
+                break;
+            }
+            if bytes.is_empty() {
+                validator = response.validator;
+            }
+            let short = (response.bytes.len() as u64) < HTTP_REQUEST_MAX_BYTES;
+            bytes.extend_from_slice(&response.bytes);
+            pieces += 1;
+            if short && total_length.is_none() {
+                break;
+            }
+        }
+        Ok(HttpRangeResponse {
+            bytes,
+            total_length,
+            validator,
+        })
+    })
+}
+
+struct HttpRangeHistory<'a> {
+    start: u64,
+    prefix: &'a [u8],
+    validator: Option<&'a str>,
+    total_length: Option<u64>,
+}
+
+// A validator-free 200 replay must agree with every retained byte before its
+// new tail can be appended. Compare the already-discarded prefix in place.
+fn http_replay_prefix_matches(
+    chunk: &[u8],
+    offset: u64,
+    history: &HttpRangeHistory<'_>,
+    current: &[u8],
+) -> bool {
+    let mut start = history.start;
+    for expected in [history.prefix, current] {
+        let end = start.saturating_add(expected.len() as u64);
+        let overlap_start = offset.max(start);
+        let overlap_end = offset.saturating_add(chunk.len() as u64).min(end);
+        if overlap_start < overlap_end {
+            let count = (overlap_end - overlap_start) as usize;
+            let actual_offset = (overlap_start - offset) as usize;
+            let expected_offset = (overlap_start - start) as usize;
+            if chunk[actual_offset..actual_offset + count]
+                != expected[expected_offset..expected_offset + count]
+            {
+                return false;
+            }
+        }
+        start = end;
+    }
+    true
+}
+
 async fn fetch_http_range_async(
     client: &reqwest::Client,
     uri: &str,
@@ -1841,9 +1928,28 @@ async fn fetch_http_range_async(
     event: &str,
     timeouts: HttpFetchTimeouts,
 ) -> Result<HttpRangeResponse> {
+    fetch_http_range_with_history_async(client, uri, http_headers, range, event, timeouts, None)
+        .await
+}
+
+async fn fetch_http_range_with_history_async(
+    client: &reqwest::Client,
+    uri: &str,
+    http_headers: &[(String, String)],
+    range: ByteRange,
+    event: &str,
+    timeouts: HttpFetchTimeouts,
+    history: Option<HttpRangeHistory<'_>>,
+) -> Result<HttpRangeResponse> {
     let mut bytes = Vec::new();
-    let mut total_length = None;
-    let mut validator: Option<String> = None;
+    let initial_length = history.as_ref().and_then(|history| history.total_length);
+    let prior_bytes = history
+        .as_ref()
+        .is_some_and(|history| !history.prefix.is_empty());
+    let mut total_length = initial_length;
+    let mut validator = history
+        .as_ref()
+        .and_then(|history| history.validator.map(str::to_owned));
     let mut gate = HttpRetryGate::new(timeouts.total);
     loop {
         let attempt = gate.begin_attempt();
@@ -1862,18 +1968,29 @@ async fn fetch_http_range_async(
         }
         let received = bytes.len() as u64;
         if received == 0 {
-            // No retained bytes bind us to the previous response's entity.
-            // Rebind its length together with the validator on the next body.
-            total_length = None;
-            validator = None;
+            // No bytes from this fetch bind us to a failed response. Restore
+            // only the history retained before this fetch, if any.
+            total_length = initial_length;
+            validator = history
+                .as_ref()
+                .and_then(|history| history.validator.map(str::to_owned));
         }
         if range.length.is_some_and(|length| received >= length) {
             return Ok(HttpRangeResponse {
                 bytes,
                 total_length,
+                validator,
             });
         }
-        if received > 0 {
+        let resuming = received > 0 || prior_bytes;
+        // A complete weak-tagged piece may be followed by a verified 200
+        // replay, but a body failure inside this fetch keeps the old rejection.
+        let weak_prior_only = received == 0
+            && prior_bytes
+            && validator
+                .as_deref()
+                .is_some_and(|value| value.starts_with("W/"));
+        if resuming && !weak_prior_only {
             validate_resume_validator(validator.as_deref())?;
         }
         let resume_range = ByteRange {
@@ -1886,7 +2003,8 @@ async fn fetch_http_range_async(
         for (name, value) in http_headers {
             request = request.header(name, value);
         }
-        if received > 0
+        if resuming
+            && !weak_prior_only
             && let Some(validator) = validator.as_deref()
         {
             request = request.header("If-Range", validator);
@@ -1924,9 +2042,18 @@ async fn fetch_http_range_async(
             }
         };
         let status = response.status().as_u16();
-        match status {
+        // A tag bound within this fetch cannot validate an older, unbound
+        // sidecar prefix, even when a retry correctly repeats that local tag.
+        let replay_history = history.as_ref().filter(|history| {
+            status == 200
+                && resuming
+                && (validator.is_none()
+                    || weak_prior_only
+                    || (!history.prefix.is_empty() && history.validator.is_none()))
+        });
+        let reported_total = match status {
             206 => {
-                if received > 0 {
+                if resuming {
                     validate_partial_response_etag(&response, validator.as_deref())?;
                 }
                 let content_range = response
@@ -1959,27 +2086,23 @@ async fn fetch_http_range_async(
                             .to_string(),
                     ));
                 }
-                if total_length.is_none() {
-                    total_length = content_range.as_deref().and_then(parse_content_range_total);
-                }
-                if validator.is_none() {
+                if validator.is_none() && (history.is_none() || received == 0) {
                     validator = response_entity_validator(&response);
                 }
+                content_range.as_deref().and_then(parse_content_range_total)
             }
             200 => {
-                if received > 0 {
+                if resuming && !weak_prior_only {
                     validate_full_response_entity(&response, validator.as_deref())?;
                 }
-                if total_length.is_none() {
-                    total_length = response
-                        .headers()
-                        .get("content-length")
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<u64>().ok());
-                }
-                if validator.is_none() {
+                if validator.is_none() && (history.is_none() || received == 0) {
                     validator = response_entity_validator(&response);
                 }
+                response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
             }
             _ => {
                 http_trace_log(format!(
@@ -1990,7 +2113,18 @@ async fn fetch_http_range_async(
                     "unexpected HTTP status {status} for Range request"
                 )));
             }
+        };
+        if history.is_some()
+            && total_length
+                .zip(reported_total)
+                .is_some_and(|(expected, actual)| expected != actual)
+        {
+            return Err(SourceError::HttpEntityChanged);
         }
+        if total_length.is_none() {
+            total_length = reported_total;
+        }
+        let mut entity_mismatch = false;
         let mut skip_remaining = if status == 200 { resume_range.start } else { 0 };
         let mut response_bytes = 0u64;
         let mut reached_eof = false;
@@ -1999,6 +2133,17 @@ async fn fetch_http_range_async(
                 .await?
                 .map_err(reqwest::Error::without_url)?
             {
+                if let Some(history) = replay_history
+                    && !http_replay_prefix_matches(
+                        &chunk,
+                        response_bytes,
+                        history,
+                        &bytes[..received as usize],
+                    )
+                {
+                    entity_mismatch = true;
+                    return Ok(());
+                }
                 response_bytes = response_bytes.saturating_add(chunk.len() as u64);
                 let skip = skip_remaining.min(chunk.len() as u64) as usize;
                 skip_remaining -= skip as u64;
@@ -2022,6 +2167,9 @@ async fn fetch_http_range_async(
             Ok(())
         }
         .await;
+        if entity_mismatch || (replay_history.is_some() && reached_eof && skip_remaining > 0) {
+            return Err(SourceError::HttpEntityChanged);
+        }
         if let Err(error) = body_result {
             // Release the stalled socket before sleeping or opening its resume.
             drop(response);
@@ -2052,6 +2200,13 @@ async fn fetch_http_range_async(
             }
             return Err(SourceError::Http(error.to_string()));
         }
+        if history.is_some()
+            && status == 200
+            && reached_eof
+            && total_length.is_some_and(|total| total != response_bytes)
+        {
+            return Err(SourceError::HttpEntityChanged);
+        }
         if status == 200 && reached_eof && total_length.is_none() {
             // Count the discarded prefix too. This also discovers EOF when
             // the requested offset is beyond a lengthless response's body.
@@ -2072,6 +2227,7 @@ async fn fetch_http_range_async(
         return Ok(HttpRangeResponse {
             bytes,
             total_length,
+            validator,
         });
     }
 }
