@@ -618,6 +618,14 @@ impl MetalRenderer {
     }
 
     fn import_player_frame(&mut self, frame: &Frame) -> Result<ImportedVideoFrame> {
+        let unsupported = || {
+            PlayerError::Renderer(format!(
+                "unsupported software video frame format {}",
+                frame
+                    .pixel_format()
+                    .unwrap_or_else(|| "unknown".to_string())
+            ))
+        };
         let mut imported = if let Some(pixel_buffer) = frame.videotoolbox_pixel_buffer() {
             unsafe {
                 self.import_video_frame_textures(VideoFrameTextureSource::new(
@@ -627,15 +635,7 @@ impl MetalRenderer {
                 ))
             }?
         } else {
-            let planar = frame.to_planar_frame().ok_or_else(|| {
-                PlayerError::Renderer(format!(
-                    "unsupported software video frame format {}",
-                    frame
-                        .pixel_format()
-                        .unwrap_or_else(|| "unknown".to_string())
-                ))
-            })?;
-            self.import_planar_frame(&planar, frame.color_range())?
+            self.import_software_frame(frame, unsupported)?
         };
         imported.set_source_color_metadata(
             frame.color_primaries(),
@@ -646,6 +646,27 @@ impl MetalRenderer {
             frame.dovi_metadata(),
         );
         Ok(imported)
+    }
+
+    fn import_software_frame(
+        &mut self,
+        frame: &Frame,
+        unsupported: impl FnOnce() -> PlayerError,
+    ) -> Result<ImportedVideoFrame> {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        if frame.is_8bit_420_software() {
+            let planes = frame.software_nv12_upload().ok_or_else(unsupported)?;
+            let result = self
+                .inner
+                .upload_software_nv12(&planes, frame.color_range() == ColorRange::Full)?;
+            return Ok(ImportedVideoFrame {
+                info: result.info,
+                source_color: SourceColorState::default(),
+                inner: Some(result.textures),
+            });
+        }
+        let planar = frame.to_planar_frame().ok_or_else(unsupported)?;
+        self.import_planar_frame(&planar, frame.color_range())
     }
 
     fn import_planar_frame(

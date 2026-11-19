@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use crate::core::{PlayerError, Result};
-use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
+use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat, SoftwareNv12Upload};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_core_foundation::CFRetained;
@@ -2272,23 +2272,13 @@ impl MetalRendererImpl {
         let height = frame.height as usize;
         let chroma_width = width.div_ceil(2);
         let chroma_height = height.div_ceil(2);
-        let (
-            format,
-            luma_format,
-            chroma_format,
-            luma_stride,
-            chroma_stride,
-            luma_name,
-            chroma_name,
-        ) = match frame.format {
+        let (format, luma_format, chroma_format, luma_stride, chroma_stride) = match frame.format {
             PlanarPixelFormat::Nv12 => (
                 ImportedVideoFormat::Nv12,
                 MTLPixelFormat::R8Unorm,
                 MTLPixelFormat::RG8Unorm,
                 width,
                 chroma_width * 2,
-                "R8Unorm",
-                "RG8Unorm",
             ),
             PlanarPixelFormat::P010 => (
                 ImportedVideoFormat::P010,
@@ -2296,8 +2286,6 @@ impl MetalRendererImpl {
                 MTLPixelFormat::RG16Unorm,
                 width * 2,
                 chroma_width * 4,
-                "R16Unorm",
-                "RG16Unorm",
             ),
         };
         let luma =
@@ -2309,7 +2297,64 @@ impl MetalRendererImpl {
             chroma_stride,
             &frame.chroma,
         )?;
-        Ok(ImportedVideoFrameResult {
+        Ok(Self::planar_video_frame_result(
+            width, height, format, full_range, luma, chroma,
+        ))
+    }
+
+    pub(super) fn upload_software_nv12(
+        &self,
+        frame: &SoftwareNv12Upload<'_>,
+        full_range: bool,
+    ) -> Result<ImportedVideoFrameResult> {
+        let (width, height) = frame.dimensions();
+        let y = frame.luma();
+        let (uv, uv_stride) = frame.chroma_parts();
+        // The prepared view validated every source plane and finished UV
+        // packing before this point. Both sources live through these
+        // synchronous copies; no source pointer enters the returned frame.
+        let (luma, chroma) = unsafe {
+            (
+                self.create_video_plane_texture_from_ptr(
+                    width,
+                    height,
+                    MTLPixelFormat::R8Unorm,
+                    y.stride(),
+                    y.as_ptr(),
+                )?,
+                self.create_video_plane_texture_from_ptr(
+                    width.div_ceil(2),
+                    height.div_ceil(2),
+                    MTLPixelFormat::RG8Unorm,
+                    uv_stride,
+                    uv,
+                )?,
+            )
+        };
+        Ok(Self::planar_video_frame_result(
+            width,
+            height,
+            ImportedVideoFormat::Nv12,
+            full_range,
+            luma,
+            chroma,
+        ))
+    }
+
+    fn planar_video_frame_result(
+        width: usize,
+        height: usize,
+        format: ImportedVideoFormat,
+        full_range: bool,
+        luma: Retained<ProtocolObject<dyn MTLTexture>>,
+        chroma: Retained<ProtocolObject<dyn MTLTexture>>,
+    ) -> ImportedVideoFrameResult {
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        let (luma_name, chroma_name) = match format {
+            ImportedVideoFormat::Nv12 => ("R8Unorm", "RG8Unorm"),
+            ImportedVideoFormat::P010 => ("R16Unorm", "RG16Unorm"),
+        };
+        ImportedVideoFrameResult {
             info: ImportedVideoFrameInfo {
                 width,
                 height,
@@ -2354,7 +2399,7 @@ impl MetalRendererImpl {
                     },
                 ],
             },
-        })
+        }
     }
 
     fn create_video_plane_texture(
@@ -2374,6 +2419,24 @@ impl MetalRendererImpl {
                 pixels.len()
             )));
         }
+        // SAFETY: a checked, fully initialized packed slice spans every row.
+        unsafe {
+            self.create_video_plane_texture_from_ptr(width, height, format, stride, pixels.as_ptr())
+        }
+    }
+
+    /// # Safety
+    /// The source must remain valid through replaceRegion, with initialized
+    /// visible pixels in every row separated by stride. Padding is not read
+    /// through a Rust reference. The texture consumes this data synchronously.
+    unsafe fn create_video_plane_texture_from_ptr(
+        &self,
+        width: usize,
+        height: usize,
+        format: MTLPixelFormat,
+        stride: usize,
+        pixels: *const u8,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
         let descriptor = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                 format, width, height, false,
@@ -2399,7 +2462,7 @@ impl MetalRendererImpl {
             texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 region,
                 0,
-                NonNull::new(pixels.as_ptr().cast::<c_void>().cast_mut())
+                NonNull::new(pixels.cast::<c_void>().cast_mut())
                     .expect("software video plane pointer is non-null"),
                 stride,
             );

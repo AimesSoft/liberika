@@ -3257,6 +3257,155 @@ impl Frame {
     }
 }
 
+// This view is internal to the Apple upload path. The public packed conversion
+// APIs, reusable D3D11 writer, and all 10-bit/fallback formats stay independent.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+mod software_nv12_upload {
+    use super::{Frame, PhantomData, slice, sys};
+
+    pub(crate) struct StridedPlane<'a> {
+        ptr: *const u8,
+        stride: usize,
+        row_bytes: usize,
+        rows: usize,
+        span: usize,
+        _frame: PhantomData<&'a Frame>,
+    }
+
+    impl<'a> StridedPlane<'a> {
+        fn from_frame(
+            frame: &'a Frame,
+            plane: usize,
+            row_bytes: usize,
+            rows: usize,
+        ) -> Option<Self> {
+            let raw = unsafe { &*frame.ptr };
+            let ptr = raw.data[plane] as *const u8;
+            let stride = usize::try_from(raw.linesize[plane]).ok()?;
+            let span = rows
+                .checked_sub(1)?
+                .checked_mul(stride)?
+                .checked_add(row_bytes)?;
+            if ptr.is_null() || row_bytes == 0 || stride < row_bytes || span > isize::MAX as usize {
+                return None;
+            }
+            (ptr as usize).checked_add(span)?;
+            Some(Self {
+                ptr,
+                stride,
+                row_bytes,
+                rows,
+                span,
+                _frame: PhantomData,
+            })
+        }
+
+        pub(crate) fn as_ptr(&self) -> *const u8 {
+            self.ptr
+        }
+        pub(crate) fn stride(&self) -> usize {
+            self.stride
+        }
+
+        pub(crate) fn visible_row(&self, row: usize) -> Option<&[u8]> {
+            let offset = row.checked_mul(self.stride)?;
+            if row >= self.rows || offset.checked_add(self.row_bytes)? > self.span {
+                return None;
+            }
+            // Only visible bytes form a Rust slice. Decoder row padding need
+            // not be initialized and is never covered by a &[u8].
+            Some(unsafe { slice::from_raw_parts(self.ptr.add(offset), self.row_bytes) })
+        }
+    }
+
+    enum Chroma<'a> {
+        Borrowed(StridedPlane<'a>),
+        Packed(Vec<u8>),
+    }
+
+    pub(crate) struct SoftwareNv12Upload<'a> {
+        width: usize,
+        height: usize,
+        luma: StridedPlane<'a>,
+        chroma: Chroma<'a>,
+    }
+
+    impl SoftwareNv12Upload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.luma
+        }
+        pub(crate) fn chroma_parts(&self) -> (*const u8, usize) {
+            match &self.chroma {
+                Chroma::Borrowed(plane) => (plane.as_ptr(), plane.stride()),
+                Chroma::Packed(bytes) => (bytes.as_ptr(), self.width.div_ceil(2) * 2),
+            }
+        }
+    }
+
+    impl Frame {
+        pub(crate) fn is_8bit_420_software(&self) -> bool {
+            matches!(
+                self.raw_pixel_format(),
+                sys::AVPixelFormat_AV_PIX_FMT_YUV420P | sys::AVPixelFormat_AV_PIX_FMT_NV12
+            )
+        }
+
+        pub(crate) fn software_nv12_upload(&self) -> Option<SoftwareNv12Upload<'_>> {
+            if !self.is_8bit_420_software() {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            let uv_row_bytes = cw.checked_mul(2)?;
+            let uv_len = uv_row_bytes.checked_mul(ch)?;
+            let luma = StridedPlane::from_frame(self, 0, width, height)?;
+            let chroma = if self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                let uv = StridedPlane::from_frame(self, 1, uv_row_bytes, ch)?;
+                // RG8 requires a row pitch divisible by two. Keep the packed
+                // row-copy path for an otherwise valid odd source UV stride.
+                if uv.stride() % 2 == 0 {
+                    Chroma::Borrowed(uv)
+                } else {
+                    let mut bytes = Vec::with_capacity(uv_len);
+                    for row in 0..ch {
+                        bytes.extend_from_slice(uv.visible_row(row)?);
+                    }
+                    Chroma::Packed(bytes)
+                }
+            } else {
+                let u = StridedPlane::from_frame(self, 1, cw, ch)?;
+                let v = StridedPlane::from_frame(self, 2, cw, ch)?;
+                // All source planes have been checked before packing UV, and
+                // the complete packed UV exists before Metal creates textures.
+                let mut bytes = vec![0; uv_len];
+                for (row, dst) in bytes.chunks_exact_mut(uv_row_bytes).enumerate() {
+                    let (u, v) = (u.visible_row(row)?, v.visible_row(row)?);
+                    for col in 0..cw {
+                        dst[col * 2] = u[col];
+                        dst[col * 2 + 1] = v[col];
+                    }
+                }
+                Chroma::Packed(bytes)
+            };
+            Some(SoftwareNv12Upload {
+                width,
+                height,
+                luma,
+                chroma,
+            })
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub(crate) use software_nv12_upload::SoftwareNv12Upload;
+
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
 /// (`width * height`) and an interleaved Cb/Cr plane at half resolution
 /// (`ceil(width / 2) * ceil(height / 2) * 2`).
