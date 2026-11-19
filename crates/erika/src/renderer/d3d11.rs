@@ -2425,8 +2425,14 @@ impl D3d11Renderer {
         }
         let key = alpha_atlas::ContentKey::new_for_overlay(frame, owner, limit, &layouts);
         let mut pages = Vec::with_capacity(layouts.len());
+        let pixel_capacity = layouts.iter().try_fold(0usize, |capacity, page| {
+            page.pixel_len().map(|len| capacity.max(len))
+        })?;
+        // Allocate the largest page exactly once; geometric growth on later
+        // pages could otherwise double this transient buffer for large atlases.
+        let mut pixels = Vec::with_capacity(pixel_capacity);
         for page in layouts {
-            let pixels = page.pixels(bitmaps)?;
+            page.write_pixels(bitmaps, &mut pixels)?;
             let texture = create_cpu_texture(
                 self.state.as_ref().expect("device ensured"),
                 page.width,
@@ -2435,6 +2441,9 @@ impl D3d11Renderer {
                 &pixels,
                 page.width,
             )?;
+            // CreateTexture2D has copied initial data before returning, just
+            // as when the old per-page Vec was dropped here. Only this CPU
+            // scratch is reused; every GPU page remains immutable.
             self.stats.overlay_alpha_atlas_uploads += 1;
             pages.push(D3d11SubtitleAlphaPage {
                 layout: page,

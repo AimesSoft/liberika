@@ -287,11 +287,22 @@ pub(super) fn layout(bitmaps: &[SubtitleAlphaBitmap], limit: u32) -> Result<Vec<
 }
 
 impl Page {
-    pub fn pixels(&self, bitmaps: &[SubtitleAlphaBitmap]) -> Result<Vec<u8>> {
-        let len = (self.width as usize)
+    pub fn pixel_len(&self) -> Result<usize> {
+        (self.width as usize)
             .checked_mul(self.height as usize)
-            .ok_or_else(invalid)?;
-        let mut pixels = vec![0; len];
+            .ok_or_else(invalid)
+    }
+
+    pub fn write_pixels(
+        &self,
+        bitmaps: &[SubtitleAlphaBitmap],
+        pixels: &mut Vec<u8>,
+    ) -> Result<()> {
+        let len = self.pixel_len()?;
+        // Reset every byte, including unused rows below shorter tiles, before
+        // filling this page. Capacity may come from an earlier page this frame.
+        pixels.clear();
+        pixels.resize(len, 0);
         for tile in &self.tiles {
             let image = &bitmaps[tile.bitmap];
             for row in 0..tile.height + 2 {
@@ -310,6 +321,6 @@ impl Page {
                 pixels[dst + width + 1] = image.alpha[src_row + right as usize];
             }
         }
-        Ok(pixels)
+        Ok(())
     }
 }
