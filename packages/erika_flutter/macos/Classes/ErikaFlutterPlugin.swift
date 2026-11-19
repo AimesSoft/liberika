@@ -622,7 +622,7 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
   case viewNotFound(Int64)
   case overlayNotAvailable
   case presenterCreateFailed
-  case erikaStatus(String, Int32, String?)
+  case erikaStatus(String, Int32)
   case libraryLoadFailed(String, String?)
   case diagnosticsUnsupported(String)
   case diagnosticsFailed(String)
@@ -647,10 +647,7 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
       return "No window-hosted Erika overlay is available."
     case .presenterCreateFailed:
       return "erika_presenter_create returned null."
-    case .erikaStatus(let operation, let status, let detail):
-      if let detail, !detail.isEmpty {
-        return "\(operation) failed with ErikaStatus \(status): \(detail)"
-      }
+    case .erikaStatus(let operation, let status):
       return "\(operation) failed with ErikaStatus \(status)."
     case .libraryLoadFailed(let path, let detail):
       if let detail, !detail.isEmpty {
@@ -1536,7 +1533,7 @@ private final class ErikaPlayerHost {
     guard let handle else { return }
     let status = library.detachSurface(handle)
     if status != 0 {
-      surfaceError = ErikaPluginError.erikaStatus("detach_surface", status, nil)
+      surfaceError = ErikaPluginError.erikaStatus("detach_surface", status)
       library.destroy(handle)
       self.handle = nil
     }
@@ -1578,7 +1575,7 @@ private final class ErikaPlayerHost {
     try withNativeCall {
       try uri.withCString { cString in
         guard !httpHeaders.isEmpty || httpReadAheadBytes > 0 || httpBackBufferBytes > 0 else {
-          try check(library.open(handle, cString), operation: "open", captureNativeDetail: true)
+          try check(library.open(handle, cString), operation: "open")
           return
         }
         // Never silently drop the headers or the HTTP tuning request: falling
@@ -1600,7 +1597,7 @@ private final class ErikaPlayerHost {
               httpBackBufferBytes: httpBackBufferBytes
             )
             try withUnsafePointer(to: &options) { optionsPtr in
-              try check(openWithOptions(handle, cString, UnsafeRawPointer(optionsPtr)), operation: "open", captureNativeDetail: true)
+              try check(openWithOptions(handle, cString, UnsafeRawPointer(optionsPtr)), operation: "open")
             }
           }
           return
@@ -1621,7 +1618,7 @@ private final class ErikaPlayerHost {
         }
         let headers = zip(names, values).map { ErikaHttpHeader(name: $0.0, value: $0.1) }
         try headers.withUnsafeBufferPointer { buffer in
-          try check(openWithHeaders(handle, cString, buffer.baseAddress.map(UnsafeRawPointer.init), UInt(headers.count)), operation: "open", captureNativeDetail: true)
+          try check(openWithHeaders(handle, cString, buffer.baseAddress.map(UnsafeRawPointer.init), UInt(headers.count)), operation: "open")
         }
       }
     }
@@ -2753,16 +2750,9 @@ private final class ErikaPlayerHost {
     return erikaDefaultDisplayFps
   }
 
-  private func check(
-    _ status: Int32,
-    operation: String,
-    captureNativeDetail: Bool = false
-  ) throws {
+  private func check(_ status: Int32, operation: String) throws {
     if status != 0 {
-      // Capture this failing call's TLS text on its native owner, before
-      // another command runs or the error crosses to Flutter's main thread.
-      let detail = captureNativeDetail ? library.currentEventMessage() : nil
-      throw ErikaPluginError.erikaStatus(operation, status, detail)
+      throw ErikaPluginError.erikaStatus(operation, status)
     }
   }
 }
