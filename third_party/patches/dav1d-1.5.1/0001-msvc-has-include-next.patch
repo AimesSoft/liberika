@@ -1,0 +1,10 @@
+diff --git a/include/compat/msvc/stdatomic.h b/include/compat/msvc/stdatomic.h
+--- a/include/compat/msvc/stdatomic.h
++++ b/include/compat/msvc/stdatomic.h
+@@ -35,2 +35,6 @@
++#ifndef __has_include_next
++#define __has_include_next(x) 0
++#endif
++
+ #if defined(__clang__) && __has_include_next(<stdatomic.h>)
+    /* use the clang stdatomic.h with clang-cl*/
