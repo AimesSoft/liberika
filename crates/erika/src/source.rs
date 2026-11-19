@@ -461,6 +461,8 @@ struct StreamInner {
     window_end: u64,
     /// Current requested read end if cache coverage is insufficient, else zero.
     uncovered_read_end: u64,
+    /// Exclusive ownership of the partial stripe during the current body read.
+    reading_partial: Option<StreamReadPartial>,
     /// Set when the source is dropped: every worker exits.
     stopped: bool,
 }
@@ -469,6 +471,23 @@ struct StripeHandoff {
     start: u64,
     bytes: Vec<u8>,
 }
+
+// A single in-flight read, never an additional response or buffer copy. The
+// reader can take the bytes only after observed network idleness and only when
+// they cover its entire uncovered request. The worker reclaims ownership when
+// that same body read completes, preserving its original stripe boundary.
+struct StreamReadPartial {
+    epoch: u64,
+    index: u64,
+    end: u64,
+    read_started: Instant,
+    idle_recovery: bool,
+    handoff: Option<StripeHandoff>,
+}
+
+// A healthy response chunk disarms this by completing the existing read. No
+// timer or extra wakeup is installed: blocked readers already recheck coverage.
+const HTTP_IDLE_PREFIX_GRACE: Duration = Duration::from_secs(1);
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
 /// by the server (`Content-Range` on 206, `Content-Length` on a whole-file
@@ -693,7 +712,27 @@ impl HttpRangeSource {
         loop {
             let handoff = {
                 let mut inner = lock_stream(&shared);
-                match inner.pending.remove(&self.stream_frontier) {
+                let handoff = inner.pending.remove(&self.stream_frontier).or_else(|| {
+                    let demand = inner.uncovered_read_end;
+                    let epoch = inner.epoch;
+                    let stopped = inner.stopped || inner.worker_done;
+                    let partial = inner.reading_partial.as_mut()?;
+                    let start = partial.handoff.as_ref()?.start;
+                    if !stopped
+                        && partial.epoch == epoch
+                        && partial.index == self.stream_frontier
+                        && start < demand
+                        && demand <= partial.end
+                        && (partial.idle_recovery
+                            || partial.read_started.elapsed() >= HTTP_IDLE_PREFIX_GRACE)
+                        && !self.agent.is_cancelled()
+                    {
+                        partial.handoff.take()
+                    } else {
+                        None
+                    }
+                });
+                match handoff {
                     Some(handoff) => {
                         self.stream_frontier += 1;
                         handoff
@@ -827,6 +866,7 @@ impl HttpRangeSource {
                 } else {
                     0
                 },
+                reading_partial: None,
                 stopped: false,
             }),
             signal: Condvar::new(),
@@ -1227,6 +1267,12 @@ fn stream_worker_main(
     let mut skip_remaining = 0;
     let mut response_start = start;
     let mut response_has_bound_strong_etag = false;
+    // Once unbound response bytes enter this worker history, never use them
+    // for an early idle-prefix handoff, even if a later response adds a tag.
+    let mut stream_history_verified = true;
+    // Enabled only after the reader actually takes an idle slot; expires at
+    // this logical stripe's original 4 MiB end, never a healthy first stripe.
+    let mut idle_partial_delivered = false;
     let mut resumes_since_progress: u32 = 0;
     let mut fast_body_retry_used = false;
     let mut release_partial_on_reconnect = false;
@@ -1332,6 +1378,28 @@ fn stream_worker_main(
             }
         }
         let mut response = live.take().expect("live response exists");
+        let offered_partial = !stripe.is_empty()
+            && stream_history_verified
+            && response.status().as_u16() == 206
+            && response_has_bound_strong_etag;
+        if offered_partial {
+            let mut inner = lock_stream(&shared);
+            if inner.stopped || inner.epoch != epoch || io.is_cancelled() {
+                return;
+            }
+            debug_assert!(inner.reading_partial.is_none());
+            inner.reading_partial = Some(StreamReadPartial {
+                epoch,
+                index: stripe_index,
+                end: offset,
+                read_started: Instant::now(),
+                idle_recovery: idle_partial_delivered,
+                handoff: Some(StripeHandoff {
+                    start: stripe_start,
+                    bytes: std::mem::take(&mut stripe),
+                }),
+            });
+        }
         let body = io.run(async move {
             let chunk = tokio::time::timeout(HTTP_STREAM_BODY_TIMEOUT, response.chunk())
                 .await
@@ -1339,6 +1407,28 @@ fn stream_worker_main(
                 .map_err(|error| SourceError::Http(error.without_url().to_string()))?;
             Ok((response, chunk))
         });
+        {
+            // Reuse the existing per-chunk progress lock for reclamation. The
+            // socket future and its body timeout above are completely unchanged.
+            let mut inner = lock_stream(&shared);
+            if offered_partial {
+                let partial = inner
+                    .reading_partial
+                    .take()
+                    .expect("in-flight partial slot");
+                if let Some(handoff) = partial.handoff {
+                    stripe = handoff.bytes;
+                } else {
+                    idle_partial_delivered = true;
+                    stripe_index += 1;
+                    stripe_start = offset;
+                }
+            }
+            if let Ok((_, Some(bytes))) = &body {
+                inner.progress_bytes += bytes.len() as u64;
+                inner.last_progress = Instant::now();
+            }
+        }
         match body {
             Ok((_response, None)) => {
                 // A valid 206 can cover less than the requested tail. Keep its
@@ -1358,16 +1448,13 @@ fn stream_worker_main(
                 }
             }
             Ok((response, Some(bytes))) => {
+                let response_verified =
+                    response.status().as_u16() == 206 && response_has_bound_strong_etag;
                 live = Some(response);
                 // A 200 starts at byte zero even after a reconnect. Discard
                 // the prefix in chunks without changing the cache offset.
                 let skip = skip_remaining.min(bytes.len() as u64) as usize;
                 skip_remaining -= skip as u64;
-                {
-                    let mut inner = lock_stream(&shared);
-                    inner.progress_bytes += bytes.len() as u64;
-                    inner.last_progress = Instant::now();
-                }
                 let bytes = &bytes[skip..];
                 if bytes.is_empty() {
                     continue;
@@ -1376,6 +1463,9 @@ fn stream_worker_main(
                     stripe_opened = Some(Instant::now());
                 }
                 let received = bytes.len().min((total - offset) as usize);
+                if received != 0 {
+                    stream_history_verified &= response_verified;
+                }
                 resumes_since_progress = 0;
                 let mut consumed = 0usize;
                 while consumed < received {
@@ -1410,8 +1500,34 @@ fn stream_worker_main(
                         stripe_index += 1;
                         stripe_start = offset;
                         stripe_received = 0;
+                        idle_partial_delivered = false;
                         if consumed < received {
                             stripe_opened = Some(Instant::now());
+                        }
+                    } else if idle_partial_delivered
+                        && stream_history_verified
+                        && response_has_bound_strong_etag
+                        && !stripe.is_empty()
+                    {
+                        if io.is_cancelled() {
+                            return;
+                        }
+                        let mut inner = lock_stream(&shared);
+                        if !inner.stopped
+                            && inner.epoch == epoch
+                            && stripe_start < inner.uncovered_read_end
+                            && inner.uncovered_read_end <= offset
+                        {
+                            inner.pending.insert(
+                                stripe_index,
+                                StripeHandoff {
+                                    start: stripe_start,
+                                    bytes: std::mem::take(&mut stripe),
+                                },
+                            );
+                            shared.signal.notify_all();
+                            stripe_index += 1;
+                            stripe_start = offset;
                         }
                     }
                 }
@@ -5002,6 +5118,7 @@ mod tests {
                     last_progress: Instant::now(),
                     window_end: total,
                     uncovered_read_end: 0,
+                    reading_partial: None,
                     stopped: false,
                 }),
                 signal: Condvar::new(),
