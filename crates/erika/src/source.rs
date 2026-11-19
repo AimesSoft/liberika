@@ -983,14 +983,20 @@ impl HttpRangeSource {
             {
                 return false;
             }
-            if inner.idle_race_read.is_some_and(|(offset, read_started)| {
-                inner.uncovered_read_end > offset && read_started.elapsed() >= HTTP_IDLE_RACE_GRACE
-            }) {
-                shared.demand.notify_one();
+            let mut wait = Duration::from_millis(500);
+            if let Some((offset, read_started)) = inner.idle_race_read
+                && inner.uncovered_read_end > offset
+            {
+                let elapsed = read_started.elapsed();
+                if elapsed >= HTTP_IDLE_RACE_GRACE {
+                    shared.demand.notify_one();
+                } else {
+                    // Existing foreground demand on a verified stalled read:
+                    // wake at its unchanged grace deadline if it comes first.
+                    wait = wait.min(HTTP_IDLE_RACE_GRACE - elapsed);
+                }
             }
-            let _ = shared
-                .signal
-                .wait_timeout(inner, Duration::from_millis(500));
+            let _ = shared.signal.wait_timeout(inner, wait);
         }
     }
 
