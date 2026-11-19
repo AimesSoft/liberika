@@ -1277,7 +1277,10 @@ class ErikaPlayer {
     };
     var startTaken = startPosition == null || startPosition <= Duration.zero;
     final atomicStart =
-        !kIsWeb && defaultTargetPlatform == TargetPlatform.macOS && !startTaken;
+        !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.windows) &&
+        !startTaken;
     if (atomicStart) {
       try {
         final taken = await _channel.invokeMethod<bool>(
