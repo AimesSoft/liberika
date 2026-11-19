@@ -2487,8 +2487,10 @@ impl PersistentGlyphAtlas {
         let height = GLYPH_ATLAS_INITIAL_HEIGHT;
         let stride = width as usize;
         let mut fill_alpha = vec![0; stride * height as usize];
+        let mut outline_alpha = vec![0; stride * height as usize];
         for row in 0..SOLID_ATLAS_BLOCK as usize {
             fill_alpha[row * stride..row * stride + SOLID_ATLAS_BLOCK as usize].fill(u8::MAX);
+            outline_alpha[row * stride..row * stride + SOLID_ATLAS_BLOCK as usize].fill(u8::MAX);
         }
         Self {
             width,
@@ -2497,7 +2499,7 @@ impl PersistentGlyphAtlas {
             cursor_x: SOLID_ATLAS_BLOCK,
             cursor_y: 0,
             row_height: SOLID_ATLAS_BLOCK,
-            outline_alpha: fill_alpha.clone(),
+            outline_alpha,
             fill_alpha,
             packed: HashMap::new(),
             version: NEXT_GLYPH_ATLAS_VERSION.fetch_add(1, Ordering::Relaxed),
