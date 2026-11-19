@@ -294,6 +294,42 @@ pub struct PresenterRuntimeSnapshot {
 mod subtitle_resolution;
 use subtitle_resolution::SubtitleResolution;
 
+// Only renderers that use immutable ownership pay for an Arc allocation.
+// Public overlay/context APIs keep their borrowed Vec-based representation.
+#[derive(Debug)]
+enum CurrentOverlay {
+    Owned(OverlayFrame),
+    Shared(Arc<OverlayFrame>),
+}
+
+impl CurrentOverlay {
+    fn new(frame: OverlayFrame, share: bool) -> Self {
+        if share && frame.subtitle_planes.is_empty() && !frame.subtitle_alpha_planes.is_empty() {
+            Self::Shared(Arc::new(frame))
+        } else {
+            Self::Owned(frame)
+        }
+    }
+
+    fn shared_owner(&self) -> Option<&Arc<OverlayFrame>> {
+        match self {
+            Self::Shared(owner) => Some(owner),
+            Self::Owned(_) => None,
+        }
+    }
+}
+
+impl std::ops::Deref for CurrentOverlay {
+    type Target = OverlayFrame;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(frame) => frame,
+            Self::Shared(owner) => owner,
+        }
+    }
+}
+
 pub struct PresenterRuntime {
     player: Player,
     renderer: Box<dyn RendererBackend>,
@@ -312,7 +348,7 @@ pub struct PresenterRuntime {
     resume_pending: bool,
     video_decode_resume_attempts: u32,
     latest_video_decoder: Option<VideoDecoderEvent>,
-    current_overlay: Option<OverlayFrame>,
+    current_overlay: Option<CurrentOverlay>,
     debug_hud: DebugHud,
     current_danmaku: Option<DanmakuRenderPlan>,
     current_danmaku_prepared: Option<CurrentDanmakuPrepared>,
@@ -1741,23 +1777,31 @@ impl PresenterRuntime {
             });
             hud_plane.map(|plane| {
                 let viewport = hud_viewport.expect("HUD requires a viewport");
-                let mut overlay = self
-                    .current_overlay
-                    .clone()
-                    .unwrap_or_else(|| OverlayFrame {
-                        pts: self.current_media_time,
-                        viewport,
-                        subtitle_planes: Vec::new(),
-                        subtitle_alpha_planes: Vec::new(),
-                        subtitle_changed: false,
-                    });
+                let mut overlay =
+                    self.current_overlay
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_else(|| OverlayFrame {
+                            pts: self.current_media_time,
+                            viewport,
+                            subtitle_planes: Vec::new(),
+                            subtitle_alpha_planes: Vec::new(),
+                            subtitle_changed: false,
+                        });
                 overlay.subtitle_planes.push(plane);
                 overlay
             })
         } else {
             None
         };
-        let render_overlay = hud_overlay.as_ref().or(self.current_overlay.as_ref());
+        let render_overlay = hud_overlay.as_ref().or(self.current_overlay.as_deref());
+        let overlay_owner = if hud_overlay.is_none() {
+            self.current_overlay
+                .as_ref()
+                .and_then(CurrentOverlay::shared_owner)
+        } else {
+            None
+        };
         let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
             .overlay(render_overlay)
             .danmaku(self.current_danmaku.as_ref())
@@ -1775,7 +1819,11 @@ impl PresenterRuntime {
             return Ok(self.stats);
         }
         let render_started = Instant::now();
-        let render_result = self.renderer.render_current_frame(context);
+        let render_result = if let Some(owner) = overlay_owner {
+            self.renderer.render_current_frame_shared(context, owner)
+        } else {
+            self.renderer.render_current_frame(context)
+        };
         self.last_render_current_duration = render_started.elapsed();
         self.last_render_duration = self.last_render_current_duration;
         self.last_render_test_duration = Duration::ZERO;
@@ -2887,7 +2935,7 @@ impl PresenterRuntime {
             if !overlay.is_empty() {
                 self.stats.overlay_frames += 1;
             }
-            self.current_overlay = Some(overlay);
+            self.current_overlay = Some(self.retain_overlay(overlay));
         } else {
             self.current_overlay = None;
         }
@@ -3109,7 +3157,7 @@ impl PresenterRuntime {
                         overlay_debug_summary(&overlay),
                     );
                 }
-                self.current_overlay = Some(overlay);
+                self.current_overlay = Some(self.retain_overlay(overlay));
             }
         }
         self.trace_danmaku_time(
@@ -3132,7 +3180,12 @@ impl PresenterRuntime {
         let Some(source) = self.subtitle_resolution.source else {
             return;
         };
-        self.current_overlay = Some(self.render_playback_overlay(self.current_media_time, source));
+        let overlay = self.render_playback_overlay(self.current_media_time, source);
+        self.current_overlay = Some(self.retain_overlay(overlay));
+    }
+
+    fn retain_overlay(&self, overlay: OverlayFrame) -> CurrentOverlay {
+        CurrentOverlay::new(overlay, self.renderer.prefers_shared_overlay())
     }
 
     fn render_playback_overlay(&mut self, pts: Duration, source: OverlayViewport) -> OverlayFrame {
@@ -5127,13 +5180,13 @@ mod tests {
             generation: 2,
             state: PlayerState::Playing,
         };
-        presenter.current_overlay = Some(OverlayFrame {
+        presenter.current_overlay = Some(CurrentOverlay::Owned(OverlayFrame {
             pts: Duration::ZERO,
             viewport: OverlayViewport::new(640, 360),
             subtitle_planes: vec![],
             subtitle_alpha_planes: vec![],
             subtitle_changed: false,
-        });
+        }));
         presenter.subtitle_resolution.source = Some(OverlayViewport::new(640, 360));
         presenter.current_surface_metrics = Some(SurfaceMetrics::new(640, 360, 1.0));
         // Replaying the same display target after other work must not move it.

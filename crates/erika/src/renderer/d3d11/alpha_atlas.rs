@@ -1,7 +1,9 @@
 //! Ordered, bounded subtitle atlas pages. A one-pixel border preserves linear
 //! filtering even when a single libass bitmap must span multiple textures.
 use crate::core::{PlayerError, Result};
-use crate::subtitle::SubtitleAlphaBitmap;
+use crate::overlay::OverlayFrame;
+use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlane};
+use std::sync::Arc;
 
 // Bounds retained CPU keys/layouts and R8 texture payload, not transient upload
 // buffers or driver allocation overhead. Large subtitles still render in full.
@@ -14,9 +16,112 @@ struct BitmapKey {
     alpha: Box<[u8]>,
 }
 
+enum AlphaStorage {
+    Owned(Box<[BitmapKey]>),
+    // Alpha-only frames keep the presenter's allocation alive; mixed RGBA
+    // overlays always use the owned mask snapshot instead.
+    Shared(Arc<OverlayFrame>),
+}
+
+pub(super) struct AlphaSnapshot {
+    storage: AlphaStorage,
+}
+
+impl AlphaSnapshot {
+    pub fn new(bitmaps: &[SubtitleAlphaBitmap]) -> Arc<Self> {
+        Arc::new(Self {
+            storage: AlphaStorage::Owned(
+                bitmaps
+                    .iter()
+                    .map(|bitmap| BitmapKey {
+                        width: bitmap.placement.width,
+                        height: bitmap.placement.height,
+                        stride: bitmap.stride,
+                        alpha: bitmap.alpha.clone().into_boxed_slice(),
+                    })
+                    .collect(),
+            ),
+        })
+    }
+
+    pub fn matches(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
+        match &self.storage {
+            AlphaStorage::Owned(keys) => {
+                keys.len() == bitmaps.len()
+                    && keys.iter().zip(bitmaps).all(|(key, bitmap)| {
+                        key.width == bitmap.placement.width
+                            && key.height == bitmap.placement.height
+                            && key.stride == bitmap.stride
+                            && key.alpha.as_ref() == bitmap.alpha.as_slice()
+                    })
+            }
+            AlphaStorage::Shared(owner) => {
+                owner.subtitle_alpha_planes.len() == bitmaps.len()
+                    && owner
+                        .subtitle_alpha_planes
+                        .iter()
+                        .zip(bitmaps)
+                        .all(|(key, bitmap)| {
+                            key.placement.width == bitmap.placement.width
+                                && key.placement.height == bitmap.placement.height
+                                && key.stride == bitmap.stride
+                                && key.alpha == bitmap.alpha
+                        })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn alpha(&self, index: usize) -> &[u8] {
+        match &self.storage {
+            AlphaStorage::Owned(keys) => &keys[index].alpha,
+            AlphaStorage::Shared(owner) => &owner.subtitle_alpha_planes[index].alpha,
+        }
+    }
+
+    fn shared_retained_bytes(frame: &OverlayFrame) -> Option<usize> {
+        // Charge the complete owner even while the presenter also retains it,
+        // including spare capacities and both Arc allocations.
+        let mut bytes = (4 * std::mem::size_of::<usize>())
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<OverlayFrame>())?
+            .checked_add(
+                frame
+                    .subtitle_planes
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<SubtitleBitmapPlane>())?,
+            )?
+            .checked_add(
+                frame
+                    .subtitle_alpha_planes
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<SubtitleAlphaBitmap>())?,
+            )?;
+        for bitmap in &frame.subtitle_alpha_planes {
+            bytes = bytes.checked_add(bitmap.alpha.capacity())?;
+        }
+        Some(bytes)
+    }
+
+    fn retained_bytes(bitmaps: &[SubtitleAlphaBitmap]) -> Option<usize> {
+        // Arc's strong/weak counters plus the snapshot and exact boxed slices.
+        let mut bytes = (2 * std::mem::size_of::<usize>())
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(
+                bitmaps
+                    .len()
+                    .checked_mul(std::mem::size_of::<BitmapKey>())?,
+            )?;
+        for bitmap in bitmaps {
+            bytes = bytes.checked_add(bitmap.alpha.len())?;
+        }
+        Some(bytes)
+    }
+}
+
 pub(super) struct ContentKey {
     limit: u32,
-    bitmaps: Box<[BitmapKey]>,
+    pub snapshot: Arc<AlphaSnapshot>,
 }
 
 impl ContentKey {
@@ -30,18 +135,62 @@ impl ContentKey {
         pages: &[Page],
         budget: usize,
     ) -> Option<Self> {
-        let mut bytes = std::mem::size_of::<Self>()
-            .checked_add(std::mem::size_of::<Vec<Page>>())?
-            .checked_add(
-                bitmaps
-                    .len()
-                    .checked_mul(std::mem::size_of::<BitmapKey>())?,
-            )?;
-        for bitmap in bitmaps {
-            bytes = bytes.checked_add(bitmap.alpha.len())?;
+        Self::snapshot_with_budget(
+            limit,
+            pages,
+            budget,
+            AlphaSnapshot::retained_bytes(bitmaps)?,
+            || AlphaSnapshot::new(bitmaps),
+        )
+    }
+
+    pub fn new_for_overlay(
+        frame: &OverlayFrame,
+        owner: Option<&Arc<OverlayFrame>>,
+        limit: u32,
+        pages: &[Page],
+    ) -> Option<Self> {
+        owner
+            .and_then(|owner| Self::shared_with_budget(frame, owner, limit, pages, CACHE_BUDGET))
+            .or_else(|| Self::new(&frame.subtitle_alpha_planes, limit, pages))
+    }
+
+    fn shared_with_budget(
+        frame: &OverlayFrame,
+        owner: &Arc<OverlayFrame>,
+        limit: u32,
+        pages: &[Page],
+        budget: usize,
+    ) -> Option<Self> {
+        if !std::ptr::eq(frame, owner.as_ref()) || !frame.subtitle_planes.is_empty() {
+            return None;
         }
+        Self::snapshot_with_budget(
+            limit,
+            pages,
+            budget,
+            AlphaSnapshot::shared_retained_bytes(frame)?,
+            || {
+                Arc::new(AlphaSnapshot {
+                    storage: AlphaStorage::Shared(owner.clone()),
+                })
+            },
+        )
+    }
+
+    fn snapshot_with_budget(
+        limit: u32,
+        pages: &[Page],
+        budget: usize,
+        snapshot_bytes: usize,
+        snapshot: impl FnOnce() -> Arc<AlphaSnapshot>,
+    ) -> Option<Self> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<Box<[Page]>>())?
+            .checked_add(snapshot_bytes)?;
+        // Cached pages are an exact boxed slice; tiles retain their actual Vec
+        // capacity. Charge the immutable snapshot fully even while shared.
         for page in pages {
-            // A cached page owns its layout and two COM references (texture/SRV).
             bytes = bytes
                 .checked_add(std::mem::size_of::<Page>() + 2 * std::mem::size_of::<usize>())?
                 .checked_add(
@@ -56,27 +205,12 @@ impl ContentKey {
         }
         Some(Self {
             limit,
-            bitmaps: bitmaps
-                .iter()
-                .map(|bitmap| BitmapKey {
-                    width: bitmap.placement.width,
-                    height: bitmap.placement.height,
-                    stride: bitmap.stride,
-                    alpha: bitmap.alpha.clone().into_boxed_slice(),
-                })
-                .collect(),
+            snapshot: snapshot(),
         })
     }
 
     pub fn matches(&self, bitmaps: &[SubtitleAlphaBitmap], limit: u32) -> bool {
-        self.limit == limit
-            && self.bitmaps.len() == bitmaps.len()
-            && self.bitmaps.iter().zip(bitmaps).all(|(key, bitmap)| {
-                key.width == bitmap.placement.width
-                    && key.height == bitmap.placement.height
-                    && key.stride == bitmap.stride
-                    && key.alpha.as_ref() == bitmap.alpha.as_slice()
-            })
+        self.limit == limit && self.snapshot.matches(bitmaps)
     }
 }
 

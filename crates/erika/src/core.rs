@@ -1009,6 +1009,23 @@ pub trait RendererBackend {
     /// caller fall back to a test frame.
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool>;
 
+    /// Requests immutable overlay ownership when the backend can retain it
+    /// without copying. The presenter allocates shared frames only on demand.
+    fn prefers_shared_overlay(&self) -> bool {
+        false
+    }
+
+    /// Render with the immutable owner of exactly `context.overlay`.
+    /// Implementations must check that identity before retaining it. Other backends
+    /// keep the original rendering contract through this default forwarding.
+    fn render_current_frame_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        _overlay_owner: &Arc<OverlayFrame>,
+    ) -> Result<bool> {
+        self.render_current_frame(context)
+    }
+
     /// Selects the native GPU texture that receives the next Flutter texture
     /// frame. Apple embedders pass an `id<MTLTexture>` pointer as `raw_texture`.
     /// Backends without an external Flutter texture path reject the request.

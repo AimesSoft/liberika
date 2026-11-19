@@ -1038,21 +1038,114 @@ struct ImportedVideoFrame {
     constants: VideoUniforms,
 }
 
+struct PresentedAlphaPlacement {
+    x: i32,
+    y: i32,
+    color: u32,
+}
+
+struct PresentedOverlay {
+    viewport: crate::overlay::OverlayViewport,
+    subtitle_planes: Vec<crate::subtitle::SubtitleBitmapPlane>,
+    placements: Box<[PresentedAlphaPlacement]>,
+    alpha: std::sync::Arc<alpha_atlas::AlphaSnapshot>,
+}
+
+impl PresentedOverlay {
+    fn new(
+        frame: &OverlayFrame,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) -> Self {
+        Self {
+            viewport: frame.viewport,
+            subtitle_planes: frame.subtitle_planes.clone(),
+            placements: frame
+                .subtitle_alpha_planes
+                .iter()
+                .map(|b| PresentedAlphaPlacement {
+                    x: b.placement.x,
+                    y: b.placement.y,
+                    color: b.color_rgba,
+                })
+                .collect(),
+            alpha: alpha
+                .cloned()
+                .unwrap_or_else(|| alpha_atlas::AlphaSnapshot::new(&frame.subtitle_alpha_planes)),
+        }
+    }
+
+    fn update(
+        &mut self,
+        frame: &OverlayFrame,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) {
+        self.viewport = frame.viewport;
+        if self.subtitle_planes != frame.subtitle_planes {
+            self.subtitle_planes = frame.subtitle_planes.clone();
+        }
+        if self.placements.len() != frame.subtitle_alpha_planes.len()
+            || !self
+                .placements
+                .iter()
+                .zip(&frame.subtitle_alpha_planes)
+                .all(|(a, b)| {
+                    a.x == b.placement.x && a.y == b.placement.y && a.color == b.color_rgba
+                })
+        {
+            self.placements = frame
+                .subtitle_alpha_planes
+                .iter()
+                .map(|b| PresentedAlphaPlacement {
+                    x: b.placement.x,
+                    y: b.placement.y,
+                    color: b.color_rgba,
+                })
+                .collect();
+        }
+        if let Some(alpha) = alpha {
+            self.alpha = alpha.clone();
+        } else if !self.alpha.matches(&frame.subtitle_alpha_planes) {
+            self.alpha = alpha_atlas::AlphaSnapshot::new(&frame.subtitle_alpha_planes);
+        }
+    }
+
+    fn matches(&self, frame: &OverlayFrame) -> bool {
+        self.viewport == frame.viewport
+            && self.subtitle_planes == frame.subtitle_planes
+            && self.placements.len() == frame.subtitle_alpha_planes.len()
+            && self
+                .placements
+                .iter()
+                .zip(&frame.subtitle_alpha_planes)
+                .all(|(a, b)| {
+                    a.x == b.placement.x && a.y == b.placement.y && a.color == b.color_rgba
+                })
+            && self.alpha.matches(&frame.subtitle_alpha_planes)
+    }
+}
+
 struct PresentedScene {
     frame_token: u64,
     generation: u64,
     upscaler: LumaUpscalerMode,
-    overlay: Option<OverlayFrame>,
+    overlay: Option<PresentedOverlay>,
     danmaku: Option<DanmakuRenderPlan>,
 }
 
 impl PresentedScene {
-    fn new(frame_token: u64, upscaler: LumaUpscalerMode, context: RenderFrameContext<'_>) -> Self {
+    fn new(
+        frame_token: u64,
+        upscaler: LumaUpscalerMode,
+        context: RenderFrameContext<'_>,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) -> Self {
         Self {
             frame_token,
             generation: context.generation,
             upscaler,
-            overlay: context.overlay.cloned(),
+            overlay: context
+                .overlay
+                .map(|frame| PresentedOverlay::new(frame, alpha)),
             danmaku: context.danmaku.cloned(),
         }
     }
@@ -1072,11 +1165,7 @@ impl PresentedScene {
 
     fn overlay_matches(&self, overlay: Option<&OverlayFrame>) -> bool {
         match (self.overlay.as_ref(), overlay) {
-            (Some(a), Some(b)) => {
-                a.viewport == b.viewport
-                    && a.subtitle_planes == b.subtitle_planes
-                    && a.subtitle_alpha_planes == b.subtitle_alpha_planes
-            }
+            (Some(a), Some(b)) => a.matches(b),
             (None, None) => true,
             _ => false,
         }
@@ -1101,12 +1190,15 @@ impl PresentedScene {
         frame_token: u64,
         upscaler: LumaUpscalerMode,
         context: RenderFrameContext<'_>,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
     ) {
         // A new video frame need not copy unchanged subtitle/HUD pixels or
         // danmaku instances. Retain each cached buffer until its own content
         // changes; keep exact comparisons rather than lossy fingerprints.
-        if !self.overlay_matches(context.overlay) {
-            self.overlay = context.overlay.cloned();
+        match (self.overlay.as_mut(), context.overlay) {
+            (Some(previous), Some(frame)) => previous.update(frame, alpha),
+            (None, Some(frame)) => self.overlay = Some(PresentedOverlay::new(frame, alpha)),
+            (_, None) => self.overlay = None,
         }
         if !self.danmaku_matches(context.danmaku) {
             self.danmaku = context.danmaku.cloned();
@@ -1223,7 +1315,7 @@ struct D3d11SubtitleAlphaPage {
 
 struct D3d11SubtitleAlphaCache {
     key: alpha_atlas::ContentKey,
-    pages: Vec<D3d11SubtitleAlphaPage>,
+    pages: Box<[D3d11SubtitleAlphaPage]>,
 }
 
 struct D3d11DanmakuAtlasCache {
@@ -2012,9 +2104,18 @@ impl D3d11Renderer {
             .target_color()
     }
 
+    #[cfg(test)]
     fn prepare_overlay_draws(
         &mut self,
         frame: Option<&OverlayFrame>,
+    ) -> Result<Vec<D3d11OverlayDraw>> {
+        self.prepare_overlay_draws_shared(frame, None)
+    }
+
+    fn prepare_overlay_draws_shared(
+        &mut self,
+        frame: Option<&OverlayFrame>,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
     ) -> Result<Vec<D3d11OverlayDraw>> {
         let Some(frame) = frame else {
             self.subtitle_alpha_cache = None;
@@ -2069,7 +2170,7 @@ impl D3d11Renderer {
             });
         }
 
-        self.append_alpha_atlas_draws(frame, viewport_w, viewport_h, target, &mut draws)?;
+        self.append_alpha_atlas_draws(frame, owner, viewport_w, viewport_h, target, &mut draws)?;
         Ok(draws)
     }
 
@@ -2259,6 +2360,7 @@ impl D3d11Renderer {
     fn append_alpha_atlas_draws(
         &mut self,
         frame: &OverlayFrame,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
         viewport_w: u32,
         viewport_h: u32,
         target: TargetColorState,
@@ -2270,12 +2372,26 @@ impl D3d11Renderer {
         } else {
             8192 // Device creation accepts feature levels 10.0 and above.
         };
-        self.append_alpha_pages(frame, viewport_w, viewport_h, target, draws, limit)
+        self.append_alpha_pages_shared(frame, owner, viewport_w, viewport_h, target, draws, limit)
     }
 
+    #[cfg(test)]
     fn append_alpha_pages(
         &mut self,
         frame: &OverlayFrame,
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+        limit: u32,
+    ) -> Result<()> {
+        self.append_alpha_pages_shared(frame, None, viewport_w, viewport_h, target, draws, limit)
+    }
+
+    fn append_alpha_pages_shared(
+        &mut self,
+        frame: &OverlayFrame,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
         viewport_w: u32,
         viewport_h: u32,
         target: TargetColorState,
@@ -2307,7 +2423,7 @@ impl D3d11Renderer {
             self.subtitle_alpha_cache = None;
             return Ok(());
         }
-        let key = alpha_atlas::ContentKey::new(bitmaps, limit, &layouts);
+        let key = alpha_atlas::ContentKey::new_for_overlay(frame, owner, limit, &layouts);
         let mut pages = Vec::with_capacity(layouts.len());
         for page in layouts {
             let pixels = page.pixels(bitmaps)?;
@@ -2328,7 +2444,10 @@ impl D3d11Renderer {
         // Build every page before replacing the previous entry. On error the
         // old cache remains valid but is never drawn for different alpha data.
         Self::append_subtitle_alpha_draws(bitmaps, &pages, viewport_w, viewport_h, target, draws);
-        self.subtitle_alpha_cache = key.map(|key| D3d11SubtitleAlphaCache { key, pages });
+        self.subtitle_alpha_cache = key.map(|key| D3d11SubtitleAlphaCache {
+            key,
+            pages: pages.into_boxed_slice(),
+        });
         Ok(())
     }
 
@@ -2462,6 +2581,14 @@ impl D3d11Renderer {
     }
 
     fn render_video(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        self.render_video_shared(context, None)
+    }
+
+    fn render_video_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+    ) -> Result<bool> {
         if self.current_video.is_none() {
             return Ok(false);
         }
@@ -2496,7 +2623,7 @@ impl D3d11Renderer {
         {
             return Ok(true);
         }
-        let overlay_draws = self.prepare_overlay_draws(context.overlay)?;
+        let overlay_draws = self.prepare_overlay_draws_shared(context.overlay, owner)?;
         let danmaku_draws = self.prepare_danmaku_draws(context.danmaku)?;
         let (video_width, video_height, frame_token, native_luma) = {
             let video = self.current_video.as_ref().expect("video checked");
@@ -2629,13 +2756,21 @@ impl D3d11Renderer {
         // A full/occluded DXGI queue is not a successful presentation. Keep
         // the scene dirty and retry on the next tick, including while paused.
         if submitted {
+            // Preparation built or verified the cache for this input. Share
+            // its immutable alpha-only owner or mask snapshot, and only after
+            // publication succeeds. An over-budget scene keeps the owned path.
+            let alpha = self
+                .subtitle_alpha_cache
+                .as_ref()
+                .map(|cache| &cache.key.snapshot);
             if let Some(scene) = self.presented_scene.as_mut() {
-                scene.update(frame_token, self.upscaler_mode, context);
+                scene.update(frame_token, self.upscaler_mode, context, alpha);
             } else {
                 self.presented_scene = Some(PresentedScene::new(
                     frame_token,
                     self.upscaler_mode,
                     context,
+                    alpha,
                 ));
             }
             self.stats.rendered_frames += 1;
@@ -2843,6 +2978,19 @@ impl RendererBackend for D3d11Renderer {
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         self.drop_device_if_removed();
         self.render_video(context)
+    }
+
+    fn prefers_shared_overlay(&self) -> bool {
+        true
+    }
+
+    fn render_current_frame_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        owner: &std::sync::Arc<OverlayFrame>,
+    ) -> Result<bool> {
+        self.drop_device_if_removed();
+        self.render_video_shared(context, Some(owner))
     }
 
     fn resource_stats(&self) -> RendererResourceStats {
@@ -4567,6 +4715,7 @@ mod tests {
             7,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay)),
+            None,
         );
         overlay.pts = Duration::from_secs(2);
         overlay.subtitle_changed = false;
@@ -4631,13 +4780,12 @@ mod tests {
             RenderFrameContext::new(Duration::ZERO, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan)),
+            None,
         );
         let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
             .rgba
             .as_ptr();
-        let alpha = scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
-            .alpha
-            .as_ptr();
+        let alpha = scene.overlay.as_ref().unwrap().alpha.alpha(0).as_ptr();
         let items = scene.danmaku.as_ref().unwrap().items.as_ptr();
         for token in 2..=121 {
             overlay.pts = Duration::from_millis(token * 10);
@@ -4647,7 +4795,7 @@ mod tests {
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan));
             assert!(!scene.matches(token, LumaUpscalerMode::Off, context));
-            scene.update(token, LumaUpscalerMode::Off, context);
+            scene.update(token, LumaUpscalerMode::Off, context, None);
             assert!(scene.matches(token, LumaUpscalerMode::Off, context));
             assert_eq!(
                 scene.overlay.as_ref().unwrap().subtitle_planes[0]
@@ -4656,9 +4804,7 @@ mod tests {
                 rgba
             );
             assert_eq!(
-                scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
-                    .alpha
-                    .as_ptr(),
+                scene.overlay.as_ref().unwrap().alpha.alpha(0).as_ptr(),
                 alpha
             );
             assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
@@ -4672,16 +4818,13 @@ mod tests {
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
         assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context);
+        scene.update(121, LumaUpscalerMode::Off, context, None);
         assert!(scene.matches(121, LumaUpscalerMode::Off, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0].rgba[0],
             17
         );
-        assert_eq!(
-            scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0].alpha[0],
-            23
-        );
+        assert_eq!(scene.overlay.as_ref().unwrap().alpha.alpha(0)[0], 23);
         assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
 
         let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
@@ -4692,7 +4835,7 @@ mod tests {
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
         assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context);
+        scene.update(121, LumaUpscalerMode::Off, context, None);
         assert!(scene.matches(121, LumaUpscalerMode::Off, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0]
@@ -4706,6 +4849,7 @@ mod tests {
             121,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 2),
+            None,
         );
         assert!(scene.overlay.is_none() && scene.danmaku.is_none());
         assert!(scene.matches(
@@ -4913,6 +5057,7 @@ mod tests {
             1,
             LumaUpscalerMode::Off,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan)),
+            None,
         );
         plan.media_time = Duration::from_secs(1);
         assert!(scene.matches(
