@@ -1614,6 +1614,11 @@ impl MetalRendererImpl {
         let viewport_width = overlay.frame.viewport.width;
         let viewport_height = overlay.frame.viewport.height;
         let layout = layout.with_source_size(viewport_width, viewport_height);
+        let edr = self.output_mode.is_edr();
+        unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+        }
         for plane in &overlay.frame.subtitle_planes {
             let texture = self.create_overlay_texture(
                 plane.width as usize,
@@ -1621,19 +1626,9 @@ impl MetalRendererImpl {
                 &plane.rgba,
             )?;
             let (x, y, width, height) = plane.scaled_rect(viewport_width, viewport_height);
-            let uniforms = OverlayUniforms::from_plane(
-                x,
-                y,
-                width,
-                height,
-                layout,
-                target,
-                self.output_mode.is_edr(),
-            );
+            let uniforms = OverlayUniforms::from_plane(x, y, width, height, layout, target, edr);
             unsafe {
-                encoder.setRenderPipelineState(&pipeline);
                 encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
-                encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
                 encoder.setVertexBytes_length_atIndex(
                     overlay_uniform_pointer(&uniforms),
                     mem::size_of::<OverlayUniforms>(),
@@ -1660,11 +1655,10 @@ impl MetalRendererImpl {
             else {
                 return Ok(());
             };
-            let pages = atlas.pages.clone();
-            let placements = atlas.placements.clone();
-            for placement in &placements {
+            let mut bound_page = None;
+            for placement in &atlas.placements {
                 let bitmap = &overlay.frame.subtitle_alpha_planes[placement.bitmap_index];
-                let page = &pages[placement.page];
+                let page = &atlas.pages[placement.page];
                 let uniforms = OverlayUniforms::from_alpha_atlas_bitmap(
                     bitmap,
                     placement,
@@ -1672,12 +1666,13 @@ impl MetalRendererImpl {
                     page.height,
                     layout,
                     target,
-                    self.output_mode.is_edr(),
+                    edr,
                 );
                 unsafe {
-                    encoder.setRenderPipelineState(&pipeline);
-                    encoder.setFragmentTexture_atIndex(Some(&*page.texture), 0);
-                    encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                    if bound_page != Some(placement.page) {
+                        encoder.setFragmentTexture_atIndex(Some(&*page.texture), 0);
+                        bound_page = Some(placement.page);
+                    }
                     encoder.setVertexBytes_length_atIndex(
                         overlay_uniform_pointer(&uniforms),
                         mem::size_of::<OverlayUniforms>(),
