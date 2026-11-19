@@ -20,9 +20,9 @@ use ::windows::Win32::Graphics::Direct3D11::{
     D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
     D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_ARRAY_SRV, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC,
     D3D11_TEXTURE3D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11BlendState,
-    ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout, ID3D11Multithread,
-    ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout,
+    ID3D11Multithread, ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11Resource,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
@@ -69,6 +69,7 @@ use crate::subtitle::AssColor;
 
 mod alpha_atlas;
 mod danmaku;
+mod p010_upload;
 use danmaku::{D3d11DanmakuBatch, D3d11DanmakuDraws, D3d11DanmakuPipeline};
 
 const SDR_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -994,6 +995,8 @@ struct D3d11DeviceState {
     overlay_sampler: ID3D11SamplerState,
     overlay_blend: ID3D11BlendState,
     danmaku_pipeline: D3d11DanmakuPipeline,
+    // The outer option tracks whether this device has been queried.
+    p010_upload_shader: Option<Option<ID3D11ComputeShader>>,
 }
 
 struct AttachedSurface {
@@ -1327,6 +1330,124 @@ struct D3d11DanmakuAtlasCache {
     outline: D3d11OverlayTexture,
 }
 
+enum D3d11SoftwareScratch {
+    Packed(PlanarFrame),
+    Yuv420pChroma {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    },
+    P010Chroma {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    },
+}
+
+enum D3d11SoftwareLuma<'a> {
+    Packed(&'a [u8]),
+    Borrowed(D3d11BorrowedLuma<'a>),
+}
+
+/// A raw initial-data pointer, never a Rust slice over decoder row padding.
+/// The frame remains borrowed until synchronous CreateTexture2D has returned.
+struct D3d11BorrowedLuma<'a> {
+    _frame: &'a Frame,
+    data: *const u8,
+    pitch: u32,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> D3d11BorrowedLuma<'a> {
+    fn new(
+        frame: &'a Frame,
+        (width, height): (usize, usize),
+        data: *const u8,
+        stride: usize,
+        row_bytes: usize,
+    ) -> std::result::Result<Option<Self>, ()> {
+        if (width, height) != (frame.width() as usize, frame.height() as usize) {
+            return Ok(None);
+        }
+        let pitch = u32::try_from(stride).map_err(|_| ())?;
+        let visible_span = height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(stride))
+            .and_then(|prefix| prefix.checked_add(row_bytes))
+            .ok_or(())?;
+        let raw = frame.as_ptr();
+        // Both callers check the visible layout first. The raw upload also
+        // checks an addressable ref-backed pitch * height span. CPU packing
+        // remains available when the backing covers only the visible rows.
+        unsafe {
+            if data != (*raw).data[0] {
+                return Err(());
+            }
+            let buffer = erika_ffmpeg_sys::av_frame_get_plane_buffer(raw.cast_mut(), 0);
+            if buffer.is_null() {
+                return if (*raw).buf[0].is_null() && (*raw).nb_extended_buf == 0 {
+                    Ok(None)
+                } else {
+                    Err(())
+                };
+            }
+            let buffer = &*buffer;
+            if buffer.data.is_null() {
+                return Err(());
+            }
+            let offset = (data as usize)
+                .checked_sub(buffer.data as usize)
+                .ok_or(())?;
+            if offset.checked_add(visible_span).ok_or(())? > buffer.size {
+                return Err(());
+            }
+            let Some(span) = stride.checked_mul(height) else {
+                return Ok(None);
+            };
+            if span > isize::MAX as usize
+                || (data as usize).checked_add(span).is_none()
+                || offset.checked_add(span).is_none_or(|end| end > buffer.size)
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Self {
+            _frame: frame,
+            data,
+            pitch,
+            width: width as u32,
+            height: height as u32,
+        }))
+    }
+
+    fn create_texture(
+        &self,
+        state: &D3d11DeviceState,
+        width: u32,
+        height: u32,
+        format: PlanarPixelFormat,
+    ) -> Result<D3d11OverlayTexture> {
+        if (width, height, format) != (self.width, self.height, PlanarPixelFormat::Nv12) {
+            return Err(PlayerError::Renderer(
+                "d3d11: borrowed luma layout mismatch".into(),
+            ));
+        }
+        // SAFETY: dimensions and R8 format are tied to the checked frame view.
+        // The frame borrow covers the synchronous call; padding is never a slice.
+        unsafe {
+            create_cpu_texture_from_ptr(
+                state,
+                self.width,
+                self.height,
+                DXGI_FORMAT_R8_UNORM,
+                self.data,
+                self.pitch,
+            )
+        }
+    }
+}
+
 impl D3d11DanmakuAtlasCache {
     fn can_reuse_for(&self, atlas: &DanmakuGlyphAtlas) -> bool {
         self.version == atlas.version
@@ -1340,7 +1461,7 @@ pub struct D3d11Renderer {
     state: Option<D3d11DeviceState>,
     surface: Option<AttachedSurface>,
     current_video: Option<ImportedVideoFrame>,
-    software_scratch: Option<PlanarFrame>,
+    software_scratch: Option<D3d11SoftwareScratch>,
     /// Signalled once the GPU finished the last draw that read
     /// `current_video` into a compositor-owned surface; `None` until a draw.
     current_video_fence: Option<ID3D11Query>,
@@ -1999,29 +2120,171 @@ impl D3d11Renderer {
         Ok(())
     }
 
-    fn upload_software_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
-        let mut planar = self.software_scratch.take().unwrap_or_else(|| PlanarFrame {
-            format: PlanarPixelFormat::P010,
-            width: 0,
-            height: 0,
-            luma: Vec::new(),
-            chroma: Vec::new(),
+    fn try_upload_software_p010(&mut self, frame: &PlayerVideoFrame) -> Result<bool> {
+        let Some(decoded) = frame.frame.decoded_frame() else {
+            return Ok(false);
+        };
+        let Some(upload) = decoded.software_p010_upload() else {
+            return Ok(false);
+        };
+        let (width, height) = upload.dimensions();
+        let y = upload.luma();
+        let Some(luma) =
+            D3d11BorrowedLuma::new(decoded, (width, height), y.as_ptr(), y.stride(), width * 2)
+                .map_err(|()| {
+                    PlayerError::Renderer("d3d11: invalid ref-backed software P010 luma".into())
+                })?
+        else {
+            return Ok(false);
+        };
+        let (width, height) = (width as u32, height as u32);
+
+        self.ensure_default_device()?;
+        let state = self.state.as_mut().expect("device ensured");
+        if state.p010_upload_shader.is_none() {
+            let shader = p010_upload::create_shader(&state.device)?;
+            if shader.is_some() {
+                trace("software P010 in-place luma upload enabled");
+            }
+            state.p010_upload_shader = Some(shader);
+        }
+        if matches!(state.p010_upload_shader, Some(None)) {
+            return Ok(false);
+        }
+
+        let mut chroma = match self.software_scratch.take() {
+            Some(D3d11SoftwareScratch::P010Chroma {
+                width: w,
+                height: h,
+                bytes,
+            }) if (w, h) == (width, height) => bytes,
+            Some(D3d11SoftwareScratch::Packed(planar))
+                if planar.format == PlanarPixelFormat::P010
+                    && (planar.width, planar.height) == (width, height) =>
+            {
+                // The old packed luma allocation is no longer needed.
+                planar.chroma
+            }
+            _ => Vec::new(),
+        };
+        let result = (|| {
+            upload.write_d3d11_chroma(&mut chroma).ok_or_else(|| {
+                PlayerError::Renderer("d3d11: invalid software P010 chroma layout".into())
+            })?;
+            let source_color = source_color_for_frame(frame);
+            let output_mode = self.select_output_mode_for_source(source_color)?;
+            let target_color = output_mode.target_color_for_source(source_color);
+            let state = self.state.as_ref().expect("device ensured");
+            let shader = state
+                .p010_upload_shader
+                .as_ref()
+                .and_then(Option::as_ref)
+                .expect("P010 upload shader initialized");
+            let planes = p010_upload::upload(state, shader, luma, &chroma)?;
+            self.publish_software_planes(
+                (width, height),
+                D3d11VideoTextureFormat::P010,
+                planes,
+                source_color,
+                target_color,
+            )
+        })();
+        self.software_scratch = Some(D3d11SoftwareScratch::P010Chroma {
+            width,
+            height,
+            bytes: chroma,
         });
+        result.map(|()| true)
+    }
+
+    fn upload_software_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        let borrowed = frame.frame.decoded_frame().and_then(|decoded| {
+            let upload = decoded.software_yuv420p_upload()?;
+            let (width, height) = upload.dimensions();
+            let y = upload.luma();
+            let luma =
+                D3d11BorrowedLuma::new(decoded, (width, height), y.as_ptr(), y.stride(), width)
+                    .ok()
+                    .flatten()?;
+            Some((upload, luma))
+        });
+        if let Some((upload, luma)) = borrowed {
+            let (width, height) = (frame.frame.width(), frame.frame.height());
+            let pitch = width
+                .div_ceil(2)
+                .checked_mul(2)
+                .ok_or_else(|| PlayerError::Renderer("d3d11: chroma row pitch overflow".into()))?;
+            let len = (pitch as usize)
+                .checked_mul(height.div_ceil(2) as usize)
+                .ok_or_else(|| PlayerError::Renderer("d3d11: CPU texture size overflow".into()))?;
+            let mut chroma = match self.software_scratch.take() {
+                Some(D3d11SoftwareScratch::Yuv420pChroma {
+                    width: w,
+                    height: h,
+                    bytes,
+                }) if (w, h) == (width, height) => bytes,
+                // Switching layouts releases the old packed Y/UV allocation;
+                // borrowed Y never leaves an idle full-size luma scratch behind.
+                _ => Vec::new(),
+            };
+            chroma.resize(len, 0);
+            let result = upload
+                .write_chroma_into(&mut chroma, pitch as usize)
+                .ok_or_else(|| {
+                    PlayerError::Renderer(format!(
+                        "d3d11: unsupported software video frame format {:?}",
+                        frame.frame.pixel_format()
+                    ))
+                })
+                .and_then(|()| {
+                    self.upload_software_planes(
+                        PlanarPixelFormat::Nv12,
+                        (width, height),
+                        D3d11SoftwareLuma::Borrowed(luma),
+                        &chroma,
+                        source_color_for_frame(frame),
+                    )
+                });
+            self.software_scratch = Some(D3d11SoftwareScratch::Yuv420pChroma {
+                width,
+                height,
+                bytes: chroma,
+            });
+            return result;
+        }
+        if self.try_upload_software_p010(frame)? {
+            return Ok(());
+        }
+        let (mut planar, previous_chroma) = match self.software_scratch.take() {
+            Some(D3d11SoftwareScratch::Packed(planar)) => (planar, None),
+            previous => (
+                PlanarFrame {
+                    format: PlanarPixelFormat::P010,
+                    width: 0,
+                    height: 0,
+                    luma: Vec::new(),
+                    chroma: Vec::new(),
+                },
+                previous,
+            ),
+        };
         let converted = frame
             .frame
             .decoded_frame()
             .and_then(|decoded| decoded.write_planar_frame(&mut planar));
-        let result = if converted.is_some() {
-            self.upload_planar_frame(&planar, source_color_for_frame(frame))
-        } else {
-            Err(PlayerError::Renderer(format!(
+        if converted.is_none() {
+            self.software_scratch = previous_chroma.or(Some(D3d11SoftwareScratch::Packed(planar)));
+            return Err(PlayerError::Renderer(format!(
                 "d3d11: unsupported software video frame format {:?}",
                 frame.frame.pixel_format()
-            )))
-        };
+            )));
+        }
+        // A successful format switch keeps only the new packed storage.
+        drop(previous_chroma);
+        let result = self.upload_planar_frame(&planar, source_color_for_frame(frame));
         // CreateTexture2D copies the CPU initial data before returning. GPU
         // texture ownership and retirement fences remain entirely unchanged.
-        self.software_scratch = Some(planar);
+        self.software_scratch = Some(D3d11SoftwareScratch::Packed(planar));
         result
     }
 
@@ -2030,41 +2293,78 @@ impl D3d11Renderer {
         planar: &PlanarFrame,
         source_color: SourceColorState,
     ) -> Result<()> {
+        self.upload_software_planes(
+            planar.format,
+            (planar.width, planar.height),
+            D3d11SoftwareLuma::Packed(&planar.luma),
+            &planar.chroma,
+            source_color,
+        )
+    }
+
+    fn upload_software_planes(
+        &mut self,
+        format: PlanarPixelFormat,
+        (width, height): (u32, u32),
+        luma: D3d11SoftwareLuma<'_>,
+        chroma: &[u8],
+        source_color: SourceColorState,
+    ) -> Result<()> {
         self.ensure_default_device()?;
         let output_mode = self.select_output_mode_for_source(source_color)?;
         let target_color = output_mode.target_color_for_source(source_color);
-        let (texture_format, bytes_per_sample) = match planar.format {
+        let (texture_format, bytes_per_sample) = match format {
             PlanarPixelFormat::Nv12 => (D3d11VideoTextureFormat::Nv12, 1),
             PlanarPixelFormat::P010 => (D3d11VideoTextureFormat::P010, 2),
         };
         let state = self.state.as_ref().expect("device ensured");
         // Separate planes support odd visible dimensions and retain 10-bit HDR
         // samples without requiring hardware video-format texture support.
-        let luma_pitch = planar
-            .width
+        let luma_pitch = width
             .checked_mul(bytes_per_sample)
             .ok_or_else(|| PlayerError::Renderer("d3d11: luma row pitch overflow".into()))?;
-        let chroma_pitch = planar
-            .width
+        let chroma_pitch = width
             .div_ceil(2)
             .checked_mul(2 * bytes_per_sample)
             .ok_or_else(|| PlayerError::Renderer("d3d11: chroma row pitch overflow".into()))?;
-        let luma = create_cpu_texture(
-            state,
-            planar.width,
-            planar.height,
-            texture_format.luma_srv(),
-            &planar.luma,
-            luma_pitch,
-        )?;
+        let luma = match luma {
+            D3d11SoftwareLuma::Packed(bytes) => create_cpu_texture(
+                state,
+                width,
+                height,
+                texture_format.luma_srv(),
+                bytes,
+                luma_pitch,
+            )?,
+            D3d11SoftwareLuma::Borrowed(luma) => {
+                luma.create_texture(state, width, height, format)?
+            }
+        };
         let chroma = create_cpu_texture(
             state,
-            planar.width.div_ceil(2),
-            planar.height.div_ceil(2),
+            width.div_ceil(2),
+            height.div_ceil(2),
             texture_format.chroma_srv(),
-            &planar.chroma,
+            chroma,
             chroma_pitch,
         )?;
+        self.publish_software_planes(
+            (width, height),
+            texture_format,
+            (luma, chroma),
+            source_color,
+            target_color,
+        )
+    }
+
+    fn publish_software_planes(
+        &mut self,
+        (width, height): (u32, u32),
+        texture_format: D3d11VideoTextureFormat,
+        (luma, chroma): (D3d11OverlayTexture, D3d11OverlayTexture),
+        source_color: SourceColorState,
+        target_color: TargetColorState,
+    ) -> Result<()> {
         let frame_token = self.next_frame_token;
         self.retire_current_video()?;
         self.current_video = Some(ImportedVideoFrame {
@@ -2074,8 +2374,8 @@ impl D3d11Renderer {
             luma: luma.view,
             // Each SRV retains its underlying texture after this upload returns.
             chroma: chroma.view,
-            width: planar.width,
-            height: planar.height,
+            width,
+            height,
             tex_rect: D3d11TexRect::FULL,
             _array_index: 0,
             frame_token,
@@ -3261,6 +3561,7 @@ impl D3d11DeviceState {
             overlay_sampler,
             overlay_blend,
             danmaku_pipeline,
+            p010_upload_shader: None,
         })
     }
 
@@ -4010,6 +4311,44 @@ fn create_cpu_texture(
             data.len()
         )));
     }
+    // SAFETY: this initialized slice covers the full checked CPU texture span.
+    unsafe {
+        create_cpu_texture_from_ptr(state, width, height, format, data.as_ptr(), bytes_per_row)
+    }
+}
+
+/// The caller must keep visible source bytes readable and the full
+/// `bytes_per_row * height` span allocated until CreateTexture2D returns.
+/// Row padding need not be initialized; no Rust reference spans that padding.
+unsafe fn create_cpu_texture_from_ptr(
+    state: &D3d11DeviceState,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    data: *const u8,
+    bytes_per_row: u32,
+) -> Result<D3d11OverlayTexture> {
+    // SAFETY: passed through the checked initialized-data span.
+    unsafe {
+        create_cpu_texture_with_view_from_ptr(
+            state,
+            (width, height),
+            (format, format),
+            (data, bytes_per_row),
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        )
+    }
+}
+
+/// The caller must keep the initial data valid under the same contract as
+/// create_cpu_texture_from_ptr and use compatible texture/view formats.
+unsafe fn create_cpu_texture_with_view_from_ptr(
+    state: &D3d11DeviceState,
+    (width, height): (u32, u32),
+    (format, srv_format): (DXGI_FORMAT, DXGI_FORMAT),
+    (data, bytes_per_row): (*const u8, u32),
+    bind_flags: u32,
+) -> Result<D3d11OverlayTexture> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
@@ -4021,12 +4360,12 @@ fn create_cpu_texture(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        BindFlags: bind_flags,
         CPUAccessFlags: 0,
         MiscFlags: 0,
     };
     let subresource = D3D11_SUBRESOURCE_DATA {
-        pSysMem: data.as_ptr() as *const c_void,
+        pSysMem: data as *const c_void,
         SysMemPitch: bytes_per_row,
         SysMemSlicePitch: bytes_per_row.saturating_mul(height),
     };
@@ -4039,7 +4378,7 @@ fn create_cpu_texture(
     }
     let texture =
         texture.ok_or_else(|| PlayerError::Renderer("d3d11: CPU texture was null".to_string()))?;
-    let view = create_texture2d_srv(state, &texture, format)?;
+    let view = create_texture2d_srv(state, &texture, srv_format)?;
     Ok(D3d11OverlayTexture {
         _texture: texture,
         view,
