@@ -665,6 +665,24 @@ impl MetalRenderer {
                 inner: Some(result.textures),
             });
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if frame.raw_pixel_format() == erika_ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+            let Some(planes) = frame.software_p010_upload() else {
+                return Err(unsupported());
+            };
+            if let Some(result) = self
+                .inner
+                .upload_linear_p010(&planes, frame.color_range() == ColorRange::Full)
+            {
+                return Ok(ImportedVideoFrame {
+                    info: result.info,
+                    source_color: SourceColorState::default(),
+                    inner: Some(result.textures),
+                });
+            }
+            // Unsupported devices/layouts or failed candidate creation release
+            // their local resources and use the unchanged packed upload below.
+        }
         let planar = frame.to_planar_frame().ok_or_else(unsupported)?;
         self.import_planar_frame(&planar, frame.color_range())
     }

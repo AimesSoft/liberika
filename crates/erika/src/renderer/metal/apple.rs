@@ -8,6 +8,8 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use crate::core::{PlayerError, Result};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::ffmpeg::SoftwareP010Upload;
 use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat, SoftwareNv12Upload};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
@@ -97,12 +99,18 @@ impl ImportedVideoFrameTextures {
 
     pub fn allocated_bytes(&self) -> u64 {
         self.planes.iter().fold(0, |total, plane| {
-            total.saturating_add(plane.metal_texture.allocatedSize() as u64)
+            // A linear texture aliases its backing; count that storage once.
+            let bytes = plane.backing_buffer.as_ref().map_or_else(
+                || plane.metal_texture.allocatedSize(),
+                |buffer| buffer.allocatedSize(),
+            );
+            total.saturating_add(bytes as u64)
         })
     }
 }
 
 struct ImportedVideoPlaneTexture {
+    backing_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     #[allow(dead_code)]
     cv_texture: Option<CFRetained<CVMetalTexture>>,
     #[allow(dead_code)]
@@ -2234,6 +2242,7 @@ impl MetalRendererImpl {
                 metal_pixel_format: plane.name,
             });
             imported_textures.push(ImportedVideoPlaneTexture {
+                backing_buffer: None,
                 cv_texture: Some(texture),
                 metal_texture,
             });
@@ -2341,6 +2350,90 @@ impl MetalRendererImpl {
         ))
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn upload_linear_p010(
+        &self,
+        frame: &SoftwareP010Upload<'_>,
+        full_range: bool,
+    ) -> Option<ImportedVideoFrameResult> {
+        if !self.device.hasUnifiedMemory() {
+            return None;
+        }
+        let (width, height) = frame.dimensions();
+        if width > self.max_texture_dimension || height > self.max_texture_dimension {
+            return None;
+        }
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let y_format = MTLPixelFormat::R16Unorm;
+        let uv_format = MTLPixelFormat::RG16Unorm;
+        let max_length = self.device.maxBufferLength();
+        let (y_pitch, y_len) = checked_linear_plane_layout(
+            width.checked_mul(2)?,
+            height,
+            self.device
+                .minimumLinearTextureAlignmentForPixelFormat(y_format),
+            max_length,
+        )?;
+        let (uv_pitch, uv_len) = checked_linear_plane_layout(
+            cw.checked_mul(4)?,
+            ch,
+            self.device
+                .minimumLinearTextureAlignmentForPixelFormat(uv_format),
+            max_length,
+        )?;
+        if y_pitch % 2 != 0 || uv_pitch % 4 != 0 {
+            return None;
+        }
+        // Fresh independent backing every frame. No buffer is recycled or
+        // overwritten after publication, including while commands are in flight.
+        let y_buffer = self
+            .device
+            .newBufferWithLength_options(y_len, MTLResourceOptions::StorageModeShared)?;
+        let uv_buffer = self
+            .device
+            .newBufferWithLength_options(uv_len, MTLResourceOptions::StorageModeShared)?;
+        let make_texture =
+            |buffer: &ProtocolObject<dyn MTLBuffer>, width, height, format, pitch| {
+                let descriptor = unsafe {
+                    MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                        format, width, height, false,
+                    )
+                };
+                descriptor.setTextureType(MTLTextureType::Type2D);
+                descriptor.setUsage(MTLTextureUsage::ShaderRead);
+                descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+                buffer.newTextureWithDescriptor_offset_bytesPerRow(&descriptor, 0, pitch)
+            };
+        let y_texture = make_texture(&y_buffer, width, height, y_format, y_pitch)?;
+        let uv_texture = make_texture(&uv_buffer, cw, ch, uv_format, uv_pitch)?;
+        // contents is uninitialized storage: initialize via raw pointers BEFORE
+        // making any Rust reference. These short-lived mutable slices are gone
+        // before the textures/backing enter an ImportedVideoFrame.
+        unsafe {
+            let y_ptr = y_buffer.contents().as_ptr().cast::<u8>();
+            let uv_ptr = uv_buffer.contents().as_ptr().cast::<u8>();
+            std::ptr::write_bytes(y_ptr, 0, y_len);
+            std::ptr::write_bytes(uv_ptr, 0, uv_len);
+            frame.write_into(
+                std::slice::from_raw_parts_mut(y_ptr, y_len),
+                y_pitch,
+                std::slice::from_raw_parts_mut(uv_ptr, uv_len),
+                uv_pitch,
+            )?;
+        }
+        let mut result = Self::planar_video_frame_result(
+            width,
+            height,
+            ImportedVideoFormat::P010,
+            full_range,
+            y_texture,
+            uv_texture,
+        );
+        result.textures.planes[0].backing_buffer = Some(y_buffer);
+        result.textures.planes[1].backing_buffer = Some(uv_buffer);
+        Some(result)
+    }
+
     fn planar_video_frame_result(
         width: usize,
         height: usize,
@@ -2390,10 +2483,12 @@ impl MetalRendererImpl {
                 source_pixel_buffer: None,
                 planes: vec![
                     ImportedVideoPlaneTexture {
+                        backing_buffer: None,
                         cv_texture: None,
                         metal_texture: luma,
                     },
                     ImportedVideoPlaneTexture {
+                        backing_buffer: None,
                         cv_texture: None,
                         metal_texture: chroma,
                     },
@@ -2724,6 +2819,27 @@ struct VideoUniforms {
     gamut_reserved0: u32,
     gamut_reserved1: u32,
     dovi: DoviUniforms,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn checked_linear_plane_layout(
+    row_bytes: usize,
+    rows: usize,
+    alignment: usize,
+    max_length: usize,
+) -> Option<(usize, usize)> {
+    if row_bytes == 0 || rows == 0 || alignment == 0 {
+        return None;
+    }
+    let pitch = row_bytes
+        .checked_add(alignment - 1)?
+        .checked_div(alignment)?
+        .checked_mul(alignment)?;
+    let len = pitch.checked_mul(rows)?;
+    if len > isize::MAX as usize || len > max_length {
+        return None;
+    }
+    Some((pitch, len))
 }
 
 fn metal_pixel_format(format: MetalDrawablePixelFormat) -> MTLPixelFormat {

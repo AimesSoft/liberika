@@ -3257,10 +3257,10 @@ impl Frame {
     }
 }
 
-// This view is internal to the Apple upload path. The public packed conversion
-// APIs, reusable D3D11 writer, and all 10-bit/fallback formats stay independent.
+// Views internal to Apple uploads. Public packed conversion APIs, the reusable
+// D3D11 writer, and fallback formats remain independent.
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
-mod software_nv12_upload {
+mod software_planar_upload {
     use super::{Frame, PhantomData, slice, sys};
 
     pub(crate) struct StridedPlane<'a> {
@@ -3315,6 +3315,80 @@ mod software_nv12_upload {
             // Only visible bytes form a Rust slice. Decoder row padding need
             // not be initialized and is never covered by a &[u8].
             Some(unsafe { slice::from_raw_parts(self.ptr.add(offset), self.row_bytes) })
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) struct SoftwareP010Upload<'a> {
+        width: usize,
+        height: usize,
+        y: StridedPlane<'a>,
+        u: StridedPlane<'a>,
+        v: StridedPlane<'a>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl SoftwareP010Upload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+
+        pub(crate) fn write_into(
+            &self,
+            y: &mut [u8],
+            y_pitch: usize,
+            uv: &mut [u8],
+            uv_pitch: usize,
+        ) -> Option<()> {
+            let y_row_bytes = self.width.checked_mul(2)?;
+            let uv_row_bytes = self.width.div_ceil(2).checked_mul(4)?;
+            let ch = self.height.div_ceil(2);
+            // Check the entire destination before writing either plane. The
+            // caller initializes the backing memory before creating these slices.
+            if y_pitch < y_row_bytes
+                || uv_pitch < uv_row_bytes
+                || y_pitch.checked_mul(self.height)? != y.len()
+                || uv_pitch.checked_mul(ch)? != uv.len()
+            {
+                return None;
+            }
+            for (row, dst) in y.chunks_exact_mut(y_pitch).enumerate() {
+                super::p010::luma_row(self.y.visible_row(row)?, &mut dst[..y_row_bytes]);
+            }
+            for (row, dst) in uv.chunks_exact_mut(uv_pitch).enumerate() {
+                super::p010::chroma_row(
+                    self.u.visible_row(row)?,
+                    self.v.visible_row(row)?,
+                    &mut dst[..uv_row_bytes],
+                );
+            }
+            Some(())
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl Frame {
+        pub(crate) fn software_p010_upload(&self) -> Option<SoftwareP010Upload<'_>> {
+            if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            // All three source planes are checked before any Metal allocation
+            // or destination write; each slice later covers visible bytes only.
+            let y = StridedPlane::from_frame(self, 0, width.checked_mul(2)?, height)?;
+            let u = StridedPlane::from_frame(self, 1, cw.checked_mul(2)?, ch)?;
+            let v = StridedPlane::from_frame(self, 2, cw.checked_mul(2)?, ch)?;
+            Some(SoftwareP010Upload {
+                width,
+                height,
+                y,
+                u,
+                v,
+            })
         }
     }
 
@@ -3404,7 +3478,10 @@ mod software_nv12_upload {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-pub(crate) use software_nv12_upload::SoftwareNv12Upload;
+pub(crate) use software_planar_upload::SoftwareNv12Upload;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use software_planar_upload::SoftwareP010Upload;
 
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
 /// (`width * height`) and an interleaved Cb/Cr plane at half resolution
