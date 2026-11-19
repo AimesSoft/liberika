@@ -373,6 +373,9 @@ pub struct HttpRangeSource {
     length_probed: bool,
     cache_start: u64,
     cache_bytes: Vec<u8>,
+    /// Strong identity observed in bytes accepted by this source, across seeks
+    /// and worker replacement. Headers without retained bytes never bind it.
+    entity_validator: Option<Arc<str>>,
     /// Cache depth target: how much *unread* data to keep buffered ahead of the
     /// reader. Deeper windows ride out longer origin hiccups; the cost is
     /// memory. This is deliberately not the on-the-wire request size -- see
@@ -472,6 +475,7 @@ struct StreamInner {
 struct StripeHandoff {
     start: u64,
     bytes: Vec<u8>,
+    validator: Option<Arc<str>>,
 }
 
 // A single in-flight read, never an additional response or buffer copy. The
@@ -500,6 +504,8 @@ struct HttpRangeResponse {
     bytes: Vec<u8>,
     total_length: Option<u64>,
     validator: Option<String>,
+    /// Strong tag actually observed on a response contributing retained bytes.
+    strong_etag: Option<String>,
 }
 
 impl HttpRangeSource {
@@ -543,6 +549,7 @@ impl HttpRangeSource {
             length_probed: false,
             cache_start: 0,
             cache_bytes: Vec::new(),
+            entity_validator: None,
             read_ahead_bytes: read_ahead
                 .filter(|bytes| *bytes > 0)
                 .unwrap_or_else(http_read_ahead_bytes)
@@ -620,14 +627,16 @@ impl HttpRangeSource {
                 &self.http_headers,
                 range.start,
                 self.content_length,
+                self.entity_validator.as_deref().map(str::to_owned),
             )
         } else {
-            fetch_http_range(
+            fetch_http_range_with_validator(
                 &self.agent,
                 &self.uri,
                 &self.http_headers,
                 range,
                 "http_range",
+                self.entity_validator.as_deref().map(str::to_owned),
             )
         }
         .inspect_err(|error| {
@@ -639,10 +648,28 @@ impl HttpRangeSource {
         if self.content_length.is_none() {
             self.content_length = response.total_length;
         }
+        if !response.bytes.is_empty() {
+            self.retain_entity_validator(response.strong_etag.as_deref())?;
+        }
         // A synchronous fetch that worked proves the origin is alive: let the
         // background prefetch chain resume.
         self.prefetch_failures = 0;
         Ok(response.bytes)
+    }
+
+    fn retain_entity_validator(&mut self, validator: Option<&str>) -> Result<()> {
+        let Some(value) = validator.filter(|value| strong_etag(value.as_bytes()).is_some()) else {
+            return Ok(());
+        };
+        if let Some(expected) = self.entity_validator.as_deref() {
+            if expected != value {
+                self.entity_changed.store(true, Ordering::Release);
+                return Err(SourceError::HttpEntityChanged);
+            }
+        } else {
+            self.entity_validator = Some(Arc::from(value));
+        }
+        Ok(())
     }
 
     fn check_entity(&self) -> Result<()> {
@@ -748,6 +775,14 @@ impl HttpRangeSource {
                 // and let the synchronous path fetch from the real cache end.
                 self.kill_streams();
                 self.prefetch_failures = self.prefetch_failures.saturating_add(1);
+                return;
+            }
+            if handoff.start.saturating_add(handoff.bytes.len() as u64) > self.cache_end()
+                && self
+                    .retain_entity_validator(handoff.validator.as_deref())
+                    .is_err()
+            {
+                self.kill_streams();
                 return;
             }
             if handoff.start == self.cache_end() {
@@ -883,6 +918,7 @@ impl HttpRangeSource {
         let worker_io = io.clone();
         let uri = self.uri.clone();
         let http_headers = self.http_headers.clone();
+        let validator = self.entity_validator.as_deref().map(str::to_owned);
         let worker = thread::Builder::new()
             .name("erika-http-stream".to_string())
             .spawn(move || {
@@ -894,6 +930,7 @@ impl HttpRangeSource {
                     epoch,
                     anchor,
                     total,
+                    validator,
                 );
                 // Every exit, including cancellation, must wake a foreground
                 // reader waiting for bytes that will no longer arrive.
@@ -1125,12 +1162,26 @@ fn lock_stream(shared: &StreamShared) -> MutexGuard<'_, StreamInner> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
-fn hand_off_stripe(shared: &StreamShared, epoch: u64, index: u64, start: u64, bytes: Vec<u8>) {
+fn hand_off_stripe(
+    shared: &StreamShared,
+    epoch: u64,
+    index: u64,
+    start: u64,
+    bytes: Vec<u8>,
+    validator: Option<Arc<str>>,
+) {
     let mut inner = lock_stream(shared);
     if inner.stopped || inner.epoch != epoch || bytes.is_empty() {
         return;
     }
-    inner.pending.insert(index, StripeHandoff { start, bytes });
+    inner.pending.insert(
+        index,
+        StripeHandoff {
+            start,
+            bytes,
+            validator,
+        },
+    );
     shared.signal.notify_all();
 }
 
@@ -1157,12 +1208,24 @@ enum StreamOpened {
 /// origin seeks once and streams. `416` means the offset sits at/past EOF.
 /// The timeouts are per-worker and generous -- a background stream must not
 /// be killed by the 15 s response deadline that shapes the synchronous path.
+#[cfg(test)]
 fn open_stream_response(
     io: &HttpIo,
     uri: &str,
     http_headers: &[(String, String)],
     offset: u64,
     validator: Option<String>,
+) -> Result<StreamOpened> {
+    open_stream_response_with_identity(io, uri, http_headers, offset, validator, None)
+}
+
+fn open_stream_response_with_identity(
+    io: &HttpIo,
+    uri: &str,
+    http_headers: &[(String, String)],
+    offset: u64,
+    validator: Option<String>,
+    identity: Option<Arc<str>>,
 ) -> Result<StreamOpened> {
     validate_resume_validator(validator.as_deref())?;
     let range = ByteRange {
@@ -1176,7 +1239,12 @@ fn open_stream_response(
     for (name, value) in http_headers {
         request = request.header(name, value);
     }
-    if let Some(validator) = validator.as_deref() {
+    let inherited_identity = identity.as_deref().filter(|_| {
+        !http_headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+        })
+    });
+    if let Some(validator) = inherited_identity.or(validator.as_deref()) {
         request = request.header("If-Range", validator);
     }
     let response = io.run(async move {
@@ -1188,6 +1256,7 @@ fn open_stream_response(
     let status = response.status().as_u16();
     match status {
         206 => {
+            validate_partial_response_etag(&response, identity.as_deref())?;
             validate_partial_response_etag(&response, validator.as_deref())?;
             // A stream that answers from anywhere but the requested offset
             // would be spliced onto the cache as silent corruption, exactly
@@ -1218,6 +1287,7 @@ fn open_stream_response(
         }
         416 => Ok(StreamOpened::Eof),
         200 => {
+            validate_partial_response_etag(&response, identity.as_deref())?;
             validate_full_response_entity(&response, validator.as_deref())?;
             Ok(StreamOpened::Body {
                 response,
@@ -1324,6 +1394,7 @@ fn stream_worker_main(
     epoch: u64,
     start: u64,
     total: u64,
+    initial_validator: Option<String>,
 ) {
     let mut offset = start;
     let mut stripe_index = 0;
@@ -1333,10 +1404,13 @@ fn stream_worker_main(
     let mut stripe_received = 0usize;
     let mut stripe_opened: Option<Instant> = None;
     let mut validator: Option<String> = None;
+    let mut retained_validator = initial_validator.as_deref().map(Arc::<str>::from);
     let mut live: Option<reqwest::Response> = None;
     let mut skip_remaining = 0;
     let mut response_start = start;
     let mut response_has_bound_strong_etag = false;
+    let mut response_validator = None;
+    let mut response_strong_etag: Option<Arc<str>> = None;
     // Once unbound response bytes enter this worker history, never use them
     // for an early idle-prefix handoff, even if a later response adds a tag.
     let mut stream_history_verified = true;
@@ -1351,7 +1425,6 @@ fn stream_worker_main(
     });
     let race_request = Arc::new((io.client().clone(), uri.clone(), http_headers.clone()));
     let race_attempted = Arc::new(AtomicBool::new(false));
-    let mut race_validator: Option<Arc<String>> = None;
     let mut response_total_verified = false;
     let mut release_partial_on_reconnect = false;
 
@@ -1359,7 +1432,14 @@ fn stream_worker_main(
         // Finish a partial final stripe without needing another socket read or
         // waiting for the read-ahead window to move beyond the known file end.
         if offset >= total {
-            hand_off_stripe(&shared, epoch, stripe_index, stripe_start, stripe);
+            hand_off_stripe(
+                &shared,
+                epoch,
+                stripe_index,
+                stripe_start,
+                stripe,
+                retained_validator.clone(),
+            );
             mark_worker_done(&shared, false);
             return;
         }
@@ -1374,23 +1454,28 @@ fn stream_worker_main(
             }
             // This permission belongs to this open attempt only, even on error.
             let release_partial = std::mem::take(&mut release_partial_on_reconnect);
-            match open_stream_response(&io, &uri, &http_headers, offset, validator.clone()) {
+            match open_stream_response_with_identity(
+                &io,
+                &uri,
+                &http_headers,
+                offset,
+                validator.clone(),
+                retained_validator.clone(),
+            ) {
                 Ok(StreamOpened::Body {
                     response,
                     skip_bytes,
                 }) => {
-                    if validator.is_none() {
-                        validator = response_entity_validator(&response);
-                    }
-                    response_has_bound_strong_etag = validator
+                    response_validator = response_entity_validator(&response);
+                    response_strong_etag = response_validator
                         .as_deref()
-                        .and_then(|value| strong_etag(value.as_bytes()))
-                        .is_some_and(|expected| {
-                            response
-                                .headers()
-                                .get("etag")
-                                .and_then(|value| strong_etag(value.as_bytes()))
-                                == Some(expected)
+                        .filter(|value| strong_etag(value.as_bytes()).is_some())
+                        .map(Arc::<str>::from);
+                    response_has_bound_strong_etag =
+                        response_strong_etag.as_deref().is_some_and(|actual| {
+                            retained_validator
+                                .as_deref()
+                                .is_none_or(|expected| actual == expected)
                         });
                     // open_stream_response has already checked the 206 start.
                     // Both the interrupted response and this response must have
@@ -1414,6 +1499,7 @@ fn stream_worker_main(
                                 StripeHandoff {
                                     start: stripe_start,
                                     bytes: std::mem::take(&mut stripe),
+                                    validator: retained_validator.clone(),
                                 },
                             );
                             shared.signal.notify_all();
@@ -1427,7 +1513,6 @@ fn stream_worker_main(
                         .and_then(|v| v.to_str().ok())
                         .and_then(parse_content_range_total)
                         == Some(total);
-                    race_validator = validator.as_ref().map(|value| Arc::new(value.clone()));
                     response_start = offset;
                     skip_remaining = skip_bytes;
                     live = Some(response);
@@ -1475,14 +1560,19 @@ fn stream_worker_main(
             && response_has_bound_strong_etag
             && offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES
             && response_total_verified;
-        let race_context = may_race.then(|| {
-            (
-                Arc::clone(&shared),
-                Arc::clone(&race_request),
-                Arc::clone(race_validator.as_ref().expect("bound strong ETag")),
-                Arc::clone(&race_attempted),
-            )
-        });
+        // The current response must itself have contributed bytes before the
+        // >=4 MiB gate. Header evidence stays provisional until that point.
+        let race_context = response_strong_etag
+            .as_ref()
+            .filter(|_| may_race)
+            .map(|validator| {
+                (
+                    Arc::clone(&shared),
+                    Arc::clone(&race_request),
+                    Arc::clone(validator),
+                    Arc::clone(&race_attempted),
+                )
+            });
         if offered_partial || may_race {
             let mut inner = lock_stream(&shared);
             if inner.stopped || inner.epoch != epoch || io.is_cancelled() {
@@ -1501,6 +1591,7 @@ fn stream_worker_main(
                     handoff: Some(StripeHandoff {
                         start: stripe_start,
                         bytes: std::mem::take(&mut stripe),
+                        validator: retained_validator.clone(),
                     }),
                 });
             }
@@ -1521,7 +1612,7 @@ fn stream_worker_main(
                     let candidate = async {
                         let mut response = open_idle_race_candidate(
                             &request_context,
-                            validator.as_str(),
+                            validator.as_ref(),
                             &attempted_request,
                             offset,
                             total,
@@ -1622,6 +1713,12 @@ fn stream_worker_main(
                 let received = bytes.len().min((total - offset) as usize);
                 if received != 0 {
                     stream_history_verified &= response_verified;
+                    if validator.is_none() {
+                        validator = response_validator.take();
+                    }
+                    if retained_validator.is_none() {
+                        retained_validator = response_strong_etag.clone();
+                    }
                 }
                 resumes_since_progress = 0;
                 let mut consumed = 0usize;
@@ -1653,6 +1750,7 @@ fn stream_worker_main(
                             stripe_index,
                             stripe_start,
                             std::mem::take(&mut stripe),
+                            retained_validator.clone(),
                         );
                         stripe_index += 1;
                         stripe_start = offset;
@@ -1680,6 +1778,7 @@ fn stream_worker_main(
                                 StripeHandoff {
                                     start: stripe_start,
                                     bytes: std::mem::take(&mut stripe),
+                                    validator: retained_validator.clone(),
                                 },
                             );
                             shared.signal.notify_all();
@@ -2124,6 +2223,7 @@ fn http_range_header(range: ByteRange) -> String {
     }
 }
 
+#[cfg(test)]
 fn fetch_http_range(
     agent: &HttpIo,
     uri: &str,
@@ -2131,18 +2231,36 @@ fn fetch_http_range(
     range: ByteRange,
     event: &str,
 ) -> Result<HttpRangeResponse> {
+    fetch_http_range_with_validator(agent, uri, http_headers, range, event, None)
+}
+
+fn fetch_http_range_with_validator(
+    agent: &HttpIo,
+    uri: &str,
+    http_headers: &[(String, String)],
+    range: ByteRange,
+    event: &str,
+    validator: Option<String>,
+) -> Result<HttpRangeResponse> {
     let client = agent.client.clone();
     let uri = uri.to_owned();
     let http_headers = http_headers.to_vec();
     let event = event.to_owned();
     agent.run(async move {
-        fetch_http_range_async(
+        fetch_http_range_with_history_async(
             &client,
             &uri,
             &http_headers,
             range,
             &event,
             HttpFetchTimeouts::default(),
+            validator.as_deref().map(|validator| HttpRangeHistory {
+                start: range.start,
+                prefix: &[],
+                validator: None,
+                strong_etag: Some(validator),
+                total_length: None,
+            }),
         )
         .await
     })
@@ -2154,6 +2272,7 @@ fn fetch_http_to_end(
     http_headers: &[(String, String)],
     start: u64,
     mut total_length: Option<u64>,
+    mut strong_etag: Option<String>,
 ) -> Result<HttpRangeResponse> {
     let client = agent.client.clone();
     let uri = uri.to_owned();
@@ -2198,6 +2317,7 @@ fn fetch_http_to_end(
                     start,
                     prefix: &bytes,
                     validator: validator.as_deref(),
+                    strong_etag: strong_etag.as_deref(),
                     total_length,
                 }),
             )
@@ -2214,6 +2334,7 @@ fn fetch_http_to_end(
             if bytes.is_empty() {
                 validator = response.validator;
             }
+            strong_etag = response.strong_etag;
             let short = (response.bytes.len() as u64) < HTTP_REQUEST_MAX_BYTES;
             bytes.extend_from_slice(&response.bytes);
             pieces += 1;
@@ -2225,6 +2346,7 @@ fn fetch_http_to_end(
             bytes,
             total_length,
             validator,
+            strong_etag,
         })
     })
 }
@@ -2233,6 +2355,9 @@ struct HttpRangeHistory<'a> {
     start: u64,
     prefix: &'a [u8],
     validator: Option<&'a str>,
+    // Separate from the original replay validator: later tagged pieces must
+    // not retroactively validate an unbound prefix.
+    strong_etag: Option<&'a str>,
     total_length: Option<u64>,
 }
 
@@ -2264,6 +2389,7 @@ fn http_replay_prefix_matches(
     true
 }
 
+#[cfg(test)]
 async fn fetch_http_range_async(
     client: &reqwest::Client,
     uri: &str,
@@ -2294,6 +2420,9 @@ async fn fetch_http_range_with_history_async(
     let mut validator = history
         .as_ref()
         .and_then(|history| history.validator.map(str::to_owned));
+    let mut strong_etag = history
+        .as_ref()
+        .and_then(|history| history.strong_etag.map(str::to_owned));
     let mut gate = HttpRetryGate::new(timeouts.total);
     loop {
         let attempt = gate.begin_attempt();
@@ -2324,6 +2453,7 @@ async fn fetch_http_range_with_history_async(
                 bytes,
                 total_length,
                 validator,
+                strong_etag,
             });
         }
         let resuming = received > 0 || prior_bytes;
@@ -2347,10 +2477,16 @@ async fn fetch_http_range_with_history_async(
         for (name, value) in http_headers {
             request = request.header(name, value);
         }
-        if resuming
-            && !weak_prior_only
-            && let Some(validator) = validator.as_deref()
-        {
+        let inherited_identity = strong_etag.as_deref().filter(|_| {
+            !http_headers.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+            })
+        });
+        if let Some(validator) = inherited_identity.or_else(|| {
+            (resuming && !weak_prior_only)
+                .then_some(validator.as_deref())
+                .flatten()
+        }) {
             request = request.header("If-Range", validator);
         }
         let remaining = timeouts.total.saturating_sub(gate.elapsed());
@@ -2386,6 +2522,9 @@ async fn fetch_http_range_with_history_async(
             }
         };
         let status = response.status().as_u16();
+        if matches!(status, 200 | 206) {
+            validate_partial_response_etag(&response, strong_etag.as_deref())?;
+        }
         // A tag bound within this fetch cannot validate an older, unbound
         // sidecar prefix, even when a retry correctly repeats that local tag.
         let replay_history = history.as_ref().filter(|history| {
@@ -2430,17 +2569,11 @@ async fn fetch_http_range_with_history_async(
                             .to_string(),
                     ));
                 }
-                if validator.is_none() && (history.is_none() || received == 0) {
-                    validator = response_entity_validator(&response);
-                }
                 content_range.as_deref().and_then(parse_content_range_total)
             }
             200 => {
                 if resuming && !weak_prior_only {
                     validate_full_response_entity(&response, validator.as_deref())?;
-                }
-                if validator.is_none() && (history.is_none() || received == 0) {
-                    validator = response_entity_validator(&response);
                 }
                 response
                     .headers()
@@ -2468,6 +2601,11 @@ async fn fetch_http_range_with_history_async(
         if total_length.is_none() {
             total_length = reported_total;
         }
+        let response_validator = response_entity_validator(&response);
+        let response_strong_etag = response_validator
+            .as_deref()
+            .filter(|value| self::strong_etag(value.as_bytes()).is_some())
+            .map(str::to_owned);
         let mut entity_mismatch = false;
         let mut skip_remaining = if status == 200 { resume_range.start } else { 0 };
         let mut response_bytes = 0u64;
@@ -2497,6 +2635,16 @@ async fn fetch_http_range_with_history_async(
                         .saturating_sub(bytes.len() as u64)
                         .min(chunk.len() as u64) as usize
                 });
+                if take != 0 {
+                    // Keep the original replay proof's scope: a tag learned
+                    // after unbound bytes cannot validate those earlier bytes.
+                    if validator.is_none() && (history.is_none() || received == 0) {
+                        validator = response_validator.clone();
+                    }
+                    if strong_etag.is_none() {
+                        strong_etag = response_strong_etag.clone();
+                    }
+                }
                 bytes.extend_from_slice(&chunk[..take]);
                 // Drop the remaining whole-file body once the requested range
                 // is covered; never buffer it just because Range was ignored.
@@ -2572,6 +2720,7 @@ async fn fetch_http_range_with_history_async(
             bytes,
             total_length,
             validator,
+            strong_etag,
         });
     }
 }
@@ -5266,6 +5415,7 @@ mod tests {
                         StripeHandoff {
                             start: 128 * 1024,
                             bytes: vec![255; 64 * 1024],
+                            validator: None,
                         },
                     )]),
                     worker_done: true,
