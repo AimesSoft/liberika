@@ -1351,11 +1351,9 @@ async fn wait_for_idle_race_demand(shared: &StreamShared, epoch: u64, offset: u6
 async fn open_idle_race_candidate(
     request_context: &(reqwest::Client, String, Vec<(String, String)>),
     validator: &str,
-    attempted: &AtomicBool,
     offset: u64,
     total: u64,
 ) -> Option<reqwest::Response> {
-    attempted.store(true, Ordering::Relaxed);
     let (client, uri, headers) = request_context;
     let mut request = client.get(uri).header(
         "Range",
@@ -1420,15 +1418,25 @@ fn stream_worker_main(
     let mut resumes_since_progress: u32 = 0;
     let mut fast_body_retry_used = false;
     // Caller-supplied range headers keep their original request semantics.
-    let mut idle_race_used = http_headers.iter().any(|(name, _)| {
+    let idle_race_allowed = !http_headers.iter().any(|(name, _)| {
         name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
     });
+    let mut idle_race_available = idle_race_allowed;
     let race_request = Arc::new((io.client().clone(), uri.clone(), http_headers.clone()));
-    let race_attempted = Arc::new(AtomicBool::new(false));
+    // A winning standby can earn one new opportunity from its own body bytes.
+    let mut idle_race_earning = false;
     let mut response_total_verified = false;
     let mut release_partial_on_reconnect = false;
 
     loop {
+        // Account before an ordinary reconnect can replace response_start. Only
+        // normal bounded byte acceptance advances offset and earns this credit.
+        let mut response_supplied_stripe =
+            offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES;
+        if idle_race_earning && response_supplied_stripe {
+            idle_race_available = true;
+            idle_race_earning = false;
+        }
         // Finish a partial final stripe without needing another socket read or
         // waiting for the read-ahead window to move beyond the known file end.
         if offset >= total {
@@ -1447,6 +1455,9 @@ fn stream_worker_main(
             return;
         }
         if live.is_none() {
+            // Keep earned credit, but never pool an unfinished winner's bytes
+            // with an ordinary response opened below.
+            idle_race_earning = false;
             // Headers from an empty/failed response have not identified any
             // retained stream bytes; bind the validator to the next body instead.
             if offset == start {
@@ -1514,6 +1525,7 @@ fn stream_worker_main(
                         .and_then(parse_content_range_total)
                         == Some(total);
                     response_start = offset;
+                    response_supplied_stripe = false;
                     skip_remaining = skip_bytes;
                     live = Some(response);
                 }
@@ -1553,12 +1565,13 @@ fn stream_worker_main(
             && response.status().as_u16() == 206
             && response_has_bound_strong_etag;
         // Only an established, strongly bound 206 may speculate. Healthy reads
-        // create no timer or request; this one-shot gate is worker scoped.
-        let may_race = !idle_race_used
+        // create no timer or request; only a productive winner can rearm it.
+        let may_race = idle_race_allowed
+            && idle_race_available
             && stream_history_verified
             && response.status().as_u16() == 206
             && response_has_bound_strong_etag
-            && offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES
+            && response_supplied_stripe
             && response_total_verified;
         // The current response must itself have contributed bytes before the
         // >=4 MiB gate. Header evidence stays provisional until that point.
@@ -1570,7 +1583,6 @@ fn stream_worker_main(
                     Arc::clone(&shared),
                     Arc::clone(&race_request),
                     Arc::clone(validator),
-                    Arc::clone(&race_attempted),
                 )
             });
         if offered_partial || may_race {
@@ -1605,51 +1617,57 @@ fn stream_worker_main(
                 Ok((response, chunk))
             };
             tokio::pin!(original);
-            if let Some((shared, request_context, validator, attempted)) = race_context {
-                let attempted_request = Arc::clone(&attempted);
-                let replacement = async move {
-                    wait_for_idle_race_demand(&shared, epoch, offset).await;
-                    let candidate = async {
-                        let mut response = open_idle_race_candidate(
-                            &request_context,
-                            validator.as_ref(),
-                            &attempted_request,
-                            offset,
-                            total,
-                        )
-                        .await?;
-                        let first = response.chunk().await.ok()??;
-                        if first.is_empty() {
-                            return None;
+            if let Some((shared, request_context, validator)) = race_context {
+                let mut attempted = false;
+                let result = {
+                    let replacement = async {
+                        wait_for_idle_race_demand(&shared, epoch, offset).await;
+                        attempted = true;
+                        let candidate = async {
+                            let mut response = open_idle_race_candidate(
+                                &request_context,
+                                validator.as_ref(),
+                                offset,
+                                total,
+                            )
+                            .await?;
+                            let first = response.chunk().await.ok()??;
+                            if first.is_empty() {
+                                return None;
+                            }
+                            Some((response, Some(first)))
+                        };
+                        if let Ok(Some(result)) =
+                            tokio::time::timeout(HTTP_STREAM_RESPONSE_TIMEOUT, candidate).await
+                        {
+                            return result;
                         }
-                        Some((response, Some(first)))
+                        // Failed speculation must neither poison identity nor end
+                        // or restart the original body read and its existing timeout.
+                        std::future::pending().await
                     };
-                    if let Ok(Some(result)) =
-                        tokio::time::timeout(HTTP_STREAM_RESPONSE_TIMEOUT, candidate).await
-                    {
-                        return result;
+                    tokio::pin!(replacement);
+                    tokio::select! {
+                        biased;
+                        result = &mut original => (result, false),
+                        result = &mut replacement => (Ok(result), true),
                     }
-                    // Failed speculation must neither poison identity nor end
-                    // or restart the original body read and its existing timeout.
-                    std::future::pending().await
-                };
-                tokio::pin!(replacement);
-                let result = tokio::select! {
-                    biased;
-                    result = &mut original => (result, false),
-                    result = &mut replacement => (Ok(result), true),
-                };
-                Ok((result.0, attempted.load(Ordering::Relaxed), result.1))
+                }; // Drop the standby future before reading its local flag.
+                Ok((result.0, attempted, result.1))
             } else {
                 Ok((original.await, false, false))
             }
         });
         let body = match body {
             Ok((result, attempted, switched)) => {
+                if attempted {
+                    idle_race_available = false;
+                    idle_race_earning = false;
+                }
                 if switched {
                     response_start = offset;
+                    idle_race_earning = true;
                 }
-                idle_race_used |= attempted;
                 result
             }
             Err(error) => Err(error),
