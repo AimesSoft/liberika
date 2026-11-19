@@ -2754,7 +2754,22 @@ unsafe fn raw_ass_image_to_alpha_bitmap(image: &RawAssImage) -> Result<SubtitleA
     let height = image.h as u32;
     let stride = image.stride.max(0) as usize;
     let required = required_bitmap_len(width, height, stride)?;
-    let alpha = unsafe { std::slice::from_raw_parts(image.bitmap, required) }.to_vec();
+    let alpha = if stride == width as usize || height <= 1 {
+        // This span contains only visible pixels, with no inter-row padding.
+        unsafe { std::slice::from_raw_parts(image.bitmap, required) }.to_vec()
+    } else {
+        let mut alpha = Vec::with_capacity(required);
+        for row in 0..height as usize {
+            let offset = row * stride;
+            // libass permits uninitialized row padding. Keep the public
+            // stride/span, but initialize gaps without reading source padding.
+            alpha.resize(offset, 0);
+            let visible =
+                unsafe { std::slice::from_raw_parts(image.bitmap.add(offset), width as usize) };
+            alpha.extend_from_slice(visible);
+        }
+        alpha
+    };
     Ok(SubtitleAlphaBitmap::new(
         SubtitleBitmapPlacement::new(image.dst_x, image.dst_y, width, height),
         stride,
@@ -2769,7 +2784,16 @@ fn required_bitmap_len(width: u32, height: u32, stride: usize) -> Result<usize> 
     if width == 0 || height == 0 {
         return Ok(0);
     }
-    Ok(stride * height.saturating_sub(1) + width as usize)
+    stride
+        .checked_mul(height - 1)
+        .and_then(|prefix| prefix.checked_add(width as usize))
+        .filter(|&required| required <= isize::MAX as usize)
+        .ok_or(SubtitleError::InvalidBitmap {
+            width,
+            height: height as u32,
+            stride,
+            bytes: usize::MAX,
+        })
 }
 
 fn duration_to_millis_i64(value: Duration) -> i64 {
