@@ -2791,15 +2791,15 @@ private extension ErikaEventC {
         "subtitle": -1,
       ]
     }
-    if let structuredMessage,
+    if kind == 9 {
+      map["error"] = structuredMessage
+    } else if let structuredMessage,
        let data = structuredMessage.data(using: .utf8),
        let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
       if kind == 11 {
         map["decoder"] = payload
       } else if kind == 12 {
         map["audio"] = payload
-      } else if kind == 9 {
-        map["error"] = structuredMessage
       }
     }
     return map
