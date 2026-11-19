@@ -4387,10 +4387,12 @@ mod tests {
 
     #[test]
     fn http_range_backfills_total_from_206_content_range() {
-        let body = vec![b'x'; 16];
-        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
-            http_206_response(0, 4096, &body),
-        )]);
+        let mut body = vec![b'y'; 4096];
+        body[..16].fill(b'x');
+        let (uri, _requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(0, 4096, &body[..16])),
+            MockResponse::immediate(http_206_response(16, 4096, &body[16..])),
+        ]);
         let mut source = HttpRangeSource::new(uri);
         assert_eq!(source.read_range(ByteRange::suffix_from(0)).unwrap(), body);
         // The 206 Content-Range total satisfies len() without a HEAD request.
