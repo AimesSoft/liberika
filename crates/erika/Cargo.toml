@@ -39,6 +39,7 @@ thiserror.workspace = true
 ttf-parser = "0.25"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+httpdate = "1.0.3"
 crossbeam-channel.workspace = true
 memmap2 = "0.9"
 ab_glyph_rasterizer = "0.1"
