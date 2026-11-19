@@ -1340,6 +1340,7 @@ pub struct D3d11Renderer {
     state: Option<D3d11DeviceState>,
     surface: Option<AttachedSurface>,
     current_video: Option<ImportedVideoFrame>,
+    software_scratch: Option<PlanarFrame>,
     /// Signalled once the GPU finished the last draw that read
     /// `current_video` into a compositor-owned surface; `None` until a draw.
     current_video_fence: Option<ID3D11Query>,
@@ -1415,6 +1416,7 @@ impl D3d11Renderer {
             state: None,
             surface: None,
             current_video: None,
+            software_scratch: None,
             current_video_fence: None,
             handoff_timeout: config.compositor_handoff_timeout,
             presented_scene: None,
@@ -1998,22 +2000,34 @@ impl D3d11Renderer {
     }
 
     fn upload_software_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
-        let planar = frame
+        let mut planar = self.software_scratch.take().unwrap_or_else(|| PlanarFrame {
+            format: PlanarPixelFormat::P010,
+            width: 0,
+            height: 0,
+            luma: Vec::new(),
+            chroma: Vec::new(),
+        });
+        let converted = frame
             .frame
             .decoded_frame()
-            .and_then(Frame::to_planar_frame)
-            .ok_or_else(|| {
-                PlayerError::Renderer(format!(
-                    "d3d11: unsupported software video frame format {:?}",
-                    frame.frame.pixel_format()
-                ))
-            })?;
-        self.upload_planar_frame(planar, source_color_for_frame(frame))
+            .and_then(|decoded| decoded.write_planar_frame(&mut planar));
+        let result = if converted.is_some() {
+            self.upload_planar_frame(&planar, source_color_for_frame(frame))
+        } else {
+            Err(PlayerError::Renderer(format!(
+                "d3d11: unsupported software video frame format {:?}",
+                frame.frame.pixel_format()
+            )))
+        };
+        // CreateTexture2D copies the CPU initial data before returning. GPU
+        // texture ownership and retirement fences remain entirely unchanged.
+        self.software_scratch = Some(planar);
+        result
     }
 
     fn upload_planar_frame(
         &mut self,
-        planar: PlanarFrame,
+        planar: &PlanarFrame,
         source_color: SourceColorState,
     ) -> Result<()> {
         self.ensure_default_device()?;
@@ -4533,7 +4547,7 @@ mod tests {
         let upload = |renderer: &mut D3d11Renderer| {
             renderer
                 .upload_planar_frame(
-                    PlanarFrame {
+                    &PlanarFrame {
                         format: PlanarPixelFormat::Nv12,
                         width: 4,
                         height: 4,
@@ -4599,7 +4613,7 @@ mod tests {
             .collect();
         renderer
             .upload_planar_frame(
-                PlanarFrame {
+                &PlanarFrame {
                     format: PlanarPixelFormat::P010,
                     width: 3,
                     height: 3,
