@@ -3,6 +3,83 @@
 use crate::core::{PlayerError, Result};
 use crate::subtitle::SubtitleAlphaBitmap;
 
+// Bounds retained CPU keys/layouts and R8 texture payload, not transient upload
+// buffers or driver allocation overhead. Large subtitles still render in full.
+const CACHE_BUDGET: usize = 32 * 1024 * 1024;
+
+struct BitmapKey {
+    width: u32,
+    height: u32,
+    stride: usize,
+    alpha: Box<[u8]>,
+}
+
+pub(super) struct ContentKey {
+    limit: u32,
+    bitmaps: Box<[BitmapKey]>,
+}
+
+impl ContentKey {
+    pub fn new(bitmaps: &[SubtitleAlphaBitmap], limit: u32, pages: &[Page]) -> Option<Self> {
+        Self::with_budget(bitmaps, limit, pages, CACHE_BUDGET)
+    }
+
+    fn with_budget(
+        bitmaps: &[SubtitleAlphaBitmap],
+        limit: u32,
+        pages: &[Page],
+        budget: usize,
+    ) -> Option<Self> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<Vec<Page>>())?
+            .checked_add(
+                bitmaps
+                    .len()
+                    .checked_mul(std::mem::size_of::<BitmapKey>())?,
+            )?;
+        for bitmap in bitmaps {
+            bytes = bytes.checked_add(bitmap.alpha.len())?;
+        }
+        for page in pages {
+            // A cached page owns its layout and two COM references (texture/SRV).
+            bytes = bytes
+                .checked_add(std::mem::size_of::<Page>() + 2 * std::mem::size_of::<usize>())?
+                .checked_add(
+                    page.tiles
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<Tile>())?,
+                )?
+                .checked_add((page.width as usize).checked_mul(page.height as usize)?)?;
+        }
+        if bytes > budget {
+            return None;
+        }
+        Some(Self {
+            limit,
+            bitmaps: bitmaps
+                .iter()
+                .map(|bitmap| BitmapKey {
+                    width: bitmap.placement.width,
+                    height: bitmap.placement.height,
+                    stride: bitmap.stride,
+                    alpha: bitmap.alpha.clone().into_boxed_slice(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn matches(&self, bitmaps: &[SubtitleAlphaBitmap], limit: u32) -> bool {
+        self.limit == limit
+            && self.bitmaps.len() == bitmaps.len()
+            && self.bitmaps.iter().zip(bitmaps).all(|(key, bitmap)| {
+                key.width == bitmap.placement.width
+                    && key.height == bitmap.placement.height
+                    && key.stride == bitmap.stride
+                    && key.alpha.as_ref() == bitmap.alpha.as_slice()
+            })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Tile {
     pub bitmap: usize,

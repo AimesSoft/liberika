@@ -1212,6 +1212,16 @@ struct D3d11OverlayDraw {
     constants: OverlayUniforms,
 }
 
+struct D3d11SubtitleAlphaPage {
+    layout: alpha_atlas::Page,
+    texture: D3d11OverlayTexture,
+}
+
+struct D3d11SubtitleAlphaCache {
+    key: alpha_atlas::ContentKey,
+    pages: Vec<D3d11SubtitleAlphaPage>,
+}
+
 struct D3d11DanmakuAtlasCache {
     version: u64,
     width: u32,
@@ -1240,6 +1250,7 @@ pub struct D3d11Renderer {
     /// `MetalRendererConfig::compositor_handoff_timeout`.
     handoff_timeout: Duration,
     flutter_scene: Option<FlutterTextureScene>,
+    subtitle_alpha_cache: Option<D3d11SubtitleAlphaCache>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
     danmaku_picture_cache: Option<(u64, D3d11OverlayTexture)>,
     requested_output_mode: crate::renderer::output::OutputMode,
@@ -1311,6 +1322,7 @@ impl D3d11Renderer {
             current_video_fence: None,
             handoff_timeout: config.compositor_handoff_timeout,
             flutter_scene: None,
+            subtitle_alpha_cache: None,
             danmaku_atlas_cache: None,
             danmaku_picture_cache: None,
             requested_output_mode: config.output_mode,
@@ -1397,6 +1409,7 @@ impl D3d11Renderer {
         let context = unsafe { frame_device.GetImmediateContext() }
             .map_err(|error| d3d_error("ID3D11Device::GetImmediateContext", error))?;
         self.retire_current_video()?;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         self.set_device(frame_device, context)
@@ -1425,6 +1438,7 @@ impl D3d11Renderer {
     fn invalidate_device(&mut self) {
         self.current_video = None;
         self.current_video_fence = None;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         self.flutter_scene = None;
@@ -1621,6 +1635,7 @@ impl D3d11Renderer {
         // unchanged: the CPU-side `gamut_lut_job` only holds parameters, so a
         // later frame regenerates the texture on the new device and reuses it.
         self.gamut_lut = None;
+        self.subtitle_alpha_cache = None;
         self.state = Some(state);
         self.recreate_surface_targets()?;
         Ok(())
@@ -1997,9 +2012,11 @@ impl D3d11Renderer {
         frame: Option<&OverlayFrame>,
     ) -> Result<Vec<D3d11OverlayDraw>> {
         let Some(frame) = frame else {
+            self.subtitle_alpha_cache = None;
             return Ok(Vec::new());
         };
         if frame.is_empty() {
+            self.subtitle_alpha_cache = None;
             return Ok(Vec::new());
         }
         self.ensure_default_device()?;
@@ -2261,7 +2278,33 @@ impl D3d11Renderer {
         limit: u32,
     ) -> Result<()> {
         let bitmaps = &frame.subtitle_alpha_planes;
-        for page in alpha_atlas::layout(bitmaps, limit)? {
+        if bitmaps.is_empty() {
+            self.subtitle_alpha_cache = None;
+            return Ok(());
+        }
+        if let Some(cache) = &self.subtitle_alpha_cache
+            && cache.key.matches(bitmaps, limit)
+        {
+            self.stats.overlay_alpha_atlas_reuses += cache.pages.len() as u64;
+            Self::append_subtitle_alpha_draws(
+                bitmaps,
+                &cache.pages,
+                viewport_w,
+                viewport_h,
+                target,
+                draws,
+            );
+            return Ok(());
+        }
+
+        let layouts = alpha_atlas::layout(bitmaps, limit)?;
+        if layouts.is_empty() {
+            self.subtitle_alpha_cache = None;
+            return Ok(());
+        }
+        let key = alpha_atlas::ContentKey::new(bitmaps, limit, &layouts);
+        let mut pages = Vec::with_capacity(layouts.len());
+        for page in layouts {
             let pixels = page.pixels(bitmaps)?;
             let texture = create_cpu_texture(
                 self.state.as_ref().expect("device ensured"),
@@ -2272,9 +2315,31 @@ impl D3d11Renderer {
                 page.width,
             )?;
             self.stats.overlay_alpha_atlas_uploads += 1;
+            pages.push(D3d11SubtitleAlphaPage {
+                layout: page,
+                texture,
+            });
+        }
+        // Build every page before replacing the previous entry. On error the
+        // old cache remains valid but is never drawn for different alpha data.
+        Self::append_subtitle_alpha_draws(bitmaps, &pages, viewport_w, viewport_h, target, draws);
+        self.subtitle_alpha_cache = key.map(|key| D3d11SubtitleAlphaCache { key, pages });
+        Ok(())
+    }
+
+    fn append_subtitle_alpha_draws(
+        bitmaps: &[crate::subtitle::SubtitleAlphaBitmap],
+        pages: &[D3d11SubtitleAlphaPage],
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+    ) {
+        for cached in pages {
+            let page = &cached.layout;
             // Pages and tiles retain libass painter order, including overlapping
             // outline/shadow/fill layers. Never sort by size or color.
-            for tile in page.tiles {
+            for tile in &page.tiles {
                 let bitmap = &bitmaps[tile.bitmap];
                 let mut constants = OverlayUniforms::alpha_atlas(
                     bitmap.color_rgba,
@@ -2293,12 +2358,13 @@ impl D3d11Renderer {
                 constants.rect[1] += tile.y as f32;
                 constants.tex_rect[1] = 1.0 / page.height as f32;
                 draws.push(D3d11OverlayDraw {
-                    texture: texture.clone(),
+                    // Draws own COM clones: evicting the cache never mutates or
+                    // releases resources still referenced by pending draws.
+                    texture: cached.texture.clone(),
                     constants,
                 });
             }
         }
-        Ok(())
     }
 
     /// Return a cached (or freshly generated) perceptual gamut LUT SRV for
@@ -2693,6 +2759,7 @@ impl RendererBackend for D3d11Renderer {
     fn detach_surface(&mut self) -> Result<()> {
         self.retire_current_video()?;
         self.surface = None;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         self.stats.attached = false;
@@ -2747,6 +2814,7 @@ impl RendererBackend for D3d11Renderer {
 
     fn clear_current_frame(&mut self) -> Result<()> {
         self.retire_current_video()?;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         if self.surface.is_some() {
