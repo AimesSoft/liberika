@@ -2041,8 +2041,13 @@ impl MetalRendererImpl {
         viewport: OverlayViewport,
         changed: bool,
     ) -> Result<Option<&OverlayAlphaAtlasCache>> {
+        let previous_changed = self
+            .overlay_alpha_atlas_cache
+            .as_ref()
+            .is_some_and(|cache| cache.previous_call_changed && cache.viewport == viewport);
         if !changed {
-            if let Some(cache) = &self.overlay_alpha_atlas_cache {
+            if let Some(cache) = &mut self.overlay_alpha_atlas_cache {
+                cache.previous_call_changed = false;
                 if cache.can_reuse_for(bitmaps, viewport) {
                     self.stats.overlay_alpha_atlas_reuses += 1;
                     return Ok(self.overlay_alpha_atlas_cache.as_ref());
@@ -2077,6 +2082,8 @@ impl MetalRendererImpl {
             plan.placements,
             bitmaps,
             viewport,
+            changed,
+            previous_changed,
         ));
         self.stats.overlay_alpha_atlas_uploads += 1;
         Ok(self.overlay_alpha_atlas_cache.as_ref())
@@ -2961,7 +2968,8 @@ struct OverlayAlphaAtlasCache {
     pages: Vec<OverlayAlphaAtlasTexture>,
     placements: Vec<OverlayAlphaAtlasPlacement>,
     viewport: OverlayViewport,
-    signature: OverlayAlphaAtlasSignature,
+    signature: Option<OverlayAlphaAtlasSignature>,
+    previous_call_changed: bool,
 }
 
 struct DanmakuAlphaAtlasCache {
@@ -3041,18 +3049,26 @@ impl OverlayAlphaAtlasCache {
         placements: Vec<OverlayAlphaAtlasPlacement>,
         bitmaps: &[SubtitleAlphaBitmap],
         viewport: OverlayViewport,
+        changed: bool,
+        previous_changed: bool,
     ) -> Self {
         Self {
             pages,
             placements,
             viewport,
-            signature: OverlayAlphaAtlasSignature::from_bitmaps(bitmaps),
+            // Consecutive dirty calls must upload anyway. Defer the full alpha
+            // scan until a later rebuild can establish a reusable signature.
+            signature: (!(changed && previous_changed))
+                .then(|| OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)),
+            previous_call_changed: changed,
         }
     }
 
     fn can_reuse_for(&self, bitmaps: &[SubtitleAlphaBitmap], viewport: OverlayViewport) -> bool {
         self.viewport == viewport
-            && self.signature == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)
+            && self.signature.as_ref().is_some_and(|signature| {
+                *signature == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)
+            })
     }
 }
 
