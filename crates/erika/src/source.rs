@@ -1155,6 +1155,7 @@ fn open_stream_response(
     let status = response.status().as_u16();
     match status {
         206 => {
+            validate_partial_response_etag(&response, validator.as_deref())?;
             // A stream that answers from anywhere but the requested offset
             // would be spliced onto the cache as silent corruption, exactly
             // like the synchronous path's resume check.
@@ -1254,6 +1255,11 @@ fn stream_worker_main(
             return;
         }
         if live.is_none() {
+            // Headers from an empty/failed response have not identified any
+            // retained stream bytes; bind the validator to the next body instead.
+            if offset == start {
+                validator = None;
+            }
             match open_stream_response(&io, &uri, &http_headers, offset, validator.clone()) {
                 Ok(StreamOpened::Body {
                     response,
@@ -1659,6 +1665,34 @@ fn validate_resume_validator(validator: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// A strong ETag is a quoted opaque byte identifier, never a date or W/ tag.
+fn strong_etag(value: &[u8]) -> Option<&[u8]> {
+    let value = value.trim_ascii();
+    let opaque = value.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    opaque
+        .iter()
+        .all(|&byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
+        .then_some(value)
+}
+
+/// An origin can ignore If-Range while explicitly returning a different entity
+/// in a 206. Missing ETag is legal, so only contradictory strong tags reject it.
+fn validate_partial_response_etag(
+    response: &reqwest::Response,
+    validator: Option<&str>,
+) -> Result<()> {
+    if let Some(expected) = validator.map(str::as_bytes).and_then(strong_etag)
+        && let Some(actual) = response
+            .headers()
+            .get("etag")
+            .and_then(|value| strong_etag(value.as_bytes()))
+        && actual != expected
+    {
+        return Err(SourceError::HttpEntityChanged);
+    }
+    Ok(())
+}
+
 /// A 200 may mean that If-Range detected a changed resource. Only splice its
 /// tail onto previously received bytes when the original validator still
 /// matches; missing validators cannot prove that the replay is the same file.
@@ -1827,6 +1861,9 @@ async fn fetch_http_range_async(
             )));
         }
         let received = bytes.len() as u64;
+        if received == 0 {
+            validator = None;
+        }
         if range.length.is_some_and(|length| received >= length) {
             return Ok(HttpRangeResponse {
                 bytes,
@@ -1886,6 +1923,9 @@ async fn fetch_http_range_async(
         let status = response.status().as_u16();
         match status {
             206 => {
+                if received > 0 {
+                    validate_partial_response_etag(&response, validator.as_deref())?;
+                }
                 let content_range = response
                     .headers()
                     .get("content-range")
