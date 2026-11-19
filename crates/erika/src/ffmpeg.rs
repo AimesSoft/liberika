@@ -3319,6 +3319,69 @@ mod software_planar_upload {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) struct SoftwareYuv420pUpload<'a> {
+        width: usize,
+        height: usize,
+        y: StridedPlane<'a>,
+        u: StridedPlane<'a>,
+        v: StridedPlane<'a>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl SoftwareYuv420pUpload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.y
+        }
+
+        pub(crate) fn write_chroma_into(&self, uv: &mut [u8], uv_pitch: usize) -> Option<()> {
+            let cw = self.width.div_ceil(2);
+            let uv_row_bytes = cw.checked_mul(2)?;
+            if uv_pitch < uv_row_bytes || uv_pitch.checked_mul(self.height.div_ceil(2))? != uv.len()
+            {
+                return None;
+            }
+            for (row, dst) in uv.chunks_exact_mut(uv_pitch).enumerate() {
+                let (u, v) = (self.u.visible_row(row)?, self.v.visible_row(row)?);
+                // Keep the ordinary interleave loop available to the compiler's
+                // vectorizer; only visible bytes enter the new immutable backing.
+                for col in 0..cw {
+                    dst[col * 2] = u[col];
+                    dst[col * 2 + 1] = v[col];
+                }
+            }
+            Some(())
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl Frame {
+        pub(crate) fn software_yuv420p_upload(&self) -> Option<SoftwareYuv420pUpload<'_>> {
+            if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            let y = StridedPlane::from_frame(self, 0, width, height)?;
+            let u = StridedPlane::from_frame(self, 1, cw, ch)?;
+            let v = StridedPlane::from_frame(self, 2, cw, ch)?;
+            Some(SoftwareYuv420pUpload {
+                width,
+                height,
+                y,
+                u,
+                v,
+            })
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) struct SoftwareP010Upload<'a> {
         width: usize,
         height: usize,
@@ -3481,7 +3544,7 @@ mod software_planar_upload {
 pub(crate) use software_planar_upload::SoftwareNv12Upload;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use software_planar_upload::SoftwareP010Upload;
+pub(crate) use software_planar_upload::{SoftwareP010Upload, SoftwareYuv420pUpload};
 
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
 /// (`width * height`) and an interleaved Cb/Cr plane at half resolution

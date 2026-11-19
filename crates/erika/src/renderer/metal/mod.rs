@@ -653,6 +653,24 @@ impl MetalRenderer {
         frame: &Frame,
         unsupported: impl FnOnce() -> PlayerError,
     ) -> Result<ImportedVideoFrame> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if frame.raw_pixel_format() == erika_ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+            let Some(planes) = frame.software_yuv420p_upload() else {
+                return Err(unsupported());
+            };
+            if let Some(result) = self
+                .inner
+                .upload_linear_yuv420p8_uv(&planes, frame.color_range() == ColorRange::Full)?
+            {
+                return Ok(ImportedVideoFrame {
+                    info: result.info,
+                    source_color: SourceColorState::default(),
+                    inner: Some(result.textures),
+                });
+            }
+            // Candidate creation failed or is unsupported: its local resources
+            // are gone before the original 8-bit upload path runs below.
+        }
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         if frame.is_8bit_420_software() {
             let planes = frame.software_nv12_upload().ok_or_else(unsupported)?;

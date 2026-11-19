@@ -8,9 +8,9 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use crate::core::{PlayerError, Result};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use crate::ffmpeg::SoftwareP010Upload;
 use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat, SoftwareNv12Upload};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::ffmpeg::{SoftwareP010Upload, SoftwareYuv420pUpload};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_core_foundation::CFRetained;
@@ -2348,6 +2348,82 @@ impl MetalRendererImpl {
             luma,
             chroma,
         ))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn upload_linear_yuv420p8_uv(
+        &self,
+        frame: &SoftwareYuv420pUpload<'_>,
+        full_range: bool,
+    ) -> Result<Option<ImportedVideoFrameResult>> {
+        if !self.device.hasUnifiedMemory() {
+            return Ok(None);
+        }
+        let (width, height) = frame.dimensions();
+        if width > self.max_texture_dimension || height > self.max_texture_dimension {
+            return Ok(None);
+        }
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let candidate = (|| {
+            let format = MTLPixelFormat::RG8Unorm;
+            let (pitch, len) = checked_linear_plane_layout(
+                cw.checked_mul(2)?,
+                ch,
+                self.device
+                    .minimumLinearTextureAlignmentForPixelFormat(format),
+                self.device.maxBufferLength(),
+            )?;
+            if pitch % 2 != 0 {
+                return None;
+            }
+            let buffer = self
+                .device
+                .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)?;
+            let descriptor = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    format, cw, ch, false,
+                )
+            };
+            descriptor.setTextureType(MTLTextureType::Type2D);
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
+            descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+            let texture =
+                buffer.newTextureWithDescriptor_offset_bytesPerRow(&descriptor, 0, pitch)?;
+            // Fresh newBufferWithLength:options: storage is already zeroed.
+            // CPU access is exclusive until publication; backing is never reused.
+            unsafe {
+                frame.write_chroma_into(
+                    std::slice::from_raw_parts_mut(buffer.contents().as_ptr().cast::<u8>(), len),
+                    pitch,
+                )?;
+            }
+            Some((buffer, texture))
+        })();
+        let Some((uv_buffer, chroma)) = candidate else {
+            return Ok(None);
+        };
+        let y = frame.luma();
+        // Keep the original synchronous Y upload. Once UV succeeds, a Y
+        // allocation failure propagates without repeating the upload path.
+        let luma = unsafe {
+            self.create_video_plane_texture_from_ptr(
+                width,
+                height,
+                MTLPixelFormat::R8Unorm,
+                y.stride(),
+                y.as_ptr(),
+            )?
+        };
+        let mut result = Self::planar_video_frame_result(
+            width,
+            height,
+            ImportedVideoFormat::Nv12,
+            full_range,
+            luma,
+            chroma,
+        );
+        result.textures.planes[1].backing_buffer = Some(uv_buffer);
+        Ok(Some(result))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
