@@ -383,7 +383,13 @@ jobs:
           }
           pip install --quiet meson ninja
           $llvmBin = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path (Join-Path $llvmBin "libclang.dll"))) {
+          $libclang = Join-Path $llvmBin "libclang.dll"
+          if ("${{ matrix.arch }}" -eq "x64" -and
+              (-not (Test-Path $libclang) -or [version](Get-Item $libclang).VersionInfo.ProductVersion -lt [version]"22.0")) {
+            # VS 2026's STL requires Clang 22 or newer when bindgen parses C++.
+            choco upgrade llvm --version=22.1.8 -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif (-not (Test-Path $libclang)) {
             choco install llvm -y --no-progress
           }
           "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

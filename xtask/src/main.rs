@@ -1449,6 +1449,14 @@ fn build_dav1d(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     fs::create_dir_all(&layout.dav1d_prefix)
         .with_context(|| format!("create {}", layout.dav1d_prefix.display()))?;
 
+    if options.target.is_windows() {
+        // Backport dav1d a34e0685b911 for the MSVC 14.52 preprocessor.
+        apply_unified_patch(
+            &layout.dav1d_source_dir,
+            include_str!("../../third_party/patches/dav1d-1.5.1/0001-msvc-has-include-next.patch"),
+        )?;
+    }
+
     let meson = ensure_meson_tools(layout)?;
     let asm_enabled = dav1d_asm_enabled(options.target);
     println!(
