@@ -2779,11 +2779,12 @@ impl PresenterRuntime {
                             let pts = frame.pts.unwrap_or(frame.media_time);
                             self.presentation.on_upload(pts, frame.generation);
                             self.current_media_time = pts;
-                            self.current_generation =
-                                frame.generation.max(self.danmaku_generation).max(1);
+                            // Danmaku edits can advance the presenter while decoded frames
+                            // still belong to the same playback generation.
+                            self.current_generation = self.current_generation.max(frame.generation);
                             self.update_overlay(
                                 pts,
-                                frame.generation,
+                                self.current_generation,
                                 frame.frame.width() as usize,
                                 frame.frame.height() as usize,
                             );
