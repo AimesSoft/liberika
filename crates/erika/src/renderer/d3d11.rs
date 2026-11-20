@@ -3298,6 +3298,22 @@ impl RendererBackend for D3d11Renderer {
         Ok(())
     }
 
+    fn advance_empty_danmaku_scene(&mut self, previous_generation: u64, generation: u64) {
+        if self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| surface.swapchain.is_some() && !surface.flutter_texture)
+            && let Some(scene) = self.presented_scene.as_mut()
+            && scene.generation == previous_generation
+            && scene
+                .danmaku
+                .as_ref()
+                .is_none_or(DanmakuRenderPlan::is_empty)
+        {
+            scene.generation = generation;
+        }
+    }
+
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         self.drop_device_if_removed();
         self.render_video(context)

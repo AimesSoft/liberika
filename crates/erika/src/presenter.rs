@@ -1456,7 +1456,6 @@ impl PresenterRuntime {
             DanmakuTrackSource::Unknown,
         );
         self.sync_danmaku_engine_timeline();
-        self.bump_danmaku_generation();
     }
 
     pub fn add_danmaku_track(
@@ -1470,7 +1469,6 @@ impl PresenterRuntime {
             self.danmaku_session
                 .add_track_with_offset(timeline, name, source, offset_micros);
         self.sync_danmaku_engine_timeline();
-        self.bump_danmaku_generation();
         track_id
     }
 
@@ -1478,7 +1476,6 @@ impl PresenterRuntime {
         let removed = self.danmaku_session.remove_track(track_id);
         if removed {
             self.sync_danmaku_engine_timeline();
-            self.bump_danmaku_generation();
         }
         removed
     }
@@ -1487,7 +1484,6 @@ impl PresenterRuntime {
         let updated = self.danmaku_session.set_track_enabled(track_id, enabled);
         if updated {
             self.sync_danmaku_engine_timeline();
-            self.bump_danmaku_generation();
         }
         updated
     }
@@ -1498,7 +1494,6 @@ impl PresenterRuntime {
             .set_track_offset(track_id, offset_micros);
         if updated {
             self.sync_danmaku_engine_timeline();
-            self.bump_danmaku_generation();
         }
         updated
     }
@@ -1509,7 +1504,6 @@ impl PresenterRuntime {
         }
         self.danmaku_session.set_global_offset(offset_micros);
         self.sync_danmaku_engine_timeline();
-        self.bump_danmaku_generation();
     }
 
     pub fn danmaku_tracks(&self) -> Vec<DanmakuTrackInfo> {
@@ -3569,8 +3563,21 @@ impl PresenterRuntime {
         self.invalidate_current_danmaku_plan();
     }
 
-    fn bump_danmaku_generation_for_config_change(&mut self) {
+    // Layout edits do not change the video timeline. A backend can keep an
+    // already displayed image until the replacement layout has visible content.
+    fn advance_danmaku_layout_generation(&mut self) {
+        #[cfg(target_os = "windows")]
+        let previous = self.current_generation;
         bump_generation(&mut self.current_generation, &mut self.danmaku_generation);
+        #[cfg(target_os = "windows")]
+        if self.current_danmaku.is_none() {
+            self.renderer
+                .advance_empty_danmaku_scene(previous, self.current_generation);
+        }
+    }
+
+    fn bump_danmaku_generation_for_config_change(&mut self) {
+        self.advance_danmaku_layout_generation();
         self.danmaku_planner.invalidate_requests();
 
         // Style/layout preparation runs on the async planner. Keep the last
@@ -3829,6 +3836,7 @@ impl PresenterRuntime {
         self.danmaku.sync_timeline(&timeline);
         self.danmaku_planner.set_timeline(timeline);
         self.invalidate_current_danmaku_plan();
+        self.advance_danmaku_layout_generation();
         // The planner forgets placement history for a new timeline; so does capture.
         self.capture_danmaku = None;
     }
