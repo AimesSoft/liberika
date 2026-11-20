@@ -3512,6 +3512,31 @@ mod software_planar_upload {
             }
         }
 
+        #[cfg(target_os = "windows")]
+        pub(crate) fn write_mapped_d3d11_chroma(
+            &self,
+            output: &mut [std::mem::MaybeUninit<u8>],
+            pitch: usize,
+        ) -> Option<()> {
+            let row_bytes = self.width.div_ceil(2).checked_mul(4)?;
+            let rows = self.height.div_ceil(2);
+            let span = rows
+                .checked_sub(1)?
+                .checked_mul(pitch)?
+                .checked_add(row_bytes)?;
+            if pitch < row_bytes || span != output.len() {
+                return None;
+            }
+            for (row, dst) in output.chunks_mut(pitch).enumerate() {
+                super::p010::chroma_row_write_only(
+                    self.u.visible_row(row)?,
+                    self.v.visible_row(row)?,
+                    &mut dst[..row_bytes],
+                );
+            }
+            Some(())
+        }
+
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         pub(crate) fn write_into(
             &self,
@@ -3667,7 +3692,7 @@ mod software_planar_upload {
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub(crate) use software_planar_upload::SoftwareNv12Upload;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(target_os = "windows", all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) use software_planar_upload::SoftwareP010Upload;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

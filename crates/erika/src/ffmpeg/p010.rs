@@ -3,6 +3,8 @@
 //! Keep frame pointers, strides and allocation in `ffmpeg.rs`. These kernels also
 //! compile directly with rustc, without FFmpeg, for regression tests and timing.
 
+use std::mem::MaybeUninit;
+
 /// Converts one complete row, including rows whose address is not u16-aligned.
 #[inline]
 pub(super) fn luma_row(src: &[u8], dst: &mut [u8]) {
@@ -29,6 +31,13 @@ pub(super) fn luma_row(src: &[u8], dst: &mut [u8]) {
 /// Interleaves one complete pair of Cb/Cr rows, preserving all ten bits.
 #[inline]
 pub(super) fn chroma_row(u: &[u8], v: &[u8], dst: &mut [u8]) {
+    // The writer initializes every byte and never reads the destination.
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), dst.len()) };
+    chroma_row_write_only(u, v, dst);
+}
+
+#[inline]
+pub(super) fn chroma_row_write_only(u: &[u8], v: &[u8], dst: &mut [MaybeUninit<u8>]) {
     #[cfg(target_arch = "x86_64")]
     chroma_row_sse2(u, v, dst);
     #[cfg(not(target_arch = "x86_64"))]
@@ -36,7 +45,7 @@ pub(super) fn chroma_row(u: &[u8], v: &[u8], dst: &mut [u8]) {
 }
 
 #[inline]
-pub(super) fn chroma_row_scalar(u: &[u8], v: &[u8], dst: &mut [u8]) {
+pub(super) fn chroma_row_scalar(u: &[u8], v: &[u8], dst: &mut [MaybeUninit<u8>]) {
     debug_assert_eq!(u.len(), v.len());
     debug_assert_eq!(u.len() * 2, dst.len());
     debug_assert_eq!(u.len() % 2, 0);
@@ -49,13 +58,13 @@ pub(super) fn chroma_row_scalar(u: &[u8], v: &[u8], dst: &mut [u8]) {
     {
         let u = (u16::from_le_bytes([u[0], u[1]]) & 0x03ff) << 6;
         let v = (u16::from_le_bytes([v[0], v[1]]) & 0x03ff) << 6;
-        dest[..2].copy_from_slice(&u.to_le_bytes());
-        dest[2..].copy_from_slice(&v.to_le_bytes());
+        dest[..2].copy_from_slice(&u.to_le_bytes().map(MaybeUninit::new));
+        dest[2..].copy_from_slice(&v.to_le_bytes().map(MaybeUninit::new));
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(super) fn chroma_row_sse2(u: &[u8], v: &[u8], dst: &mut [u8]) {
+pub(super) fn chroma_row_sse2(u: &[u8], v: &[u8], dst: &mut [MaybeUninit<u8>]) {
     use std::arch::x86_64::*;
     assert_eq!(u.len(), v.len());
     assert_eq!(u.len() % 2, 0);
