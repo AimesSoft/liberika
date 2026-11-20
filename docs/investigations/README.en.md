@@ -6,7 +6,6 @@ Read each record in the context of its date, commit and devices. Current integra
 
 | Record | Scope |
 |---|---|
-| [Windows D3D11 screenshots and 4K playback (Chinese)](windows-d3d11-capture-2026-11-16/README.md) | 2026-11-16, WARP / Intel UHD 770 pixel tests, real RTX 5060 Ti 4K HEVC capture, and HWND/Composition lifecycle |
 | [#197 headless subtitle export (Chinese)](issue-197-headless-subtitles-2026-11-16/README.md) | 2026-11-16, Apple Metal: real 1080p ASS playback to 640×360 native textures; main/fixed comparison, pixel checks and overlay calls |
 | [#205 HTTP cancellation and repeated seeks (Chinese)](issue-205-http-seek-2026-11-16/README.md) | 2026-11-16, macOS / Windows: real HTTP Range, 12 in-flight cancellations, baseline failure and natural EOF after the fix |
 | [Issue #213: Rust consumer and Windows host validation](issue-213-rust-consumer-2026-11-16/README.md) | 2026-11-16; explicit HAL patch, Linux compile/link, and Windows xtask/C API/native checks |

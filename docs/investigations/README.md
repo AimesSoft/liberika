@@ -6,7 +6,6 @@
 
 | 记录 | 范围 |
 |---|---|
-| [Windows D3D11 截图与 4K 播放验证（中文）](windows-d3d11-capture-2026-11-16/README.md) | 2026-11-16，WARP / Intel UHD 770 像素测试、RTX 5060 Ti 真实 4K HEVC 截图及 HWND/Composition 生命周期 |
 | [#197 无 surface 字幕导出实测（中文）](issue-197-headless-subtitles-2026-11-16/README.md) | 2026-11-16，Apple Metal：1080p ASS → 640×360 原生纹理；原主干与修复版 A/B、逐帧像素与字幕层调用数 |
 | [#205 HTTP 取消与连续 seek 实测（中文）](issue-205-http-seek-2026-11-16/README.md) | 2026-11-16，macOS / Windows：真实 HTTP Range、12 轮在途取消、旧主干失败对照与修复后自然结束 |
 | [Issue #213：Rust 消费端与 Windows host 验证（English）](issue-213-rust-consumer-2026-11-16/README.md) | 2026-11-16；显式 HAL patch、Linux 编译链接与 Windows xtask/C API/原生检查 |

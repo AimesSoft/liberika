@@ -1,8 +1,0 @@
-dispose services worker sent messages without a platform callback deadlock passed
-video underlay stays below Flutter controls without topmost passed
-overlay owner preservation, exclusive takeover and stale detach protection passed
-worker capture (stub RGBA), real WIC PNG encoding and platform result passed
-PLAYBACK started position_us=416666 rendered=5 hardware=8 software=0 render_failures=0 playing=1
-RENDER_ADAPTER NVIDIA GeForce RTX 5060 Ti vendor=4318 device=11524 owner_thread=18756 platform_thread=18828
-CAPTURE owner_thread=18756 platform_thread=18828
-CAPTURE encode_and_readback_ms=0
