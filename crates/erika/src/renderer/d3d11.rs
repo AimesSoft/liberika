@@ -2182,10 +2182,26 @@ impl D3d11Renderer {
             height,
             bytes: chroma,
         });
+        let planes = match result {
+            Ok(planes) => planes,
+            Err(error) => {
+                let state = self.state.as_mut().expect("device ensured");
+                if unsafe { state.device.GetDeviceRemovedReason() }.is_err() {
+                    return Err(error);
+                }
+                // A driver can pass the capability probe and still fail here.
+                // Keep this device on the CPU path; the caller uploads this
+                // frame that way.
+                state.p010_upload_shader = Some(None);
+                state.p010_chroma_staging = None;
+                p010_upload::fallback(&error.to_string());
+                return Ok(false);
+            }
+        };
         self.publish_software_planes(
             (width, height),
             D3d11VideoTextureFormat::P010,
-            result?,
+            planes,
             source_color,
             target_color,
         )?;
