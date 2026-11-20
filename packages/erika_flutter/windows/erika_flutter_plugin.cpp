@@ -3898,6 +3898,7 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
       platform_result->Error("ERIKA_ERROR", error);
     } else if (!reply->implemented) {
       platform_result->NotImplemented();
+      return;
     } else {
       if (method == "play" && players_.find(id) != players_.end())
         SetActivePlayer(id);
