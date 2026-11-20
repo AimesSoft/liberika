@@ -2754,7 +2754,9 @@ unsafe fn raw_ass_image_to_alpha_bitmap(image: &RawAssImage) -> Result<SubtitleA
     let height = image.h as u32;
     let stride = image.stride.max(0) as usize;
     let required = required_bitmap_len(width, height, stride)?;
-    let alpha = if stride == width as usize || height <= 1 {
+    let alpha = if required == 0 {
+        Vec::new()
+    } else if stride == width as usize || height <= 1 {
         // This span contains only visible pixels, with no inter-row padding.
         unsafe { std::slice::from_raw_parts(image.bitmap, required) }.to_vec()
     } else {
