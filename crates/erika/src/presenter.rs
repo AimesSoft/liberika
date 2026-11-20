@@ -2773,9 +2773,8 @@ impl PresenterRuntime {
                             let pts = frame.pts.unwrap_or(frame.media_time);
                             self.presentation.on_upload(pts, frame.generation);
                             self.current_media_time = pts;
-                            // Danmaku edits can advance the presenter while decoded frames
-                            // still belong to the same playback generation.
-                            self.current_generation = self.current_generation.max(frame.generation);
+                            self.current_generation =
+                                generation_after_upload(self.current_generation, frame.generation);
                             self.update_overlay(
                                 pts,
                                 self.current_generation,
@@ -4293,6 +4292,14 @@ fn normalize_subtitle_font_scale(scale: f64) -> f64 {
     } else {
         DEFAULT_SUBTITLE_FONT_SCALE
     }
+}
+
+/// The presenter generation after uploading a decoded frame. Danmaku edits can
+/// advance the presenter while decoded frames still belong to the same playback
+/// generation, so an upload may raise the generation but never lower it: going
+/// back would reject a layout already prepared for the newer generation.
+fn generation_after_upload(current_generation: u64, frame_generation: u64) -> u64 {
+    current_generation.max(frame_generation)
 }
 
 fn bump_generation(current_generation: &mut u64, danmaku_generation: &mut u64) {
@@ -6187,6 +6194,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         assert_eq!(danmaku_generation, 5);
         assert_eq!(generation, 8);
+    }
+
+    #[test]
+    fn uploaded_frame_keeps_generation_advanced_by_a_danmaku_edit() {
+        // Playback generation 3 is on screen; loading danmaku advances the
+        // presenter to 4 and a layout is prepared for 4.
+        let mut generation = 3;
+        let mut danmaku_generation = 1;
+        bump_generation(&mut generation, &mut danmaku_generation);
+        assert_eq!(generation, 4);
+
+        // A frame decoded for playback generation 3 arrives after the edit. The
+        // layout prepared for 4 must stay valid, so the generation stays at 4.
+        assert_eq!(generation_after_upload(generation, 3), 4);
+        // The formula this replaced, frame.max(danmaku_generation).max(1), went
+        // back to 3 here and rejected the prepared layout for one refresh.
+        assert_eq!(3u64.max(danmaku_generation).max(1), 3);
+
+        // A frame from a newer playback generation still advances it.
+        assert_eq!(generation_after_upload(4, 6), 6);
     }
 
     #[test]
