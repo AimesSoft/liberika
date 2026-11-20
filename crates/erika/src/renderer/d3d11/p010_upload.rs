@@ -67,24 +67,51 @@ fn supports_in_place_luma(device: &ID3D11Device) -> ::windows::core::Result<bool
     Ok(support.OutFormatSupport2 & required == required)
 }
 
+/// The in-place luma shader, or `None` when this device should keep the CPU
+/// path. Only a removed device is an error: a failed capability query, shader
+/// compile or shader creation on a live device falls back instead.
 pub(super) fn create_shader(device: &ID3D11Device) -> Result<Option<ID3D11ComputeShader>> {
+    let removed = || unsafe { device.GetDeviceRemovedReason() }.is_err();
     match supports_in_place_luma(device) {
         Ok(false) => return Ok(None),
         Ok(true) => {}
         Err(error) if error.code() == E_INVALIDARG || error.code() == DXGI_ERROR_UNSUPPORTED => {
             return Ok(None);
         }
-        Err(error) => return Err(d3d_error("Query P010 luma UAV support", error)),
+        Err(error) if removed() => return Err(d3d_error("Query P010 luma UAV support", error)),
+        Err(error) => {
+            fallback(&format!("capability query failed: {error}"));
+            return Ok(None);
+        }
     }
-    let bytecode = compile_with_flags(SHADER, D3DCOMPILE_OPTIMIZATION_LEVEL3).map_err(|error| {
-        PlayerError::Renderer(format!("d3d11: software P010 luma shader: {error}"))
-    })?;
+    let bytecode = match compile_with_flags(SHADER, D3DCOMPILE_OPTIMIZATION_LEVEL3) {
+        Ok(bytecode) => bytecode,
+        Err(error) => {
+            fallback(&format!("shader compile failed: {error}"));
+            return Ok(None);
+        }
+    };
     let mut shader = None;
-    unsafe { device.CreateComputeShader(&bytecode, None, Some(&mut shader)) }
-        .map_err(|error| d3d_error("CreateComputeShader(P010 in-place luma)", error))?;
-    shader
-        .map(Some)
-        .ok_or_else(|| PlayerError::Renderer("d3d11: software P010 luma shader was null".into()))
+    match unsafe { device.CreateComputeShader(&bytecode, None, Some(&mut shader)) } {
+        Ok(()) if shader.is_some() => Ok(shader),
+        Err(error) if removed() => Err(d3d_error("CreateComputeShader(P010 in-place luma)", error)),
+        Err(error) => {
+            fallback(&format!("shader creation failed: {error}"));
+            Ok(None)
+        }
+        Ok(()) => {
+            fallback("shader creation returned null");
+            Ok(None)
+        }
+    }
+}
+
+/// Records why software P010 keeps the CPU path on this device.
+pub(super) fn fallback(reason: &str) {
+    crate::trace::diagnostic_at(
+        crate::trace::LogLevel::Warn,
+        &format!("erika d3d11: software P010 uses the CPU path: {reason}"),
+    );
 }
 
 pub(super) struct ChromaStaging {
