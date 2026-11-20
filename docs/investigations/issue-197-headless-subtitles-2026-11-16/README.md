@@ -22,7 +22,7 @@
 原主干日志中的 playback canvas 为 **3840×2160**（默认字幕分辨率策略），
 而实际导出为 640×360。修复后，上述两条无消费者的 playback overlay 路径不再执行，
 字幕仍出现在每张检查过的导出纹理上。两次运行的最终 PNG **字节完全相同**，共同样本见
-[export.png](export.png)。
+export.png。
 
 这是功能和调用次数回归验证，**不是帧率或吞吐性能基准**；95/100 的帧数差不能用来估算
 性能收益。诊断数量代表 overlay 生成调用，并不意味着每次调用都让 libass 重画位图。
@@ -61,6 +61,6 @@ ERIKA_EXPECT_REDUNDANT_OVERLAY=1 \
 上例复用已准备好的同平台原生依赖；若通过 `ERIKA_FFMPEG_DIR` 等环境变量提供依赖，保持相同
 环境即可，不需要创建 `dist` 链接。对照模式断言旧版确实产生冗余 overlay；默认模式断言该计数为零。
 
-[summary.json](summary.json) 保存原始数值、fixture 探测结果及源码/harness 哈希。
-[baseline.log](baseline.log) 和 [patched.log](patched.log) 是精简执行日志；完整诊断的重复行只保留
+summary.json 保存原始数值、fixture 探测结果及源码/harness 哈希。
+baseline.log 和 patched.log 是精简执行日志；完整诊断的重复行只保留
 样例与计数。目录中不包含源码副本、媒体文件或构建产物。

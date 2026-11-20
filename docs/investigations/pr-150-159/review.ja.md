@@ -136,7 +136,7 @@ Windows：erika 単体テスト 702 件通過／1 ignored、integration 4＋6 �
 
 `--workspace` 全体は Apple-only demo の ObjC ビルドスクリプトで失敗し、後続の検証はコアと C API に限定した。Linux synthetic Vulkan direct-frame チェックは llvmpipe に synchronization2／external-semaphore の機能がないため失敗しており、この経路が検証に通過したわけではない。#155 の Linux コードは採用していない。
 
-元作者の 10 件の PR は fork CI がすべて成功し、実行 SHA はレビュー対象の head と完全に一致した。詳細は [author-ci.json](author-ci.json)を参照。CI の成功は上記の機能面・実行面の判断の代わりにはならない。
+元作者の 10 件の PR は fork CI がすべて成功し、実行 SHA はレビュー対象の head と完全に一致した。詳細は author-ci.jsonを参照。CI の成功は上記の機能面・実行面の判断の代わりにはならない。
 
 ## 再現資料
 

@@ -38,7 +38,7 @@ The MP3 exposed only one audio track; decoded/rendered video were both 0 and the
 
 The emulator's system decoder was counted as `hardwareVideoFrames`, but all output used CPU fallback and `zeroCopyVideoFrames` was 0. This does not establish hardware-decode performance on real devices, NativeBuffer zero-copy, or audible physical-speaker output. libass was not built; subtitles, HDR and real device loss were outside this OHOS validation. The Flutter part called the production NAPI bridge without starting a full Flutter engine; Dart-side evidence remains the tests and analysis in the original report.
 
-![Live video through both bridges](evidence/ohos-live-finished.png)
+Live video through both bridges
 
 The screenshot was obtained and verified via hdc. The repository copy is reduced to 660 pixels wide; the original 1320×2232 image is in the local evidence directory.
 

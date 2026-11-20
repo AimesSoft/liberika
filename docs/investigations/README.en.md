@@ -2,7 +2,7 @@
 
 # Investigations and validation records
 
-Read each record in the context of its date, commit and devices. Current integration guidance is in the [documentation index](../README.en.md). Links below identify the language of each original record; raw logs, screenshots and other evidence remain unchanged.
+Read each record in the context of its date, commit and devices. Current integration guidance is in the [documentation index](../README.en.md). Links below identify the language of each original record. Raw logs, screenshots and captured data are not kept in the repository; records keep conclusions, key figures and reproduction steps. Log and screenshot file names mentioned in a record refer to the original evidence, which stays with whoever ran the investigation.
 
 | Record | Scope |
 |---|---|

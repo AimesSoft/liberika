@@ -58,6 +58,6 @@ use the guides above for current installation, API and release procedures.
 ## Maintaining documentation
 
 - The root README introduces the project, installation options and platforms; each SDK README maintains its public usage instructions.
-- `docs/` covers integration, kernel design and development; experiments belong in `docs/investigations/`.
+- `docs/` covers integration, kernel design and development; experiments belong in `docs/investigations/`, without raw logs, screenshots or captured data.
 - Check API changes against `crates/erika_capi/include/erika.h` and SDK implementations, and update the corresponding guides in all three languages.
 - Add new topics to this index; compatibility entries retaining old filenames should point only to current documents.

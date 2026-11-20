@@ -133,4 +133,4 @@ cargo fmt --all
 
 ## ドキュメントの管理場所
 
-ドキュメントの入口は [docs/README.md](docs/README.md) です。 SDK の使用法は package README、接続・設計は `docs/`、日付付きの調査結果は `docs/investigations/` に保存します。新しい topic を目次に追加し、API 変更と翻訳を同時に更新します。
+ドキュメントの入口は [docs/README.md](docs/README.md) です。 SDK の使用法は package README、接続・設計は `docs/`、日付付きの調査結果は `docs/investigations/` に保存します（結論、主要な数値、再現手順のみ。生のログ、スクリーンショット、取得データは含めません）。新しい topic を目次に追加し、API 変更と翻訳を同時に更新します。

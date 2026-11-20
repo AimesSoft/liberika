@@ -54,7 +54,7 @@ zeroCopyVideoFrames 为 0。不能据此宣称真机硬解效率、NativeBuffer 
 未构建 libass，字幕/HDR/真实设备丢失也不在这组鸿蒙验证内。
 Flutter 部分调用的是生产 NAPI 桥接，没有启动完整 Flutter 引擎；Dart 侧证据仍是原报告的测试和分析。
 
-![双桥接真实视频画面](evidence/ohos-live-finished.png)
+双桥接真实视频画面
 
 截图由 hdc 取得并核实；仓库内缩小到 660 像素宽，原始 1320×2232 图保存在本机证据目录。
 

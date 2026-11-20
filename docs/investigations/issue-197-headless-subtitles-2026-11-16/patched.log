@@ -1,6 +1,0 @@
-# Condensed execution log; repeated lifecycle/font diagnostics are omitted.
-{"activeBackend":"software","codec":"h264","event":"video_decoder_changed","fallbackCount":0,"lineSizes":null,"pixelFormat":null,"previousBackend":null,"reason":null,"requestedBackend":"software","stage":"open"}
-# Full-log counts: update_overlay=0, clock_overlay=0
-HEADLESS_ASS_RESULT {"backend":"wgpu/Metal","decodedFrames":100,"decodedSubtitleFrames":1,"decoder":{"activeBackend":"software","codec":"h264","fallbackCount":0,"fellBack":false,"hardware":false,"lineSizes":null,"pixelFormat":null,"previousBackend":null,"reason":null,"requestedBackend":"software","stage":"open"},"device":"Apple M5 Pro","expectRedundantOverlay":false,"exportSize":[640,360],"exportedFrames":100,"inspectedFrames":89,"mediaSeconds":4.000695584,"playbackOverlayFrames":0,"sourceSize":[1920,1080],"surfaceAttached":false,"wallSeconds":4.043413209,"whiteSubtitlePixelsMax":698,"whiteSubtitlePixelsMin":698}
-test real_1080p_ass_playback_exports_subtitles_without_a_surface_overlay ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.29s

@@ -142,4 +142,4 @@ follow the threading and ownership implications.
 
 ## Documentation ownership
 
-Documentation starts at [docs/README.md](docs/README.md). Keep SDK usage in its package README, implementation/design in `docs/`, and dated investigation results in `docs/investigations/`. Add new topics to the documentation index and update matching translations with API changes.
+Documentation starts at [docs/README.md](docs/README.md). Keep SDK usage in its package README, implementation/design in `docs/`, and dated investigation results in `docs/investigations/` (conclusions, key figures and reproduction steps only; no raw logs, screenshots or captured data). Add new topics to the documentation index and update matching translations with API changes.
