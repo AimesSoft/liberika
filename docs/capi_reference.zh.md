@@ -791,8 +791,7 @@ Fallback 数值是稳定 ABI；新增原因只能追加，不能重排 `0..8`：
 `capture_frame_rgba` 是**截图**：把当前合成帧（视频 + 字幕，不含弹幕）离屏渲染进调用方
 分配的 RGBA8 缓冲，按请求的 `width`×`height`（与显示 surface 尺寸无关）。
 `out_capacity` 至少为 `width*height*4`。尚无可用帧时返回 `PlayerError`。Metal 与
-wgpu（包括 Android）已实现截图；尚未发布的源码补齐了 Windows D3D11 截图，
-v0.3.7 的 D3D11 运行库仍不提供截图。截图始终使用 SDR RGBA8
+wgpu（包括 Android）已实现截图；Windows D3D11 自 0.3.8 起也支持截图。截图始终使用 SDR RGBA8
 离屏 target，并对 HDR/extended-linear 内容 tone-map，因此即使显示输出是 Apple EDR、
 HDR10 或 Android extended-linear scRGB，返回字节仍是 SDR。
 

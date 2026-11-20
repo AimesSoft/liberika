@@ -812,8 +812,7 @@ Fallback value は ABI-stable です。新しい reason は末尾へ追加し、
 弾幕は含みません）を、要求した `width`×`height`（表示 surface サイズとは独立）で呼び出し側確保の
 RGBA8 バッファにオフスクリーン描画します。`out_capacity` は少なくとも `width*height*4`。
 フレームがまだ無いときは `PlayerError` を返します。Metal と wgpu（Android を含む）は
-capture を実装済みです。未リリースのソースでは Windows D3D11 capture も実装していますが、
-v0.3.7 の D3D11 ランタイムはまだ capture を提供しません。capture は常に SDR RGBA8
+capture を実装済みです。Windows D3D11 も 0.3.8 から capture に対応します。capture は常に SDR RGBA8
 offscreen target を使い、HDR/extended-linear content を tone-map します。したがって display
 output が Apple EDR、HDR10、Android extended-linear scRGB の場合も返す byte は SDR です。
 
