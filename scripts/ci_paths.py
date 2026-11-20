@@ -131,7 +131,7 @@ def platforms_for_path(path):
 def select(paths, pull_request):
     """Missing or empty diffs are conservative; only PRs narrow the matrices."""
     impacted = ALL
-    if pull_request and paths:
+    if paths:
         impacted = set()
         for path in paths:
             impacted.update(platforms_for_path(path))
@@ -171,12 +171,19 @@ def main():
         print(json.dumps(select(decode_paths(sys.stdin.buffer.read()), pull_request=True)))
         return
 
-    pull_request = os.environ["EVENT_NAME"] == "pull_request"
+    event = os.environ["EVENT_NAME"]
+    pull_request = event == "pull_request"
     paths = None
     if pull_request:
         paths = pull_request_paths(os.environ.get("BASE_SHA"), os.environ.get("HEAD_SHA"))
         if paths is None:
             print("::warning::PR diff unavailable; selecting every platform")
+    elif event == "push" and os.environ.get("REF") == "refs/heads/main":
+        # Branch pushes skip untouched platforms but keep full matrices. Tag
+        # pushes (releases) and new branches have no usable base: run all.
+        before = os.environ.get("BEFORE_SHA") or ""
+        if before.strip("0"):
+            paths = pull_request_paths(before, os.environ.get("SHA"))
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         for name, value in select(paths, pull_request).items():
             print(f"{name}={json.dumps(value, separators=(',', ':'))}", file=output)

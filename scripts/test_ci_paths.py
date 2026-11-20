@@ -89,7 +89,11 @@ class SelectionTest(unittest.TestCase):
                     [row["abi"] for row in result["android_matrix"]["include"]],
                     ["arm64-v8a"] if pull_request else ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"],
                 )
-                self.assertEqual({name for name in ci_paths.ALL if result[name]}, set() if pull_request else ci_paths.ALL)
+                self.assertEqual({name for name in ci_paths.ALL if result[name]}, set())
+                self.assertEqual(
+                    {name for name in ci_paths.ALL if ci_paths.select(None, pull_request=pull_request)[name]},
+                    ci_paths.ALL,
+                )
 
     def test_missing_or_empty_diff(self):
         self.assert_platforms(None, ci_paths.ALL)
