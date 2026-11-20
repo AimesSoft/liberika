@@ -1319,6 +1319,7 @@ struct D3d11SubtitleAlphaPage {
 struct D3d11SubtitleAlphaCache {
     key: alpha_atlas::ContentKey,
     pages: Box<[D3d11SubtitleAlphaPage]>,
+    scratch: Vec<u8>,
 }
 
 struct D3d11DanmakuAtlasCache {
@@ -2742,9 +2743,16 @@ impl D3d11Renderer {
         let pixel_capacity = layouts.iter().try_fold(0usize, |capacity, page| {
             page.pixel_len().map(|len| capacity.max(len))
         })?;
-        // Allocate the largest page exactly once; geometric growth on later
-        // pages could otherwise double this transient buffer for large atlases.
-        let mut pixels = Vec::with_capacity(pixel_capacity);
+        // Limit spare capacity to one largest page so a small, static atlas
+        // cannot retain a much larger buffer. Size fresh allocations up front.
+        let mut pixels = self
+            .subtitle_alpha_cache
+            .as_mut()
+            .map(|cache| mem::take(&mut cache.scratch))
+            .filter(|pixels| {
+                (pixel_capacity..=pixel_capacity.saturating_mul(2)).contains(&pixels.capacity())
+            })
+            .unwrap_or_else(|| Vec::with_capacity(pixel_capacity));
         for page in layouts {
             page.write_pixels(bitmaps, &mut pixels)?;
             let texture = create_cpu_texture(
@@ -2767,9 +2775,19 @@ impl D3d11Renderer {
         // Build every page before replacing the previous entry. On error the
         // old cache remains valid but is never drawn for different alpha data.
         Self::append_subtitle_alpha_draws(bitmaps, &pages, viewport_w, viewport_h, target, draws);
-        self.subtitle_alpha_cache = key.map(|key| D3d11SubtitleAlphaCache {
-            key,
-            pages: pages.into_boxed_slice(),
+        self.subtitle_alpha_cache = key.map(|(key, remaining_bytes)| {
+            let scratch_budget = remaining_bytes.saturating_sub(mem::size_of::<Vec<u8>>());
+            let scratch = if pixels.capacity() <= scratch_budget {
+                pixels.clear();
+                pixels
+            } else {
+                Vec::new()
+            };
+            D3d11SubtitleAlphaCache {
+                key,
+                pages: pages.into_boxed_slice(),
+                scratch,
+            }
         });
         Ok(())
     }
