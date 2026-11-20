@@ -997,6 +997,7 @@ struct D3d11DeviceState {
     danmaku_pipeline: D3d11DanmakuPipeline,
     // The outer option tracks whether this device has been queried.
     p010_upload_shader: Option<Option<ID3D11ComputeShader>>,
+    p010_chroma_staging: Option<p010_upload::ChromaStaging>,
 }
 
 struct AttachedSurface {
@@ -2118,6 +2119,9 @@ impl D3d11Renderer {
         };
         self.retire_current_video()?;
         self.current_video = Some(imported);
+        if let Some(state) = self.state.as_mut() {
+            state.p010_chroma_staging = None;
+        }
         Ok(())
     }
 
@@ -2153,6 +2157,9 @@ impl D3d11Renderer {
             return Ok(false);
         }
 
+        let source_color = source_color_for_frame(frame);
+        let output_mode = self.select_output_mode_for_source(source_color)?;
+        let target_color = output_mode.target_color_for_source(source_color);
         let mut chroma = match self.software_scratch.take() {
             Some(D3d11SoftwareScratch::P010Chroma {
                 width: w,
@@ -2168,34 +2175,21 @@ impl D3d11Renderer {
             }
             _ => Vec::new(),
         };
-        let result = (|| {
-            upload.write_d3d11_chroma(&mut chroma).ok_or_else(|| {
-                PlayerError::Renderer("d3d11: invalid software P010 chroma layout".into())
-            })?;
-            let source_color = source_color_for_frame(frame);
-            let output_mode = self.select_output_mode_for_source(source_color)?;
-            let target_color = output_mode.target_color_for_source(source_color);
-            let state = self.state.as_ref().expect("device ensured");
-            let shader = state
-                .p010_upload_shader
-                .as_ref()
-                .and_then(Option::as_ref)
-                .expect("P010 upload shader initialized");
-            let planes = p010_upload::upload(state, shader, luma, &chroma)?;
-            self.publish_software_planes(
-                (width, height),
-                D3d11VideoTextureFormat::P010,
-                planes,
-                source_color,
-                target_color,
-            )
-        })();
+        let state = self.state.as_mut().expect("device ensured");
+        let result = p010_upload::upload(state, luma, &upload, &mut chroma);
         self.software_scratch = Some(D3d11SoftwareScratch::P010Chroma {
             width,
             height,
             bytes: chroma,
         });
-        result.map(|()| true)
+        self.publish_software_planes(
+            (width, height),
+            D3d11VideoTextureFormat::P010,
+            result?,
+            source_color,
+            target_color,
+        )?;
+        Ok(true)
     }
 
     fn upload_software_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
@@ -2210,6 +2204,9 @@ impl D3d11Renderer {
             Some((upload, luma))
         });
         if let Some((upload, luma)) = borrowed {
+            if let Some(state) = self.state.as_mut() {
+                state.p010_chroma_staging = None;
+            }
             let (width, height) = (frame.frame.width(), frame.frame.height());
             let pitch = width
                 .div_ceil(2)
@@ -2282,6 +2279,9 @@ impl D3d11Renderer {
         }
         // A successful format switch keeps only the new packed storage.
         drop(previous_chroma);
+        if let Some(state) = self.state.as_mut() {
+            state.p010_chroma_staging = None;
+        }
         let result = self.upload_planar_frame(&planar, source_color_for_frame(frame));
         // CreateTexture2D copies the CPU initial data before returning. GPU
         // texture ownership and retirement fences remain entirely unchanged.
@@ -3303,6 +3303,9 @@ impl RendererBackend for D3d11Renderer {
 
     fn clear_current_frame(&mut self) -> Result<()> {
         self.retire_current_video()?;
+        if let Some(state) = self.state.as_mut() {
+            state.p010_chroma_staging = None;
+        }
         self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
@@ -3596,6 +3599,7 @@ impl D3d11DeviceState {
             overlay_blend,
             danmaku_pipeline,
             p010_upload_shader: None,
+            p010_chroma_staging: None,
         })
     }
 
