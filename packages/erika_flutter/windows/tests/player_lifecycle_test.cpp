@@ -1,5 +1,6 @@
 // Include the implementation so the test peer exercises the actual internal
-// PlayerHost and native-library loader, without starting a Flutter/DWM window.
+// PlayerHost and native-library loader, without starting a Flutter engine.
+// --surface-clip additionally needs an interactive Windows desktop.
 #include "../erika_flutter_plugin.cpp"
 
 #include <cstdlib>
@@ -42,13 +43,61 @@ class ErikaFlutterPluginTestPeer {
   }
 
   static void Command(ErikaFlutterPlugin::PlayerHost& player, std::function<void()> command) {
-    player.Submit([command] { command(); return EncodableValue(); },
+    player.Submit([&player, command] {
+      {
+        std::lock_guard<std::mutex> lock(owner_mutex);
+        Require(GetCurrentThreadId() != platform_thread);
+        Require(native_owners.at(player.handle) == GetCurrentThreadId());
+      }
+      command();
+      return EncodableValue();
+    },
                  [](EncodableValue, std::string error) {
       Require(GetCurrentThreadId() == platform_thread);
       if (!error.empty()) std::cerr << error << "\n";
       Require(error.empty());
     });
     Wait(player);
+  }
+
+  struct PlaybackSnapshot {
+    ErikaPresenterStats stats{};
+    uint64_t position = 0;
+    bool playing = false;
+  };
+
+  static PlaybackSnapshot Snapshot(ErikaFlutterPlugin::PlayerHost& player) {
+    PlaybackSnapshot snapshot;
+    Command(player, [&] {
+      snapshot.stats = player.latest_presenter_stats;
+      snapshot.position = player.smtc_state.position_micros;
+      snapshot.playing = player.smtc_state.playing;
+    });
+    return snapshot;
+  }
+
+  static PlaybackSnapshot PumpUntil(ErikaFlutterPlugin::PlayerHost& player,
+      const std::function<bool(const PlaybackSnapshot&)>& ready) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      player.RequestTick(0);
+      Wait(player);
+      const auto snapshot = Snapshot(player);
+      Require(snapshot.stats.render_failures == 0);
+      if (ready(snapshot)) return snapshot;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::cerr << "timed out waiting for media progress\n";
+    std::abort();
+  }
+
+  static void ReportPlayback(const char* stage, const PlaybackSnapshot& snapshot) {
+    std::cout << "PLAYBACK " << stage << " position_us=" << snapshot.position
+              << " rendered=" << snapshot.stats.rendered_video_frames
+              << " hardware=" << snapshot.stats.hardware_video_frames
+              << " software=" << snapshot.stats.software_video_frames
+              << " render_failures=" << snapshot.stats.render_failures
+              << " playing=" << snapshot.playing << std::endl;
   }
 
   static void RunScreenshotEncoding(
@@ -108,39 +157,134 @@ class ErikaFlutterPluginTestPeer {
         if (!rendered) std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
       Require(rendered);
-      player.Submit([&] {
-          return player.Screenshot(EncodableMap{
-              {EncodableValue("width"), EncodableValue(320)},
-              {EncodableValue("height"), EncodableValue(180)}});
+      const auto started = PumpUntil(player, [](const auto& snapshot) {
+        return snapshot.position >= 400000 && snapshot.stats.rendered_video_frames >= 5;
+      });
+      ReportPlayback("started", started);
+      Command(player, [&] {
+        void* raw = nullptr;
+        player.CheckNative(library->windows_flutter_texture(player.handle, &raw),
+                           "texture device diagnostics");
+        Microsoft::WRL::ComPtr<IUnknown> unknown;
+        unknown.Attach(static_cast<IUnknown*>(raw));
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> output;
+        Require(SUCCEEDED(unknown.As(&output)));
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        output->GetDevice(&device);
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+        Require(SUCCEEDED(device.As(&dxgi_device)));
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        Require(SUCCEEDED(dxgi_device->GetAdapter(&adapter)));
+        DXGI_ADAPTER_DESC description{};
+        Require(SUCCEEDED(adapter->GetDesc(&description)));
+        std::cout << "RENDER_ADAPTER " << WideToUtf8(description.Description)
+                  << " vendor=" << description.VendorId << " device=" << description.DeviceId
+                  << " owner_thread=" << GetCurrentThreadId()
+                  << " platform_thread=" << platform_thread << std::endl;
+      });
+      for (const auto& extent : {std::pair<int, int>{320, 180},
+                                 std::pair<int, int>{3840, 2160}}) {
+        const auto width = extent.first;
+        const auto height = extent.second;
+        player.Submit([&] {
+          {
+            std::lock_guard<std::mutex> lock(owner_mutex);
+            Require(GetCurrentThreadId() != platform_thread);
+            Require(native_owners.at(player.handle) == GetCurrentThreadId());
+          }
+          std::cout << "CAPTURE owner_thread=" << GetCurrentThreadId()
+                    << " platform_thread=" << platform_thread << std::endl;
+          const auto capture_started = std::chrono::steady_clock::now();
+          auto result = player.Screenshot(EncodableMap{
+              {EncodableValue("width"), EncodableValue(width)},
+              {EncodableValue("height"), EncodableValue(height)}});
+          std::cout << "CAPTURE encode_and_readback_ms="
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - capture_started).count()
+                    << std::endl;
+          return result;
         }, [&](EncodableValue value, std::string error) {
           Require(GetCurrentThreadId() == platform_thread);
           Require(error.empty());
           const auto* bytes = std::get_if<std::vector<uint8_t>>(&value);
-          if (bytes) {
-            Require(bytes->size() > 8 && (*bytes)[0] == 0x89 && (*bytes)[1] == 'P');
-            std::cout << "runtime PNG capture passed\n";
-          } else {
-            Require(std::holds_alternative<std::monostate>(value));
-            std::cout << "runtime screenshot returned null (D3D11 capture unavailable)\n";
+          Require(bytes && bytes->size() > 24 && (*bytes)[0] == 0x89 && (*bytes)[1] == 'P');
+          const auto dimension = [&](size_t offset) {
+            return (static_cast<uint32_t>((*bytes)[offset]) << 24) |
+                   (static_cast<uint32_t>((*bytes)[offset + 1]) << 16) |
+                   (static_cast<uint32_t>((*bytes)[offset + 2]) << 8) |
+                   static_cast<uint32_t>((*bytes)[offset + 3]);
+          };
+          Require(dimension(16) == static_cast<uint32_t>(width) &&
+                  dimension(20) == static_cast<uint32_t>(height));
+          if (auto path = EnvironmentPath(L"ERIKA_TEST_CAPTURE_PATH")) {
+            if (width == 3840) path->replace_extension(L".4k.png");
+            std::ofstream output(*path, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(bytes->data()),
+                         static_cast<std::streamsize>(bytes->size()));
+            Require(output.good());
           }
+          std::cout << "runtime PNG capture passed width=" << width << " height=" << height
+                    << " bytes=" << bytes->size() << std::endl;
         });
         Wait(player);
-      Command(player, [&] { player.Pause(); player.Seek(1000000); });
+      }
+      Command(player, [&] { player.Pause(); });
       player.RequestTick(0); Wait(player);
+      const auto paused = Snapshot(player);
+      const auto pause_started = std::chrono::steady_clock::now();
+      for (int i = 0; i < 15; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        player.RequestTick(0); Wait(player);
+      }
+      const auto held = Snapshot(player);
+      const auto drift = held.position > paused.position ? held.position - paused.position
+                                                       : paused.position - held.position;
+      ReportPlayback("paused", held);
+      Require(!held.playing && drift <= 100000);
+      const auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - pause_started).count();
+      std::cout << "PAUSE held_ms=" << held_ms << " drift_us=" << drift << std::endl;
+      Command(player, [&] { player.Seek(1000000); });
+      const auto before_resume = Snapshot(player);
       Command(player, [&] { player.Play(); });
+      const auto resumed = PumpUntil(player, [&](const auto& snapshot) {
+        return snapshot.position >= 1300000 &&
+               snapshot.stats.rendered_video_frames > before_resume.stats.rendered_video_frames &&
+               snapshot.stats.decoded_video_frames > before_resume.stats.decoded_video_frames;
+      });
+      ReportPlayback("seek-resumed", resumed);
       player.ResizeFlutterTexture(texture, 640, 360, 1.0);
       player.RequestTick(0); Wait(player);
       Require(player.surface_error.empty());
+      const auto* resized = texture.publication.AcquireDescriptor();
+      Require(resized && resized->width == 640 && resized->height == 360);
+      std::cout << "RESIZE texture=640x360 marked_frames=" << registrar.marked_frames << std::endl;
       player.Detach(std::nullopt);
       Wait(player);
+      Require(texture.publication.AcquireDescriptor() == nullptr);
       player.AttachFlutterTexture(texture);
       player.RequestTick(0); Wait(player);
       Require(player.surface_error.empty());
+      Require(texture.publication.AcquireDescriptor() != nullptr);
+      const auto reattached = PumpUntil(player, [&](const auto& snapshot) {
+        return snapshot.position > resumed.position + 200000 &&
+               snapshot.stats.rendered_video_frames > resumed.stats.rendered_video_frames;
+      });
+      ReportPlayback("reattached", reattached);
+      using Diagnostics = ErikaStatus (*)(ErikaPresenterHandle*, char**);
+      const auto diagnostics = reinterpret_cast<Diagnostics>(GetProcAddress(
+          library->module, "erika_presenter_get_diagnostics_json"));
+      if (diagnostics) Command(player, [&] {
+        char* json = nullptr;
+        player.CheckNative(diagnostics(player.handle, &json), "diagnostics");
+        std::cout << "TEXTURE_DIAGNOSTICS " << json << std::endl;
+        library->string_free(json);
+      });
       Command(player, [&] { player.Pause(); });
     }
     Drain();
     Require(texture.owner_player_id == 0);
-    std::cout << "4K HEVC runtime open/play/render, pause/seek/resume, resize, detach/reattach and joined disposal passed\n";
+    std::cout << "runtime clip open/play/progress, stable pause, seek/resume, resize, detach/reattach and joined disposal passed\n";
   }
 
   // Opt-in desktop smoke: exercises the same HWND/Composition attachment and
@@ -170,14 +314,19 @@ class ErikaFlutterPluginTestPeer {
         Wait(player);
         Require(player.surface_error.empty());
         Command(player, [&] { player.Open(clip, EncodableMap{}); player.Play(); });
-        for (int i = 0; i < 150; ++i) {
+        bool started = false;
+        for (int i = 0; i < 150 && !started; ++i) {
           player.RequestTick(0); Wait(player);
           MSG message;
           while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&message); DispatchMessageW(&message);
           }
+          const auto snapshot = Snapshot(player);
+          started = snapshot.position >= 400000 && snapshot.stats.rendered_video_frames >= 5;
+          if (started) ReportPlayback(composition ? "composition" : "hwnd", snapshot);
           std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        Require(started);
         Command(player, [&] {
           const auto& stats = player.latest_presenter_stats;
           Require(stats.rendered_video_frames > 0 && stats.render_failures == 0);
@@ -238,8 +387,9 @@ class ErikaFlutterPluginTestPeer {
           Require(presents > 0);
           std::cout << "COMPOSITION bound root, swapchain presents=" << presents << "\n";
         } else {
-          Require(GetWindow(window, GW_HWNDPREV) == overlay.hwnd);
-          std::cout << "HWND overlay above host passed\n";
+          Require(GetWindow(window, GW_HWNDNEXT) == overlay.hwnd);
+          Require((GetWindowLongPtrW(overlay.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0);
+          std::cout << "HWND video underlay below host without topmost passed\n";
         }
         player.ResizeSurface(480, 270, 1.0);
         player.RequestTick(0); Wait(player);
@@ -556,6 +706,10 @@ class ErikaFlutterPluginTestPeer {
 }  // namespace erika_flutter
 
 int wmain(int argc, wchar_t** argv) {
+  // A failed manual desktop check must terminate instead of waiting on a CRT
+  // assertion/error dialog in an unattended interactive session.
+  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
   if (argc != 2 && argc != 3 && argc != 4) return 1;
   const bool keep_loaded = argc == 3 && wcscmp(argv[2], L"--keep-runtime-loaded") == 0;
   if (argc == 3 && !keep_loaded) return 1;

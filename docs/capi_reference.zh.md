@@ -791,9 +791,17 @@ Fallback 数值是稳定 ABI；新增原因只能追加，不能重排 `0..8`：
 `capture_frame_rgba` 是**截图**：把当前合成帧（视频 + 字幕，不含弹幕）离屏渲染进调用方
 分配的 RGBA8 缓冲，按请求的 `width`×`height`（与显示 surface 尺寸无关）。
 `out_capacity` 至少为 `width*height*4`。尚无可用帧时返回 `PlayerError`。Metal 与
-wgpu（包括 Android）已实现截图；当前 D3D11 backend 尚未实现。截图始终使用 SDR RGBA8
+wgpu（包括 Android）已实现截图；尚未发布的源码补齐了 Windows D3D11 截图，
+v0.3.7 的 D3D11 运行库仍不提供截图。截图始终使用 SDR RGBA8
 离屏 target，并对 HDR/extended-linear 内容 tone-map，因此即使显示输出是 Apple EDR、
 HDR10 或 Android extended-linear scRGB，返回字节仍是 SDR。
+
+D3D11 截图返回非预乘 alpha（straight alpha）的 RGBA，保留打包透明视频的颜色，供 PNG 编码使用；
+不会改变当前 surface、输出模式或已发布的 Flutter 纹理。视频使用普通缩放，
+不应用 ArtCNN/FSR/VSR 超分增强。GPU 读回有等待上限，超时返回错误，不会提前
+把仍被 GPU 读取的帧归还解码池。如果销毁时再次超时且设备仍有效，会保留该帧及
+关联的解码池资源直到进程退出，并记录警告。
+
 
 ```c
 uint32_t w = 1920, h = 1080;

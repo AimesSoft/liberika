@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Implement Windows D3D11 SDR screenshots, including subtitles and optional
+  danmaku, with HDR tone mapping and straight-alpha RGBA output. Capture leaves
+  live output settings intact and uses bounded GPU readback; it does not apply
+  super-resolution enhancement. Add pixel regressions and real 4K HEVC plugin checks.
 - Skip unused playback subtitle rasterization for hosts that only export frames;
   attaching a surface restores the current subtitle overlay, including while paused (#197).
 - Keep seek-cancelled source reads distinct from I/O failures, wait for the next
