@@ -39,6 +39,9 @@
 #include <utility>
 #include <vector>
 
+// Optional runtime ABI also works with older packaged C headers.
+struct ErikaColdOpenCancellation;
+
 namespace erika_flutter {
 namespace {
 
@@ -558,6 +561,26 @@ std::optional<std::string> StringValue(const EncodableValue* value) {
   return std::nullopt;
 }
 
+// Borrow only from the current thread's owned args map. Consume synchronously;
+// never capture these C-string pointers in an owner task or another thread.
+std::vector<ErikaHttpHeader> OpenHeaders(const EncodableMap& args) {
+  const auto* raw = FindArg(args, "httpHeaders");
+  if (!raw || std::holds_alternative<std::monostate>(*raw)) return {};
+  const auto* headers = std::get_if<EncodableMap>(raw);
+  if (!headers) throw PluginError("httpHeaders must be a map of string names to string values.");
+  std::vector<ErikaHttpHeader> native;
+  native.reserve(headers->size());
+  for (const auto& entry : *headers) {
+    const auto* name = std::get_if<std::string>(&entry.first);
+    const auto* value = std::get_if<std::string>(&entry.second);
+    if (!name || !value) throw PluginError("httpHeaders must contain string names and values.");
+    if (name->find('\0') != std::string::npos || value->find('\0') != std::string::npos)
+      throw PluginError("HTTP headers must contain no embedded NUL.");
+    native.push_back({name->c_str(), value->c_str()});
+  }
+  return native;
+}
+
 std::string RequiredString(const EncodableMap& args, const char* name) {
   const auto value = StringValue(FindArg(args, name));
   if (!value) {
@@ -779,6 +802,12 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   using OpenFn = ErikaStatus (*)(ErikaPresenterHandle*, const char*);
   using OpenWithHeadersFn = ErikaStatus (*)(ErikaPresenterHandle*, const char*, const ErikaHttpHeader*, uintptr_t);
   using OpenWithOptionsFn = ErikaStatus (*)(ErikaPresenterHandle*, const char*, const ErikaOpenOptions*);
+  using CancellableOpenFn = ErikaStatus (*)(ErikaPresenterHandle*, const char*,
+      const ErikaOpenOptions*, const ErikaColdOpenCancellation*);
+  using OpenValidateFn = ErikaStatus (*)(const char*, const ErikaOpenOptions*);
+  using ColdOpenCreateFn = ErikaColdOpenCancellation* (*)();
+  using ColdOpenCancelFn = void (*)(const ErikaColdOpenCancellation*);
+  using ColdOpenReleaseFn = void (*)(ErikaColdOpenCancellation*);
   using CommandFn = ErikaStatus (*)(ErikaPresenterHandle*);
   using SeekFn = ErikaStatus (*)(ErikaPresenterHandle*, uint64_t);
   using LoadUpscalerModelFn = ErikaStatus (*)(
@@ -854,6 +883,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
       ErikaStatus (*)(ErikaPresenterHandle*, uint32_t, uint32_t, double);
   using RenderTickFn =
       ErikaStatus (*)(ErikaPresenterHandle*, double, ErikaPresenterStats*);
+  using GetPresenterStatsFn = ErikaStatus (*)(ErikaPresenterHandle*, ErikaPresenterStats*);
   using PollEventFn = ErikaStatus (*)(ErikaPresenterHandle*, ErikaEvent*);
   using CaptureFrameFn = ErikaStatus (*)(ErikaPresenterHandle*, uint32_t,
                                         uint32_t, uint8_t*, uintptr_t);
@@ -917,6 +947,15 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   OpenFn open = nullptr;
   OpenWithHeadersFn open_with_headers = nullptr;
   OpenWithOptionsFn open_with_options = nullptr;
+  CancellableOpenFn cancellable_open = nullptr;
+  OpenValidateFn open_validate = nullptr;
+  ColdOpenCreateFn cold_open_create = nullptr;
+  ColdOpenCancelFn cold_open_cancel = nullptr;
+  ColdOpenReleaseFn cold_open_release = nullptr;
+  bool SupportsColdOpen() const {
+    return cancellable_open && cold_open_create && cold_open_cancel &&
+           cold_open_release && open_with_options && open_validate;
+  }
   CommandFn play = nullptr;
   CommandFn pause = nullptr;
   CommandFn stop = nullptr;
@@ -971,6 +1010,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   ResizeSurfaceFn resize_surface = nullptr;
   CommandFn detach_surface = nullptr;
   RenderTickFn render_tick = nullptr;
+  GetPresenterStatsFn get_presenter_stats = nullptr;
   PollEventFn poll_event = nullptr;
   CaptureFrameFn capture_frame = nullptr;
   LastErrorMessageFn last_error_message = nullptr;
@@ -991,6 +1031,11 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
     open = LoadRequired<OpenFn>("erika_presenter_open");
     open_with_headers = LoadOptional<OpenWithHeadersFn>("erika_presenter_open_with_headers");
     open_with_options = LoadOptional<OpenWithOptionsFn>("erika_presenter_open_with_options");
+    cancellable_open = LoadOptional<CancellableOpenFn>("erika_presenter_open_with_options_cancellable");
+    open_validate = LoadOptional<OpenValidateFn>("erika_open_validate");
+    cold_open_create = LoadOptional<ColdOpenCreateFn>("erika_cold_open_cancellation_create");
+    cold_open_cancel = LoadOptional<ColdOpenCancelFn>("erika_cold_open_cancellation_cancel");
+    cold_open_release = LoadOptional<ColdOpenReleaseFn>("erika_cold_open_cancellation_release");
     play = LoadRequired<CommandFn>("erika_presenter_play");
     pause = LoadRequired<CommandFn>("erika_presenter_pause");
     stop = LoadRequired<CommandFn>("erika_presenter_stop");
@@ -1090,6 +1135,7 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
     detach_surface =
         LoadRequired<CommandFn>("erika_presenter_detach_surface");
     render_tick = LoadRequired<RenderTickFn>("erika_presenter_render_tick");
+    get_presenter_stats = LoadOptional<GetPresenterStatsFn>("erika_presenter_get_stats");
     poll_event = LoadRequired<PollEventFn>("erika_presenter_poll_event");
     capture_frame = LoadOptional<CaptureFrameFn>("erika_presenter_capture_frame_rgba");
     last_error_message =
@@ -1143,6 +1189,18 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
     }
     return reinterpret_cast<T>(raw);
   }
+};
+
+// The platform owns the pending reference; the closed owner task keeps another
+// reference until native open returns. Neither cancellation nor release borrows
+// the owner-confined presenter, and the library outlives every ticket call.
+struct ErikaFlutterPlugin::ColdOpenTicket {
+  std::shared_ptr<ErikaNativeLibrary> library;
+  ErikaColdOpenCancellation* handle;
+  explicit ColdOpenTicket(std::shared_ptr<ErikaNativeLibrary> value)
+      : library(std::move(value)), handle(library->cold_open_create()) {}
+  ~ColdOpenTicket() { if (handle) library->cold_open_release(handle); }
+  void Cancel() const { library->cold_open_cancel(handle); }
 };
 
 struct ErikaFlutterPlugin::ErikaOverlayWindow {
@@ -1632,6 +1690,7 @@ struct ErikaFlutterPlugin::PlayerHost {
   }
 
   ~PlayerHost() {
+    CancelPendingColdOpen();
     DebugLog("presenter shutdown begin player=" + std::to_string(id));
     Detach(std::nullopt);
     worker.Stop([this] {
@@ -1656,6 +1715,35 @@ struct ErikaFlutterPlugin::PlayerHost {
       }
     });
     DebugLog("presenter shutdown joined player=" + std::to_string(id));
+  }
+
+  void ValidateColdOpen(const std::string& uri, const EncodableMap& args) const {
+    const auto native_headers = OpenHeaders(args);
+    ErikaOpenOptions options{};
+    options.headers = native_headers.empty() ? nullptr : native_headers.data();
+    options.header_count = native_headers.size();
+    options.http_read_ahead_bytes = OpenByteCountArg(args, "httpReadAheadBytes");
+    options.http_back_buffer_bytes = OpenByteCountArg(args, "httpBackBufferBytes");
+    options.start_position_micros = OpenByteCountArg(args, "startPositionMicros");
+    // This pure ABI validates the exact open options without borrowing the
+    // presenter. Read its error here on this same platform thread if it fails.
+    const auto status = library->open_validate(uri.c_str(), &options);
+    CheckNative(status, "open");
+  }
+
+  std::shared_ptr<ColdOpenTicket> PrepareColdOpen(const std::string& uri) {
+    CancelPendingColdOpen();
+    if (!library->SupportsColdOpen() ||
+        (uri.rfind("http://", 0) != 0 && uri.rfind("https://", 0) != 0)) return {};
+    auto ticket = std::make_shared<ColdOpenTicket>(library);
+    if (!ticket->handle) return {};
+    pending_cold_open = ticket;
+    return ticket;
+  }
+
+  void CancelPendingColdOpen() {
+    if (pending_cold_open) pending_cold_open->Cancel();
+    pending_cold_open.reset();
   }
 
   void EnsureNative() const {
@@ -1719,57 +1807,35 @@ struct ErikaFlutterPlugin::PlayerHost {
                                    : library->TakeLastError());
   }
 
-  void Open(const std::string& uri, const EncodableMap& args) {
-    const auto* raw_headers = FindArg(args, "httpHeaders");
-    const EncodableMap* headers = nullptr;
-    if (raw_headers != nullptr &&
-        !std::holds_alternative<std::monostate>(*raw_headers)) {
-      headers = std::get_if<EncodableMap>(raw_headers);
-      if (headers == nullptr) {
-        throw PluginError("httpHeaders must be a map of string names to string values.");
-      }
-    }
+  void Open(const std::string& uri, const EncodableMap& args,
+            const std::shared_ptr<ColdOpenTicket>& ticket = {}) {
+    const auto native_headers = OpenHeaders(args);
     const uint64_t read_ahead_bytes = OpenByteCountArg(args, "httpReadAheadBytes");
     const uint64_t back_buffer_bytes = OpenByteCountArg(args, "httpBackBufferBytes");
-    const bool wants_headers = headers != nullptr && !headers->empty();
-    if (!wants_headers && read_ahead_bytes == 0 && back_buffer_bytes == 0) {
-      Check(library->open(handle, uri.c_str()), "open", library->TakeLastError());
+    const auto start_position = OpenByteCountArg(args, "startPositionMicros");
+    const bool wants_headers = !native_headers.empty();
+    if (!ticket && start_position == 0 && !wants_headers && read_ahead_bytes == 0 && back_buffer_bytes == 0) {
+      const auto status = library->open(handle, uri.c_str());
+      CheckNative(status, "open");
       return;
     }
     // Never silently drop the headers or the HTTP tuning request: falling back
     // to the headerless entry point turns an authenticated stream into an
     // opaque 403, and swallowing them hides a stale kernel.
     if (library->open_with_options != nullptr) {
-      std::vector<std::string> names;
-      std::vector<std::string> values;
-      std::vector<ErikaHttpHeader> native_headers;
-      if (wants_headers) {
-        names.reserve(headers->size());
-        values.reserve(headers->size());
-        native_headers.reserve(headers->size());
-        for (const auto& entry : *headers) {
-          const auto name = StringValue(&entry.first);
-          const auto value = StringValue(&entry.second);
-          if (!name || !value) {
-            throw PluginError("httpHeaders must contain string names and values.");
-          }
-          names.push_back(*name);
-          values.push_back(*value);
-        }
-        for (size_t index = 0; index < names.size(); ++index) {
-          native_headers.push_back({names[index].c_str(), values[index].c_str()});
-        }
-      }
       ErikaOpenOptions options = {};
       options.headers = native_headers.empty() ? nullptr : native_headers.data();
       options.header_count = native_headers.size();
       options.http_read_ahead_bytes = read_ahead_bytes;
       options.http_back_buffer_bytes = back_buffer_bytes;
-      Check(library->open_with_options(handle, uri.c_str(), &options), "open",
-            library->TakeLastError());
+      options.start_position_micros = start_position;
+      const auto status = ticket
+          ? library->cancellable_open(handle, uri.c_str(), &options, ticket->handle)
+          : library->open_with_options(handle, uri.c_str(), &options);
+      CheckNative(status, "open");
       return;
     }
-    if (read_ahead_bytes > 0 || back_buffer_bytes > 0) {
+    if (start_position > 0 || read_ahead_bytes > 0 || back_buffer_bytes > 0) {
       throw PluginError(
           "The loaded Erika native library does not export "
           "erika_presenter_open_with_options, so httpReadAheadBytes / "
@@ -1786,27 +1852,9 @@ struct ErikaFlutterPlugin::PlayerHost {
           "Update the bundled erika_capi.dll (a prebuilt from 0.1.3 or earlier "
           "predates HTTP header support).");
     }
-    std::vector<std::string> names;
-    std::vector<std::string> values;
-    std::vector<ErikaHttpHeader> native_headers;
-    names.reserve(headers->size());
-    values.reserve(headers->size());
-    native_headers.reserve(headers->size());
-    for (const auto& entry : *headers) {
-      const auto name = StringValue(&entry.first);
-      const auto value = StringValue(&entry.second);
-      if (!name || !value) {
-        throw PluginError("httpHeaders must contain string names and values.");
-      }
-      names.push_back(*name);
-      values.push_back(*value);
-    }
-    for (size_t index = 0; index < names.size(); ++index) {
-      native_headers.push_back({names[index].c_str(), values[index].c_str()});
-    }
-    Check(library->open_with_headers(handle, uri.c_str(), native_headers.data(),
-                                     native_headers.size()), "open",
-          library->TakeLastError());
+    const auto status = library->open_with_headers(
+        handle, uri.c_str(), native_headers.data(), native_headers.size());
+    CheckNative(status, "open");
   }
 
   void SetMediaMetadata(const EncodableMap& metadata) {
@@ -2059,7 +2107,14 @@ struct ErikaFlutterPlugin::PlayerHost {
     return ResourceStatusToMap(status);
   }
 
-  EncodableValue GetPresenterStats() const {
+  EncodableValue GetPresenterStats() {
+    // Submitted on the presenter worker, like render_tick. A render failure
+    // leaves its output argument untouched; query the live snapshot so failed
+    // renders cannot freeze all counters at the last successful frame.
+    if (library->get_presenter_stats) {
+      CheckNative(library->get_presenter_stats(handle, &latest_presenter_stats),
+                  "get_presenter_stats");
+    }
     return PresenterStatsToMap(latest_presenter_stats);
   }
 
@@ -2743,6 +2798,7 @@ struct ErikaFlutterPlugin::PlayerHost {
   ErikaSmtcState smtc_state{};  // Worker only.
   ErikaSmtcState platform_smtc_state{};  // Platform only.
   std::shared_ptr<ErikaNativeLibrary> library;
+  std::shared_ptr<ColdOpenTicket> pending_cold_open;  // Platform only.
   ErikaPresenterHandle* handle = nullptr;  // Worker only, including create/destroy.
   // Platform-only attachment bookkeeping. Native work captures values and never
   // dereferences these HWND/overlay/registrar pointers.
@@ -3578,7 +3634,8 @@ void ErikaFlutterPlugin::SendEvent(EncodableValue event) {
 
 void ErikaFlutterPlugin::DispatchNativeMethod(
     PlayerHost& host, std::string method, EncodableMap args,
-    std::shared_ptr<flutter::MethodResult<EncodableValue>> platform_result) {
+    std::shared_ptr<flutter::MethodResult<EncodableValue>> platform_result,
+    std::shared_ptr<ColdOpenTicket> cold_open_ticket) {
   // This is a value collector, not Flutter's MethodResult. Only the posted
   // completion below calls Flutter, including for errors and unsupported calls.
   struct Reply {
@@ -3589,9 +3646,9 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
   };
   auto reply = std::make_shared<Reply>();
   const int64_t id = host.id;
-  host.Submit([&host, method, args = std::move(args), reply] {
+  host.Submit([&host, method, args = std::move(args), reply, cold_open_ticket] {
     auto* result = reply.get();
-    if (method == "open") {
+    if (method == "open" || method == "openWithStartPosition") {
       auto& player = host;
       if (const auto* value = FindArg(args, "metadata"); value != nullptr) {
         if (const auto* metadata = std::get_if<EncodableMap>(value)) {
@@ -3605,8 +3662,8 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
         player.ClearMediaMetadata();
       }
       player.PrepareForOpen();
-      player.Open(RequiredString(args, "uri"), args);
-      result->Success();
+      player.Open(RequiredString(args, "uri"), args, cold_open_ticket);
+      result->Success(method == "openWithStartPosition" ? EncodableValue(true) : EncodableValue());
     } else if (method == "play") {
       auto& player = host;
       player.Play();
@@ -3996,8 +4053,35 @@ void ErikaFlutterPlugin::HandleMethodCall(
       host.CompleteSurface(std::move(result));
     } else {
       auto& host = PlayerFromArgs(args);
+      std::shared_ptr<ColdOpenTicket> ticket;
+      if (method == "open" || method == "openWithStartPosition") {
+        if (method == "openWithStartPosition" && !host.library->SupportsColdOpen()) {
+          result->NotImplemented();
+          return;
+        }
+        const auto uri = RequiredString(args, "uri");
+        if (uri.empty() || uri.find('\0') != std::string::npos)
+          throw PluginError("uri must be nonempty and contain no embedded NUL.");
+        OpenByteCountArg(args, "httpReadAheadBytes");
+        OpenByteCountArg(args, "httpBackBufferBytes");
+        OpenByteCountArg(args, "startPositionMicros");
+        if (const auto* raw = FindArg(args, "metadata"); raw && !std::holds_alternative<std::monostate>(*raw)) {
+          const auto* metadata = std::get_if<EncodableMap>(raw);
+          if (!metadata) throw PluginError("metadata must be a map.");
+          const auto title = StringValue(FindArg(*metadata, "title"));
+          if (!title || title->empty()) throw PluginError("metadata.title is required.");
+          if (const auto* artwork = FindArg(*metadata, "artwork"); artwork &&
+              !std::holds_alternative<std::monostate>(*artwork) &&
+              !std::get_if<std::vector<uint8_t>>(artwork))
+            throw PluginError("metadata.artwork must contain image bytes.");
+        }
+        if (host.library->SupportsColdOpen()) host.ValidateColdOpen(uri, args);
+        ticket = host.PrepareColdOpen(uri);
+      } else if (method == "stop" || method == "close") {
+        host.CancelPendingColdOpen();
+      }
       DispatchNativeMethod(host, method, args,
-          std::shared_ptr<flutter::MethodResult<EncodableValue>>(std::move(result)));
+          std::shared_ptr<flutter::MethodResult<EncodableValue>>(std::move(result)), ticket);
     }
   } catch (const std::exception& error) {
     const auto message = SafeUtf8Message(error.what());

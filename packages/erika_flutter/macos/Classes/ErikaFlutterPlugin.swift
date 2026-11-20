@@ -622,7 +622,7 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
   case viewNotFound(Int64)
   case overlayNotAvailable
   case presenterCreateFailed
-  case erikaStatus(String, Int32)
+  case erikaStatus(String, Int32, String?)
   case libraryLoadFailed(String, String?)
   case diagnosticsUnsupported(String)
   case diagnosticsFailed(String)
@@ -647,7 +647,10 @@ private enum ErikaPluginError: Error, CustomStringConvertible {
       return "No window-hosted Erika overlay is available."
     case .presenterCreateFailed:
       return "erika_presenter_create returned null."
-    case .erikaStatus(let operation, let status):
+    case .erikaStatus(let operation, let status, let detail):
+      if let detail, !detail.isEmpty {
+        return "\(operation) failed with ErikaStatus \(status): \(detail)"
+      }
       return "\(operation) failed with ErikaStatus \(status)."
     case .libraryLoadFailed(let path, let detail):
       if let detail, !detail.isEmpty {
@@ -677,6 +680,8 @@ private final class ErikaNativeLibrary {
   typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
   typealias OpenWithHeadersFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?, UInt) -> Int32
   typealias OpenWithOptionsFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?) -> Int32
+  typealias ValidateOpenFn = @convention(c) (UnsafePointer<CChar>?, UnsafeRawPointer?) -> Int32
+  typealias CancellableOpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
   typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
@@ -794,6 +799,14 @@ private final class ErikaNativeLibrary {
   let open: OpenFn
   let openWithHeaders: OpenWithHeadersFn?
   let openWithOptions: OpenWithOptionsFn?
+  let validateOpen: ValidateOpenFn?
+  let cancellableOpen: CancellableOpenFn?
+  let coldOpenCreate: CreateFn?
+  let coldOpenCancel: DestroyFn?
+  let coldOpenRelease: DestroyFn?
+  var supportsColdOpen: Bool {
+    validateOpen != nil && cancellableOpen != nil && coldOpenCreate != nil && coldOpenCancel != nil && coldOpenRelease != nil
+  }
   let play: CommandFn
   let pause: CommandFn
   let stop: CommandFn
@@ -880,6 +893,11 @@ private final class ErikaNativeLibrary {
     open = try Self.load("erika_presenter_open", from: libraryHandle, as: OpenFn.self)
     openWithHeaders = Self.loadOptional("erika_presenter_open_with_headers", from: libraryHandle, as: OpenWithHeadersFn.self)
     openWithOptions = Self.loadOptional("erika_presenter_open_with_options", from: libraryHandle, as: OpenWithOptionsFn.self)
+    validateOpen = Self.loadOptional("erika_open_validate", from: libraryHandle, as: ValidateOpenFn.self)
+    cancellableOpen = Self.loadOptional("erika_presenter_open_with_options_cancellable", from: libraryHandle, as: CancellableOpenFn.self)
+    coldOpenCreate = Self.loadOptional("erika_cold_open_cancellation_create", from: libraryHandle, as: CreateFn.self)
+    coldOpenCancel = Self.loadOptional("erika_cold_open_cancellation_cancel", from: libraryHandle, as: DestroyFn.self)
+    coldOpenRelease = Self.loadOptional("erika_cold_open_cancellation_release", from: libraryHandle, as: DestroyFn.self)
     play = try Self.load("erika_presenter_play", from: libraryHandle, as: CommandFn.self)
     pause = try Self.load("erika_presenter_pause", from: libraryHandle, as: CommandFn.self)
     stop = try Self.load("erika_presenter_stop", from: libraryHandle, as: CommandFn.self)
@@ -962,6 +980,22 @@ private final class ErikaNativeLibrary {
     getDiagnosticsJson = Self.loadOptional("erika_presenter_get_diagnostics_json", from: libraryHandle, as: GetDiagnosticsJsonFn.self)
     logReadJson = Self.loadOptional("erika_log_read_json", from: libraryHandle, as: LogReadJsonFn.self)
     invokeJson = Self.loadOptional("erika_presenter_invoke_json", from: libraryHandle, as: InvokeJsonFn.self)
+  }
+
+  func withOpenOptions<T>(
+    headers: [String: String], readAhead: UInt64, backBuffer: UInt64,
+    startPositionMicros: UInt64, body: (UnsafeRawPointer) throws -> T
+  ) rethrows -> T {
+    let pairs = headers.map { (strdup($0.key), strdup($0.value)) }
+    defer { pairs.forEach { free($0.0); free($0.1) } }
+    let encoded = pairs.map { ErikaHttpHeader(name: $0.0, value: $0.1) }
+    return try encoded.withUnsafeBufferPointer { buffer in
+      var options = ErikaOpenOptions(
+        headers: buffer.baseAddress.map(UnsafeRawPointer.init), headerCount: UInt(encoded.count),
+        httpReadAheadBytes: readAhead, httpBackBufferBytes: backBuffer,
+        startPositionMicros: startPositionMicros)
+      return try withUnsafePointer(to: &options) { try body(UnsafeRawPointer($0)) }
+    }
   }
 
   deinit {
@@ -1365,6 +1399,21 @@ private extension CAMetalLayer {
   }
 }
 
+// A closure owns this object until its native open returns. Main can signal
+// cancellation without borrowing the owner-confined presenter. No pointer may
+// outlive the library or be freed while cancel/open is using it.
+private final class ErikaColdOpenTicket {
+  let library: ErikaNativeLibrary
+  let handle: UnsafeMutableRawPointer
+  init?(_ library: ErikaNativeLibrary) {
+    guard library.supportsColdOpen, let handle = library.coldOpenCreate?() else { return nil }
+    self.library = library
+    self.handle = handle
+  }
+  func cancel() { library.coldOpenCancel?(handle) }
+  deinit { library.coldOpenRelease?(handle) }
+}
+
 private final class ErikaPlayerHost {
   let id: Int64
 
@@ -1372,6 +1421,7 @@ private final class ErikaPlayerHost {
   private var creationError: Error?
   private var handle: UnsafeMutableRawPointer!
   let owner: ErikaPresenterOwner
+  private var pendingColdOpen: ErikaColdOpenTicket? // main only
   private var closed = false
   private var surfaceLease: ErikaSurfaceLease? // main only
   private var nativeLease: ErikaSurfaceLease? // owner only
@@ -1432,8 +1482,43 @@ private final class ErikaPlayerHost {
 
   /// Main owns driver/UI bookkeeping; native state is released only after
   /// all accepted commands have drained. No join or main.sync is necessary.
+  func validateOpenBeforeReplacement(
+    uri: String, headers: [String: String], readAhead: UInt64, backBuffer: UInt64,
+    startPositionMicros: UInt64
+  ) throws {
+    precondition(Thread.isMainThread)
+    guard !uri.utf8.contains(0), !headers.contains(where: { $0.key.utf8.contains(0) || $0.value.utf8.contains(0) }) else {
+      throw ErikaPluginError.invalidArguments("URI and HTTP headers cannot contain NUL.")
+    }
+    guard let library = ErikaNativeLibrary.shared, library.supportsColdOpen,
+      let validate = library.validateOpen else { return }
+    try library.withOpenOptions(headers: headers, readAhead: readAhead, backBuffer: backBuffer,
+        startPositionMicros: startPositionMicros) { optionsPtr in
+      let status = uri.withCString { validate($0, optionsPtr) }
+      if status != 0 {
+        throw ErikaPluginError.erikaStatus("open", status, library.currentEventMessage())
+      }
+    }
+  }
+
+  func prepareColdOpen(uri: String) -> ErikaColdOpenTicket? {
+    precondition(Thread.isMainThread)
+    cancelPendingColdOpen()
+    guard uri.hasPrefix("http://") || uri.hasPrefix("https://") else { return nil }
+    let ticket = ErikaNativeLibrary.shared.flatMap(ErikaColdOpenTicket.init)
+    pendingColdOpen = ticket
+    return ticket
+  }
+
+  func cancelPendingColdOpen() {
+    precondition(Thread.isMainThread)
+    pendingColdOpen?.cancel()
+    pendingColdOpen = nil
+  }
+
   func shutdown(completion: (() -> Void)? = nil) {
     precondition(Thread.isMainThread)
+    cancelPendingColdOpen()
     guard !closed else { completion?(); return }
     closed = true
     stopDisplayDriver()
@@ -1533,7 +1618,7 @@ private final class ErikaPlayerHost {
     guard let handle else { return }
     let status = library.detachSurface(handle)
     if status != 0 {
-      surfaceError = ErikaPluginError.erikaStatus("detach_surface", status)
+      surfaceError = ErikaPluginError.erikaStatus("detach_surface", status, nil)
       library.destroy(handle)
       self.handle = nil
     }
@@ -1561,7 +1646,9 @@ private final class ErikaPlayerHost {
     uri: String,
     httpHeaders: [String: String],
     httpReadAheadBytes: UInt64 = 0,
-    httpBackBufferBytes: UInt64 = 0
+    httpBackBufferBytes: UInt64 = 0,
+    startPositionMicros: UInt64 = 0,
+    coldOpenTicket: ErikaColdOpenTicket? = nil
   ) throws {
     playbackState = 0
     positionSeconds = 0
@@ -1574,30 +1661,20 @@ private final class ErikaPlayerHost {
     }
     try withNativeCall {
       try uri.withCString { cString in
-        guard !httpHeaders.isEmpty || httpReadAheadBytes > 0 || httpBackBufferBytes > 0 else {
-          try check(library.open(handle, cString), operation: "open")
+        guard startPositionMicros > 0 || coldOpenTicket != nil || !httpHeaders.isEmpty || httpReadAheadBytes > 0 || httpBackBufferBytes > 0 else {
+          try check(library.open(handle, cString), operation: "open", captureNativeDetail: true)
           return
         }
         // Never silently drop the headers or the HTTP tuning request: falling
         // back to the headerless entry point turns an authenticated stream
         // into an opaque 403, and swallowing them hides a stale kernel.
         if let openWithOptions = library.openWithOptions {
-          let names = httpHeaders.keys.map { strdup($0) }
-          let values = httpHeaders.values.map { strdup($0) }
-          defer {
-            names.forEach { free($0) }
-            values.forEach { free($0) }
-          }
-          let headers = zip(names, values).map { ErikaHttpHeader(name: $0.0, value: $0.1) }
-          try headers.withUnsafeBufferPointer { buffer in
-            var options = ErikaOpenOptions(
-              headers: buffer.baseAddress.map(UnsafeRawPointer.init),
-              headerCount: UInt(headers.count),
-              httpReadAheadBytes: httpReadAheadBytes,
-              httpBackBufferBytes: httpBackBufferBytes
-            )
-            try withUnsafePointer(to: &options) { optionsPtr in
-              try check(openWithOptions(handle, cString, UnsafeRawPointer(optionsPtr)), operation: "open")
+          try library.withOpenOptions(headers: httpHeaders, readAhead: httpReadAheadBytes,
+              backBuffer: httpBackBufferBytes, startPositionMicros: startPositionMicros) { optionsPtr in
+            if let ticket = coldOpenTicket, let cancellableOpen = library.cancellableOpen {
+              try check(cancellableOpen(handle, cString, optionsPtr, ticket.handle), operation: "open", captureNativeDetail: true)
+            } else {
+              try check(openWithOptions(handle, cString, optionsPtr), operation: "open", captureNativeDetail: true)
             }
           }
           return
@@ -1618,7 +1695,7 @@ private final class ErikaPlayerHost {
         }
         let headers = zip(names, values).map { ErikaHttpHeader(name: $0.0, value: $0.1) }
         try headers.withUnsafeBufferPointer { buffer in
-          try check(openWithHeaders(handle, cString, buffer.baseAddress.map(UnsafeRawPointer.init), UInt(headers.count)), operation: "open")
+          try check(openWithHeaders(handle, cString, buffer.baseAddress.map(UnsafeRawPointer.init), UInt(headers.count)), operation: "open", captureNativeDetail: true)
         }
       }
     }
@@ -2750,9 +2827,16 @@ private final class ErikaPlayerHost {
     return erikaDefaultDisplayFps
   }
 
-  private func check(_ status: Int32, operation: String) throws {
+  private func check(
+    _ status: Int32,
+    operation: String,
+    captureNativeDetail: Bool = false
+  ) throws {
     if status != 0 {
-      throw ErikaPluginError.erikaStatus(operation, status)
+      // Capture this failing call's TLS text on its native owner, before
+      // another command runs or the error crosses to Flutter's main thread.
+      let detail = captureNativeDetail ? library.currentEventMessage() : nil
+      throw ErikaPluginError.erikaStatus(operation, status, detail)
     }
   }
 }
@@ -2791,15 +2875,15 @@ private extension ErikaEventC {
         "subtitle": -1,
       ]
     }
-    if let structuredMessage,
+    if kind == 9 {
+      map["error"] = structuredMessage
+    } else if let structuredMessage,
        let data = structuredMessage.data(using: .utf8),
        let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
       if kind == 11 {
         map["decoder"] = payload
       } else if kind == 12 {
         map["audio"] = payload
-      } else if kind == 9 {
-        map["error"] = structuredMessage
       }
     }
     return map
@@ -3020,7 +3104,7 @@ final class ErikaVideoPlatformView: NSView, ErikaMetalSurfaceView {
     metalLayer.pixelFormat = .bgra8Unorm
     metalLayer.framebufferOnly = true
     let params = arguments as? [String: Any]
-    let alphaVideo = (params?["videoAlphaMode"] as? NSNumber)?.intValue != 0
+    let alphaVideo = ((params?["videoAlphaMode"] as? NSNumber)?.intValue ?? 0) != 0
     metalLayer.isOpaque = !alphaVideo
     metalLayer.backgroundColor = alphaVideo
       ? NSColor.clear.cgColor
@@ -3467,7 +3551,11 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
           refreshRemoteCommands()
         }
         if let retiringHost { retiringHost.shutdown { result(nil) } } else { result(nil) }
-      case "open":
+      case "open", "openWithStartPosition":
+        if call.method == "openWithStartPosition" && ErikaNativeLibrary.shared?.supportsColdOpen != true {
+          result(FlutterMethodNotImplemented)
+          return
+        }
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
         var operations: [() throws -> Any?] = []
@@ -3477,20 +3565,25 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let headers = (args["httpHeaders"] as? [String: String]) ?? [:]
         let readAhead = try optionalReadAheadBytes(args["httpReadAheadBytes"])
         let backBuffer = try optionalBackBufferBytes(args["httpBackBufferBytes"])
+        let startPositionMicros = UInt64(clamping: int64Value(args["startPositionMicros"]) ?? 0)
+        try host.validateOpenBeforeReplacement(uri: uri, headers: headers, readAhead: readAhead,
+          backBuffer: backBuffer, startPositionMicros: startPositionMicros)
         if let metadata = args["metadata"] as? [String: Any] {
           try applyMediaMetadata(metadata, to: host)
         } else {
           host.clearMediaMetadata()
         }
+        let coldOpenTicket = host.prepareColdOpen(uri: uri)
         operations.append {
           [
             host, argument1 = uri, argument2 = headers, argument3 = readAhead,
-            argument4 = backBuffer
+            argument4 = backBuffer, coldOpenTicket, startPositionMicros
           ] in
           try host.open(
             uri: argument1, httpHeaders: argument2, httpReadAheadBytes: argument3,
-            httpBackBufferBytes: argument4);
-          return nil
+            httpBackBufferBytes: argument4, startPositionMicros: startPositionMicros,
+            coldOpenTicket: coldOpenTicket);
+          return call.method == "openWithStartPosition" ? true : nil
         }
         host.enqueue(operations: operations, result: result, label: call.method)
       case "play":
@@ -3520,6 +3613,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case "stop":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        host.cancelPendingColdOpen()
         var operations: [() throws -> Any?] = []
         operations.append { [host] in
           try host.stop(); return nil
@@ -3528,6 +3622,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case "close":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        host.cancelPendingColdOpen()
         var operations: [() throws -> Any?] = []
         operations.append { [host] in
           try host.close(); return nil

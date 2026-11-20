@@ -52,7 +52,8 @@ impl D3d11Renderer {
             constants.gamut_lut_enabled = 0;
         }
         let overlay_target = D3d11OutputMode::Sdr.target_color();
-        let overlays = self.prepare_overlay_draws_for_target(context.overlay, overlay_target)?;
+        let overlays =
+            self.prepare_overlay_draws_for_target(context.overlay, None, overlay_target)?;
         let danmaku = context.danmaku.filter(|plan| {
             plan.generation == context.generation
                 && plan.viewport.width == width

@@ -479,8 +479,11 @@ fn send_demux_message(
             Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
                 message = returned;
-                match commands.recv_timeout(Duration::from_millis(5)) {
-                    Ok(command) => {
+                // A full packet queue needs either consumer progress or a
+                // control command. Prefer a ready command without polling.
+                crossbeam_channel::select_biased! {
+                    recv(commands) -> command => {
+                        let Ok(command) = command else { return false; };
                         trace_demux_send_wait(started, packets.len(), "command_after_full");
                         if !handle_demux_command(
                             demuxer,
@@ -497,8 +500,13 @@ fn send_demux_message(
                             return true;
                         }
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return false,
+                    send(packets, message) -> result => {
+                        if result.is_err() {
+                            return false;
+                        }
+                        trace_demux_send_wait(started, packets.len(), "sent");
+                        return true;
+                    }
                 }
             }
         }
@@ -1014,14 +1022,24 @@ impl PlaybackSession {
         config: PlaybackSessionConfig,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
+        Self::open_with_cold_open_cancellation(request, config, decoder_resources, None)
+    }
+
+    pub(crate) fn open_with_cold_open_cancellation(
+        request: &MediaRequest,
+        config: PlaybackSessionConfig,
+        decoder_resources: PlaybackDecoderResources,
+        cancellation: Option<crate::source::ColdOpenCancellation>,
+    ) -> Result<Self> {
         let queue_limits = PlaybackQueueLimits::for_request(request);
-        let source = source_from_uri_with_options(
+        let mut source = source_from_uri_with_options(
             &request.uri,
             request.source_hint,
             request.http_headers.clone(),
             request.http_read_ahead_bytes,
             request.http_back_buffer_bytes,
         )?;
+        source.set_cold_open_cancellation(cancellation);
         let mut demuxer = Demuxer::open_source(source)?;
         let mut probe = demuxer.probe().clone();
         let subtitle_fonts = probe.subtitle_fonts.clone();
@@ -4906,9 +4924,23 @@ impl VideoPlaybackEngine {
         config: PlaybackSessionConfig,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
+        Self::open_with_cold_open_cancellation(request, config, decoder_resources, None)
+    }
+
+    pub(crate) fn open_with_cold_open_cancellation(
+        request: &MediaRequest,
+        config: PlaybackSessionConfig,
+        decoder_resources: PlaybackDecoderResources,
+        cancellation: Option<crate::source::ColdOpenCancellation>,
+    ) -> Result<Self> {
         let timing = playback_timing_for_request(request, config.timing);
         Ok(Self::from_session_with_timing(
-            PlaybackSession::open_with_decoder_resources(request, config, decoder_resources)?,
+            PlaybackSession::open_with_cold_open_cancellation(
+                request,
+                config,
+                decoder_resources,
+                cancellation,
+            )?,
             timing,
         ))
     }

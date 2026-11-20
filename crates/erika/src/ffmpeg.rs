@@ -1,3 +1,5 @@
+mod p010;
+
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomData;
@@ -3114,23 +3116,15 @@ impl Frame {
         unsafe {
             let frame = &*self.ptr;
             if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
-                let luma =
-                    read_10bit_plane_as_p010(frame.data[0], frame.linesize[0], width, height)?;
-                let chroma = read_10bit_chroma_as_p010(
-                    frame.data[1],
-                    frame.linesize[1],
-                    frame.data[2],
-                    frame.linesize[2],
-                    chroma_width,
-                    chroma_height,
-                )?;
-                Some(PlanarFrame {
+                let mut output = PlanarFrame {
                     format: PlanarPixelFormat::P010,
                     width: width as u32,
                     height: height as u32,
-                    luma,
-                    chroma,
-                })
+                    luma: Vec::new(),
+                    chroma: Vec::new(),
+                };
+                self.write_planar_frame(&mut output)?;
+                Some(output)
             } else if format == sys::AVPixelFormat_AV_PIX_FMT_P010LE {
                 let luma = copy_16bit_rows(frame.data[0], frame.linesize[0], width, height)?;
                 let chroma = copy_16bit_rows(
@@ -3150,6 +3144,117 @@ impl Frame {
                 self.to_nv12_with_swscale()
             }
         }
+    }
+
+    /// Reuses renderer-owned CPU storage for 10-bit planar software frames and
+    /// exact-layout 8-bit NV12 output. Other layouts retain the allocating path.
+    /// No AVFrame pointers escape: CreateTexture2D copies the planes synchronously.
+    pub(crate) fn write_planar_frame(&self, output: &mut PlanarFrame) -> Option<()> {
+        let format = self.raw_pixel_format();
+        if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P
+            || format == sys::AVPixelFormat_AV_PIX_FMT_NV12
+        {
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            if width != 0
+                && height != 0
+                && output.format == PlanarPixelFormat::Nv12
+                && output.width as usize == width
+                && output.height as usize == height
+                && width.checked_mul(height) == Some(output.luma.len())
+                && cw.checked_mul(ch).and_then(|len| len.checked_mul(2))
+                    == Some(output.chroma.len())
+            {
+                // Validate ALL source planes before changing either output.
+                // A failed source validation leaves bytes and metadata intact.
+                let validate_plane =
+                    |data: *const u8, stride: i32, row_bytes: usize, rows: usize| {
+                        let stride = usize::try_from(stride).ok()?;
+                        let span = rows
+                            .checked_sub(1)?
+                            .checked_mul(stride)?
+                            .checked_add(row_bytes)?;
+                        if data.is_null() || stride < row_bytes || span > isize::MAX as usize {
+                            return None;
+                        }
+                        (data as usize).checked_add(span)?;
+                        Some(stride)
+                    };
+                // SAFETY: the Frame owns each software plane. The checks above
+                // bound the visible layout; checked spans below bound every row
+                // offset. No borrowed source pointer survives this synchronous copy.
+                unsafe {
+                    let frame = &*self.ptr;
+                    let y_stride = validate_plane(frame.data[0], frame.linesize[0], width, height)?;
+                    let uv_row_bytes = cw.checked_mul(2)?;
+                    let source_chroma_bytes = if format == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                        uv_row_bytes
+                    } else {
+                        cw
+                    };
+                    let u_stride =
+                        validate_plane(frame.data[1], frame.linesize[1], source_chroma_bytes, ch)?;
+                    let v_stride = if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+                        validate_plane(frame.data[2], frame.linesize[2], cw, ch)?
+                    } else {
+                        0
+                    };
+                    for (row, dst) in output.luma.chunks_exact_mut(width).enumerate() {
+                        let src = slice::from_raw_parts(frame.data[0].add(row * y_stride), width);
+                        dst.copy_from_slice(src);
+                    }
+                    for (row, dst) in output.chroma.chunks_exact_mut(uv_row_bytes).enumerate() {
+                        let u = slice::from_raw_parts(
+                            frame.data[1].add(row * u_stride),
+                            source_chroma_bytes,
+                        );
+                        if format == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                            dst.copy_from_slice(u);
+                        } else {
+                            let v = slice::from_raw_parts(frame.data[2].add(row * v_stride), cw);
+                            for col in 0..cw {
+                                dst[col * 2] = u[col];
+                                dst[col * 2 + 1] = v[col];
+                            }
+                        }
+                    }
+                }
+                return Some(());
+            }
+        }
+        if format != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+            *output = self.to_planar_frame()?;
+            return Some(());
+        }
+        let (width, height) = (self.width() as usize, self.height() as usize);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // SAFETY: the AVFrame owns these strided 16-bit LE planes. Helpers
+        // validate visible row sizes and write only initialized output storage.
+        unsafe {
+            let frame = &*self.ptr;
+            read_10bit_plane_as_p010(
+                frame.data[0],
+                frame.linesize[0],
+                width,
+                height,
+                &mut output.luma,
+            )?;
+            read_10bit_chroma_as_p010(
+                frame.data[1],
+                frame.linesize[1],
+                frame.data[2],
+                frame.linesize[2],
+                width.div_ceil(2),
+                height.div_ceil(2),
+                &mut output.chroma,
+            )?;
+        }
+        output.format = PlanarPixelFormat::P010;
+        output.width = width as u32;
+        output.height = height as u32;
+        Some(())
     }
 
     fn to_nv12_with_swscale(&self) -> Option<PlanarFrame> {
@@ -3223,6 +3328,350 @@ impl Frame {
         }
     }
 }
+
+// Views internal to native uploads. Public packed conversion APIs and fallback
+// formats remain independent.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows",
+    test
+))]
+mod software_planar_upload {
+    use super::{Frame, PhantomData, slice, sys};
+
+    pub(crate) struct StridedPlane<'a> {
+        ptr: *const u8,
+        stride: usize,
+        row_bytes: usize,
+        rows: usize,
+        span: usize,
+        _frame: PhantomData<&'a Frame>,
+    }
+
+    impl<'a> StridedPlane<'a> {
+        fn from_frame(
+            frame: &'a Frame,
+            plane: usize,
+            row_bytes: usize,
+            rows: usize,
+        ) -> Option<Self> {
+            let raw = unsafe { &*frame.ptr };
+            let ptr = raw.data[plane] as *const u8;
+            let stride = usize::try_from(raw.linesize[plane]).ok()?;
+            let span = rows
+                .checked_sub(1)?
+                .checked_mul(stride)?
+                .checked_add(row_bytes)?;
+            if ptr.is_null() || row_bytes == 0 || stride < row_bytes || span > isize::MAX as usize {
+                return None;
+            }
+            (ptr as usize).checked_add(span)?;
+            Some(Self {
+                ptr,
+                stride,
+                row_bytes,
+                rows,
+                span,
+                _frame: PhantomData,
+            })
+        }
+
+        pub(crate) fn as_ptr(&self) -> *const u8 {
+            self.ptr
+        }
+        pub(crate) fn stride(&self) -> usize {
+            self.stride
+        }
+
+        pub(crate) fn visible_row(&self, row: usize) -> Option<&[u8]> {
+            let offset = row.checked_mul(self.stride)?;
+            if row >= self.rows || offset.checked_add(self.row_bytes)? > self.span {
+                return None;
+            }
+            // Only visible bytes form a Rust slice. Decoder row padding need
+            // not be initialized and is never covered by a &[u8].
+            Some(unsafe { slice::from_raw_parts(self.ptr.add(offset), self.row_bytes) })
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) struct SoftwareYuv420pUpload<'a> {
+        width: usize,
+        height: usize,
+        y: StridedPlane<'a>,
+        u: StridedPlane<'a>,
+        v: StridedPlane<'a>,
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl SoftwareYuv420pUpload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.y
+        }
+
+        pub(crate) fn write_chroma_into(&self, uv: &mut [u8], uv_pitch: usize) -> Option<()> {
+            let cw = self.width.div_ceil(2);
+            let uv_row_bytes = cw.checked_mul(2)?;
+            if uv_pitch < uv_row_bytes || uv_pitch.checked_mul(self.height.div_ceil(2))? != uv.len()
+            {
+                return None;
+            }
+            for (row, dst) in uv.chunks_exact_mut(uv_pitch).enumerate() {
+                let (u, v) = (self.u.visible_row(row)?, self.v.visible_row(row)?);
+                // Keep the ordinary interleave loop available to the compiler's
+                // vectorizer; only visible bytes enter the new immutable backing.
+                for col in 0..cw {
+                    dst[col * 2] = u[col];
+                    dst[col * 2 + 1] = v[col];
+                }
+            }
+            Some(())
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl Frame {
+        pub(crate) fn software_yuv420p_upload(&self) -> Option<SoftwareYuv420pUpload<'_>> {
+            if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            let y = StridedPlane::from_frame(self, 0, width, height)?;
+            let u = StridedPlane::from_frame(self, 1, cw, ch)?;
+            let v = StridedPlane::from_frame(self, 2, cw, ch)?;
+            Some(SoftwareYuv420pUpload {
+                width,
+                height,
+                y,
+                u,
+                v,
+            })
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) struct SoftwareP010Upload<'a> {
+        width: usize,
+        height: usize,
+        y: StridedPlane<'a>,
+        u: StridedPlane<'a>,
+        v: StridedPlane<'a>,
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl SoftwareP010Upload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+
+        #[cfg(target_os = "windows")]
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.y
+        }
+
+        #[cfg(target_os = "windows")]
+        pub(crate) fn write_d3d11_chroma(&self, output: &mut Vec<u8>) -> Option<()> {
+            // SAFETY: These strided planes borrow the software AVFrame, and
+            // their visible layout has been checked. The CPU helper accesses
+            // only visible U/V bytes and accepts different source pitches.
+            unsafe {
+                super::read_10bit_chroma_as_p010(
+                    self.u.as_ptr().cast_mut(),
+                    self.u.stride() as i32,
+                    self.v.as_ptr().cast_mut(),
+                    self.v.stride() as i32,
+                    self.width.div_ceil(2),
+                    self.height.div_ceil(2),
+                    output,
+                )
+            }
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        pub(crate) fn write_into(
+            &self,
+            y: &mut [u8],
+            y_pitch: usize,
+            uv: &mut [u8],
+            uv_pitch: usize,
+        ) -> Option<()> {
+            let y_row_bytes = self.width.checked_mul(2)?;
+            let uv_row_bytes = self.width.div_ceil(2).checked_mul(4)?;
+            let ch = self.height.div_ceil(2);
+            // Check the entire destination before writing either plane. The
+            // caller initializes the backing memory before creating these slices.
+            if y_pitch < y_row_bytes
+                || uv_pitch < uv_row_bytes
+                || y_pitch.checked_mul(self.height)? != y.len()
+                || uv_pitch.checked_mul(ch)? != uv.len()
+            {
+                return None;
+            }
+            for (row, dst) in y.chunks_exact_mut(y_pitch).enumerate() {
+                super::p010::luma_row(self.y.visible_row(row)?, &mut dst[..y_row_bytes]);
+            }
+            for (row, dst) in uv.chunks_exact_mut(uv_pitch).enumerate() {
+                super::p010::chroma_row(
+                    self.u.visible_row(row)?,
+                    self.v.visible_row(row)?,
+                    &mut dst[..uv_row_bytes],
+                );
+            }
+            Some(())
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl Frame {
+        pub(crate) fn software_p010_upload(&self) -> Option<SoftwareP010Upload<'_>> {
+            if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            // All three source planes are checked before any GPU allocation
+            // or destination write; each slice later covers visible bytes only.
+            let y = StridedPlane::from_frame(self, 0, width.checked_mul(2)?, height)?;
+            let u = StridedPlane::from_frame(self, 1, cw.checked_mul(2)?, ch)?;
+            let v = StridedPlane::from_frame(self, 2, cw.checked_mul(2)?, ch)?;
+            Some(SoftwareP010Upload {
+                width,
+                height,
+                y,
+                u,
+                v,
+            })
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    enum Chroma<'a> {
+        Borrowed(StridedPlane<'a>),
+        Packed(Vec<u8>),
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    pub(crate) struct SoftwareNv12Upload<'a> {
+        width: usize,
+        height: usize,
+        luma: StridedPlane<'a>,
+        chroma: Chroma<'a>,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    impl SoftwareNv12Upload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.luma
+        }
+        pub(crate) fn chroma_parts(&self) -> (*const u8, usize) {
+            match &self.chroma {
+                Chroma::Borrowed(plane) => (plane.as_ptr(), plane.stride()),
+                Chroma::Packed(bytes) => (bytes.as_ptr(), self.width.div_ceil(2) * 2),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    impl Frame {
+        pub(crate) fn is_8bit_420_software(&self) -> bool {
+            matches!(
+                self.raw_pixel_format(),
+                sys::AVPixelFormat_AV_PIX_FMT_YUV420P | sys::AVPixelFormat_AV_PIX_FMT_NV12
+            )
+        }
+
+        pub(crate) fn software_nv12_upload(&self) -> Option<SoftwareNv12Upload<'_>> {
+            if !self.is_8bit_420_software() {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            let uv_row_bytes = cw.checked_mul(2)?;
+            let uv_len = uv_row_bytes.checked_mul(ch)?;
+            let luma = StridedPlane::from_frame(self, 0, width, height)?;
+            let chroma = if self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                let uv = StridedPlane::from_frame(self, 1, uv_row_bytes, ch)?;
+                // RG8 requires a row pitch divisible by two. Keep the packed
+                // row-copy path for an otherwise valid odd source UV stride.
+                if uv.stride() % 2 == 0 {
+                    Chroma::Borrowed(uv)
+                } else {
+                    let mut bytes = Vec::with_capacity(uv_len);
+                    for row in 0..ch {
+                        bytes.extend_from_slice(uv.visible_row(row)?);
+                    }
+                    Chroma::Packed(bytes)
+                }
+            } else {
+                let u = StridedPlane::from_frame(self, 1, cw, ch)?;
+                let v = StridedPlane::from_frame(self, 2, cw, ch)?;
+                // All source planes have been checked before packing UV, and
+                // the complete packed UV exists before Metal creates textures.
+                let mut bytes = vec![0; uv_len];
+                for (row, dst) in bytes.chunks_exact_mut(uv_row_bytes).enumerate() {
+                    let (u, v) = (u.visible_row(row)?, v.visible_row(row)?);
+                    for col in 0..cw {
+                        dst[col * 2] = u[col];
+                        dst[col * 2 + 1] = v[col];
+                    }
+                }
+                Chroma::Packed(bytes)
+            };
+            Some(SoftwareNv12Upload {
+                width,
+                height,
+                luma,
+                chroma,
+            })
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub(crate) use software_planar_upload::SoftwareNv12Upload;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use software_planar_upload::SoftwareP010Upload;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use software_planar_upload::SoftwareYuv420pUpload;
 
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
 /// (`width * height`) and an interleaved Cb/Cr plane at half resolution
@@ -3526,26 +3975,21 @@ unsafe fn read_10bit_plane_as_p010(
     stride: i32,
     width: usize,
     height: usize,
-) -> Option<Vec<u8>> {
-    let ptr = ptr as *const u8;
-    if ptr.is_null() {
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let row_bytes = width.checked_mul(2)?;
+    let len = row_bytes.checked_mul(height)?;
+    let stride = usize::try_from(stride).ok()?;
+    if ptr.is_null() || row_bytes == 0 || stride < row_bytes {
         return None;
     }
-    let stride = stride.max(0) as usize;
-    if stride < width * 2 {
-        return None;
+    stride.checked_mul(height)?;
+    out.resize(len, 0);
+    for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+        let src = unsafe { std::slice::from_raw_parts(ptr.add(row * stride), row_bytes) };
+        p010::luma_row(src, dst);
     }
-    let mut out = Vec::with_capacity(width * height * 2);
-    for row in 0..height {
-        let row_ptr = unsafe { ptr.add(row * stride) };
-        for col in 0..width {
-            let lo = unsafe { *row_ptr.add(col * 2) };
-            let hi = unsafe { *row_ptr.add(col * 2 + 1) };
-            let sample = (u16::from_le_bytes([lo, hi]) & 0x03FF) << 6;
-            out.extend_from_slice(&sample.to_le_bytes());
-        }
-    }
-    Some(out)
+    Some(())
 }
 
 /// Interleaves two 10-bit LE chroma planes (Cb, Cr) into P010 (`value << 6`) order.
@@ -3560,35 +4004,30 @@ unsafe fn read_10bit_chroma_as_p010(
     v_stride: i32,
     cw: usize,
     ch: usize,
-) -> Option<Vec<u8>> {
-    let u_ptr = u_ptr as *const u8;
-    let v_ptr = v_ptr as *const u8;
-    if u_ptr.is_null() || v_ptr.is_null() {
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let source_row_bytes = cw.checked_mul(2)?;
+    let row_bytes = cw.checked_mul(4)?;
+    let len = row_bytes.checked_mul(ch)?;
+    let u_stride = usize::try_from(u_stride).ok()?;
+    let v_stride = usize::try_from(v_stride).ok()?;
+    if u_ptr.is_null()
+        || v_ptr.is_null()
+        || row_bytes == 0
+        || u_stride < source_row_bytes
+        || v_stride < source_row_bytes
+    {
         return None;
     }
-    let u_stride = u_stride.max(0) as usize;
-    let v_stride = v_stride.max(0) as usize;
-    if u_stride < cw * 2 || v_stride < cw * 2 {
-        return None;
+    u_stride.checked_mul(ch)?;
+    v_stride.checked_mul(ch)?;
+    out.resize(len, 0);
+    for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+        let u = unsafe { std::slice::from_raw_parts(u_ptr.add(row * u_stride), source_row_bytes) };
+        let v = unsafe { std::slice::from_raw_parts(v_ptr.add(row * v_stride), source_row_bytes) };
+        p010::chroma_row(u, v, dst);
     }
-    let mut out = Vec::with_capacity(cw * ch * 4);
-    for row in 0..ch {
-        let u_row = unsafe { u_ptr.add(row * u_stride) };
-        let v_row = unsafe { v_ptr.add(row * v_stride) };
-        for col in 0..cw {
-            let u = (u16::from_le_bytes([unsafe { *u_row.add(col * 2) }, unsafe {
-                *u_row.add(col * 2 + 1)
-            }]) & 0x03FF)
-                << 6;
-            let v = (u16::from_le_bytes([unsafe { *v_row.add(col * 2) }, unsafe {
-                *v_row.add(col * 2 + 1)
-            }]) & 0x03FF)
-                << 6;
-            out.extend_from_slice(&u.to_le_bytes());
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    Some(out)
+    Some(())
 }
 
 /// Copies `samples_per_row` 16-bit samples per row for `rows` rows, resolving stride.

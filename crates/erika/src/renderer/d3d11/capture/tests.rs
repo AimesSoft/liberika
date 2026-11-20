@@ -35,7 +35,7 @@ fn renderer() -> D3d11Renderer {
 fn upload(renderer: &mut D3d11Renderer, width: u32, height: u32, y: u8, uv: [u8; 2]) {
     renderer
         .upload_planar_frame(
-            PlanarFrame {
+            &PlanarFrame {
                 format: PlanarPixelFormat::Nv12,
                 width,
                 height,
@@ -170,7 +170,7 @@ fn capture_hdr_uses_sdr_tone_mapping_without_changing_live_uniforms() {
         .range(ColorRange::Limited);
     renderer
         .upload_planar_frame(
-            PlanarFrame {
+            &PlanarFrame {
                 format: PlanarPixelFormat::P010,
                 width: 4,
                 height: 4,
@@ -215,7 +215,7 @@ fn capture_packed_alpha_uses_logical_width_and_transparent_letterbox() {
     renderer.video_alpha_mode = VideoAlphaMode::PackedAlphaRight;
     renderer
         .upload_planar_frame(
-            PlanarFrame {
+            &PlanarFrame {
                 format: PlanarPixelFormat::Nv12,
                 width: 8,
                 height: 4,
@@ -263,7 +263,7 @@ fn capture_preserves_published_surface_and_subsequent_live_draw() {
         .clone();
     let before = read_bgra_pixels(renderer.state.as_ref().unwrap(), &published);
     let status = renderer.output_status();
-    let scene_token = renderer.flutter_scene.as_ref().unwrap().frame_token;
+    let scene_token = renderer.presented_scene.as_ref().unwrap().frame_token;
     let capture = capture(&mut renderer, 7, 5);
     assert_eq!(capture.rgba.len(), 140);
     assert_eq!(
@@ -279,7 +279,7 @@ fn capture_preserves_published_surface_and_subsequent_live_draw() {
     );
     assert_eq!(renderer.output_status(), status);
     assert_eq!(
-        renderer.flutter_scene.as_ref().unwrap().frame_token,
+        renderer.presented_scene.as_ref().unwrap().frame_token,
         scene_token
     );
     assert_eq!(
@@ -287,7 +287,7 @@ fn capture_preserves_published_surface_and_subsequent_live_draw() {
         before
     );
     // Force a real draw after capture, rather than a cached scene hit.
-    renderer.flutter_scene = None;
+    renderer.presented_scene = None;
     renderer.render_current_frame(context).unwrap();
     let after = renderer
         .surface
