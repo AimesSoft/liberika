@@ -3316,6 +3316,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
+    fn raw_ass_image_import_never_reads_row_padding() {
+        // Two rows of three visible pixels with a stride of five. libass may
+        // leave the padding after each row uninitialized; 0xEE marks it here so
+        // that any read of it shows up in the result.
+        let source = [
+            10u8, 20, 30, 0xEE, 0xEE, //
+            40, 50, 60, 0xEE, 0xEE,
+        ];
+        let image = RawAssImage {
+            w: 3,
+            h: 2,
+            stride: 5,
+            bitmap: source.as_ptr(),
+            color: 0,
+            dst_x: 0,
+            dst_y: 0,
+            next: std::ptr::null(),
+            image_type: 0,
+        };
+
+        let bitmap = unsafe { raw_ass_image_to_alpha_bitmap(&image) }.unwrap();
+
+        // The public stride and span stay the same; the gap between rows is
+        // zero instead of the source padding.
+        assert_eq!(bitmap.stride, 5);
+        assert_eq!(bitmap.alpha, [10, 20, 30, 0, 0, 40, 50, 60]);
+    }
+
+    #[test]
+    fn raw_ass_bitmap_length_rejects_overflowing_layouts() {
+        assert_eq!(required_bitmap_len(3, 2, 5).unwrap(), 8);
+        assert_eq!(required_bitmap_len(0, 2, 5).unwrap(), 0);
+        assert!(required_bitmap_len(1, 3, usize::MAX).is_err());
+        assert!(required_bitmap_len(1, 2, isize::MAX as usize + 1).is_err());
+    }
+
+    #[test]
     fn raw_ass_image_list_imports_alpha_bitmaps() {
         let alpha = [255u8, 128, 64, 0];
         let image = RawAssImage {
