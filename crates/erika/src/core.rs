@@ -1004,6 +1004,11 @@ pub trait RendererBackend {
         Ok(())
     }
 
+    /// A danmaku edit advanced the layout generation while the
+    /// current frame still has no danmaku. Other scene inputs retain their keys.
+    #[cfg(target_os = "windows")]
+    fn advance_empty_danmaku_scene(&mut self, _previous_generation: u64, _generation: u64) {}
+
     /// Render the current frame (optionally compositing `overlay`) to the attached
     /// surface. Returns `false` if there is no current frame to draw, letting the
     /// caller fall back to a test frame.

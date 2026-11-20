@@ -5,8 +5,8 @@ use crate::overlay::OverlayFrame;
 use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlane};
 use std::sync::Arc;
 
-// Bounds retained CPU keys/layouts and R8 texture payload, not transient upload
-// buffers or driver allocation overhead. Large subtitles still render in full.
+// Bounds retained CPU keys/layouts, R8 texture payload, and retained upload
+// scratch. Large subtitles still render in full.
 const CACHE_BUDGET: usize = 32 * 1024 * 1024;
 
 struct BitmapKey {
@@ -125,16 +125,12 @@ pub(super) struct ContentKey {
 }
 
 impl ContentKey {
-    pub fn new(bitmaps: &[SubtitleAlphaBitmap], limit: u32, pages: &[Page]) -> Option<Self> {
-        Self::with_budget(bitmaps, limit, pages, CACHE_BUDGET)
-    }
-
     fn with_budget(
         bitmaps: &[SubtitleAlphaBitmap],
         limit: u32,
         pages: &[Page],
         budget: usize,
-    ) -> Option<Self> {
+    ) -> Option<(Self, usize)> {
         Self::snapshot_with_budget(
             limit,
             pages,
@@ -144,15 +140,16 @@ impl ContentKey {
         )
     }
 
+    /// Returns the selected key and the remaining cache budget for upload scratch.
     pub fn new_for_overlay(
         frame: &OverlayFrame,
         owner: Option<&Arc<OverlayFrame>>,
         limit: u32,
         pages: &[Page],
-    ) -> Option<Self> {
+    ) -> Option<(Self, usize)> {
         owner
             .and_then(|owner| Self::shared_with_budget(frame, owner, limit, pages, CACHE_BUDGET))
-            .or_else(|| Self::new(&frame.subtitle_alpha_planes, limit, pages))
+            .or_else(|| Self::with_budget(&frame.subtitle_alpha_planes, limit, pages, CACHE_BUDGET))
     }
 
     fn shared_with_budget(
@@ -161,7 +158,7 @@ impl ContentKey {
         limit: u32,
         pages: &[Page],
         budget: usize,
-    ) -> Option<Self> {
+    ) -> Option<(Self, usize)> {
         if !std::ptr::eq(frame, owner.as_ref()) || !frame.subtitle_planes.is_empty() {
             return None;
         }
@@ -184,7 +181,7 @@ impl ContentKey {
         budget: usize,
         snapshot_bytes: usize,
         snapshot: impl FnOnce() -> Arc<AlphaSnapshot>,
-    ) -> Option<Self> {
+    ) -> Option<(Self, usize)> {
         let mut bytes = std::mem::size_of::<Self>()
             .checked_add(std::mem::size_of::<Box<[Page]>>())?
             .checked_add(snapshot_bytes)?;
@@ -200,13 +197,14 @@ impl ContentKey {
                 )?
                 .checked_add((page.width as usize).checked_mul(page.height as usize)?)?;
         }
-        if bytes > budget {
-            return None;
-        }
-        Some(Self {
-            limit,
-            snapshot: snapshot(),
-        })
+        let remaining_bytes = budget.checked_sub(bytes)?;
+        Some((
+            Self {
+                limit,
+                snapshot: snapshot(),
+            },
+            remaining_bytes,
+        ))
     }
 
     pub fn matches(&self, bitmaps: &[SubtitleAlphaBitmap], limit: u32) -> bool {
@@ -300,7 +298,7 @@ impl Page {
     ) -> Result<()> {
         let len = self.pixel_len()?;
         // Reset every byte, including unused rows below shorter tiles, before
-        // filling this page. Capacity may come from an earlier page this frame.
+        // filling this page. The buffer may contain pixels from an earlier page.
         pixels.clear();
         pixels.resize(len, 0);
         for tile in &self.tiles {
