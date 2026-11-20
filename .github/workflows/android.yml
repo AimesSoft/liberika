@@ -2,28 +2,8 @@ name: Android
 
 on:
   pull_request:
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/android.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "packaging/**"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
-      - "xtask/**"
   push:
     branches: [main]
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/android.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "packaging/**"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
-      - "xtask/**"
   workflow_dispatch:
 
 permissions:
@@ -40,30 +20,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-select.yml
+
   native:
     name: ${{ matrix.abi }}
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - rust_target: aarch64-linux-android
-            abi: arm64-v8a
-            clang_target: aarch64-linux-android
-            cxx_runtime_target: aarch64-linux-android
-          - rust_target: armv7-linux-androideabi
-            abi: armeabi-v7a
-            clang_target: armv7a-linux-androideabi
-            cxx_runtime_target: arm-linux-androideabi
-          - rust_target: x86_64-linux-android
-            abi: x86_64
-            clang_target: x86_64-linux-android
-            cxx_runtime_target: x86_64-linux-android
-          - rust_target: i686-linux-android
-            abi: x86
-            clang_target: i686-linux-android
-            cxx_runtime_target: i686-linux-android
+      matrix: ${{ fromJSON(needs.changes.outputs.android_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -82,6 +50,12 @@ jobs:
         with:
           path: third_party
           key: native-v2-android-${{ matrix.rust_target }}-ndk${{ env.ANDROID_NDK_VERSION }}-api${{ env.ANDROID_API_LEVEL }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: ${{ matrix.rust_target }}-${{ env.ERIKA_NATIVE_PROFILE }}-ndk${{ env.ANDROID_NDK_VERSION }}-api${{ env.ANDROID_API_LEVEL }}-${{ hashFiles('Cargo.lock', '.github/workflows/android.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.abi == 'arm64-v8a' }}
       - name: Build native dependencies and static C API
         shell: bash
         run: |

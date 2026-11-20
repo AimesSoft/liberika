@@ -3,42 +3,8 @@ name: CI
 on:
   pull_request:
     branches: [main]
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/**"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "LICENSE"
-      - "crates/**"
-      - "examples/**"
-      - "packaging/**"
-      - "scripts/*linux*.sh"
-      - "packages/erika_flutter/**"
-      - "!packages/erika_flutter/**/*.md"
-      - "packages/erika_ohos/**"
-      - "!packages/erika_ohos/**/*.md"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
-      - "xtask/**"
   push:
     branches: [main]
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/**"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "LICENSE"
-      - "crates/**"
-      - "examples/**"
-      - "packaging/**"
-      - "scripts/*linux*.sh"
-      - "packages/erika_flutter/**"
-      - "!packages/erika_flutter/**/*.md"
-      - "packages/erika_ohos/**"
-      - "!packages/erika_ohos/**/*.md"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
-      - "xtask/**"
   workflow_dispatch:
 
 permissions:
@@ -55,41 +21,12 @@ env:
 
 jobs:
   changes:
-    name: Select native checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      native: ${{ steps.paths.outputs.native }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Detect native build inputs
-        id: paths
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          set -euo pipefail
-          # Manual runs and unavailable bases run every check conservatively.
-          if [[ "$EVENT_NAME" == workflow_dispatch ]] || \
-             ! git cat-file -e "${BASE_REF}^{commit}" 2>/dev/null; then
-            echo "native=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git diff --name-only -z "$BASE_REF" "$HEAD_REF" > "$RUNNER_TEMP/changed-paths"
-          native=false
-          while IFS= read -r -d '' path; do
-            case "$path" in
-              .cargo/*|Cargo.lock|Cargo.toml|crates/*|examples/*|packaging/*|third_party/patches/*|third_party/wgpu-hal/*|xtask/*|.github/workflows/ci.yml|.github/workflows/release.yml)
-                native=true ;;
-            esac
-          done < "$RUNNER_TEMP/changed-paths"
-          echo "native=$native" >> "$GITHUB_OUTPUT"
+    uses: ./.github/workflows/ci-select.yml
 
   quality:
     name: Quality (Ubuntu)
+    needs: changes
+    if: needs.changes.outputs.quality == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -97,6 +34,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Test CI path and matrix selection
+        run: python3 -B scripts/test_ci_paths.py -v
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: quality-host-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Verify playback fixture checksums
         working-directory: crates/erika/testdata/playback
         run: sha256sum --check SHA256SUMS
@@ -124,18 +69,11 @@ jobs:
   rust-macos:
     name: Rust (macOS ${{ matrix.arch }})
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.macos == 'true'
     timeout-minutes: 150
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            target: aarch64-apple-darwin
-            runner: macos-26
-          - arch: x64
-            target: x86_64-apple-darwin
-            runner: macos-26
+      matrix: ${{ fromJSON(needs.changes.outputs.macos_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -150,6 +88,12 @@ jobs:
         with:
           path: third_party
           key: native-v2-macos-${{ matrix.target }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: ${{ matrix.target }}-${{ env.PROFILE }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'arm64' }}
       - name: Build native dependencies
         run: |
           cargo run --locked -p xtask -- deps build --all \
@@ -210,7 +154,7 @@ jobs:
   ios:
     name: iOS device staticlib
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.ios == 'true'
     runs-on: macos-26
     timeout-minutes: 150
     env:
@@ -229,6 +173,12 @@ jobs:
           key: native-v2-ios-aarch64-apple-ios-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
           restore-keys: |
             native-v2-ios-device-aarch64-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: aarch64-apple-ios-${{ env.PROFILE }}-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Build iOS native dependencies
         run: >-
           cargo run --locked -p xtask -- deps build --all
@@ -243,7 +193,7 @@ jobs:
   tvos:
     name: tvOS simulator staticlib
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.tvos == 'true'
     runs-on: macos-26
     timeout-minutes: 150
     env:
@@ -262,6 +212,12 @@ jobs:
           key: native-v2-tvos-aarch64-apple-tvos-sim-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
           restore-keys: |
             native-v2-tvos-simulator-aarch64-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: aarch64-apple-tvos-sim-${{ env.PROFILE }}-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Build tvOS native dependencies
         run: >-
           cargo run --locked -p xtask -- deps build --all
@@ -280,23 +236,12 @@ jobs:
   windows:
     name: Windows ${{ matrix.arch }} build
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: needs.changes.outputs.windows == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            host_arch: AMD64
-            target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            msys2: true
-          - arch: arm64
-            host_arch: ARM64
-            target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            msys2: false
+      matrix: ${{ fromJSON(needs.changes.outputs.windows_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -357,6 +302,12 @@ jobs:
         with:
           path: third_party
           key: native-v2-windows-${{ matrix.target }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: ${{ matrix.target }}-${{ env.PROFILE }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'x64' }}
       - name: Verify FFmpeg make shell
         shell: pwsh
         run: |
