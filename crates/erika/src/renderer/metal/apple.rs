@@ -2,6 +2,8 @@
 mod danmaku;
 use crate::renderer::danmaku_batch::{DanmakuBatch, DanmakuBatchGlyph, DanmakuBatchInstance};
 
+#[cfg(target_os = "macos")]
+use std::cell::OnceCell;
 use std::ffi::c_void;
 use std::mem;
 use std::ptr::NonNull;
@@ -192,6 +194,9 @@ pub struct MetalRendererImpl {
     flutter_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     texture_cache: Option<CFRetained<CVMetalTextureCache>>,
     video_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    #[cfg(target_os = "macos")]
+    sdr_pipeline_without_dovi:
+        OnceCell<Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
     overlay_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     danmaku_batch_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     video_sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
@@ -290,6 +295,8 @@ impl MetalRendererImpl {
             flutter_texture: None,
             texture_cache: None,
             video_pipeline: None,
+            #[cfg(target_os = "macos")]
+            sdr_pipeline_without_dovi: OnceCell::new(),
             overlay_pipeline: None,
             danmaku_batch_pipeline: None,
             video_sampler: None,
@@ -1111,6 +1118,9 @@ impl MetalRendererImpl {
         }
 
         unsafe {
+            #[cfg(target_os = "macos")]
+            let pipeline = self.video_pipeline_for_playback(&frame, textures)?;
+            #[cfg(not(target_os = "macos"))]
             let pipeline = self.video_pipeline_state()?;
             let sampler = self.video_sampler_state()?;
             let Some(command_buffer) = self.queue.commandBuffer() else {
@@ -2676,52 +2686,86 @@ impl MetalRendererImpl {
         Ok(self.texture_cache.as_deref().expect("texture cache exists"))
     }
 
+    #[cfg(target_os = "macos")]
+    fn video_pipeline_for_playback(
+        &mut self,
+        frame: &VideoRenderFrame<'_>,
+        textures: &ImportedVideoFrameTextures,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        // of_for_representation sets flags.x exactly when source DOVI data is present.
+        if frame.pipeline.source.dovi.is_none()
+            && !frame.pipeline.source.is_hdr()
+            && self.output_mode == MetalOutputMode::Sdr
+            && self.drawable_pixel_format == MetalDrawablePixelFormat::Bgra8Unorm
+            && !self.video_alpha_mode.has_alpha()
+            && self.layer.is_some()
+            && textures.source_pixel_buffer.is_some()
+            && frame.frame.info.format == ImportedVideoFormat::Nv12
+            && let Some(pipeline) = self.sdr_pipeline_without_dovi.get_or_init(|| {
+                let source = format!("#define ERIKA_NO_DOLBY_VISION\n{VIDEO_SHADER_SOURCE}");
+                self.build_video_pipeline(&source).ok()
+            })
+        {
+            // This specialization always targets BGRA8 and can coexist with
+            // the general pipeline when frame metadata changes mid-stream.
+            return Ok(pipeline.clone());
+        }
+        self.video_pipeline_state()
+    }
+
     fn video_pipeline_state(
         &mut self,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
         if self.video_pipeline.is_none() {
-            let library = self
-                .device
-                .newLibraryWithSource_options_error(&NSString::from_str(VIDEO_SHADER_SOURCE), None)
-                .map_err(|error| {
-                    PlayerError::Renderer(format!(
-                        "Metal video shader compile failed: {}",
-                        error.localizedDescription()
-                    ))
-                })?;
-            let vertex = library
-                .newFunctionWithName(&NSString::from_str("erika_video_vertex"))
-                .ok_or_else(|| {
-                    PlayerError::Renderer("Metal shader missing erika_video_vertex".to_string())
-                })?;
-            let fragment = library
-                .newFunctionWithName(&NSString::from_str("erika_video_fragment"))
-                .ok_or_else(|| {
-                    PlayerError::Renderer("Metal shader missing erika_video_fragment".to_string())
-                })?;
-            let descriptor = MTLRenderPipelineDescriptor::new();
-            descriptor.setLabel(Some(&NSString::from_str("Erika Video Pipeline")));
-            descriptor.setVertexFunction(Some(&*vertex));
-            descriptor.setFragmentFunction(Some(&*fragment));
-            let attachments = descriptor.colorAttachments();
-            let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
-            attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
-            let pipeline = self
-                .device
-                .newRenderPipelineStateWithDescriptor_error(&descriptor)
-                .map_err(|error| {
-                    PlayerError::Renderer(format!(
-                        "Metal video pipeline create failed: {}",
-                        error.localizedDescription()
-                    ))
-                })?;
-            self.video_pipeline = Some(pipeline);
+            self.video_pipeline = Some(self.build_video_pipeline(VIDEO_SHADER_SOURCE)?);
         }
         Ok(self
             .video_pipeline
             .as_ref()
             .expect("video pipeline exists")
             .clone())
+    }
+
+    fn build_video_pipeline(
+        &self,
+        source: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        let library = self
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+            .map_err(|error| {
+                PlayerError::Renderer(format!(
+                    "Metal video shader compile failed: {}",
+                    error.localizedDescription()
+                ))
+            })?;
+        let vertex = library
+            .newFunctionWithName(&NSString::from_str("erika_video_vertex"))
+            .ok_or_else(|| {
+                PlayerError::Renderer("Metal shader missing erika_video_vertex".to_string())
+            })?;
+        let fragment = library
+            .newFunctionWithName(&NSString::from_str("erika_video_fragment"))
+            .ok_or_else(|| {
+                PlayerError::Renderer("Metal shader missing erika_video_fragment".to_string())
+            })?;
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setLabel(Some(&NSString::from_str("Erika Video Pipeline")));
+        descriptor.setVertexFunction(Some(&*vertex));
+        descriptor.setFragmentFunction(Some(&*fragment));
+        let attachments = descriptor.colorAttachments();
+        let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
+        attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
+        let pipeline = self
+            .device
+            .newRenderPipelineStateWithDescriptor_error(&descriptor)
+            .map_err(|error| {
+                PlayerError::Renderer(format!(
+                    "Metal video pipeline create failed: {}",
+                    error.localizedDescription()
+                ))
+            })?;
+        Ok(pipeline)
     }
 
     fn video_sampler_state(&mut self) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>> {
@@ -4291,7 +4335,11 @@ fragment float4 erika_video_fragment(
     float2 alpha_coord = float2(0.5 + in.tex_coord.x * 0.5, in.tex_coord.y);
     float y_sample = luma_texture.sample(video_sampler, color_coord).r;
     float2 cbcr_sample = chroma_texture.sample(video_sampler, color_coord).rg;
+#ifdef ERIKA_NO_DOLBY_VISION
+    const bool dovi_enabled = false;
+#else
     bool dovi_enabled = uniforms.dovi_flags.x != 0.0;
+#endif
     float3 rgb;
     if (dovi_enabled) {
         // The base layer carries the raw 12-bit DV signal (10-bit container,
