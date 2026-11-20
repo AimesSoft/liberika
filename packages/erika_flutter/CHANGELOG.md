@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.8 - 2026-11-20
+
+- Windows supports frame capture through D3D11, with subtitles and optional
+  danmaku composited into an SDR straight-alpha RGBA image.
+- Superseded HTTP opens are cancelled on Windows and macOS. Native playback and
+  open errors are reported on Apple platforms, and macOS video is opaque when
+  `alphaVideo` is omitted.
+- The native runtime resumes stalled HTTP reads, honours bounded `Retry-After`,
+  and reduces CPU in D3D11 and Metal rendering, subtitles and danmaku.
+
 ## 0.3.7 - 2026-11-13
 
 - The native runtime supports Bilibili mode 7 advanced comments and corrects

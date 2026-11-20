@@ -4,14 +4,57 @@
 
 ## Unreleased
 
-- Implement Windows D3D11 SDR screenshots, including subtitles and optional
-  danmaku, with HDR tone mapping and straight-alpha RGBA output. Capture leaves
-  live output settings intact and uses bounded GPU readback; it does not apply
-  super-resolution enhancement. Add pixel regressions and real 4K HEVC plugin checks.
+## 0.3.8 - 2026-11-20
+
+### Windows
+
+- D3D11 screenshots: SDR readback of the current frame with subtitles and
+  optional danmaku, HDR tone mapped, straight-alpha RGBA. Capture leaves live
+  output settings intact, bounds its GPU readback and does not apply
+  super-resolution (#215).
+- Flutter cancels superseded HTTP opens on Windows and macOS (#259).
+- Reading stats or calling an unsupported method no longer triggers a redraw (#265).
+- libass uses its SSE2 and SSSE3 code paths (#237).
+- Backport the dav1d MSVC header feature-probe fix (#263).
+
+### macOS and iOS
+
+- Ordinary SDR video on macOS uses a Metal path specialized for content without
+  Dolby Vision (#268).
+- Metal performs fewer subtitle atlas comparisons and encoder bindings (#228).
+- Video is opaque when Flutter omits `alphaVideo` on macOS (#242).
+- Flutter reports native playback and open errors on Apple platforms (#239).
+
+### HTTP sources
+
+- Verify response identity and read sidecar files across short responses (#246).
+- Resume stalled reads and deliver verified buffered data (#253).
+- Honour a bounded `Retry-After` when resuming playback (#257).
+
+### Subtitles and danmaku
+
 - Skip unused playback subtitle rasterization for hosts that only export frames;
   attaching a surface restores the current subtitle overlay, including while paused (#197).
+- libass bitmap import never reads row padding (#223, #270).
+- ASS events replay from a single transferred log (#226).
+- The first danmaku layout appears without redundant Presents or flicker, and a
+  frame upload keeps the generation a danmaku edit advanced (#266, #269).
+- Danmaku timing no longer jitters with pump latency (#217).
+- Danmaku atlas planes are initialized independently (#218).
+
+### Playback and rendering
+
 - Keep seek-cancelled source reads distinct from I/O failures, wait for the next
   demux command, and clear stale AVIO errors before seeking (#205).
+- A full demux queue wakes on packet or control events (#241).
+- Software video planes upload directly on Metal and D3D11 (#230); software
+  conversion buffers are reused and P010 packing is faster (#222); D3D11 software
+  P010 upload uses less CPU (#267).
+- D3D11 reuses subtitle atlases and their upload storage, and skips presenting
+  unchanged scenes (#236, #264).
+
+### Integration
+
 - Document the explicit `wgpu-hal` patch required by external Rust workspaces and
   compile a separate consumer in Linux CI. Windows dependency builds now resolve
   `host` to the MSVC target directory expected by Cargo (#213).

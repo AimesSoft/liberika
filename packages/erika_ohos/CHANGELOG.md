@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.8 - 2026-11-20
+
+- Align with the 0.3.8 native runtime: HTTP sources resume stalled reads and
+  honour bounded `Retry-After`; subtitle and danmaku rendering use less CPU.
+  The ArkTS API is unchanged.
+
 ## 0.3.7 - 2026-11-13
 
 - Align with the 0.3.7 native runtime: Bilibili mode 7 advanced comments and
