@@ -57,6 +57,6 @@ Linux 预编译包、mode 7 弹幕和 dma-buf 输出见[更新日志](../CHANGEL
 ## 文档维护
 
 - 根 README 介绍项目、安装入口和平台；SDK README 维护该 SDK 的公开用法。
-- `docs/` 维护接入、内核设计与开发流程；实验结果放在 `docs/investigations/`。
+- `docs/` 维护接入、内核设计与开发流程；实验结果放在 `docs/investigations/`，不提交原始日志、截图或抓取数据。
 - API 变更按 `crates/erika_capi/include/erika.h` 和 SDK 实现核对，并同步对应三语指南。
 - 新主题加入本目录；保留旧文件名的兼容入口时，入口只指向现行文档。

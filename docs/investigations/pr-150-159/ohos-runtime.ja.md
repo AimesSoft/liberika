@@ -38,7 +38,7 @@ MP3 は音声トラック 1 本のみを公開し、decoded/rendered video は�
 
 動画はエミュレーターのシステム decoder を使用し `hardwareVideoFrames` としてカウントされましたが、出力はすべて CPU fallback を経由し、`zeroCopyVideoFrames` は 0 です。実機のハードウェアデコード効率、NativeBuffer ゼロコピー、物理スピーカーの聴感は検証できていません。libass はビルドしておらず、字幕、HDR、実際のデバイス喪失もこの OHOS 検証の対象外です。Flutter 部分は製品版 NAPI ブリッジを呼び出しましたが、完全な Flutter エンジンは起動していません。Dart 側の証拠は元レポートのテストと分析です。
 
-![両ブリッジの実動画画面](evidence/ohos-live-finished.png)
+両ブリッジの実動画画面
 
 スクリーンショットは hdc で取得・確認しました。リポジトリ内は幅 660 ピクセルに縮小し、元の 1320×2232 画像はローカル証拠ディレクトリにあります。
 

@@ -122,4 +122,4 @@ cargo fmt --all
 
 ## 文档维护位置
 
-文档入口为 [docs/README.md](docs/README.md)。 SDK 用法放在各 package README，接入与内核设计放在 `docs/`，带日期的调查结果放在 `docs/investigations/`。新增主题加入文档目录，API 变更同步对应三语指南。
+文档入口为 [docs/README.md](docs/README.md)。 SDK 用法放在各 package README，接入与内核设计放在 `docs/`，带日期的调查结果放在 `docs/investigations/`，只提交结论、关键数据和复现方法，不提交原始日志、截图或抓取数据。新增主题加入文档目录，API 变更同步对应三语指南。

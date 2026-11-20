@@ -130,7 +130,7 @@ Windows: erika unit tests 702 passed/1 ignored, integration 4＋6 passed, C API 
 
 The entire `--workspace` failed in an Apple-only demo's ObjC build script; subsequent verification was limited to core and C API. Linux synthetic Vulkan direct-frame checks failed because llvmpipe lacks synchronization2/external-semaphore capability; this is not a pass for that path. The #155 Linux code was not adopted.
 
-All 10 original author PR fork CI runs passed and their run SHAs exactly matched the reviewed heads; see [author-ci.json](author-ci.json). CI success does not replace the functional and runtime judgments above.
+All 10 original author PR fork CI runs passed and their run SHAs exactly matched the reviewed heads; see author-ci.json. CI success does not replace the functional and runtime judgments above.
 
 ## Reproduction materials
 

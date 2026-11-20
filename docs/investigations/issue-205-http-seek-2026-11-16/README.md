@@ -64,9 +64,9 @@ A/B 基线是在独立目录解包上述 main 提交，仅复制集成测试文�
 
 ## 原始日志
 
-- [原始 main / macOS：失败](main-macos.log)
-- [修复版 / macOS：通过](fixed-macos.log)
-- [修复版 / Windows：通过](fixed-windows.log)
+- 原始 main / macOS：失败
+- 修复版 / macOS：通过
+- 修复版 / Windows：通过
 
 Windows 日志由 PowerShell 收集，长行有显示折行；归档时仅统一换行并去掉行尾空白。主机上另运行了原有
 `cargo test -p erika --test media_lifecycle -- --test-threads=1`，4 项通过、2 项手动实验忽略。

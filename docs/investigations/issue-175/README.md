@@ -30,7 +30,7 @@ library's public interface.
 | Same WSL workstation, NVIDIA RTX 5060 Ti (driver 616.56), wgpu GLES over Mesa D3D12, hardware required | Presenter danmaku pixel/screenshot regression **1 passed**. Renderer fixture capture completed 120 measured frames, matched the final reference and exited successfully. |
 | Workstation Vulkan with hardware required | Correctly rejected llvmpipe. This environment exposes hardware through D3D12/OpenGL, but enumerates only a CPU Vulkan adapter. **Hardware Vulkan external-memory import was not validated.** |
 
-[Adapter evidence](evidence/adapters.txt) distinguishes software Vulkan from
+Adapter evidence distinguishes software Vulkan from
 NVIDIA-backed GLES. WSLg endpoints were available, but these tests were
 windowless. No Wayland surface or Dioxus UI integration is claimed.
 
@@ -59,9 +59,9 @@ These are not measurements of the issue author's playback workload or a
 
 | Path | Mean completed frame | Fixture throughput | Report |
 |---|---:|---:|---|
-| M5 Pro Metal native export → wgpu 26 composition | 4.095 ms | 244.2 fps | [JSON](evidence/native-macos-metal.json) |
-| WSL llvmpipe Vulkan native export → wgpu 26 composition | 9.355 ms | 106.9 fps | [JSON](evidence/native-wsl-software.json) |
-| WSL RTX 5060 Ti GLES RGBA capture only | 3.998 ms | 250.1 fps | [JSON](evidence/rgba-wsl-hardware.json) |
+| M5 Pro Metal native export → wgpu 26 composition | 4.095 ms | 244.2 fps | JSON |
+| WSL llvmpipe Vulkan native export → wgpu 26 composition | 9.355 ms | 106.9 fps | JSON |
+| WSL RTX 5060 Ti GLES RGBA capture only | 3.998 ms | 250.1 fps | JSON |
 
 ## Reproduction
 
@@ -112,7 +112,7 @@ container; its PulseAudio connection was unavailable.
 - With unrestricted Mesa workers and many parallel presenter initializations,
   the WSL C API suite intermittently segfaulted in Vulkan loader/validation
   `set_debug_utils_object_name` while creating a device's internal compute
-  pipeline during presenter construction. The [captured stack](evidence/capi-loader-stack.txt)
+  pipeline during presenter construction. The captured stack
   is retained. Serial execution passed; setting `LP_NUM_THREADS=4` also passed
   the full suite and **10 consecutive parallel C API runs (55 tests each)**.
   This records an environment workaround, not a claim that the loader's

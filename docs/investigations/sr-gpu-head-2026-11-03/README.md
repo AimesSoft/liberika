@@ -23,8 +23,8 @@
 
 两种矩阵配置中的原向量末层均使用 fp32 累加；新末层使用 fp16 系数与累加器，
 其他层保持所选精度。桌面活动会带来样本波动，完整数据保存在
-[fp16 矩阵累加记录](data/results_confirm.json)与
-[fp32 矩阵累加记录](data/results_confirm32.json)。
+fp16 矩阵累加记录与
+fp32 矩阵累加记录。
 
 ## 从计算图定位热点
 
@@ -82,8 +82,8 @@ shader 将这两个字重解释为 `f16vec4`，用 fp16 FMA 完成四个输出�
 
 末层计时包含边缘修正，来自单独开启 profiling 的运行。
 约 **25%** 的末层耗时下降，与整网约 **0.27/0.52 ms** 的节省相吻合。
-资源数据见 [half-stats.log](data/half-stats.log)，分层数据见
-[原末层](data/profile.log)和[新末层](data/half-profile.log)。
+资源数据见 half-stats.log，分层数据见
+原末层和新末层。
 
 ## 数值结果与默认选路
 
@@ -99,7 +99,7 @@ CPU 参考裁剪保留所需感受野的完整上下文。另外检查了基础 
 | 现有验收阈值 | 0.002 | 0.03 |
 
 124 项候选比较全部通过，输出均为有限值。半精度会改变舍入，以上是测试输入中的实测误差。
-原始记录见 [quality.log](data/quality.log) 与 [quality32.log](data/quality32.log)。
+原始记录见 quality.log 与 quality32.log。
 
 NVIDIA 上对这两套已验证的内置图默认启用新末层。选择时先匹配模型名称，再比较完整图与权重，
 同名但权重不同的自定义模型保留其原有精度策略。
@@ -127,9 +127,9 @@ NVIDIA 上对这两套已验证的内置图默认启用新末层。选择时先�
 
 接入验证记录：
 
-- [策略与布局测试](data/integration-tests.txt)
-- [fp16 数值比较](data/integration_quality.log)、[fp32 数值比较](data/integration_quality32.log)
-- [fp16 交替计时](data/integration_results_confirm.json)、[fp32 交替计时](data/integration_results_confirm32.json)
+- 策略与布局测试
+- fp16 数值比较、fp32 数值比较
+- fp16 交替计时、fp32 交替计时
 
 ## 其他候选方案与消融结果
 
@@ -142,8 +142,8 @@ NVIDIA 上对这两套已验证的内置图默认启用新末层。选择时先�
   因此保留横向 resident kernel。
 - 更复杂的共享内存置换增加了寄存器和共享存储占用，未带来收益；最终使用简单的通道平面补齐。
 
-消融样本见 [行复用](data/results_rows.json)、[加载布局](data/results_heads.json)、
-[半精度分解](data/results_half.json)。这次优化保持训练网络的结构，
+消融样本见 行复用、加载布局、
+半精度分解。这次优化保持训练网络的结构，
 通过改善末层数据布局和运算实现得到额外收益。
 
 ## 复现方式

@@ -209,7 +209,7 @@ Linux synthetic Vulkan direct-frame 检查因 llvmpipe 缺 synchronization2／ex
 不是该路径验证通过。#155 的 Linux 代码没有被采用。
 
 原作者 10 个 PR 的 fork CI 均成功，而且运行 SHA 与审阅的 head 精确匹配；
-详情见 [author-ci.json](author-ci.json)。CI 通过不能替代上面的功能与运行判断。
+详情见 author-ci.json。CI 通过不能替代上面的功能与运行判断。
 
 ## 重现材料
 
