@@ -3692,7 +3692,10 @@ mod software_planar_upload {
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub(crate) use software_planar_upload::SoftwareNv12Upload;
 
-#[cfg(any(target_os = "windows", all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 pub(crate) use software_planar_upload::SoftwareP010Upload;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
