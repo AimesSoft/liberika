@@ -923,8 +923,7 @@ requested `width`×`height` (independent of the display surface size). Danmaku
 is deliberately not included — screenshots represent the video rather than
 transient on-screen comments. `out_capacity` must be at least `width*height*4`.
 It returns `PlayerError` when no frame is available yet. Metal and wgpu
-(including Android) implement capture. Windows D3D11 capture is implemented in
-unreleased source; the published v0.3.7 D3D11 runtime still returns no capture.
+(including Android) implement capture, and so does Windows D3D11 since 0.3.8.
 Capture always uses an SDR RGBA8 offscreen target and tone-maps
 HDR/extended-linear content, so the returned
 bytes are SDR even when the display output is Apple EDR, HDR10, or Android
