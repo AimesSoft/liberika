@@ -5675,6 +5675,10 @@ impl VideoPlaybackEngine {
         self.timing = timing;
     }
 
+    pub(crate) fn playback_rate(&self) -> f64 {
+        self.clock.rate()
+    }
+
     pub fn set_playback_rate(&mut self, rate: f64) {
         self.set_playback_rate_at(rate, Instant::now());
     }

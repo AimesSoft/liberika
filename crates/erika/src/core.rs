@@ -22,7 +22,11 @@ use crate::trace;
 static NEXT_PLAYER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_EXTERNAL_SUBTITLE_TRACK_ID: AtomicU64 = AtomicU64::new(1);
 const EXTERNAL_SUBTITLE_TRACK_ID_BASE: i64 = 1_000_000;
-const AUDIO_PREFILL_AFTER_VIDEO_LIMIT: usize = 8;
+// Match the burst headroom of ~8 1024-sample AAC frames (~170 ms) by decoded
+// PCM playback duration rather than raw frame count so short-frame codecs
+// (such as 40-sample TrueHD) do not starve in the worker loop under timer
+// jitter or fast playback rates.
+const AUDIO_PREFILL_AFTER_VIDEO_DURATION_LIMIT: Duration = Duration::from_millis(160);
 const AUDIO_PREFILL_PACKET_BUDGET: usize = 6;
 const AUDIO_PREFILL_TIME_BUDGET: Duration = Duration::from_millis(5);
 // Keep producer prefill aligned with the output queue high-water mark. This
@@ -2584,7 +2588,7 @@ fn run_playback_worker(
                     &inner,
                     playback_generation,
                     "after_video_tick",
-                    AUDIO_PREFILL_AFTER_VIDEO_LIMIT,
+                    AUDIO_PREFILL_AFTER_VIDEO_DURATION_LIMIT,
                     &mut audio_output_backpressure,
                 );
             }
@@ -2897,18 +2901,41 @@ impl AudioOutputBackpressureState {
     }
 }
 
+fn pcm_audio_frame_duration(frame: &PcmAudioFrame) -> Duration {
+    if frame.format.sample_rate == 0 || frame.frames == 0 {
+        return Duration::ZERO;
+    }
+    let seconds = frame.frames as f64 / f64::from(frame.format.sample_rate);
+    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
+}
+
+fn pcm_audio_frame_playback_duration(frame: &PcmAudioFrame, rate: f64) -> Duration {
+    if frame.format.sample_rate == 0 || frame.frames == 0 {
+        return Duration::ZERO;
+    }
+    let rate = if rate.is_finite() && rate > 0.0 {
+        rate.clamp(0.25, 16.0)
+    } else {
+        1.0
+    };
+    let seconds = frame.frames as f64 / f64::from(frame.format.sample_rate) / rate;
+    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
+}
+
 fn pump_audio_from_worker(
     engine: &mut VideoPlaybackEngine,
     inner: &Arc<Mutex<PlayerInner>>,
     playback_generation: u64,
     stage: &'static str,
-    burst_limit: usize,
+    duration_limit: Duration,
     backpressure: &mut AudioOutputBackpressureState,
 ) {
     let started = Instant::now();
+    let playback_rate = engine.playback_rate();
     let mut emitted = 0usize;
+    let mut emitted_duration = Duration::ZERO;
     let mut budget_exhausted = false;
-    for _ in 0..burst_limit {
+    while emitted_duration < duration_limit {
         let elapsed = started.elapsed();
         if elapsed >= AUDIO_PREFILL_TIME_BUDGET {
             budget_exhausted = true;
@@ -2919,11 +2946,10 @@ fn pump_audio_from_worker(
             AUDIO_PREFILL_TIME_BUDGET.saturating_sub(elapsed),
         ) {
             Ok(Some(frame)) => {
-                let output_end = frame.pts.map(|pts| {
-                    pts.saturating_add(Duration::from_secs_f64(
-                        frame.frame.frames as f64 / f64::from(frame.frame.format.sample_rate),
-                    ))
-                });
+                let media_duration = pcm_audio_frame_duration(&frame.frame);
+                let playback_duration =
+                    pcm_audio_frame_playback_duration(&frame.frame, playback_rate);
+                let output_end = frame.pts.map(|pts| pts.saturating_add(media_duration));
                 match try_emit_audio_frame_from_worker(
                     inner,
                     PlayerAudioFrame {
@@ -2935,6 +2961,7 @@ fn pump_audio_from_worker(
                         engine.record_audio_output_end(output_end);
                         backpressure.reset();
                         emitted += 1;
+                        emitted_duration = emitted_duration.saturating_add(playback_duration);
                     }
                     AudioFrameEmitResult::Full(frame) => {
                         engine.restore_pending_audio_frame(frame);
@@ -2964,9 +2991,10 @@ fn pump_audio_from_worker(
     }
     if emitted > 0 || budget_exhausted {
         trace::log(format!(
-            "[erika-clock-trace] stage=worker_audio_prefill:{stage} emitted={} frame_limit={} packet_budget={} budget_exhausted={} elapsed_ms={:.3}",
+            "[erika-clock-trace] stage=worker_audio_prefill:{stage} emitted={} emitted_ms={:.3} duration_limit_ms={:.3} packet_budget={} budget_exhausted={} elapsed_ms={:.3}",
             emitted,
-            burst_limit,
+            emitted_duration.as_secs_f64() * 1000.0,
+            duration_limit.as_secs_f64() * 1000.0,
             AUDIO_PREFILL_PACKET_BUDGET,
             budget_exhausted,
             started.elapsed().as_secs_f64() * 1000.0,
@@ -6166,5 +6194,52 @@ mod tests {
             }
         }
         player.close().unwrap();
+    }
+
+    #[test]
+    fn worker_audio_prefill_duration_budget_scales_for_short_frames_and_rates() {
+        let aac = PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 1_024,
+            samples: vec![0.0; 2_048],
+        };
+        let truehd = PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 40,
+            samples: vec![0.0; 80],
+        };
+        let zero_rate = PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(0, 2),
+            pts: None,
+            frames: 40,
+            samples: Vec::new(),
+        };
+
+        assert_eq!(pcm_audio_frame_duration(&zero_rate), Duration::ZERO);
+        assert_eq!(
+            pcm_audio_frame_playback_duration(&zero_rate, 2.0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            pcm_audio_frame_playback_duration(&aac, f64::NAN),
+            pcm_audio_frame_duration(&aac)
+        );
+
+        let count_for = |frame: &PcmAudioFrame, rate: f64| -> usize {
+            let step = pcm_audio_frame_playback_duration(frame, rate);
+            let mut emitted = Duration::ZERO;
+            let mut count = 0usize;
+            while emitted < AUDIO_PREFILL_AFTER_VIDEO_DURATION_LIMIT {
+                emitted = emitted.saturating_add(step);
+                count += 1;
+            }
+            count
+        };
+
+        assert_eq!(count_for(&aac, 1.0), 8);
+        assert!(count_for(&truehd, 1.0) >= 192);
+        assert!(count_for(&truehd, 2.0) >= 384);
     }
 }
