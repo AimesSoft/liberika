@@ -29,6 +29,7 @@
 namespace erika_flutter {
 
 class ErikaFlutterPlugin;
+class ErikaPresenterWorker;
 
 class ErikaEventStreamHandler
     : public flutter::StreamHandler<flutter::EncodableValue> {
@@ -97,6 +98,7 @@ class ErikaFlutterPlugin : public flutter::Plugin {
                                                  WPARAM wparam,
                                                  LPARAM lparam);
   void OnFrameTimer();
+  ErikaPresenterWorker& EnsureLogWorker();
   void PostCompletion(std::function<void()> completion);
   void DrainCompletions();
   void DispatchNativeMethod(PlayerHost& host, std::string method,
@@ -144,6 +146,7 @@ class ErikaFlutterPlugin : public flutter::Plugin {
   std::unordered_map<int64_t, std::shared_ptr<ErikaFlutterTexture>> textures_;
   std::unique_ptr<ErikaOverlayWindow> overlay_window_;
   std::unique_ptr<ErikaWindowsSmtc> smtc_;
+  std::unique_ptr<ErikaPresenterWorker> log_worker_;
   int64_t active_player_id_ = 0;
   int64_t requested_flutter_view_id_ = 0;
   bool overlay_uses_secondary_window_ = false;

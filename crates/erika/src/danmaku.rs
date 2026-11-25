@@ -694,6 +694,42 @@ impl DanmakuSession {
         self.add_track_with_id(DEFAULT_DANMAKU_TRACK_ID, timeline, name, source)
     }
 
+    /// Appends a viewer-sent live comment into the session's manual track so it
+    /// appears at its requested playback time even when a global or track offset
+    /// is active. Returns the manual track's id.
+    pub fn push_live_item(&mut self, mut item: DanmakuItem) -> Result<u64> {
+        let existing_index = self
+            .tracks
+            .iter()
+            .position(|track| track.source == DanmakuTrackSource::Manual);
+        let track_offset = existing_index.map_or(0, |index| self.tracks[index].offset);
+        let combined_offset = track_offset.saturating_add(self.global_offset);
+        if combined_offset != 0 {
+            item.pts = apply_track_offset(item.pts, combined_offset.saturating_neg())
+                .unwrap_or(Duration::ZERO);
+        }
+        if let Some(index) = existing_index {
+            let track = &mut self.tracks[index];
+            item.id = track
+                .timeline
+                .items()
+                .iter()
+                .map(|existing| existing.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            track.enabled = true;
+            track.timeline.push(item)?;
+            let id = track.id;
+            self.mark_dirty();
+            Ok(id)
+        } else {
+            item.id = 1;
+            let timeline = DanmakuTimeline::new(vec![item])?;
+            Ok(self.add_track(timeline, "live", DanmakuTrackSource::Manual))
+        }
+    }
+
     pub fn clear(&mut self) {
         if self.tracks.is_empty() && self.active_timeline.is_empty() {
             return;

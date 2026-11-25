@@ -52,8 +52,11 @@ export class Player extends EventTarget {
     });
     this.audio.addEventListener("error", (event) => this.fail(event.detail));
     this.audio.addEventListener("blocked", () => this.dispatchEvent(new Event("playblocked")));
+    this._volume = Math.max(0, Math.min(1, Number.isFinite(volume) ? volume : 1));
+    this._muted = false;
+    this._subtitleDelay = 0;
     this.gain = this.context.createGain();
-    this.gain.gain.value = Math.max(0, Math.min(1, volume));
+    this.gain.gain.value = this._volume;
     this.gain.connect(this.context.destination);
     this.resetClock(0);
     this.worker.onmessage = (event) => this.message(event.data);
@@ -286,6 +289,9 @@ export class Player extends EventTarget {
   addDanmaku(text) {
     return this.request("danmaku", { text });
   }
+  clearDanmaku() {
+    return this.request("clearDanmaku");
+  }
   sendDanmaku(text, color) {
     return this.request("sendDanmaku", { text, color, seconds: this.currentTime });
   }
@@ -304,14 +310,39 @@ export class Player extends EventTarget {
     return this.request("configure", { config });
   }
   configureSubtitles(config) {
+    if (config && Number.isFinite(config.delay)) {
+      this._subtitleDelay = Math.max(-600, Math.min(600, config.delay));
+    }
     return this.request("subtitleOptions", config);
+  }
+  setSubtitleDelay(seconds) {
+    if (!Number.isFinite(seconds)) throw new Error("Invalid subtitle delay");
+    this._subtitleDelay = Math.max(-600, Math.min(600, seconds));
+    return this.request("subtitleOptions", { delay: this._subtitleDelay });
+  }
+  getSubtitleDelay() {
+    return this._subtitleDelay;
   }
   addFont(name, data) {
     return this.request("font", { name, data: new Uint8Array(data) });
   }
+  get volume() {
+    return this._volume;
+  }
+  get muted() {
+    return this._muted;
+  }
   setVolume(volume) {
     if (!Number.isFinite(volume)) throw new Error("Invalid volume");
-    this.gain.gain.value = Math.max(0, Math.min(1, volume));
+    this._volume = Math.max(0, Math.min(1, volume));
+    this.gain.gain.value = this._muted ? 0 : this._volume;
+  }
+  setMuted(muted) {
+    this._muted = Boolean(muted);
+    this.gain.gain.value = this._muted ? 0 : this._volume;
+  }
+  getVolume() {
+    return { volume: this._volume, muted: this._muted };
   }
   async setRate(rate) {
     if (!Number.isFinite(rate) || rate < 0.25 || rate > 4)

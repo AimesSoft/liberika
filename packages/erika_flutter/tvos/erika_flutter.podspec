@@ -68,6 +68,7 @@ Pod::Spec.new do |s|
     erika_frame_export_session_open
     erika_log_read_json
     erika_presenter_get_diagnostics_json
+    erika_presenter_capture_frame_rgba_with_danmaku
   ]
   erika_cabi_undefined_flags = erika_cabi_symbols
     .map { |symbol| "-Wl,-u,_#{symbol}" }

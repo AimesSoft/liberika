@@ -36,10 +36,11 @@ use crate::core::{
     VideoDecoderEvent, VideoFrameImportFailure,
 };
 use crate::danmaku::{
-    DANMAKU_DEBUG_BUCKETS, DanmakuConfigChange, DanmakuDebugBucket, DanmakuFontSelection,
-    DanmakuLayoutConfig, DanmakuMode, DanmakuPreparedStats, DanmakuRenderPlan, DanmakuSession,
-    DanmakuTextRasterizer, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource, DanmakuViewport,
-    DfmLayoutEngine, DfmPreparedLayout, scroll_duration_for_viewport,
+    DANMAKU_DEBUG_BUCKETS, DanmakuColor, DanmakuConfigChange, DanmakuDebugBucket,
+    DanmakuFontSelection, DanmakuItem, DanmakuLayoutConfig, DanmakuMode, DanmakuPreparedStats,
+    DanmakuRenderPlan, DanmakuSession, DanmakuTextRasterizer, DanmakuTimeline, DanmakuTrackInfo,
+    DanmakuTrackSource, DanmakuViewport, DfmLayoutEngine, DfmPreparedLayout,
+    scroll_duration_for_viewport,
 };
 use crate::debug_hud::{DebugHud, DebugHudSnapshot};
 use crate::ffmpeg::DecoderBackend;
@@ -1482,6 +1483,46 @@ impl PresenterRuntime {
                 .add_track_with_offset(timeline, name, source, offset_micros);
         self.sync_danmaku_engine_timeline();
         track_id
+    }
+
+    /// Inserts a viewer-sent live comment into the manual danmaku track,
+    /// bordered to mark it as the viewer's own comment. `color_rgb` is
+    /// `0xRRGGBB` (white when `None`); `position` defaults to the current
+    /// playback time.
+    pub fn send_danmaku(
+        &mut self,
+        text: impl Into<String>,
+        color_rgb: Option<u32>,
+        mode: DanmakuMode,
+        position: Option<Duration>,
+    ) -> Result<u64> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(PlayerError::Playback(
+                "danmaku text must not be empty".to_string(),
+            ));
+        }
+        let color = color_rgb.map_or(DanmakuColor::WHITE, |rgb| {
+            DanmakuColor::rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+        });
+        let pts = position.unwrap_or(self.current_media_time);
+        let item = DanmakuItem {
+            id: 0,
+            pts,
+            text,
+            mode,
+            font_size: self.danmaku.config().font_size,
+            color,
+            opacity: 1.0,
+            is_self: true,
+            special: None,
+        };
+        let track_id = self
+            .danmaku_session
+            .push_live_item(item)
+            .map_err(|error| PlayerError::Playback(error.to_string()))?;
+        self.sync_danmaku_engine_timeline();
+        Ok(track_id)
     }
 
     pub fn remove_danmaku_track(&mut self, track_id: u64) -> bool {

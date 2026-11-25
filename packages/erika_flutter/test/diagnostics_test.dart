@@ -288,6 +288,142 @@ void main() {
     });
   });
 
+  group('typed JSON helpers', () {
+    test('chapters, containerInfo, trackSelection and getSubtitleDelay decode responses',
+        () async {
+      mockPlayer((MethodCall call) {
+        expect(call.method, 'invokeJson');
+        final args = call.arguments as Map<Object?, Object?>;
+        switch (args['method']) {
+          case 'chapters':
+            return jsonEncode(<String, Object?>{
+              'ok': true,
+              'status': 0,
+              'value': <String, Object?>{
+                'mediaOpen': true,
+                'chapters': <Object?>[
+                  <String, Object?>{
+                    'index': 0,
+                    'title': 'Opening',
+                    'startMs': 0,
+                    'endMs': 90000,
+                  },
+                  <String, Object?>{
+                    'index': 1,
+                    'title': 'Part A',
+                    'startMs': 90000,
+                    'endMs': null,
+                  },
+                ],
+              },
+            });
+          case 'container':
+            return jsonEncode(<String, Object?>{
+              'ok': true,
+              'status': 0,
+              'value': <String, Object?>{
+                'format': 'matroska,webm',
+                'bitRate': 12500000,
+                'mediaOpen': true,
+              },
+            });
+          case 'trackSelection':
+            return <Object?, Object?>{
+              'ok': true,
+              'status': 0,
+              'value': <Object?, Object?>{
+                'video': 0,
+                'audio': 2,
+                'subtitle': null,
+              },
+            };
+          case 'subtitleDelay':
+            return <Object?, Object?>{
+              'ok': true,
+              'status': 0,
+              'value': <Object?, Object?>{'delayMicros': -250000},
+            };
+          default:
+            return null;
+        }
+      });
+
+      final player = ErikaPlayer();
+      final chapters = await player.chapters();
+      expect(chapters, hasLength(2));
+      expect(chapters[0].index, 0);
+      expect(chapters[0].title, 'Opening');
+      expect(chapters[0].start, Duration.zero);
+      expect(chapters[0].end, const Duration(seconds: 90));
+      expect(chapters[1].end, isNull);
+
+      final container = await player.containerInfo();
+      expect(container, isNotNull);
+      expect(container!.format, 'matroska,webm');
+      expect(container.bitRate, 12500000);
+      expect(container.mediaOpen, isTrue);
+
+      final selection = await player.trackSelection();
+      expect(selection, isNotNull);
+      expect(selection!.video, 0);
+      expect(selection.audio, 2);
+      expect(selection.subtitle, isNull);
+
+      final delay = await player.getSubtitleDelay();
+      expect(delay, const Duration(milliseconds: -250));
+
+      mockPlayer((MethodCall call) {
+        if (call.method == 'invokeJson') {
+          final args = call.arguments as Map<Object?, Object?>;
+          expect(args['method'], 'sendDanmaku');
+          final payload = args['arguments'] as Map<Object?, Object?>;
+          expect(payload['text'], 'hello live');
+          expect(payload['color'], 0x00FFAA);
+          expect(payload['mode'], 'top');
+          expect(payload['positionMicros'], 5000000);
+          return <Object?, Object?>{
+            'ok': true,
+            'status': 0,
+            'value': <Object?, Object?>{'trackId': 3},
+          };
+        }
+        if (call.method == 'screenshot') {
+          final args = call.arguments as Map<Object?, Object?>;
+          expect(args['includeDanmaku'], isTrue);
+          return Uint8List.fromList(<int>[1, 2, 3, 4]);
+        }
+        return null;
+      });
+      final trackId = await player.sendDanmaku(
+        'hello live',
+        color: 0x00FFAA,
+        mode: 'top',
+        position: const Duration(seconds: 5),
+      );
+      expect(trackId, 3);
+      final shot = await player.screenshot(
+        width: 16,
+        height: 9,
+        includeDanmaku: true,
+      );
+      expect(shot, Uint8List.fromList(<int>[1, 2, 3, 4]));
+      expect(() => player.sendDanmaku('   '), throwsArgumentError);
+      await player.dispose();
+    });
+
+    test('typed JSON helpers degrade cleanly when invokeJson is unsupported',
+        () async {
+      mockPlayer((MethodCall call) => throw MissingPluginException());
+      final player = ErikaPlayer();
+      expect(await player.chapters(), isEmpty);
+      expect(await player.containerInfo(), isNull);
+      expect(await player.trackSelection(), isNull);
+      expect(await player.getSubtitleDelay(), isNull);
+      expect(await player.sendDanmaku('hello'), isNull);
+      await player.dispose();
+    });
+  });
+
   group('platform contracts', () {
     for (final platform in <String>['macos', 'ios', 'tvos']) {
       test('$platform resolves diagnostics symbols optionally', () {
@@ -312,6 +448,28 @@ void main() {
       });
     }
 
+    test('Windows resolves diagnostics and JSON pass-through optionally', () {
+      final plugin = File('windows/erika_flutter_plugin.cpp').readAsStringSync();
+      for (final symbol in <String>[
+        'erika_presenter_get_diagnostics_json',
+        'erika_log_read_json',
+        'erika_presenter_invoke_json',
+      ]) {
+        expect(plugin, contains('"$symbol"'));
+        expect(plugin, isNot(contains('LoadRequired<InvokeJsonFn>')));
+        expect(plugin, isNot(contains('LoadRequired<GetDiagnosticsJsonFn>')));
+        expect(plugin, isNot(contains('LoadRequired<LogReadJsonFn>')));
+      }
+      for (final method in <String>[
+        'getDiagnosticsSnapshot',
+        'getLogs',
+        'invokeJson',
+      ]) {
+        expect(plugin, contains('method == "$method"'));
+      }
+      expect(plugin, contains('"ERIKA_UNSUPPORTED"'));
+    });
+
     test('Android and HarmonyOS forward the methods to the shared JSON table',
         () {
       final android = File(
@@ -323,11 +481,51 @@ void main() {
       for (final method in <String>[
         'getDiagnosticsSnapshot',
         'getLogs',
-        'invokeJson'
+        'invokeJson',
+        'setSubtitleStyle',
+        'setDebugHudEnabled',
       ]) {
         expect(android, contains('"$method",'));
         expect(ohos, contains("'$method'"));
       }
+    });
+
+    test('every native Flutter platform wires includeDanmaku screenshots', () {
+      for (final platform in <String>['macos', 'ios', 'tvos']) {
+        final plugin = File('$platform/Classes/ErikaFlutterPlugin.swift')
+            .readAsStringSync();
+        expect(plugin, contains('erika_presenter_capture_frame_rgba_with_danmaku'));
+        expect(plugin, contains('args["includeDanmaku"]'));
+      }
+      for (final platform in <String>['ios', 'tvos']) {
+        final podspec =
+            File('$platform/erika_flutter.podspec').readAsStringSync();
+        expect(podspec, contains('erika_presenter_capture_frame_rgba_with_danmaku'));
+      }
+      final windows = File('windows/erika_flutter_plugin.cpp').readAsStringSync();
+      expect(windows, contains('erika_presenter_capture_frame_rgba_with_danmaku'));
+      expect(windows, contains('FindArg(args, "includeDanmaku")'));
+
+      final linux = File('linux/erika_flutter_plugin.cc').readAsStringSync();
+      expect(linux, contains('erika_presenter_capture_frame_rgba_with_danmaku'));
+      expect(linux, contains('boolean(args, "includeDanmaku")'));
+
+      final androidNative = File(
+        'android/src/main/kotlin/dev/aimesoft/erika_flutter/ErikaNative.kt',
+      ).readAsStringSync();
+      expect(androidNative, contains('nativeCaptureFrameWithDanmaku'));
+      final androidPlugin = File(
+        'android/src/main/kotlin/dev/aimesoft/erika_flutter/ErikaFlutterPlugin.kt',
+      ).readAsStringSync();
+      expect(androidPlugin, contains('arguments["includeDanmaku"]'));
+
+      final ohosBridge =
+          File('ohos/src/main/cpp/presenter_bridge.h').readAsStringSync();
+      expect(ohosBridge, contains('erika_presenter_capture_frame_rgba_with_danmaku'));
+      final ohosPlugin = File(
+        'ohos/src/main/ets/components/plugin/ErikaFlutterPlugin.ets',
+      ).readAsStringSync();
+      expect(ohosPlugin, contains("args.get('includeDanmaku')"));
     });
 
     test('the bundled header declares the diagnostics functions', () {

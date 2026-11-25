@@ -93,3 +93,47 @@ test("pending browser activation does not block seek, pause or close", async t =
   assert.equal(context.state, "closed");
   assert.equal(gestures.handlers.size, 0);
 });
+
+test("web Player aligns mute/volume, subtitle delay and clearDanmaku", async t => {
+  const previousWorker = globalThis.Worker, previousCancel = globalThis.cancelAnimationFrame;
+  const posted = [];
+  globalThis.Worker = class {
+    postMessage(data) {
+      posted.push(data);
+      queueMicrotask(() => this.onmessage({ data: { type: "reply", requestId: data.requestId } }));
+    }
+    terminate() {}
+  };
+  globalThis.cancelAnimationFrame = () => {};
+  t.after(() => { globalThis.Worker = previousWorker; globalThis.cancelAnimationFrame = previousCancel; });
+  const context = new Context(), gestures = new Gestures();
+  const audio = new AudioSession({ context, gestures });
+  const player = new Player({}, 0.6, audio);
+
+  assert.deepEqual(player.getVolume(), { volume: 0.6, muted: false });
+  assert.equal(player.gain.gain.value, 0.6);
+  player.setMuted(true);
+  assert.deepEqual(player.getVolume(), { volume: 0.6, muted: true });
+  assert.equal(player.gain.gain.value, 0);
+  player.setVolume(0.35);
+  assert.deepEqual(player.getVolume(), { volume: 0.35, muted: true });
+  assert.equal(player.gain.gain.value, 0);
+  player.setMuted(false);
+  assert.deepEqual(player.getVolume(), { volume: 0.35, muted: false });
+  assert.equal(player.gain.gain.value, 0.35);
+
+  await player.setSubtitleDelay(-1.25);
+  assert.equal(player.getSubtitleDelay(), -1.25);
+  assert.equal(posted.at(-1).type, "subtitleOptions");
+  assert.equal(posted.at(-1).delay, -1.25);
+  await player.setSubtitleDelay(9999);
+  assert.equal(player.getSubtitleDelay(), 600);
+  assert.throws(() => player.setSubtitleDelay(NaN));
+  await player.configureSubtitles({ scale: 1.5, delay: 0.5 });
+  assert.equal(player.getSubtitleDelay(), 0.5);
+
+  await player.clearDanmaku();
+  assert.equal(posted.at(-1).type, "clearDanmaku");
+
+  await player.destroy();
+});

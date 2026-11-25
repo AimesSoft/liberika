@@ -559,6 +559,40 @@ pub(crate) static JSON_METHODS: &[JsonMethodSpec] = &[
         "null",
     ),
     method(
+        "sendDanmaku",
+        P,
+        "Inserts a viewer-sent bordered live danmaku comment at the current playback time (or positionMicros when given); color is 0xRRGGBB (white by default).",
+        &[
+            arg("text", "string", true),
+            arg("color", "integer", false),
+            arg("mode", "string", false),
+            arg("positionMicros", "integer", false),
+        ],
+        "{trackId}",
+    ),
+    method(
+        "exportGif",
+        G,
+        "Exports an animated GIF over [startMillis, endMillis) with its own independent demux/decode/encode pipeline and writes it to outputPath.",
+        &[
+            arg("inputUri", "string", true),
+            arg("outputPath", "string", true),
+            arg("startMillis", "integer", true),
+            arg("endMillis", "integer", true),
+            arg("framesPerSecond", "integer", true),
+            arg("outputWidth", "integer", true),
+            arg("outputHeight", "integer", true),
+            arg("quality", "integer", false),
+            arg("loopCount", "integer", false),
+            arg("overwrite", "boolean", false),
+            arg("httpHeaders", "object", false),
+            arg("httpReadAheadBytes", "integer", false),
+        ],
+        "{width, height, frameCount, fileSize, path}",
+    )
+    .blocking()
+    .writes_files(),
+    method(
         "exportFrame",
         G,
         "Decodes the picture shown at one media time with its own demuxer and decoder (no player involved), scales it keeping the display aspect ratio without enlarging, and tone maps HDR sources to SDR. With outputPath the PNG or RGBA bytes are written there; without it they are returned base64 encoded.",
@@ -889,10 +923,12 @@ pub(crate) unsafe fn invoke(
             )
         }),
         "setDanmakuConfig" => unsafe { set_danmaku_config(handle, args) },
+        "sendDanmaku" => unsafe { send_danmaku_json(handle, args) },
         "getDiagnosticsSnapshot" => unsafe { diagnostics_snapshot_json(handle) },
         // The log ring is process-wide; the handle only routes the call.
         "getLogs" => logs_json(args),
         "listMethods" => Ok(list_methods_json()),
+        "exportGif" => gif_export_json(args),
         "exportFrame" => frame_export_json(args),
         "exportFrames" => frames_export_json(args),
         "invokeJson" => {
@@ -1441,6 +1477,128 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 fn micros(duration: Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn gif_export_json(args: &Map<String, Value>) -> Result<Value, String> {
+    let input_uri = required_string(args, "inputUri")?;
+    if input_uri.trim().is_empty() {
+        return Err("inputUri must not be empty".to_string());
+    }
+    let output_path = required_string(args, "outputPath")?;
+    if output_path.trim().is_empty() {
+        return Err("outputPath must not be empty".to_string());
+    }
+    let start_millis = required_u64(args, "startMillis")?;
+    let end_millis = required_u64(args, "endMillis")?;
+    let fps = u32::try_from(required_u64(args, "framesPerSecond")?)
+        .map_err(|_| "framesPerSecond is out of range".to_string())?;
+    let width = u32::try_from(required_u64(args, "outputWidth")?)
+        .map_err(|_| "outputWidth is out of range".to_string())?;
+    let height = u32::try_from(required_u64(args, "outputHeight")?)
+        .map_err(|_| "outputHeight is out of range".to_string())?;
+    let quality = match args.get("quality") {
+        None | Some(Value::Null) => GifExportQuality::Normal,
+        Some(Value::Number(value)) => match value.as_i64() {
+            Some(0) => GifExportQuality::Normal,
+            Some(1) => GifExportQuality::High,
+            other => return Err(format!("unsupported GIF export quality: {other:?}")),
+        },
+        Some(Value::String(value)) => match value.as_str() {
+            "normal" => GifExportQuality::Normal,
+            "high" => GifExportQuality::High,
+            other => return Err(format!("unsupported GIF export quality: {other}")),
+        },
+        Some(_) => return Err("quality must be 0/1 or \"normal\"/\"high\"".to_string()),
+    };
+    let loop_count = match optional_i64(args, "loopCount") {
+        Some(value) => i32::try_from(value).map_err(|_| "loopCount is out of range".to_string())?,
+        None => 0,
+    };
+    let overwrite = optional_bool(args, "overwrite").unwrap_or(true);
+    let mut headers = Vec::new();
+    if let Some(value) = args.get("httpHeaders").filter(|value| !value.is_null()) {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "httpHeaders must be a JSON object".to_string())?;
+        for (name, value) in object {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("HTTP header {name} must be a string"))?;
+            if let Some(error) = http_header_error(name, value) {
+                return Err(error);
+            }
+            headers.push((name.clone(), value.to_string()));
+        }
+    }
+    let request = MediaRequest::new(input_uri)
+        .with_http_headers(headers)
+        .map_http_read_ahead_bytes(Some(optional_open_byte_count(args, "httpReadAheadBytes")?));
+    let output_path_buf = PathBuf::from(output_path);
+    let result = erika::export::export_gif(&GifExportOptions {
+        input: request,
+        output_path: output_path_buf.clone(),
+        start: Duration::from_millis(start_millis),
+        end: Duration::from_millis(end_millis),
+        frames_per_second: fps,
+        output_width: width,
+        output_height: height,
+        quality,
+        loop_count,
+        overwrite,
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "width": result.width,
+        "height": result.height,
+        "frameCount": result.frame_count,
+        "fileSize": result.file_size,
+        "path": output_path_buf.to_string_lossy(),
+    }))
+}
+
+unsafe fn send_danmaku_json(
+    handle: *mut ErikaPresenterHandle,
+    args: &Map<String, Value>,
+) -> Result<Value, String> {
+    if handle.is_null() {
+        return Err("presenter handle is null".to_string());
+    }
+    let text = required_string(args, "text")?;
+    let color = match args.get("color") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| "color must be a non-negative RGB integer".to_string())?;
+            Some((raw & 0x00ff_ffff) as u32)
+        }
+    };
+    let mode = match args.get("mode") {
+        None | Some(Value::Null) => erika::danmaku::DanmakuMode::Scroll,
+        Some(Value::String(value)) => match value.as_str() {
+            "scroll" => erika::danmaku::DanmakuMode::Scroll,
+            "top" => erika::danmaku::DanmakuMode::Top,
+            "bottom" => erika::danmaku::DanmakuMode::Bottom,
+            other => return Err(format!("unsupported danmaku mode: {other}")),
+        },
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(code) => erika::danmaku::DanmakuMode::from_bilibili_mode(code as u32),
+            None => return Err("mode must be scroll, top, bottom or a mode code".to_string()),
+        },
+        Some(_) => return Err("mode must be scroll, top, bottom or a mode code".to_string()),
+    };
+    let position = match args.get("positionMicros") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(Duration::from_micros(value.as_u64().ok_or_else(|| {
+            "positionMicros must be a non-negative integer".to_string()
+        })?)),
+    };
+    let presenter = unsafe { &mut *handle };
+    let track_id = presenter
+        .presenter
+        .send_danmaku(text, color, mode, position)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "trackId": track_id }))
 }
 
 fn frame_export_json(args: &Map<String, Value>) -> Result<Value, String> {
@@ -2303,5 +2461,81 @@ mod tests {
         assert_eq!(nested_unknown["value"]["code"], "unknown_method");
 
         unsafe { erika_presenter_destroy(handle) };
+    }
+
+    #[test]
+    fn send_danmaku_appends_to_manual_track_and_compensates_global_offset() {
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+
+        let offset = invoke(
+            handle,
+            c"setDanmakuGlobalOffset",
+            r#"{"offsetMicros":2000000}"#,
+        );
+        assert_eq!(offset["ok"], true, "{offset}");
+
+        let first = invoke(
+            handle,
+            c"sendDanmaku",
+            r#"{"text":"live one","color":16711680,"mode":"top","positionMicros":5000000}"#,
+        );
+        assert_eq!(first["ok"], true, "{first}");
+        let track_id = first["value"]["trackId"].as_u64().unwrap();
+
+        let second = invoke(
+            handle,
+            c"sendDanmaku",
+            r#"{"text":"live two","positionMicros":6000000}"#,
+        );
+        assert_eq!(second["ok"], true, "{second}");
+        assert_eq!(second["value"]["trackId"].as_u64().unwrap(), track_id);
+
+        let tracks = invoke(handle, c"danmakuTracks", "{}");
+        assert_eq!(tracks["ok"], true, "{tracks}");
+        let list = tracks["value"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"].as_u64().unwrap(), track_id);
+        assert_eq!(list[0]["source"], "manual");
+        assert_eq!(list[0]["itemCount"], 2);
+
+        let bad_empty = invoke(handle, c"sendDanmaku", r#"{"text":"   "}"#);
+        assert_eq!(bad_empty["ok"], false, "{bad_empty}");
+        let bad_mode = invoke(handle, c"sendDanmaku", r#"{"text":"hi","mode":"diagonal"}"#);
+        assert_eq!(bad_mode["ok"], false, "{bad_mode}");
+
+        unsafe { erika_presenter_destroy(handle) };
+    }
+
+    #[test]
+    fn export_gif_through_json_writes_gif_and_rejects_bad_arguments() {
+        let bad = invoke(ptr::null_mut(), c"exportGif", r#"{"inputUri":""}"#);
+        assert_eq!(bad["ok"], false, "{bad}");
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../erika/testdata/chapters/chapters.mkv");
+        let output =
+            std::env::temp_dir().join(format!("erika-json-gif-{}.gif", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+
+        let args = json!({
+            "inputUri": fixture.to_string_lossy(),
+            "outputPath": output.to_string_lossy(),
+            "startMillis": 0,
+            "endMillis": 400,
+            "framesPerSecond": 5,
+            "outputWidth": 64,
+            "outputHeight": 36,
+            "quality": "normal",
+            "overwrite": true,
+        });
+        let result = invoke(ptr::null_mut(), c"exportGif", &args.to_string());
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["value"]["width"], 64);
+        assert_eq!(result["value"]["height"], 36);
+        assert!(result["value"]["frameCount"].as_u64().unwrap() > 0);
+        assert!(result["value"]["fileSize"].as_u64().unwrap() > 0);
+        assert!(output.exists());
+        let _ = std::fs::remove_file(&output);
     }
 }

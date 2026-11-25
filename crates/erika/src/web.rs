@@ -230,6 +230,12 @@ impl WebDanmaku {
                 *slot = b;
             }
         }
+        if let Some(words) = v.get("blockWords").and_then(|value| value.as_array()) {
+            self.config.block_words = words
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect();
+        }
         self.config.font_size = self.config.font_size.clamp(1.0, 256.0);
         self.config.opacity = self.config.opacity.clamp(0.0, 1.0);
         self.config.scroll_duration_seconds = self.config.scroll_duration_seconds.clamp(1.0, 120.0);
@@ -251,6 +257,11 @@ impl WebDanmaku {
             p.apply_paint_config(&self.config);
         }
         Ok(())
+    }
+    pub fn clear(&mut self) {
+        self.timeline = DanmakuTimeline::default();
+        self.prepared = None;
+        self.engine.invalidate_placement_history();
     }
     pub fn reset(&mut self) {
         self.prepared = None;
