@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -153,6 +154,60 @@ class SelectionTest(unittest.TestCase):
                 paths = ci_paths.pull_request_paths(base, head)
             self.assertCountEqual(paths, [old, new])
             self.assert_platforms(paths, {"macos", "ios", "tvos", "windows"})
+
+    def test_forced_push_reports_what_the_rewritten_branch_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-c", "user.name=CI", "-c", "user.email=ci@example.invalid",
+                     "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                    cwd=directory, text=True,
+                ).strip()
+
+            git("init", "-q", "-b", "main")
+            windows = "crates/erika/src/windows.rs"
+            (Path(directory) / windows).parent.mkdir(parents=True)
+            (Path(directory) / "README.md").write_text("liberika\n")
+            git("add", ".")
+            git("commit", "-qm", "Common ancestor")
+            ancestor = git("rev-parse", "HEAD")
+            (Path(directory) / windows).write_text("windows\n")
+            git("add", ".")
+            git("commit", "-qm", "Windows change")
+            before = git("rev-parse", "HEAD")
+            # main is rewritten: the Windows commit is gone, a README edit took its place.
+            git("reset", "-q", "--hard", ancestor)
+            (Path(directory) / "README.md").write_text("liberika, rewritten\n")
+            git("commit", "-qam", "README edit")
+            after = git("rev-parse", "HEAD")
+            run = subprocess.run
+            with patch("ci_paths.subprocess.run", side_effect=lambda *args, **kw: run(*args, cwd=directory, **kw)):
+                self.assertEqual(ci_paths.pull_request_paths(before, after), ["README.md"])
+                paths = ci_paths.push_paths(before, after)
+                unreachable = ci_paths.push_paths("1" * 40, after)
+            self.assertCountEqual(paths, ["README.md", windows])
+            self.assert_platforms(paths, {"windows"})
+            self.assertIsNone(unreachable)
+
+    def test_main_push_compares_trees_and_falls_back_to_every_platform(self):
+        for paths, windows in ((["README.md"], "false"), ([SOURCE + "windows.rs"], "true"), (None, "true")):
+            with self.subTest(paths=paths), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                env = {"EVENT_NAME": "push", "REF": "refs/heads/main", "BEFORE_SHA": "a" * 40,
+                       "SHA": "b" * 40, "GITHUB_OUTPUT": str(output)}
+                with patch.dict(os.environ, env), patch("sys.argv", ["ci_paths.py", "--github"]), \
+                        patch("ci_paths.push_paths", return_value=paths) as diff, \
+                        patch("ci_paths.pull_request_paths") as merge_base_diff, \
+                        patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    ci_paths.main()
+                diff.assert_called_once_with("a" * 40, "b" * 40)
+                merge_base_diff.assert_not_called()
+                values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                self.assertEqual(values["windows"], windows)
+                self.assertEqual(values["linux"], "true" if paths is None else "false")
+                # A push to main never narrows a matrix, whatever it selects.
+                self.assertEqual(len(json.loads(values["linux_matrix"])["include"]), 4)
+                self.assertEqual("::warning::" in stdout.getvalue(), paths is None)
 
 
 if __name__ == "__main__":

@@ -150,17 +150,34 @@ def decode_paths(raw):
     return [os.fsdecode(path) for path in raw.split(b"\0")[:-1]]
 
 
-def pull_request_paths(base, head):
-    if not base or not head:
-        return None
+def diff_paths(*revisions):
     diff = subprocess.run(
-        ["git", "diff", "--no-renames", "--name-only", "-z", f"{base}...{head}", "--"],
+        ["git", "diff", "--no-renames", "--name-only", "-z", *revisions, "--"],
         stdout=subprocess.PIPE,
         check=False,
     )
     if diff.returncode:
         return None
     return decode_paths(diff.stdout)
+
+
+def pull_request_paths(base, head):
+    """What the PR itself changed: from its merge base, not from the base tip."""
+    if not base or not head:
+        return None
+    return diff_paths(f"{base}...{head}")
+
+
+def push_paths(before, after):
+    """Every path that differs between the two trees.
+
+    A forced push has no merge base worth trusting: the rewritten branch can
+    drop a commit the old tip had, and that removal is a change to check. When
+    the old tip is no longer fetchable the diff fails and every platform runs.
+    """
+    if not before or not after:
+        return None
+    return diff_paths(before, after)
 
 
 def main():
@@ -183,7 +200,9 @@ def main():
         # pushes (releases) and new branches have no usable base: run all.
         before = os.environ.get("BEFORE_SHA") or ""
         if before.strip("0"):
-            paths = pull_request_paths(before, os.environ.get("SHA"))
+            paths = push_paths(before, os.environ.get("SHA"))
+            if paths is None:
+                print("::warning::Push diff unavailable; selecting every platform")
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         for name, value in select(paths, pull_request).items():
             print(f"{name}={json.dumps(value, separators=(',', ':'))}", file=output)
