@@ -3,28 +3,8 @@ name: OpenHarmony
 on:
   pull_request:
     branches: [main]
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/ohos.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "packages/erika_flutter/ohos/**"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
-      - "xtask/**"
   push:
     branches: [main]
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/ohos.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "packages/erika_flutter/ohos/**"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
-      - "xtask/**"
   workflow_dispatch:
 
 permissions:
@@ -41,8 +21,13 @@ env:
   OHOS_COMPATIBLE_SDK_VERSION: "18"
 
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-select.yml
+
   native:
     name: OpenHarmony native (arm64)
+    needs: changes
+    if: needs.changes.outputs.ohos == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -94,6 +79,12 @@ jobs:
             third_party/build/${{ env.ERIKA_NATIVE_TARGET }}/${{ env.ERIKA_NATIVE_PROFILE }}
             third_party/dist/${{ env.ERIKA_NATIVE_TARGET }}/${{ env.ERIKA_NATIVE_PROFILE }}
           key: native-v1-ohos-${{ env.ERIKA_NATIVE_TARGET }}-api${{ env.OHOS_COMPATIBLE_SDK_VERSION }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: ${{ env.ERIKA_NATIVE_TARGET }}-${{ env.ERIKA_NATIVE_PROFILE }}-api${{ env.OHOS_COMPATIBLE_SDK_VERSION }}-${{ hashFiles('Cargo.lock', '.github/workflows/ohos.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Build OpenHarmony native dependencies
         run: >-
           cargo run --locked -p xtask -- deps build --all

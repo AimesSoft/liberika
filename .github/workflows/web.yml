@@ -2,20 +2,17 @@ name: Browser backend
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - ".github/workflows/web.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/erika/**"
-      - "packages/erika_web/**"
-      - "scripts/*web*"
-      - "examples/web_player/**"
-      - "xtask/**"
-      - "third_party/patches/**"
+  push:
+    branches: [main]
 permissions:
   contents: read
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-select.yml
+
   browser:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -30,6 +27,12 @@ jobs:
         with:
           version: "4.0.23"
           actions-cache-folder: emsdk-cache
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: wasm32-unknown-unknown-${{ hashFiles('Cargo.lock', '.github/workflows/web.yml', 'scripts/build_web.py', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Build tools
         run: |
           sudo apt-get update
@@ -49,6 +52,19 @@ jobs:
           python3 scripts/web_test_fixtures.py
           python3 scripts/serve_web.py > target/web-server.log 2>&1 &
           PLAYWRIGHT_MODULE="$PWD/target/web-tests/node_modules/playwright/index.mjs" node packages/erika_web/tests/browser.mjs
+      - name: npm package in a Vite site
+        run: |
+          set -euo pipefail
+          python3 scripts/web_npm_package.py
+          (cd target/npm/web && npm pack --pack-destination ..)
+          rm -rf target/web-consumer
+          cp -R packages/erika_web/tests/consumer target/web-consumer
+          (cd target/web-consumer && npm install --no-audit --no-fund ../npm/aimessoft-liberika-web-*.tgz && npm run build)
+          cp -R target/web/fixtures target/web-consumer/dist/fixtures
+          cp -R target/npm/web target/web-consumer/dist/liberika
+          python3 scripts/serve_web.py --port 18766 --directory target/web-consumer/dist > target/web-consumer-server.log 2>&1 &
+          python3 scripts/serve_web.py --port 18767 --cors --directory target/npm/web > target/web-cdn-server.log 2>&1 &
+          PLAYWRIGHT_MODULE="$PWD/target/web-tests/node_modules/playwright/index.mjs" node packages/erika_web/tests/consumer.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -57,6 +73,8 @@ jobs:
             target/web-tests/*.json
             target/web-tests/*.png
             target/web-server.log
+            target/web-consumer-server.log
+            target/web-cdn-server.log
       - uses: actions/upload-artifact@v4
         with:
           name: liberika-web

@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+### 浏览器
+
+- Web 运行时以 `@aimessoft/liberika-web` 和不含回退字体的 `@aimessoft/liberika-web-nofont` 发布到 npm，Vite 无需配置即可打包。
+- 页面可从其他源（如 npm CDN）加载运行时；`Player.create` 新增 `workerURL`，供自行托管 `worker.js` 的宿主使用。
+- 构建产物中的 `package.json` 版本与 Cargo workspace 一致（此前停在 0.1.8）。
+
 ## 0.3.8 - 2026-11-20
 
 ### Windows

@@ -80,6 +80,9 @@ export class Player extends EventTarget {
     audioSession?: AudioSession;
     /** Stands in for text no font covers, in a package built without its own. */
     fallbackFont?: { data: ArrayBuffer | Uint8Array; index?: number };
+    /** Where the page hosts this package's `worker.js`, next to the other
+     * runtime files. Defaults to the copy beside `index.js`. */
+    workerURL?: string | URL;
   }): Promise<Player>;
   private constructor();
   readonly currentTime: number;

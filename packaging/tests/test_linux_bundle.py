@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Portable Linux packaging/ABI contract tests; no native build or downloads."""
+import json
 import os
 from pathlib import Path
 import runpy
@@ -281,12 +282,33 @@ fi
     def test_release_gates_on_four_combinations_and_clean_runtime(self):
         workflow = (ROOT / ".github/workflows/linux.yml").read_text()
         self.assertIn("workflow_call:", workflow)
-        self.assertEqual(workflow.count("arch: [x64, arm64]"), 2)
-        self.assertEqual(workflow.count("dependencies: [bundled, system]"), 2)
+        # The build and the clean runtime check both take their combinations
+        # from the selector, and the runtime check waits for the build.
+        self.assertEqual(
+            workflow.count("matrix: ${{ fromJSON(needs.changes.outputs.linux_matrix) }}"), 2)
+        self.assertIn("uses: ./.github/workflows/ci-select.yml", workflow)
+        self.assertIn("needs: [changes, native]", workflow)
         self.assertEqual(workflow.count("container: ubuntu:22.04"), 2)
         self.assertNotIn("ubuntu:26.04", workflow)
-        self.assertIn("runner: ubuntu-24.04-arm", workflow)
-        self.assertIn("needs: native", workflow)
+        # What the selector hands a release: a tag push, or a manual dispatch.
+        for event in (
+            {"EVENT_NAME": "push", "REF": "refs/tags/v1.2.3", "BEFORE_SHA": "0" * 40, "SHA": "a" * 40},
+            {"EVENT_NAME": "workflow_dispatch", "REF": "refs/heads/main", "SHA": "a" * 40},
+        ):
+            with self.subTest(event=event["EVENT_NAME"]), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                subprocess.run(
+                    [sys.executable, "-B", str(ROOT / "scripts/ci_paths.py"), "--github"],
+                    env={**os.environ, **event, "GITHUB_OUTPUT": str(output)}, cwd=ROOT, check=True,
+                )
+                values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                self.assertEqual(values["linux"], "true")
+                combinations = json.loads(values["linux_matrix"])["include"]
+                self.assertCountEqual(
+                    [(row["arch"], row["dependencies"], row["runner"]) for row in combinations],
+                    [("x64", "bundled", "ubuntu-24.04"), ("x64", "system", "ubuntu-24.04"),
+                     ("arm64", "bundled", "ubuntu-24.04-arm"), ("arm64", "system", "ubuntu-24.04-arm")],
+                )
         self.assertIn("bash scripts/check_linux_bundle.sh", workflow)
         release = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("uses: ./.github/workflows/linux.yml", release)
