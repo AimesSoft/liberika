@@ -10,14 +10,14 @@ required.
 
 The backend is integrated into the **Erika Web application**, including its
 playback controls, track selection, chapters, screenshots and danmaku settings.
-Release 0.3.7 includes `liberika-web-0.3.7.zip`, a complete browser runtime and
+Release 0.3.8 includes `liberika-web-0.3.8.zip`, a complete browser runtime and
 `index.html` demo with SHA-256 recorded in `SHA256SUMS`. Extract the whole archive
 and serve it over HTTPS or localhost. It is separate from the native bundles.
 The same runtime is published to npm as `@aimessoft/liberika-web`, and source builds
 remain available.
 
-The [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7)
-also includes `liberika-web-nofont-0.3.7.zip`. This variant requires the host to
+The [0.3.8 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8)
+also includes `liberika-web-nofont-0.3.8.zip`. This variant requires the host to
 provide font bytes through `Player.create({ canvas, fallbackFont: { data, index } })`;
 the WASM subtitle/text pipeline cannot load installed system font files automatically. Choose the full archive
 when the page does not supply a fallback font.
