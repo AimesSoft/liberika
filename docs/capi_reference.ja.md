@@ -812,9 +812,17 @@ Fallback value は ABI-stable です。新しい reason は末尾へ追加し、
 弾幕は含みません）を、要求した `width`×`height`（表示 surface サイズとは独立）で呼び出し側確保の
 RGBA8 バッファにオフスクリーン描画します。`out_capacity` は少なくとも `width*height*4`。
 フレームがまだ無いときは `PlayerError` を返します。Metal と wgpu（Android を含む）は
-capture を実装済みで、現在の D3D11 backend は未実装です。capture は常に SDR RGBA8
+capture を実装済みです。Windows D3D11 も 0.3.8 から capture に対応します。capture は常に SDR RGBA8
 offscreen target を使い、HDR/extended-linear content を tone-map します。したがって display
 output が Apple EDR、HDR10、Android extended-linear scRGB の場合も返す byte は SDR です。
+
+D3D11 capture はストレートアルファ RGBA を返し、packed-alpha 映像の色を PNG 用に
+保持します。表示中の surface、出力モード、公開済み Flutter テクスチャは変更しません。
+通常の映像スケーラーを使用し、ArtCNN/FSR/VSR は適用しません。GPU 読み戻しには
+待機上限があり、タイムアウト時はエラーを返し、読み取り中のフレームを早期にデコード
+プールへ返しません。破棄時にもタイムアウトし、デバイスが有効な場合は、そのフレームと
+関連プール資源をプロセス終了まで保持し、警告を記録します。
+
 
 ```c
 uint32_t w = 1920, h = 1080;

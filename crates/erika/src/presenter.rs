@@ -949,6 +949,18 @@ impl PresenterRuntime {
         self.renderer.windows_flutter_texture_iunknown()
     }
 
+    /// Enables or disables GPU snapshot copies for alpha-blended composition
+    /// surfaces (used on Windows while a video view has `0 < Opacity < 1`).
+    pub fn set_composition_blended(&mut self, enabled: bool) {
+        self.renderer.set_composition_blended(enabled);
+    }
+
+    /// Borrowed `ID3D11Texture2D` pointer and monotonic generation of the
+    /// latest blended composition snapshot. No `AddRef`.
+    pub fn composition_blended_texture(&self) -> Option<(*mut std::ffi::c_void, u64)> {
+        self.renderer.composition_blended_texture()
+    }
+
     pub fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
         let metrics = SurfaceMetrics::new(width, height, scale);
         let previous_metrics = self.current_surface_metrics;
