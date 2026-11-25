@@ -2,8 +2,8 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-以下平台以 0.3.7 为基线；浏览器后端已接入 Erika Web，并随 Release 提供独立 Web 归档。
-Linux 功能仍为实验性；0.3.7 Release 已提供 x64 / ARM64 × bundled / system 四种包，均以 Ubuntu 22.04 构建。
+以下平台以 0.3.8 为基线；浏览器后端已接入 Erika Web，以 npm 包和 Release 中的独立 Web 归档分发，
+并有[在线演示](https://liberika.aimes-soft.com/demo/)。Linux 功能仍为实验性；0.3.7 起 Release 提供 x64 / ARM64 × bundled / system 四种包，均以 Ubuntu 22.04 构建。
 
 | 平台 | 最低版本 | 解码 / 渲染 | 音频 | 分发与构建 |
 |---|---|---|---|---|
@@ -14,7 +14,7 @@ Linux 功能仍为实验性；0.3.7 Release 已提供 x64 / ARM64 × bundled / s
 | Android | 8 / API 26 | MediaCodec / 软解 + wgpu | AAudio | 四个 ABI；Flutter |
 | OpenHarmony | API 18 | AVCodec / 软解 + wgpu | OHAudio | arm64；Flutter / ArkTS OHPM |
 | Linux（实验性） | glibc 2.35；system 另需 FFmpeg 8 共享库 | NVDEC / VA-API / 软解 + wgpu | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system；Rust / C ABI / Flutter |
-| 浏览器 | HTTPS / localhost；WebCodecs 视频与音频、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | Release 预编译归档或源码构建 JS / WASM；尚未发布到 npm |
+| 浏览器 | HTTPS / localhost；WebCodecs 视频与音频、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | npm `@aimessoft/liberika-web`、Release 预编译归档或源码构建 JS / WASM |
 
 原生平台提供 C ABI Presenter；浏览器通过 JavaScript / TypeScript `Player` 接入。
 硬件解码能力取决于编码格式、设备及驱动；浏览器会在运行时检查编码配置支持。
