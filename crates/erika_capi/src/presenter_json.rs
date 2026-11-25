@@ -1582,7 +1582,9 @@ unsafe fn send_danmaku_json(
             other => return Err(format!("unsupported danmaku mode: {other}")),
         },
         Some(Value::Number(value)) => match value.as_u64() {
-            Some(code) => erika::danmaku::DanmakuMode::from_bilibili_mode(code as u32),
+            // Mode 7 and above carry a script or payload a sent comment does not have.
+            Some(code @ 1..=6) => erika::danmaku::DanmakuMode::from_bilibili_mode(code as u32),
+            Some(code) => return Err(format!("unsupported danmaku mode code: {code}")),
             None => return Err("mode must be scroll, top, bottom or a mode code".to_string()),
         },
         Some(_) => return Err("mode must be scroll, top, bottom or a mode code".to_string()),
@@ -2464,7 +2466,7 @@ mod tests {
     }
 
     #[test]
-    fn send_danmaku_appends_to_manual_track_and_compensates_global_offset() {
+    fn send_danmaku_appends_to_the_live_track() {
         let handle = erika_presenter_create();
         assert!(!handle.is_null());
 
@@ -2503,6 +2505,11 @@ mod tests {
         assert_eq!(bad_empty["ok"], false, "{bad_empty}");
         let bad_mode = invoke(handle, c"sendDanmaku", r#"{"text":"hi","mode":"diagonal"}"#);
         assert_eq!(bad_mode["ok"], false, "{bad_mode}");
+        // Mode 7 needs a script payload a sent comment cannot carry.
+        let advanced = invoke(handle, c"sendDanmaku", r#"{"text":"hi","mode":7}"#);
+        assert_eq!(advanced["ok"], false, "{advanced}");
+        let reverse = invoke(handle, c"sendDanmaku", r#"{"text":"hi","mode":6}"#);
+        assert_eq!(reverse["ok"], true, "{reverse}");
 
         unsafe { erika_presenter_destroy(handle) };
     }
