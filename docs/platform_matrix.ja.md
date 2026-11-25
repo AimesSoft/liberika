@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-以下は 0.3.7 を基準としたプラットフォームです。ブラウザバックエンドは Erika Web に組み込まれ、Release には独立した Web アーカイブがあります。Linux の機能は実験的ですが、0.3.7 Release は Ubuntu 22.04 で構築した x64 / ARM64 × bundled / system の 4 種類を提供します。
+以下は 0.3.8 を基準としたプラットフォームです。ブラウザバックエンドは Erika Web に組み込まれ、npm パッケージと Release の独立した Web アーカイブで配布しており、[オンラインデモ](https://liberika.aimes-soft.com/demo/)もあります。Linux の機能は実験的ですが、0.3.7 以降の Release は Ubuntu 22.04 で構築した x64 / ARM64 × bundled / system の 4 種類を提供します。
 
 | プラットフォーム | 最低バージョン | デコード / 描画 | 音声 | 配布とビルド |
 |---|---|---|---|---|
@@ -13,7 +13,7 @@
 | Android | 8 / API 26 | MediaCodec / ソフトウェア + wgpu | AAudio | 4 ABI；Flutter |
 | OpenHarmony | API 18 | AVCodec / ソフトウェア + wgpu | OHAudio | arm64；Flutter / ArkTS OHPM |
 | Linux（実験的） | glibc 2.35；system は FFmpeg 8 共有ライブラリも必要 | NVDEC / VA-API / ソフトウェア + wgpu | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system；Rust / C ABI / Flutter |
-| ブラウザ | HTTPS / localhost、WebCodecs 動画・音声、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | Release アーカイブまたは JS / WASM ソースビルド。npm 未公開 |
+| ブラウザ | HTTPS / localhost、WebCodecs 動画・音声、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | npm `@aimessoft/liberika-web`、Release アーカイブ、または JS / WASM ソースビルド |
 
 ネイティブプラットフォームは C ABI Presenter を提供し、ブラウザは JavaScript / TypeScript の `Player` を使用します。ハードウェアデコードの可否はコーデック、デバイス、ドライバに依存し、ブラウザのコーデック設定は実行時に対応を確認します。
 

@@ -13,19 +13,20 @@
 
 ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて liberika 内部で完結します。
 
-現在のリリースは **0.3.7** です。[ドキュメント一覧](../docs/README.ja.md) からガイドを選べます。
+現在のリリースは **0.3.8** です。[ドキュメント一覧](../docs/README.ja.md) からガイドを選べます。
 
 **MKV 内の ASS 字幕と添付フォントを使って、ブラウザーで直接再生できます。**
+[オンラインデモを開く](https://liberika.aimes-soft.com/demo/)か、`npm install @aimessoft/liberika-web` を実行してください。
 現在のソースには [Web / WASM バックエンド](../docs/web.md) が含まれ、Erika Web に
 組み込み済みです。WebCodecs が映像・音声をデコードし、WASM の libass が字幕の
 フォント・配置・縁取り・エフェクトを描画します。Rust 弾幕と字幕は同じ再生クロックに
 従い、WebGL2 で合成されます。サイト独自の UI を維持したまま、サーバーは元ファイルを
 HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは不要です。
 
-0.3.5–0.3.7 では Windows のコントロール表示順と外部字幕エラーの分離を修正し、
-カラー Emoji 弾幕、組み込みフォントの選択、Bilibili mode 7 弾幕、Linux の線形
-dma-buf 出力を追加しました。0.3.7 は Linux x64 / ARM64 の各 bundled / system、
-計 4 種のビルド済みアーカイブを提供します。変更と移行手順は
+0.3.8 では Windows D3D11 のスクリーンショット、HTTP ソースの応答検証と停滞からの復帰、
+キャンセル可能なオープン、ソフトウェアデコードのアップロードと字幕アトラスの高速化を追加しました。
+0.3.5–0.3.7 ではカラー Emoji 弾幕、組み込みフォントの選択、Bilibili mode 7 弾幕、Linux の線形
+dma-buf 出力、Linux x64 / ARM64 の各 bundled / system 計 4 種のビルド済みアーカイブを追加しています。変更と移行手順は
 [更新履歴](../CHANGELOG.ja.md)を参照してください。
 
 ## 機能
@@ -41,18 +42,35 @@ dma-buf 出力を追加しました。0.3.7 は Linux x64 / ARM64 の各 bundled
 
 | ホスト | インストール / 入口 | ガイド |
 |---|---|---|
-| ブラウザー / JavaScript / TypeScript | `liberika-web-0.3.7.zip` またはソースビルド | [Web 組み込み・配信](../docs/web.ja.md) |
-| Flutter | `flutter pub add erika_flutter`（0.3.7） | [プラグイン](../packages/erika_flutter/README.ja.md) |
-| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加。公開済み SDK 最新版は 2026-11-16 時点で 0.3.7 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| ブラウザー / JavaScript / TypeScript | `npm install @aimessoft/liberika-web`、または `liberika-web-0.3.8.zip` | [Web 組み込み・配信](../docs/web.ja.md) |
+| Flutter | `flutter pub add erika_flutter`（0.3.8） | [プラグイン](../packages/erika_flutter/README.ja.md) |
+| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加。公開済み SDK 最新版は 2026-11-26 時点で 0.3.8 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.ja.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
-| Rust | Git 依存を `v0.3.7` に固定 | [ビルド](../docs/building.ja.md) |
+| Rust | Git 依存を `v0.3.8` に固定 | [ビルド](../docs/building.ja.md) |
 | Linux | x64 / ARM64、bundled / system、glibc 2.35 基準 | [Linux](../docs/linux.md) |
 
-2026-11-16 時点の OHPM 公開最新バージョンは 0.3.7 です。
-ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) にあります。
+2026-11-26 時点の OHPM 公開最新バージョンは 0.3.8 です。
+ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8) にあります。
 
 ### ブラウザー
+
+```sh
+npm install @aimessoft/liberika-web
+```
+
+```js
+import { Player } from '@aimessoft/liberika-web';
+
+const player = await Player.create({ canvas });
+await player.open(fileOrURL);
+await player.play();
+```
+
+まず[オンラインデモ](https://liberika.aimes-soft.com/demo/)で試せます。デモは同じパッケージを npm CDN から読み込みます。
+Vite などのバンドラーは設定不要です。`@aimessoft/liberika-web-nofont` は約 6 MB の
+フォールバックフォントを含まず、ホストがフォントを提供します。
+Release の `liberika-web-0.3.8.zip` を展開して自分で配信するか、ソースからビルドすることもできます。
 
 ```sh
 # 先に Emscripten、wasm-bindgen などのビルド依存を準備します。
@@ -60,10 +78,7 @@ cargo run -p xtask -- web build
 python3 scripts/serve_web.py
 ```
 
-`http://127.0.0.1:18765` でサンプルを開けます。`target/web/` のランタイムを配信し、
-`Player.create({ canvas })` と `player.open(fileOrURL)` で独自の UI に組み込みます。
-Release の `liberika-web-0.3.7.zip` は `index.html` デモを含みます。
-全体を展開し HTTPS または localhost で配信できます。ソースビルドも可能で、npm には未公開です。音声・映像コーデックは
+音声・映像コーデックは
 ブラウザーの WebCodecs 対応範囲に依存します。依存、サンプル、Erika への組み込みは
 [ブラウザーガイド（英語）](../docs/web.md) を参照してください。
 
@@ -88,7 +103,7 @@ Windows HDR10 にはネイティブ映像サーフェスを使います。選択
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.8" }
 ```
 
 ```rust

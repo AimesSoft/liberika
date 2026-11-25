@@ -13,18 +13,19 @@
 
 宿主应用只需提供一个渲染表面并发送播放命令——解码、时序同步、音视频渲染、字幕、弹幕、音频输出均由 liberika 内部完成。原生视频层直接呈现；Flutter 纹理可交给宿主合成。
 
-当前版本：**0.3.7**。从 [文档目录](docs/README.md) 选择接入、构建或内核设计说明。
+当前版本：**0.3.8**。从 [文档目录](docs/README.md) 选择接入、构建或内核设计说明。
 
-**浏览器也能直接播放 MKV，并保留随片 ASS 字幕和字体附件。** 当前源码提供
+**浏览器也能直接播放 MKV，并保留随片 ASS 字幕和字体附件。** [打开在线演示](https://liberika.aimes-soft.com/demo/)，
+或 `npm install @aimessoft/liberika-web`。当前源码提供
 [Web / WASM 后端](docs/web.zh.md)，已接入 Erika Web：浏览器 WebCodecs 解码音视频，
 WASM 内的 libass 还原字幕字体、定位、描边与特效，Rust 弹幕与字幕按同一播放时钟
 交给 WebGL2 合成。网站可以保留自己的界面，服务器提供原文件和 HTTP Range，
 无需先在服务端拆出字幕或烧录进画面。
 
-0.3.5–0.3.7 带来 Windows 播放控件层级与外挂字幕错误隔离修复、彩色 Emoji 弹幕、
-可选内嵌字体，以及 Bilibili mode 7 高级弹幕和 Linux 线性 dma-buf 输出。
-0.3.7 已提供 Linux x64 / ARM64 的 bundled、system 四种预编译包；详细变化与
-升级说明见 [更新日志](CHANGELOG.zh.md)。
+0.3.8 带来 Windows D3D11 截图、HTTP 来源的响应校验与停滞恢复、可取消的打开，
+以及软件解码上传和字幕图集的性能改进。0.3.5–0.3.7 带来彩色 Emoji 弹幕、可选内嵌字体、
+Bilibili mode 7 高级弹幕、Linux 线性 dma-buf 输出，以及 Linux x64 / ARM64 的
+bundled、system 四种预编译包；详细变化与升级说明见 [更新日志](CHANGELOG.zh.md)。
 
 ## 能力
 
@@ -39,18 +40,34 @@ WASM 内的 libass 还原字幕字体、定位、描边与特效，Rust 弹幕�
 
 | 宿主 | 安装或入口 | 指南 |
 |---|---|---|
-| 浏览器 / JavaScript / TypeScript | 下载 `liberika-web-0.3.7.zip`，或从源码构建 | [Web 接入与部署](docs/web.zh.md) |
-| Flutter | `flutter pub add erika_flutter`，当前 0.3.7 | [插件使用指南](packages/erika_flutter/README.zh.md) |
-| Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`；SDK 最新公开版为 0.3.7（截至 2026-11-16） | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| 浏览器 / JavaScript / TypeScript | `npm install @aimessoft/liberika-web`，或下载 `liberika-web-0.3.8.zip` | [Web 接入与部署](docs/web.zh.md) |
+| Flutter | `flutter pub add erika_flutter`，当前 0.3.8 | [插件使用指南](packages/erika_flutter/README.zh.md) |
+| Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`；SDK 最新公开版为 0.3.8（截至 2026-11-26） | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.zh.md) |
 | C / C++ | 下载匹配版本的 C ABI 归档与 `erika.h` | [原生接入](docs/integration.zh.md) |
-| Rust | Git 依赖，固定 `tag = "v0.3.7"` | [构建与依赖](docs/building.zh.md) |
+| Rust | Git 依赖，固定 `tag = "v0.3.8"` | [构建与依赖](docs/building.zh.md) |
 | Linux | x64 / ARM64，bundled / system 双模式，glibc 2.35 基线 | [Linux 接入](docs/linux.zh.md) |
 
-截至 2026-11-16，OHPM 公开的最新版本为 0.3.7。原生二进制从
-[GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) 下载。
+截至 2026-11-26，OHPM 公开的最新版本为 0.3.8。原生二进制从
+[GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8) 下载。
 
 ### 浏览器
+
+```sh
+npm install @aimessoft/liberika-web
+```
+
+```js
+import { Player } from '@aimessoft/liberika-web';
+
+const player = await Player.create({ canvas });
+await player.open(fileOrURL);
+await player.play();
+```
+
+先在[在线演示](https://liberika.aimes-soft.com/demo/)里试播，它直接从 npm CDN 加载同一个包。Vite 等打包器无需额外配置；
+`@aimessoft/liberika-web-nofont` 不含约 6 MB 的回退字体，由宿主提供字体。
+也可解压 Release 中的 `liberika-web-0.3.8.zip` 自行托管，或从源码构建：
 
 ```sh
 # 准备 Emscripten、wasm-bindgen 等依赖后，一次构建全部 WASM 与运行时资源。
@@ -58,10 +75,7 @@ cargo run -p xtask -- web build
 python3 scripts/serve_web.py
 ```
 
-打开 `http://127.0.0.1:18765` 运行示例。将 `target/web/` 中的运行时资源放到网站，
-通过 `Player.create({ canvas })` 和 `player.open(fileOrURL)` 接入自己的界面。
-也可解压 Release 中的 `liberika-web-0.3.7.zip`，通过 HTTPS 或本机 HTTP 服务打开 `index.html` 演示页。
-Web 包尚未发布到 npm；音视频编码由浏览器 WebCodecs 支持范围决定。
+音视频编码由浏览器 WebCodecs 支持范围决定。
 构建依赖、完整示例和 Erika 接入说明见 [浏览器指南](docs/web.zh.md)。
 
 ### Flutter
@@ -84,7 +98,7 @@ Apple EDR、Windows HDR10 等直接呈现。平台差异和生命周期在插件
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.8" }
 ```
 
 ```rust
@@ -113,7 +127,7 @@ Linux Rust 宿主还需启用 `wgpu`，并在消费者 workspace 根 manifest �
 | Android 8+ | MediaCodec / 软解 | wgpu Vulkan / GLES | AAudio | 四个 ABI 预编译、Flutter |
 | OpenHarmony API 18+ | AVCodec / 软解 | wgpu | OHAudio | arm64 预编译、Flutter、OHPM |
 | Linux（实验性） | NVDEC / VA-API / 软解 | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system 发布构建；Rust、C ABI、Flutter |
-| 浏览器 | WebCodecs | WebGL2 / Canvas | Web Audio | Release Web 归档或源码构建 JS / WASM 包 |
+| 浏览器 | WebCodecs | WebGL2 / Canvas | Web Audio | npm、Release Web 归档或源码构建 |
 
 各平台的视频表面和 HDR 路径在 [平台矩阵](docs/platform_matrix.zh.md) 中汇总。
 浏览器后端当前输出 SDR，已在 Chrome 验证；需要 HTTPS 或 localhost，以及

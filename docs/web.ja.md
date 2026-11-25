@@ -4,10 +4,10 @@
 
 liberika のブラウザービルドには、既存の Rust 弾幕エンジン、リポジトリでパッチを適用した libass と FreeType/HarfBuzz/FriBidi、コンテナーのデマルチプレックス用に絞った FFmpeg が含まれます。`Player` がパイプライン全体を管理し、アプリは Canvas とメディアソースを渡します。別の字幕・弾幕ライブラリは不要です。
 
-このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.7 の `liberika-web-0.3.7.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別で、npm では未公開です。ソースからのビルドも可能です。
+このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.8 の `liberika-web-0.3.8.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別です。同じランタイムを npm の `@aimessoft/liberika-web` として公開しており、ソースからのビルドも可能です。
 
-[0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) は
-`liberika-web-nofont-0.3.7.zip` も提供します。この版では
+[0.3.8 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8) は
+`liberika-web-nofont-0.3.8.zip` も提供します。この版では
 `Player.create({ canvas, fallbackFont: { data, index } })` でホストからフォントの
 バイト列を渡します。WASM の字幕・文字処理は端末のフォントファイルを自動で読めないため、ページでフォントを
 提供しない場合は完全版を選んでください。
@@ -49,11 +49,23 @@ python3 scripts/serve_web.py
 
 既存の xtask 依存管理を用いて固定バージョンのネイティブソースを取得し、同じ libass パッチを適用してテキスト依存と FFmpeg、Rust WASM をビルドし、完全なパッケージを `target/web/` に出力します。有効化済み SDK は `EMSDK` または PATH 上の `emcc` で指定できます。`web build --skip-native` はビルド済み Web C ライブラリを再利用し、ブリッジ、Rust、ブラウザーパッケージを再ビルドします。ネイティブ依存の出力先は変わらず、Web ライブラリは `target/web-build` に置かれます。
 
-`http://127.0.0.1:18765` を開いてください。サンプルはローカルファイル、外部字幕、Bilibili XML / Dandanplay JSON 弾幕を受け付け、`?src=URL` でリモートメディアを開きます。付属の localhost サーバーは Range に対応します。生成ディレクトリはデプロイ可能なパッケージであり npm 公開物ではありません。JS、WASM、Worker、ライセンス表記を一緒に保管してください。`build-manifest.json` に出力の SHA-256 ハッシュが記録されます。
+`http://127.0.0.1:18765` を開いてください。サンプルはローカルファイル、外部字幕、Bilibili XML / Dandanplay JSON 弾幕を受け付け、`?src=URL` でリモートメディアを開きます。付属の localhost サーバーは Range に対応します。生成ディレクトリはデプロイ可能なパッケージです。JS、WASM、Worker、ライセンス表記を一緒に保管してください。`python3 scripts/web_npm_package.py` はここから npm パッケージを `target/npm/web` に用意します。`build-manifest.json` に出力の SHA-256 ハッシュが記録されます。
 
 ## 組み込み
 
-生成したランタイムを相対パスを保ってサイトの `liberika/` ディレクトリにコピーします。以下はユーザーがローカル MKV を選択し再生するページです。埋め込み ASS と添付フォントは自動で読み込まれます。
+バンドラーを使う場合は、インストールしてパッケージ名でインポートします。
+
+```sh
+npm install @aimessoft/liberika-web
+```
+
+```js
+import { Player } from '@aimessoft/liberika-web';
+```
+
+Vite は設定なしでビルド・開発できます。Worker と両 WASM は `new URL(..., import.meta.url)` で参照しており、この書き方を解釈する他のバンドラーでも同様です。`@aimessoft/liberika-web-nofont` はフォールバックフォントを含まない同じパッケージです。
+
+バンドラーを使わない場合は、生成したランタイム、またはインストールしたパッケージのディレクトリを、相対パスを保ってサイトの `liberika/` ディレクトリにコピーします。以下はユーザーがローカル MKV を選択し再生するページです。埋め込み ASS と添付フォントは自動で読み込まれます。
 
 ```html
 <input id="media" type="file">
@@ -136,6 +148,7 @@ await player.configureSubtitles({ scale: 1, supersampling: true });
 - ホストが提供可能なフォントのバイト列を持っている場合は、`liberika-web-nofont` パッケージか `web build --without-fallback-font` で約 6 MB 削り、`Player.create({ canvas, fallbackFont: { data, index } })` でフォントを渡せます。
 - Canvas にゼロでない CSS 幅と高さを指定します。`Player` はサイズを監視し描画面を自動更新します。
 - リモートメディアはブラウザーからのリクエストを許可する必要があります。8 MiB を超えるファイルには、総サイズが既知の有効な HTTP `206` バイト範囲応答が必要です。クロスオリジンサーバーは `Access-Control-Expose-Headers` で `Content-Range` を公開します。`scripts/serve_web.py` はローカルテスト用に Range をサポートします。
+- CORS ヘッダーを返す別オリジン（npm CDN など）からランタイムを読み込めます。その場合 Worker は同一オリジンの blob モジュール経由で起動するため、Content-Security-Policy を設定したページでは `worker-src blob:` の許可が必要です。`worker.js` と同じディレクトリのファイルだけを自分で配信する場合は、`Player.create({ canvas, workerURL })` でアドレスを指定します。
 - ランタイムをバージョン付きディレクトリにデプロイするか、エントリーポイントとリソースをまとめて再検証し、キャッシュされた JS が別ビルドの WASM を読み込まないようにします。
 - SharedArrayBuffer とクロスオリジン分離は不要です。音声はユーザージェスチャーから開始します。ローカルメディアはユーザーが選択した File/Blob を使います。
 
