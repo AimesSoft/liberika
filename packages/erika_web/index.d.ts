@@ -96,6 +96,7 @@ export interface PlayerStats {
   hasVideo?: boolean;
   eof?: boolean;
   renderer?: RendererBackend;
+  rendererLost?: boolean;
   upscaler?: {
     mode: string;
     backend: UpscalerStatus["activeBackend"];

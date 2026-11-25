@@ -340,7 +340,12 @@ export class WebGpuRenderer {
    */
   static async create(
     canvas,
-    { srPlannerFactory, availableModes, gpu = globalThis.navigator?.gpu } = {},
+    {
+      srPlannerFactory,
+      availableModes,
+      onDeviceLost,
+      gpu = globalThis.navigator?.gpu,
+    } = {},
   ) {
     if (!gpu?.requestAdapter) return null;
     let adapter;
@@ -376,21 +381,44 @@ export class WebGpuRenderer {
       }
     }
 
-    let renderer;
+    const renderer = new WebGpuRenderer(
+      canvas,
+      device,
+      format,
+      caps,
+      srPlanner,
+      availableModes || [],
+      onDeviceLost,
+    );
+
+    // Compile and validate every presentation shader/pipeline inside explicit
+    // error scopes BEFORE claiming canvas.getContext("webgpu"), so fallback to
+    // WebGL2 still has an untouched canvas if shader or pipeline creation fails.
+    device.pushErrorScope?.("out-of-memory");
+    device.pushErrorScope?.("internal");
+    device.pushErrorScope?.("validation");
+    let initError = null;
     try {
-      renderer = new WebGpuRenderer(
-        canvas,
-        device,
-        format,
-        caps,
-        srPlanner,
-        availableModes || [],
-      );
-      renderer.initPipelines();
+      await renderer.initPipelines();
     } catch (error) {
-      srPlanner?.free?.();
-      device.destroy?.();
-      throw error;
+      initError = error;
+    }
+    const scopeErrors = [];
+    if (device.popErrorScope) {
+      for (let i = 0; i < 3; i++) {
+        const err = await device.popErrorScope();
+        if (err) scopeErrors.push(err.message || String(err));
+      }
+    }
+    const finalInitError =
+      initError ||
+      (scopeErrors.length ? new Error(scopeErrors.join("; ")) : null) ||
+      (renderer.lost
+        ? new Error("WebGPU device lost during initialization")
+        : null);
+    if (finalInitError) {
+      renderer.destroy();
+      throw finalInitError;
     }
 
     // Acquire canvas context ONLY after device and pipelines succeeded.
@@ -405,15 +433,30 @@ export class WebGpuRenderer {
         format,
         alphaMode: "opaque",
       });
-    } catch {
+    } catch (error) {
       renderer.destroy();
-      return null;
+      // Once getContext("webgpu") returns a context, the canvas is permanently
+      // bound to WebGPU and cannot obtain a WebGL2 context anymore.
+      const err = new Error(
+        `WebGPU canvas configuration failed: ${error?.message || error}`,
+      );
+      err.canvasContextClaimed = true;
+      throw err;
     }
     renderer.context = context;
+    renderer.ready = true;
     return renderer;
   }
 
-  constructor(canvas, device, format, caps, srPlanner, availableModes) {
+  constructor(
+    canvas,
+    device,
+    format,
+    caps,
+    srPlanner,
+    availableModes,
+    onDeviceLost = null,
+  ) {
     this.backend = "webgpu";
     this.canvas = canvas;
     this.device = device;
@@ -421,10 +464,29 @@ export class WebGpuRenderer {
     this.caps = caps;
     this.srPlanner = srPlanner;
     this.availableModes = availableModes;
+    this.onDeviceLost = onDeviceLost;
     this.context = null;
+    this.ready = false;
+    this.disposed = false;
     this.lost = false;
-    device.lost?.then?.(() => {
+    device.lost?.then?.((info) => {
+      if (this.disposed) return;
       this.lost = true;
+      const reason = info?.reason ? ` (${info.reason})` : "";
+      const detail = info?.message ? `: ${info.message}` : "";
+      const message = `WebGPU device lost${reason}${detail}`;
+      this.srActive = null;
+      this.srBackend = "inactive";
+      this.srLastError = message;
+      this.srLastCacheKey = "";
+      this.srFramePlanKey = "";
+      this.srBindGroups = null;
+      if (this.ready) {
+        this.onDeviceLost?.({
+          reason: info?.reason ?? "unknown",
+          message,
+        });
+      }
     });
 
     this.width = 1;
@@ -491,8 +553,24 @@ export class WebGpuRenderer {
     this.emojiHeight = 0;
   }
 
-  initPipelines() {
+  async createCheckedShaderModule(code) {
+    const module = this.device.createShaderModule({ code });
+    if (typeof module?.getCompilationInfo === "function") {
+      const info = await module.getCompilationInfo();
+      const errors = (info?.messages || []).filter((m) => m.type === "error");
+      if (errors.length) {
+        throw new Error(errors.map((m) => m.message).join("; "));
+      }
+    }
+    return module;
+  }
+
+  async initPipelines() {
     const d = this.device;
+    const createRenderPipeline = (desc) =>
+      d.createRenderPipelineAsync
+        ? d.createRenderPipelineAsync(desc)
+        : d.createRenderPipeline(desc);
     this.linearSampler = d.createSampler({
       magFilter: "linear",
       minFilter: "linear",
@@ -572,8 +650,8 @@ export class WebGpuRenderer {
         },
       ],
     });
-    const videoModule = d.createShaderModule({ code: VIDEO_WGSL });
-    this.videoPipeline = d.createRenderPipeline({
+    const videoModule = await this.createCheckedShaderModule(VIDEO_WGSL);
+    this.videoPipeline = await createRenderPipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [this.videoBgl] }),
       vertex: { module: videoModule, entryPoint: "vs_main" },
       primitive: { topology: "triangle-strip" },
@@ -604,8 +682,8 @@ export class WebGpuRenderer {
         },
       ],
     });
-    const subModule = d.createShaderModule({ code: SUBTITLE_WGSL });
-    this.subtitlePipeline = d.createRenderPipeline({
+    const subModule = await this.createCheckedShaderModule(SUBTITLE_WGSL);
+    this.subtitlePipeline = await createRenderPipeline({
       layout: d.createPipelineLayout({
         bindGroupLayouts: [this.frameBgl, this.subtitleBgl],
       }),
@@ -643,8 +721,8 @@ export class WebGpuRenderer {
         },
       ],
     });
-    const danmakuModule = d.createShaderModule({ code: DANMAKU_WGSL });
-    this.danmakuPipeline = d.createRenderPipeline({
+    const danmakuModule = await this.createCheckedShaderModule(DANMAKU_WGSL);
+    this.danmakuPipeline = await createRenderPipeline({
       layout: d.createPipelineLayout({
         bindGroupLayouts: [this.frameBgl, this.danmakuBgl],
       }),
@@ -688,8 +766,8 @@ export class WebGpuRenderer {
         },
       ],
     });
-    const pictureModule = d.createShaderModule({ code: PICTURE_WGSL });
-    this.picturePipeline = d.createRenderPipeline({
+    const pictureModule = await this.createCheckedShaderModule(PICTURE_WGSL);
+    this.picturePipeline = await createRenderPipeline({
       layout: d.createPipelineLayout({
         bindGroupLayouts: [this.frameBgl, this.pictureBgl],
       }),
@@ -844,6 +922,9 @@ export class WebGpuRenderer {
   }
 
   async loadUpscalerModel(name, bytes) {
+    if (this.disposed || this.lost) {
+      throw new Error("WebGPU device is unavailable");
+    }
     if (!this.srPlanner) {
       throw new Error("WebGPU super-resolution planner is unavailable");
     }
@@ -855,9 +936,15 @@ export class WebGpuRenderer {
           : new Uint8Array(bytes);
     const info = this.srPlanner.loadCustomModel(name || "custom", payload);
     this.srCustomGeneration++;
-    // Drop cached custom pipelines.
+    // Drop cached custom pipelines, clearing srActive first if it used one.
     for (const [key, entry] of this.srCache) {
       if (key.startsWith("custom:")) {
+        if (this.srActive === entry) {
+          this.srActive = null;
+          this.srLastCacheKey = "";
+          this.srFramePlanKey = "";
+          this.srBindGroups = null;
+        }
         this.disposeSrEntry(entry);
         this.srCache.delete(key);
       }
@@ -873,6 +960,12 @@ export class WebGpuRenderer {
     this.srCustomGeneration++;
     for (const [key, entry] of this.srCache) {
       if (key.startsWith("custom:")) {
+        if (this.srActive === entry) {
+          this.srActive = null;
+          this.srLastCacheKey = "";
+          this.srFramePlanKey = "";
+          this.srBindGroups = null;
+        }
         this.disposeSrEntry(entry);
         this.srCache.delete(key);
       }
@@ -886,9 +979,21 @@ export class WebGpuRenderer {
     }
   }
 
+  activateSrEntry(mode, entry) {
+    this.srRequestedMode = mode;
+    this.srActive = entry;
+    this.srBackend = "compute";
+    this.srLastCacheKey = "";
+    this.srFramePlanKey = "";
+    this.srBindGroups = null;
+  }
+
   disposeSrEntry(entry) {
     for (const kernel of entry.kernels) {
       kernel.weightBuffer?.destroy?.();
+    }
+    if (entry.planId != null) {
+      this.srPlanner?.releasePlan?.(entry.planId);
     }
   }
 
@@ -906,6 +1011,13 @@ export class WebGpuRenderer {
       this.srPlanner?.compile?.("off");
       return this.getUpscalerStatus();
     }
+    if (this.disposed || this.lost) {
+      this.srRequestedMode = requested;
+      this.srBackend = "inactive";
+      this.srActive = null;
+      this.srLastError = this.srLastError || "WebGPU device is lost";
+      throw new Error(this.srLastError);
+    }
     if (!this.srPlanner) {
       this.srRequestedMode = requested;
       this.srBackend = "inactive";
@@ -915,18 +1027,66 @@ export class WebGpuRenderer {
       throw new Error(this.srLastError);
     }
 
-    this.srRequestedMode = requested;
+    let canonical = requested;
+    if (typeof this.srPlanner.constructor?.normalizeMode === "function") {
+      try {
+        canonical = this.srPlanner.constructor.normalizeMode(requested);
+      } catch (error) {
+        if (epoch !== this.srEpoch) return this.getUpscalerStatus();
+        this.srRequestedMode = requested;
+        this.srActive = null;
+        this.srBackend = "inactive";
+        this.srFallbackCount++;
+        this.srLastError = String(error);
+        throw error;
+      }
+      if (canonical === "off") {
+        this.srRequestedMode = "off";
+        this.srBackend = "off";
+        this.srActive = null;
+        this.srLastCacheKey = "";
+        this.srFramePlanKey = "";
+        this.srBindGroups = null;
+        this.srPlanner.compile("off");
+        return this.getUpscalerStatus();
+      }
+    }
+
+    const initialCacheKey =
+      canonical === "custom"
+        ? `custom:${this.srCustomGeneration}`
+        : canonical;
+    const cached = this.srCache.get(initialCacheKey);
+    if (cached) {
+      if (epoch !== this.srEpoch || this.disposed || this.lost) {
+        return this.getUpscalerStatus();
+      }
+      // Refresh LRU recency so active pipelines are never evicted first.
+      this.srCache.delete(initialCacheKey);
+      this.srCache.set(initialCacheKey, cached);
+      this.activateSrEntry(cached.mode, cached);
+      return this.getUpscalerStatus();
+    }
+
+    // Keep any previous srActive rendering smoothly while async shader
+    // compilation runs; srActive swaps atomically once compilation succeeds.
+    this.srRequestedMode = canonical;
     this.srBackend = "building";
 
     let compiled;
     try {
-      compiled = this.srPlanner.compile(requested);
+      compiled = this.srPlanner.compile(canonical);
     } catch (error) {
-      if (epoch !== this.srEpoch) return this.getUpscalerStatus();
+      if (epoch !== this.srEpoch || this.disposed || this.lost) {
+        return this.getUpscalerStatus();
+      }
       this.srActive = null;
       this.srBackend = "inactive";
       this.srFallbackCount++;
       this.srLastError = String(error);
+      this.srLastCacheKey = "";
+      this.srFramePlanKey = "";
+      this.srBindGroups = null;
       throw error;
     }
     if (!compiled) {
@@ -940,15 +1100,17 @@ export class WebGpuRenderer {
       compiled.mode === "custom"
         ? `custom:${this.srCustomGeneration}`
         : compiled.mode;
-    const cached = this.srCache.get(cacheKey);
-    if (cached) {
-      if (epoch !== this.srEpoch) return this.getUpscalerStatus();
-      this.srRequestedMode = compiled.mode;
-      this.srActive = cached;
-      this.srBackend = "compute";
-      this.srLastCacheKey = "";
-      this.srFramePlanKey = "";
-      this.srBindGroups = null;
+    const cachedByCanonical = this.srCache.get(cacheKey);
+    if (cachedByCanonical) {
+      if (compiled.planId != null) {
+        this.srPlanner?.releasePlan?.(compiled.planId);
+      }
+      if (epoch !== this.srEpoch || this.disposed || this.lost) {
+        return this.getUpscalerStatus();
+      }
+      this.srCache.delete(cacheKey);
+      this.srCache.set(cacheKey, cachedByCanonical);
+      this.activateSrEntry(cachedByCanonical.mode, cachedByCanonical);
       return this.getUpscalerStatus();
     }
 
@@ -962,9 +1124,11 @@ export class WebGpuRenderer {
     let buildError = null;
     try {
       for (const spec of compiled.kernels) {
+        if (this.disposed || this.lost || epoch !== this.srEpoch) {
+          break;
+        }
         const weightUsage =
-          (spec.uniform ? BUF.UNIFORM : BUF.STORAGE) |
-          BUF.COPY_DST;
+          (spec.uniform ? BUF.UNIFORM : BUF.STORAGE) | BUF.COPY_DST;
         const weights = spec.weights;
         const byteLength = Math.max(16, weights.byteLength);
         const weightBuffer = d.createBuffer({
@@ -976,7 +1140,7 @@ export class WebGpuRenderer {
         const sourceKey = `${spec.uniform ? "u" : "s"}:${spec.source}`;
         let pipeline = pipelineBySource.get(sourceKey);
         if (!pipeline) {
-          const module = d.createShaderModule({ code: spec.source });
+          const module = await this.createCheckedShaderModule(spec.source);
           const layout = spec.uniform
             ? this.srUniformPipelineLayout
             : this.srStoragePipelineLayout;
@@ -1001,47 +1165,64 @@ export class WebGpuRenderer {
     }
 
     const scopeErrors = [];
-    if (d.popErrorScope) {
+    if (d.popErrorScope && !this.disposed) {
       for (let i = 0; i < 3; i++) {
-        const err = await d.popErrorScope();
-        if (err) scopeErrors.push(err.message || String(err));
+        try {
+          const err = await d.popErrorScope();
+          if (err) scopeErrors.push(err.message || String(err));
+        } catch {
+          break;
+        }
       }
     }
     const finalError =
-      buildError || (scopeErrors.length ? new Error(scopeErrors.join("; ")) : null);
+      buildError ||
+      (scopeErrors.length ? new Error(scopeErrors.join("; ")) : null);
 
-    if (finalError || epoch !== this.srEpoch) {
+    if (finalError || this.disposed || this.lost || epoch !== this.srEpoch) {
       for (const k of builtKernels) k.weightBuffer?.destroy?.();
-      if (epoch !== this.srEpoch) return this.getUpscalerStatus();
+      if (compiled.planId != null) {
+        this.srPlanner?.releasePlan?.(compiled.planId);
+      }
+      if (this.disposed || this.lost || epoch !== this.srEpoch) {
+        return this.getUpscalerStatus();
+      }
       this.srActive = null;
       this.srBackend = "inactive";
       this.srFallbackCount++;
       this.srLastError = String(finalError);
+      this.srLastCacheKey = "";
+      this.srFramePlanKey = "";
+      this.srBindGroups = null;
       throw finalError;
     }
 
     const entry = {
       key: cacheKey,
+      planId: compiled.planId ?? null,
       mode: compiled.mode,
       packed: compiled.packed,
       half: compiled.half,
       kernels: builtKernels,
     };
-    if (this.srCache.size >= 4) {
+    const previous = this.srCache.get(cacheKey);
+    if (previous) {
+      this.srCache.delete(cacheKey);
+    }
+    this.srCache.set(cacheKey, entry);
+    this.activateSrEntry(compiled.mode, entry);
+    if (previous && previous !== entry) {
+      this.disposeSrEntry(previous);
+    }
+    while (this.srCache.size > 4) {
       const oldestKey = this.srCache.keys().next().value;
+      if (oldestKey === cacheKey) break;
       const oldest = this.srCache.get(oldestKey);
       this.srCache.delete(oldestKey);
       if (oldest && oldest !== this.srActive) {
         this.disposeSrEntry(oldest);
       }
     }
-    this.srCache.set(cacheKey, entry);
-    this.srRequestedMode = compiled.mode;
-    this.srActive = entry;
-    this.srBackend = "compute";
-    this.srLastCacheKey = "";
-    this.srFramePlanKey = "";
-    this.srBindGroups = null;
     return this.getUpscalerStatus();
   }
 
@@ -1074,16 +1255,30 @@ export class WebGpuRenderer {
 
     try {
       if (planKey !== this.srFramePlanKey || !this.srFramePlan) {
-        const framePlan = this.srPlanner.planFrame(
-          vw,
-          vh,
-          targetW,
-          targetH,
-          BT709_LUMA[0],
-          BT709_LUMA[1],
-          BT709_LUMA[2],
-          true,
-        );
+        const framePlan =
+          this.srActive.planId != null &&
+          typeof this.srPlanner.planFrameFor === "function"
+            ? this.srPlanner.planFrameFor(
+                this.srActive.planId,
+                vw,
+                vh,
+                targetW,
+                targetH,
+                BT709_LUMA[0],
+                BT709_LUMA[1],
+                BT709_LUMA[2],
+                true,
+              )
+            : this.srPlanner.planFrame(
+                vw,
+                vh,
+                targetW,
+                targetH,
+                BT709_LUMA[0],
+                BT709_LUMA[1],
+                BT709_LUMA[2],
+                true,
+              );
         this.srFramePlan = framePlan;
         this.srFramePlanKey = planKey;
         this.ensureSrResources(framePlan);
@@ -1330,7 +1525,6 @@ export class WebGpuRenderer {
     const d = this.device;
     this.glyphs = plan.glyphs.length / 8;
 
-    let danmakuAtlasDirty = false;
     if (plan.fill) {
       if (plan.x === undefined) {
         if (
@@ -1360,7 +1554,9 @@ export class WebGpuRenderer {
           this.outlineView = this.outlineTexture.createView();
           this.fillWidth = plan.width;
           this.fillHeight = plan.height;
-          danmakuAtlasDirty = true;
+          // Invalidate immediately even if this frame has zero glyphs so the
+          // next glyph frame never binds the destroyed textures.
+          this.danmakuBindGroup = null;
         }
       }
       const origin = { x: plan.x ?? 0, y: plan.y ?? 0 };
@@ -1421,7 +1617,7 @@ export class WebGpuRenderer {
         BUF.STORAGE | BUF.COPY_DST,
       );
       d.queue.writeBuffer(this.glyphBuffer, 0, plan.glyphs);
-      if (glyphRealloc || danmakuAtlasDirty || !this.danmakuBindGroup) {
+      if (glyphRealloc || !this.danmakuBindGroup) {
         this.danmakuBindGroup = d.createBindGroup({
           layout: this.danmakuBgl,
           entries: [
@@ -1550,6 +1746,9 @@ export class WebGpuRenderer {
   }
 
   destroy() {
+    this.disposed = true;
+    this.lost = true;
+    this.srEpoch++;
     if (this.pass) {
       try {
         this.pass.end();
@@ -1594,6 +1793,5 @@ export class WebGpuRenderer {
     } catch {}
     this.context = null;
     this.device?.destroy?.();
-    this.lost = true;
   }
 }

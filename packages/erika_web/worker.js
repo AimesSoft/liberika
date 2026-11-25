@@ -57,6 +57,9 @@ let frames = [],
   loaded = false,
   demuxBusy = false,
   queue = Promise.resolve(),
+  srQueue = Promise.resolve(),
+  destroyed = false,
+  rendererLost = false,
   scheduled = false;
 let packet = null,
   seekTarget = 0,
@@ -82,6 +85,17 @@ const enqueue = (fn) => {
   queue = task.catch(() => {});
   return task;
 };
+const enqueueSr = (fn) => {
+  const task = srQueue.then(fn);
+  srQueue = task.catch(() => {});
+  return task;
+};
+const SR_METHODS = new Set([
+  "setUpscaler",
+  "loadUpscalerModel",
+  "clearUpscalerModel",
+  "getUpscalerStatus",
+]);
 const check = (result) => {
   if (result < 0)
     throw new Error(
@@ -298,7 +312,7 @@ async function pump() {
   } else schedulePump();
 }
 function draw(t) {
-  if (!loaded || !renderer) return;
+  if (!loaded || !renderer || rendererLost) return;
   time = Math.max(seekTarget, t);
   let chosen = null;
   while (frames.length && frames[0].timestamp / 1e6 <= time + 0.008) {
@@ -369,6 +383,7 @@ function draw(t) {
         hasVideo: !!currentFrame,
         eof,
         renderer: renderer.backend,
+        rendererLost,
         upscaler: {
           mode: upscaler.requestedMode,
           backend: upscaler.activeBackend,
@@ -383,6 +398,8 @@ function draw(t) {
 }
 const methods = {
   async init({ canvas, width, height, scale, font, renderer: preference = "auto" }) {
+    destroyed = false;
+    rendererLost = false;
     await init();
     setEmojiPainter(paintEmoji);
     if (font) {
@@ -403,9 +420,15 @@ const methods = {
         renderer = await WebGpuRenderer.create(canvas, {
           srPlannerFactory: (capsJson) => new WebSrPlanner(capsJson),
           availableModes,
+          onDeviceLost: ({ message }) => {
+            if (destroyed) return;
+            rendererLost = true;
+            loaded = false;
+            send("error", { message });
+          },
         });
       } catch (error) {
-        if (mode === "webgpu") throw error;
+        if (mode === "webgpu" || error?.canvasContextClaimed) throw error;
         send("log", { message: `WebGPU unavailable, falling back to WebGL2: ${error}` });
         renderer = null;
       }
@@ -545,15 +568,19 @@ const methods = {
     );
   },
   async setUpscaler({ mode }) {
+    if (!renderer) throw new Error("Renderer is not initialized");
     return renderer.setUpscaler(mode);
   },
   async loadUpscalerModel({ name, data }) {
+    if (!renderer) throw new Error("Renderer is not initialized");
     return renderer.loadUpscalerModel(name, data);
   },
   async clearUpscalerModel() {
+    if (!renderer) throw new Error("Renderer is not initialized");
     renderer.clearUpscalerModel();
   },
   async getUpscalerStatus() {
+    if (!renderer) throw new Error("Renderer is not initialized");
     return renderer.getUpscalerStatus();
   },
   async capture({ width, seconds }) {
@@ -581,6 +608,7 @@ const methods = {
     renderer.end();
   },
   async destroy() {
+    destroyed = true;
     loaded = false;
     generation++;
     disposeDecoders();
@@ -621,7 +649,13 @@ onmessage = ({ data }) => {
     });
     return;
   }
-  enqueue(() => method(data)).then(
+  const schedule = SR_METHODS.has(data.type) ? enqueueSr : enqueue;
+  schedule(() => {
+    if (destroyed && data.type !== "destroy") {
+      throw new Error("Player is disposed");
+    }
+    return method(data);
+  }).then(
     (result) => send("reply", { requestId: data.requestId, result }),
     (error) =>
       send("reply", { requestId: data.requestId, error: String(error) }),

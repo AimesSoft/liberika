@@ -269,3 +269,50 @@ test('WebSrPlanner loads custom .esr networks and clears them cleanly', async ()
     planner.free();
   }
 });
+
+test('WebSrPlanner rejects adversarial mpv shaders and corrupt .esr without trapping WASM', () => {
+  const planner = new WebSrPlanner(JSON.stringify({
+    maxBufferSize: 4294967296, // 4 GiB — must not truncate to 0 on 32-bit wasm32
+    maxUniformBufferBindingSize: 4294967296,
+  }));
+  const danmaku = new WebDanmaku();
+  const enc = new TextEncoder();
+  try {
+    const adversarialShaders = [
+      '//!HOOK LUMA\n//!SAVE F1\nvec4 hook() {\nvec4 res = vec4(1,0,0,0) * float(LUMA_texOff(vec2(100000, 0)));\nreturn res;\n}\n',
+      '//!HOOK LUMA\n//!SAVE F1\nvec4 hook() {\nvec4 res = vec4(1,0,0,0) * float(LUMA_texOff(vec2(-2147483648, 0)));\nreturn res;\n}\n',
+      '//!HOOK LUMA\n//!SAVE F1\nvec4 hook() {\nvec4 res = vec4(1,0,0,0) * float(LUMA_texOff(vec2(-1e30, 0)));\nreturn res;\n}\n',
+      '//!HOOK MAIN\n//!SAVE F1\n#define g_0 (中_texOff(vec2(0,0)))\nvec4 hook() { return vec4(0.0); }\n',
+      '//!HOOK LUMA\n//!SAVE F1\nvec4 hook() {\nvec4 res = vec4(NaN,0,0,0) * float(LUMA_texOff(vec2(0, 0)));\nreturn res;\n}\n',
+    ];
+    for (const shader of adversarialShaders) {
+      assert.throws(() => planner.loadCustomModel('bad.glsl', enc.encode(shader)));
+    }
+    // Corrupt ESRM header claiming 65535 tensors.
+    const badEsr = new Uint8Array([
+      0x45, 0x53, 0x52, 0x4d, // "ESRM"
+      1, 0, 0, 0,             // version 1
+      0, 0, 0, 0, 0,          // f32, empty name, Zero, Raw
+      0xff, 0xff,             // tensor_count = 65535
+    ]);
+    assert.throws(() => planner.loadCustomModel('bad.esr', badEsr));
+
+    // Both WebSrPlanner (including planId/planFrameFor with 4 GiB limits) and WebDanmaku remain intact!
+    assert.equal(WebSrPlanner.normalizeMode('32'), 'fsr1');
+    const fsr = planner.compile('fsr1');
+    const a4k = planner.compile('anime4k_s');
+    assert.notEqual(fsr.planId, a4k.planId);
+    const fsrFrame = planner.planFrameFor(fsr.planId, 320, 180, 640, 360, 0.2126, 0.7152, 0.0722, true);
+    assert.equal(fsrFrame.packed, false);
+    const a4kFrame = planner.planFrameFor(a4k.planId, 320, 180, 640, 360, 0.2126, 0.7152, 0.0722, true);
+    assert.equal(a4kFrame.packed, true);
+    planner.releasePlan(fsr.planId);
+    assert.throws(() => planner.planFrameFor(fsr.planId, 320, 180, 640, 360, 0.2126, 0.7152, 0.0722, true));
+
+    assert.equal(danmaku.load('[{"time":0,"text":"still alive"}]'), 1);
+    assert.ok(danmaku.frame(0.5, 1280, 720, 1, 0).glyphs.length > 0);
+  } finally {
+    planner.free();
+    danmaku.free();
+  }
+});

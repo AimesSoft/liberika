@@ -6,7 +6,7 @@ use crate::danmaku::{
     DanmakuTimeline, DanmakuViewport, DfmLayoutEngine, DfmPreparedLayout,
 };
 use crate::font::{FallbackFont, SubtitleFontAttachment};
-use crate::renderer::pipeline::LumaUpscalerMode;
+use crate::renderer::pipeline::{LumaUpscalerMode, UpscalerFamily};
 use crate::renderer::sr::{
     catalog as sr_catalog, fold as sr_fold,
     model::SrModel,
@@ -14,7 +14,7 @@ use crate::renderer::sr::{
     reference::LumaRange,
 };
 use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array, Uint32Array};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use wasm_bindgen::prelude::*;
 
 thread_local! {
@@ -430,7 +430,9 @@ impl Default for WebDanmaku {
 pub struct WebSrPlanner {
     caps: DeviceCapabilities,
     custom: Option<Arc<SrModel>>,
-    active: Option<SrPlan>,
+    plans: HashMap<u32, SrPlan>,
+    next_plan_id: u32,
+    active_plan_id: Option<u32>,
 }
 
 fn parse_device_capabilities(json: &str) -> Result<DeviceCapabilities, JsValue> {
@@ -499,7 +501,9 @@ impl WebSrPlanner {
         Ok(Self {
             caps,
             custom: None,
-            active: None,
+            plans: HashMap::new(),
+            next_plan_id: 1,
+            active_plan_id: None,
         })
     }
 
@@ -510,6 +514,22 @@ impl WebSrPlanner {
             list.push(&JsValue::from_str(mode.label()));
         }
         list
+    }
+
+    #[wasm_bindgen(js_name = normalizeMode)]
+    pub fn normalize_mode(mode: &str) -> Result<String, JsValue> {
+        let parsed = LumaUpscalerMode::parse(mode)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown upscaler mode: {mode}")))?;
+        if parsed != LumaUpscalerMode::Off
+            && parsed != LumaUpscalerMode::Fsr1
+            && parsed.family() != UpscalerFamily::Network
+        {
+            return Err(JsValue::from_str(&format!(
+                "upscaler mode {} is platform-specific and unavailable on WebGPU",
+                parsed.label()
+            )));
+        }
+        Ok(parsed.label().to_string())
     }
 
     #[wasm_bindgen(js_name = loadCustomModel)]
@@ -532,11 +552,11 @@ impl WebSrPlanner {
         )?;
         self.custom = Some(optimized);
         if self
-            .active
-            .as_ref()
+            .active_plan_id
+            .and_then(|id| self.plans.get(&id))
             .is_some_and(|p| p.mode == LumaUpscalerMode::Custom)
         {
-            self.active = None;
+            self.active_plan_id = None;
         }
         Ok(info.into())
     }
@@ -545,11 +565,19 @@ impl WebSrPlanner {
     pub fn clear_custom_model(&mut self) {
         self.custom = None;
         if self
-            .active
-            .as_ref()
+            .active_plan_id
+            .and_then(|id| self.plans.get(&id))
             .is_some_and(|p| p.mode == LumaUpscalerMode::Custom)
         {
-            self.active = None;
+            self.active_plan_id = None;
+        }
+    }
+
+    #[wasm_bindgen(js_name = releasePlan)]
+    pub fn release_plan(&mut self, plan_id: u32) {
+        self.plans.remove(&plan_id);
+        if self.active_plan_id == Some(plan_id) {
+            self.active_plan_id = None;
         }
     }
 
@@ -557,13 +585,22 @@ impl WebSrPlanner {
         let parsed = LumaUpscalerMode::parse(mode)
             .ok_or_else(|| JsValue::from_str(&format!("unknown upscaler mode: {mode}")))?;
         if parsed == LumaUpscalerMode::Off {
-            self.active = None;
+            self.active_plan_id = None;
             return Ok(JsValue::NULL);
         }
         let plan = SrPlan::compile(parsed, self.custom.clone(), self.caps)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
+        let plan_id = loop {
+            let candidate = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
+            if !self.plans.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
         let result = Object::new();
+        set(&result, "planId", plan_id.into())?;
         set(&result, "mode", JsValue::from_str(plan.mode.label()))?;
         set(&result, "packed", plan.packed.into())?;
         set(&result, "half", plan.half.into())?;
@@ -593,7 +630,8 @@ impl WebSrPlanner {
         }
         set(&result, "kernels", kernels.into())?;
 
-        self.active = Some(plan);
+        self.plans.insert(plan_id, plan);
+        self.active_plan_id = Some(plan_id);
         Ok(result.into())
     }
 
@@ -610,8 +648,38 @@ impl WebSrPlanner {
         luma_b: f32,
         full_range: bool,
     ) -> Result<JsValue, JsValue> {
-        let Some(plan) = &self.active else {
+        let Some(plan_id) = self.active_plan_id else {
             return Err(JsValue::from_str("no active upscaler mode compiled"));
+        };
+        self.plan_frame_for(
+            plan_id,
+            width,
+            height,
+            target_width,
+            target_height,
+            luma_r,
+            luma_g,
+            luma_b,
+            full_range,
+        )
+    }
+
+    #[wasm_bindgen(js_name = planFrameFor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_frame_for(
+        &self,
+        plan_id: u32,
+        width: u32,
+        height: u32,
+        target_width: u32,
+        target_height: u32,
+        luma_r: f32,
+        luma_g: f32,
+        luma_b: f32,
+        full_range: bool,
+    ) -> Result<JsValue, JsValue> {
+        let Some(plan) = self.plans.get(&plan_id) else {
+            return Err(JsValue::from_str("no compiled upscaler plan for planId"));
         };
         let frame = plan
             .plan_frame(

@@ -23,12 +23,14 @@ use std::collections::HashMap;
 
 use super::model::{
     Activation, ConvInput, ConvLayer, Head, HeadBase, INPUT_TENSOR, InputRange, InputTransform,
-    Padding, SrModel, SubpixelOrder,
+    MAX_KERNEL, MAX_LAYERS, MAX_TENSORS, Padding, SrModel, SubpixelOrder,
 };
 use crate::core::{PlayerError, Result};
 
 /// BT.709 luma coefficients used to fold RGB residual heads.
 const LUMA_RGB: [f32; 3] = [0.2126, 0.7152, 0.0722];
+const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TAP_RADIUS: i32 = (MAX_KERNEL / 2) as i32;
 
 struct Pass {
     desc: String,
@@ -55,6 +57,9 @@ struct Operand {
 }
 
 pub fn parse(name: &str, source: &str) -> Result<SrModel> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(error(name, "shader source exceeds maximum supported size"));
+    }
     let passes = split_passes(source)?;
     let hook = passes
         .first()
@@ -87,17 +92,28 @@ pub fn parse(name: &str, source: &str) -> Result<SrModel> {
             head_sources = sources;
             continue;
         }
+        let save_name = pass
+            .save
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| error(name, "pass has empty //!SAVE target"))?;
+        if tensors.len() >= MAX_TENSORS || layers.len() >= MAX_LAYERS {
+            return Err(error(name, "shader exceeds maximum layer or tensor count"));
+        }
         let output = tensors.len();
         tensors.push(4);
         let layer = parse_conv(name, pass, &hook, rgb_input, &names, &tensors, output)?;
         layers.push(layer);
-        names.insert(pass.save.clone().expect("checked above"), output);
+        names.insert(save_name.to_string(), output);
     }
 
     let mut head = head.ok_or_else(|| error(name, "no output pass"))?;
     match head_sources.len() {
         1 => head.tensor = head_sources[0],
         3 => {
+            if tensors.len() >= MAX_TENSORS || layers.len() >= MAX_LAYERS {
+                return Err(error(name, "shader exceeds maximum layer or tensor count"));
+            }
             let output = tensors.len();
             tensors.push(4);
             let folded = fold_rgb_layers(name, &layers, &head_sources, output)?;
@@ -139,6 +155,12 @@ fn split_passes(source: &str) -> Result<Vec<Pass>> {
         if let Some(directive) = line.strip_prefix("//!") {
             if !in_header {
                 passes.extend(current.take());
+                if passes.len() > MAX_LAYERS {
+                    return Err(PlayerError::Renderer(format!(
+                        "mpv shader exceeds maximum {} passes",
+                        MAX_LAYERS + 1
+                    )));
+                }
                 current = Some(Pass {
                     desc: String::new(),
                     hook: String::new(),
@@ -207,7 +229,11 @@ fn parse_conv(
             .split('(')
             .next()
             .unwrap_or(macro_name)
+            .trim()
             .to_string();
+        if macro_name.is_empty() {
+            return Err(fail("malformed #define"));
+        }
         let transform = if expansion.contains("max(-") {
             InputTransform::NegRelu
         } else if expansion.contains("max(") {
@@ -271,15 +297,23 @@ fn parse_conv(
             };
             let key = operand.key;
             let (weights, alpha_bias) = if key.tensor == INPUT_TENSOR && rgb_input {
-                // R = G = B = Y; alpha is 1 everywhere.
-                let luma = (0..4)
-                    .map(|o| weights[o * 4] + weights[o * 4 + 1] + weights[o * 4 + 2])
-                    .collect::<Vec<_>>();
-                let alpha = (0..4).map(|o| weights[o * 4 + 3]).collect::<Vec<_>>();
-                (luma, Some(alpha))
+                if weights.len() == 16 {
+                    // R = G = B = Y; alpha is 1 everywhere.
+                    let luma = (0..4)
+                        .map(|o| weights[o * 4] + weights[o * 4 + 1] + weights[o * 4 + 2])
+                        .collect::<Vec<_>>();
+                    let alpha = (0..4).map(|o| weights[o * 4 + 3]).collect::<Vec<_>>();
+                    (luma, Some(alpha))
+                } else {
+                    // Scalar float(MAIN_texOff(...)) already supplies a 1-channel input.
+                    (weights, None)
+                }
             } else {
                 (weights, None)
             };
+            if weights.len() != 4 * tensors[key.tensor] {
+                return Err(fail("operand channel count disagrees with tensor"));
+            }
             if let Some(alpha) = alpha_bias {
                 for o in 0..4 {
                     bias[o] += alpha[o];
@@ -291,6 +325,9 @@ fn parse_conv(
             let entry = taps
                 .entry((key, operand.dx, operand.dy))
                 .or_insert_with(|| vec![0.0; weights.len()]);
+            if entry.len() != weights.len() {
+                return Err(fail("operand channel count changed between taps"));
+            }
             for (slot, value) in entry.iter_mut().zip(&weights) {
                 *slot += value;
             }
@@ -315,17 +352,31 @@ fn parse_conv(
         let radius = taps
             .keys()
             .filter(|(tap_key, _, _)| *tap_key == key)
-            .map(|(_, dx, dy)| dx.abs().max(dy.abs()))
+            .map(|(_, dx, dy)| dx.unsigned_abs().max(dy.unsigned_abs()) as usize)
             .max()
-            .unwrap_or(0) as usize;
+            .unwrap_or(0);
+        if radius > MAX_KERNEL / 2 {
+            return Err(fail("convolution kernel exceeds maximum supported size"));
+        }
         let kernel = radius * 2 + 1;
-        let mut weights = vec![0.0f32; 4 * channels * kernel * kernel];
+        let weight_count = 4usize
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(kernel))
+            .and_then(|n| n.checked_mul(kernel))
+            .ok_or_else(|| fail("convolution weight count overflow"))?;
+        let mut weights = vec![0.0f32; weight_count];
         for ((tap_key, dx, dy), values) in &taps {
             if *tap_key != key {
                 continue;
             }
-            let kx = (dx + radius as i32) as usize;
-            let ky = (dy + radius as i32) as usize;
+            let kx = usize::try_from(*dx + radius as i32)
+                .ok()
+                .filter(|&v| v < kernel)
+                .ok_or_else(|| fail("convolution tap offset out of bounds"))?;
+            let ky = usize::try_from(*dy + radius as i32)
+                .ok()
+                .filter(|&v| v < kernel)
+                .ok_or_else(|| fail("convolution tap offset out of bounds"))?;
             let tap_channels = values.len() / 4;
             if tap_channels != channels {
                 return Err(fail("operand channel count changed between taps"));
@@ -416,7 +467,12 @@ fn fold_rgb_layers(
                 .ok_or_else(|| error(name, "RGB head source is not a layer"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let first = producers[0];
+    let Some(&first) = producers.first() else {
+        return Err(error(name, "RGB head has no source layers"));
+    };
+    if producers.len() != LUMA_RGB.len() {
+        return Err(error(name, "RGB head requires exactly 3 source layers"));
+    }
     let compatible = producers.iter().all(|layer| {
         layer.activation == Activation::None
             && layer.residual.is_none()
@@ -499,7 +555,7 @@ fn parse_floats_call(call: &str) -> Option<Vec<f32>> {
     }
     call[open + 1..close]
         .split(',')
-        .map(|value| value.trim().parse::<f32>().ok())
+        .map(|value| value.trim().parse::<f32>().ok().filter(|v| v.is_finite()))
         .collect()
 }
 
@@ -525,9 +581,12 @@ fn vec4_literals(line: &str) -> Vec<Vec<f32>> {
 fn texture_in(text: &str) -> Option<String> {
     let index = text.find("_texOff(").or_else(|| text.find("_tex("))?;
     let start = text[..index]
-        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .map_or(0, |position| position + 1);
-    Some(text[start..index].to_string())
+        .char_indices()
+        .rev()
+        .find(|&(_, ch)| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .map_or(0, |(position, ch)| position + ch.len_utf8());
+    let name = &text[start..index];
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn resolve_operand(
@@ -583,7 +642,15 @@ fn offsets(text: &str) -> Option<(i32, i32)> {
         .map(|value| value.trim().parse::<f32>().ok());
     let dx = values.next()??;
     let dy = values.next()??;
-    if values.next().is_some() || dx.fract() != 0.0 || dy.fract() != 0.0 {
+    let limit = MAX_TAP_RADIUS as f32;
+    if values.next().is_some()
+        || !dx.is_finite()
+        || !dy.is_finite()
+        || dx.fract() != 0.0
+        || dy.fract() != 0.0
+        || dx.abs() > limit
+        || dy.abs() > limit
+    {
         return None;
     }
     Some((dx as i32, dy as i32))
@@ -728,6 +795,118 @@ return vec4(res[index.x * 2 + index.y], 0, 0, 1);
         assert_eq!(residual.inputs[0].kernel, 3);
         // Identity at tap (-1, 0): ky = 1, kx = 0.
         assert_eq!(residual.inputs[0].weights[3], 1.0);
+    }
+
+    #[test]
+    fn rejects_adversarial_mpv_shaders_without_panicking() {
+        // 1. Huge positive/negative offsets and i32::MIN saturation must never OOM or panic.
+        for bad_offset in [
+            "100000.0, 0.0",
+            "-100000.0, 0.0",
+            "-1e30, 0.0",
+            "1e30, 0.0",
+            "-2147483648.0, 0.0",
+            "NaN, 0.0",
+            "inf, 0.0",
+            "5.0, 0.0",
+        ] {
+            let shader = format!(
+                r#"
+//!HOOK LUMA
+//!BIND LUMA
+//!SAVE F1
+vec4 hook() {{
+    vec4 res = vec4(1.0, 0.0, 0.0, 0.0) * float(LUMA_texOff(vec2({bad_offset})));
+    return res;
+}}
+//!HOOK LUMA
+//!BIND F1
+vec4 hook() {{
+    ivec2 index = ivec2(0);
+    return vec4(F1_tex(F1_pos)[index.x * 2 + index.y], 0, 0, 1);
+}}
+"#
+            );
+            assert!(
+                parse("bad-offset", &shader).is_err(),
+                "expected Err for offset {bad_offset}"
+            );
+        }
+
+        // 2. MAIN hook with 1-channel float(MAIN_texOff(...)) must not OOB-panic.
+        let main_scalar = r#"
+//!HOOK MAIN
+//!BIND MAIN
+//!SAVE F1
+vec4 hook() {
+    vec4 res = vec4(1.0, 0.0, 0.0, 0.0) * float(MAIN_texOff(vec2(0, 0)));
+    return res;
+}
+//!HOOK MAIN
+//!BIND MAIN
+//!BIND F1
+//!SAVE MAIN
+vec4 hook() {
+    ivec2 i0 = ivec2(0);
+    return vec4(F1_tex(F1_pos)[i0.y * 2 + i0.x]) + MAIN_tex(MAIN_pos);
+}
+"#;
+        let parsed = parse("main-scalar", main_scalar).unwrap();
+        assert_eq!(parsed.layers[0].inputs[0].weights, vec![1.0, 0.0, 0.0, 0.0]);
+
+        // 3. LUMA hook with 4-channel mat4 * LUMA_texOff must error cleanly.
+        let luma_mat4 = r#"
+//!HOOK LUMA
+//!BIND LUMA
+//!SAVE F1
+vec4 hook() {
+    vec4 res = mat4(1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1) * LUMA_texOff(vec2(0, 0));
+    return res;
+}
+//!HOOK LUMA
+//!BIND F1
+vec4 hook() {
+    ivec2 index = ivec2(0);
+    return vec4(F1_tex(F1_pos)[index.x * 2 + index.y], 0, 0, 1);
+}
+"#;
+        assert!(parse("luma-mat4", luma_mat4).is_err());
+
+        // 4. Multi-byte UTF-8 immediately before _texOff( / _tex( must not panic on char boundary.
+        for utf8_shader in [
+            "//!HOOK MAIN\n//!SAVE F1\n#define g_0 (中_texOff(vec2(0,0)))\nvec4 hook() { return vec4(0.0); }\n",
+            "//!HOOK LUMA\n//!SAVE F1\nvec4 hook() {\nvec4 res = vec4(1,0,0,0) * float(中_texOff(vec2(0,0)));\nreturn res;\n}\n",
+            "//!HOOK MAIN\n//!SAVE F1\n#define g_0 (日本語_tex(pos))\nvec4 hook() { return vec4(0.0); }\n",
+        ] {
+            assert!(parse("utf8", utf8_shader).is_err());
+        }
+
+        // 5. Non-finite matrix/bias/PReLU literals must error cleanly.
+        let non_finite = r#"
+//!HOOK LUMA
+//!BIND LUMA
+//!SAVE F1
+vec4 hook() {
+    vec4 res = vec4(NaN, 0.0, 0.0, 0.0) * float(LUMA_texOff(vec2(0, 0)));
+    return res;
+}
+//!HOOK LUMA
+//!BIND F1
+vec4 hook() {
+    ivec2 index = ivec2(0);
+    return vec4(F1_tex(F1_pos)[index.x * 2 + index.y], 0, 0, 1);
+}
+"#;
+        assert!(parse("non-finite", non_finite).is_err());
+
+        // 6. Excessive passes must error cleanly.
+        let mut many = String::new();
+        for i in 0..=MAX_LAYERS + 2 {
+            many.push_str(&format!(
+                "//!HOOK LUMA\n//!SAVE T{i}\nvec4 hook() {{\nvec4 res = vec4(1,0,0,0) * float(LUMA_texOff(vec2(0,0)));\nreturn res;\n}}\n"
+            ));
+        }
+        assert!(parse("too-many-passes", &many).is_err());
     }
 
     /// Converts the Anime4K shaders in `ERIKA_ANIME4K_GLSL_DIR` (a checkout of

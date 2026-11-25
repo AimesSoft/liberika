@@ -91,17 +91,18 @@ impl DeviceCapabilities {
                 "WebGPU SR requires at least 2 storage buffers per compute stage".into(),
             ));
         }
-        if (self.max_uniform_buffer_binding_size as usize) < PARAMS_BYTES {
+        if self.max_uniform_buffer_binding_size < PARAMS_BYTES as u64 {
             return Err(PlayerError::Renderer(format!(
                 "WebGPU uniform limit ({}) is smaller than SR parameter block ({PARAMS_BYTES})",
                 self.max_uniform_buffer_binding_size
             )));
         }
         if self.min_uniform_buffer_offset_alignment == 0
+            || self.min_uniform_buffer_offset_alignment > 65536
             || !self.min_uniform_buffer_offset_alignment.is_power_of_two()
         {
             return Err(PlayerError::Renderer(
-                "WebGPU minUniformBufferOffsetAlignment must be a power of two".into(),
+                "WebGPU minUniformBufferOffsetAlignment must be a power of two <= 65536".into(),
             ));
         }
         if self.max_compute_workgroup_size_x == 0
@@ -198,7 +199,7 @@ impl SrPlan {
             fsr_unroll: true,
             fsr_half_math: false,
             shared_bytes: (caps.max_compute_workgroup_storage_size as usize).min(28 * 1024),
-            uniform_bytes: (caps.max_uniform_buffer_binding_size as usize).min(16384),
+            uniform_bytes: caps.max_uniform_buffer_binding_size.min(16384) as usize,
             fusion: true,
             staging: true,
             unroll: false,
@@ -359,9 +360,19 @@ impl SrPlan {
             .min(caps.max_buffer_size);
         let halo = self.max_halo;
         let (pitch, rows, arena_bytes) = loop {
-            let pitch = tile[0] + 2 * halo;
-            let rows = tile[1] + 2 * halo;
-            let size = u64::from(pitch) * u64::from(rows) * total_slices * element_bytes;
+            let halo2 = halo
+                .checked_mul(2)
+                .ok_or_else(|| PlayerError::Renderer("SR receptive field halo overflow".into()))?;
+            let pitch = tile[0]
+                .checked_add(halo2)
+                .ok_or_else(|| PlayerError::Renderer("SR tile pitch overflow".into()))?;
+            let rows = tile[1]
+                .checked_add(halo2)
+                .ok_or_else(|| PlayerError::Renderer("SR tile height overflow".into()))?;
+            let size = u64::from(pitch)
+                .saturating_mul(u64::from(rows))
+                .saturating_mul(total_slices)
+                .saturating_mul(element_bytes);
             if size <= budget {
                 break (pitch, rows, size.max(16));
             }
@@ -442,7 +453,7 @@ impl SrPlan {
                 }
 
                 let param_offset = params_bytes.len();
-                if param_offset + stride > caps.max_buffer_size as usize
+                if (param_offset as u64).saturating_add(stride as u64) > caps.max_buffer_size
                     || param_offset > u32::MAX as usize
                 {
                     return Err(PlayerError::Renderer(
