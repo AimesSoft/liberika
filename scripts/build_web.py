@@ -13,6 +13,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+from web_npm_package import workspace_version
+
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'target/web-build'
 PREFIX = BUILD / 'prefix'
@@ -91,6 +93,9 @@ def main():
     for file in (ROOT/'packages/erika_web').glob('*'):
         if file.is_file() and file.suffix in ['.js','.json','.ts','.md']: shutil.copy2(file, OUT/file.name)
     shutil.copy2(ROOT/'examples/web_player/index.html', OUT/'index.html')
+    package = json.loads((OUT/'package.json').read_text())
+    package['version'] = workspace_version()
+    (OUT/'package.json').write_text(json.dumps(package, indent=2)+'\n')
     # Rust embeds the fallback font and supplies it to libass at runtime.
     # Retire the extra file too when rebuilding an existing output directory.
     (OUT/'subfont.ttf').unlink(missing_ok=True)

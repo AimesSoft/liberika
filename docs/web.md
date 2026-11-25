@@ -10,13 +10,14 @@ required.
 
 The backend is integrated into the **Erika Web application**, including its
 playback controls, track selection, chapters, screenshots and danmaku settings.
-Release 0.3.7 includes `liberika-web-0.3.7.zip`, a complete browser runtime and
+Release 0.3.8 includes `liberika-web-0.3.8.zip`, a complete browser runtime and
 `index.html` demo with SHA-256 recorded in `SHA256SUMS`. Extract the whole archive
-and serve it over HTTPS or localhost. It is separate from the native bundles
-and is not published to npm; source builds remain available.
+and serve it over HTTPS or localhost. It is separate from the native bundles.
+The same runtime is published to npm as `@aimessoft/liberika-web`, and source builds
+remain available.
 
-The [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7)
-also includes `liberika-web-nofont-0.3.7.zip`. This variant requires the host to
+The [0.3.8 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8)
+also includes `liberika-web-nofont-0.3.8.zip`. This variant requires the host to
 provide font bytes through `Player.create({ canvas, fallbackFont: { data, index } })`;
 the WASM subtitle/text pipeline cannot load installed system font files automatically. Choose the full archive
 when the page does not supply a fallback font.
@@ -87,8 +88,9 @@ their existing directories; Web libraries live in `target/web-build`.
 Open `http://127.0.0.1:18765`. The example accepts local files, external subtitles
 and Bilibili XML/Dandanplay JSON comments. `?src=URL` opens remote media. The
 included localhost server supports Range requests. The generated directory is
-a deployable package, not an npm publication; keep JS, WASM, workers and
-license notices together. `build-manifest.json` records output SHA-256 hashes.
+a deployable package; keep JS, WASM, workers and license notices together.
+`python3 scripts/web_npm_package.py` stages the npm package from it in
+`target/npm/web`. `build-manifest.json` records output SHA-256 hashes.
 
 A host that already has font bytes can drop about 6 MB with
 the `liberika-web-nofont` package or `web build --without-fallback-font`, and hand the font over with
@@ -96,8 +98,24 @@ the `liberika-web-nofont` package or `web build --without-fallback-font`, and ha
 
 ## Embed
 
-Copy the generated runtime into your site's `liberika/` directory, preserving
-its relative paths. The following page lets a user select a local MKV and then
+With a bundler, install the package and import it by name:
+
+```sh
+npm install @aimessoft/liberika-web
+```
+
+```js
+import { Player } from '@aimessoft/liberika-web';
+```
+
+Vite builds and serves it without configuration: the worker and both WASM
+files are referenced through `new URL(..., import.meta.url)`, which other
+bundlers that follow that form also pick up. `@aimessoft/liberika-web-nofont` is the
+same package without the fallback font.
+
+Without a bundler, copy the generated runtime, or the installed package
+directory, into your site's `liberika/` directory, preserving its relative
+paths. The following page lets a user select a local MKV and then
 start playback. Embedded ASS and font attachments are loaded automatically.
 
 ```html
@@ -205,6 +223,11 @@ these figures are package sizes, not runtime memory usage.
   valid HTTP `206` byte-range responses with a known total length; cross-origin
   servers must expose `Content-Range` through `Access-Control-Expose-Headers`.
   The included `scripts/serve_web.py` supports Range for local testing.
+- A page may load the runtime from another origin, such as an npm CDN, when
+  that origin sends CORS headers. The worker then starts through a same-origin
+  blob module, which a Content-Security-Policy must allow with
+  `worker-src blob:`. To host only `worker.js` and the files beside it
+  yourself, pass its address as `Player.create({ canvas, workerURL })`.
 - Deploy each runtime as a versioned directory, or revalidate its entry points
   and resources together, so cached JS does not load a different WASM build.
 - SharedArrayBuffer and cross-origin isolation are not required. Start audio

@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+### ブラウザー
+
+- Web ランタイムを npm の `@aimessoft/liberika-web`、およびフォールバックフォントを含まない `@aimessoft/liberika-web-nofont` として公開。Vite は設定なしでバンドルできます。
+- ページは別オリジン（npm CDN など）からランタイムを読み込めます。`worker.js` を自分で配信するホスト向けに `Player.create` へ `workerURL` を追加。
+- ビルド出力の `package.json` のバージョンを Cargo workspace に合わせました（従来は 0.1.8 のまま）。
+
 ## 0.3.8 - 2026-11-20
 
 ### Windows

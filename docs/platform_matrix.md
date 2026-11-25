@@ -2,7 +2,7 @@
 
 > [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
 
-These platforms use 0.3.7 as their baseline. The browser backend is integrated into Erika Web and a separate Web archive is available in the Release. Linux remains experimental; the 0.3.7 Release includes x64 / ARM64 × bundled / system packages, all built on Ubuntu 22.04.
+These platforms use 0.3.8 as their baseline. The browser backend is integrated into Erika Web, ships as an npm package and as a separate Web archive in the Release, and has a [live demo](https://liberika.aimes-soft.com/demo/). Linux remains experimental; since 0.3.7 the Release includes x64 / ARM64 × bundled / system packages, all built on Ubuntu 22.04.
 
 | Platform | Minimum | Decode / render | Audio | Distribution and builds |
 |---|---|---|---|---|
@@ -13,7 +13,7 @@ These platforms use 0.3.7 as their baseline. The browser backend is integrated i
 | Android | 8 / API 26 | MediaCodec / software + wgpu | AAudio | Four ABIs; Flutter |
 | OpenHarmony | API 18 | AVCodec / software + wgpu | OHAudio | arm64; Flutter / ArkTS OHPM |
 | Linux (experimental) | glibc 2.35; system mode also needs FFmpeg 8 shared libraries | NVDEC / VA-API / software + wgpu | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system; Rust / C ABI / Flutter |
-| Browser | HTTPS / localhost; WebCodecs video and audio, OffscreenCanvas, WebGL2, Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | Prebuilt Release archive or JS / WASM source build; not published on npm |
+| Browser | HTTPS / localhost; WebCodecs video and audio, OffscreenCanvas, WebGL2, Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | npm `@aimessoft/liberika-web`, prebuilt Release archive, or JS / WASM source build |
 
 Native platforms provide a C ABI Presenter; browsers use the JavaScript / TypeScript `Player`. Hardware decode depends on the codec, device and driver; browser codec configuration support is checked at runtime.
 

@@ -3,10 +3,23 @@
 An embeddable browser player for MKV with ASS subtitles, attached fonts and
 danmaku. The backend is part of liberika and is integrated into Erika Web.
 
-Download `liberika-web-0.3.7.zip` from the [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7), or
-build from current source with `cargo run -p xtask -- web build`; deploy the
-complete runtime in `target/web/`, preserving its relative paths. This source
-directory alone is not a deployable package, and no npm release is available.
+```sh
+npm install @aimessoft/liberika-web
+```
+
+Vite and other bundlers that follow `new URL(..., import.meta.url)` pick up the
+worker and both WASM files without configuration. Without a bundler, serve the
+package directory unchanged and import its `index.js`; from another origin, such
+as a CDN, the worker is started through a same-origin blob, so a page with a
+Content-Security-Policy needs `worker-src blob:`. A host that serves `worker.js`
+itself, beside the other runtime files, names it with
+`Player.create({ canvas, workerURL })`.
+
+The same runtime is in `liberika-web-X.Y.Z.zip` on each
+[Release](https://github.com/AimesSoft/liberika/releases), with an `index.html`
+demo, and builds from source with `cargo run -p xtask -- web build` into
+`target/web/`. The `packages/erika_web` source directory alone has no WASM and
+is not deployable.
 
 [Build, API and browser requirements](../../docs/web.md) ·
 [中文说明](../../docs/web.zh.md)
@@ -20,8 +33,8 @@ into one canvas, automatically falling back to WebGL2 where WebGPU is
 unavailable. Embedded ASS fonts load automatically,
 and subtitle/danmaku supersampling is independent of the video resolution.
 The complete fallback font is embedded once in the Rust WASM and supplied to
-libass by the worker; no standalone font download is required. The
-`liberika-web-nofont-0.3.7.zip` archive, or a build with `web build --without-fallback-font`,
+libass by the worker; no standalone font download is required.
+`@aimessoft/liberika-web-nofont`, about 6 MB smaller, or a build with `web build --without-fallback-font`,
 requires the host to supply font bytes instead; the WASM subtitle/text pipeline
 cannot load installed system font files automatically:
 `Player.create({ canvas, fallbackFont: { data, index } })`.
@@ -32,7 +45,7 @@ Color emoji danmaku arrived in 0.3.6 and uses the browser’s own color fonts
 through canvas text drawing; libass subtitle emoji remain monochrome.
 
 ```js
-import { AudioSession, Player } from './liberika/index.js';
+import { AudioSession, Player } from '@aimessoft/liberika-web';
 
 const audioSession = new AudioSession(); // page setup, before the first click
 const player = await Player.create({ canvas, audioSession });
@@ -56,3 +69,10 @@ WebCodecs video/audio decoding, OffscreenCanvas, WebGPU or WebGL2, and Web Audio
 Chrome regression and Safari 27.0.1 HEVC Main 10 / Opus / ASS playback and seeking
 have been verified; detailed codec requirements and current limits are
 in the browser guide above.
+
+## Licenses
+
+liberika is MPL-2.0. The WASM files also contain FFmpeg and FriBidi
+(LGPL-2.1-or-later), libass (ISC), HarfBuzz (MIT-style), FreeType (FTL) and,
+in `@aimessoft/liberika-web`, the Droid Sans Fallback font (Apache-2.0). Their texts are
+in `licenses/`.

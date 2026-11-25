@@ -13,9 +13,10 @@
 
 The host application provides a rendering surface and sends playback commands — decoding, timing, video rendering, subtitles, danmaku, and audio output are handled entirely inside Erika. Native video surfaces present directly; Flutter textures can participate in host composition.
 
-Current release: **0.3.7**. Start with the [documentation index](../docs/README.en.md).
+Current release: **0.3.8**. Start with the [documentation index](../docs/README.en.md).
 
-**Play MKV in the browser with its ASS subtitles and attached fonts.** The current
+**Play MKV in the browser with its ASS subtitles and attached fonts.** [Open the live demo](https://liberika.aimes-soft.com/demo/),
+or `npm install @aimessoft/liberika-web`. The current
 source includes a [Web / WASM backend](../docs/web.md), integrated into Erika Web.
 WebCodecs decodes audio/video; libass in WASM renders subtitle fonts, positioning,
 outlines and effects; Rust danmaku and subtitles share the playback clock and
@@ -23,10 +24,11 @@ WebGL2 compositor. Sites can keep their own UI and serve the original file with
 HTTP Range, without first extracting subtitles or burning them into video on
 the server.
 
-Releases 0.3.5–0.3.7 fix Windows control layering and isolate external subtitle
-failures, add color emoji danmaku and optional embedded fonts, and introduce
-Bilibili mode 7 comments and Linux linear dma-buf output. Version 0.3.7 ships
-four Linux archives: x64 / ARM64, each with bundled or system dependencies.
+Release 0.3.8 adds Windows D3D11 screenshots, response validation and stall
+recovery for HTTP sources, cancellable opens, and faster software-decode uploads
+and subtitle atlases. Releases 0.3.5–0.3.7 added color emoji danmaku, optional
+embedded fonts, Bilibili mode 7 comments, Linux linear dma-buf output, and four
+Linux archives: x64 / ARM64, each with bundled or system dependencies.
 See the [changelog](../CHANGELOG.md) for changes and migration notes.
 
 ## Features
@@ -42,18 +44,36 @@ See the [changelog](../CHANGELOG.md) for changes and migration notes.
 
 | Host | Install / entry point | Guide |
 |---|---|---|
-| Browser / JavaScript / TypeScript | Download `liberika-web-0.3.7.zip` or build from source | [Web integration and deployment](../docs/web.md) |
-| Flutter | `flutter pub add erika_flutter` (0.3.7) | [Plugin guide](../packages/erika_flutter/README.md) |
-| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode; latest public SDK is 0.3.7 as of 2026-11-16 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| Browser / JavaScript / TypeScript | `npm install @aimessoft/liberika-web`, or download `liberika-web-0.3.8.zip` | [Web integration and deployment](../docs/web.md) |
+| Flutter | `flutter pub add erika_flutter` (0.3.8) | [Plugin guide](../packages/erika_flutter/README.md) |
+| Swift / Apple | Add `https://github.com/AimesSoft/liberika-swift` in Xcode; latest public SDK is 0.3.8 as of 2026-11-26 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
 | OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
 | C / C++ | Matching C ABI bundle and `erika.h` | [Native integration](../docs/integration.md) |
-| Rust | Git dependency pinned to `v0.3.7` | [Build guide](../docs/building.md) |
+| Rust | Git dependency pinned to `v0.3.8` | [Build guide](../docs/building.md) |
 | Linux | x64 / ARM64, bundled / system modes, glibc 2.35 baseline | [Linux guide](../docs/linux.md) |
 
-As of 2026-11-16, OHPM lists 0.3.7 as the latest public version.
-Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7).
+As of 2026-11-26, OHPM lists 0.3.8 as the latest public version.
+Native archives are available from [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8).
 
 ### Browser
+
+```sh
+npm install @aimessoft/liberika-web
+```
+
+```js
+import { Player } from '@aimessoft/liberika-web';
+
+const player = await Player.create({ canvas });
+await player.open(fileOrURL);
+await player.play();
+```
+
+Try it first in the [live demo](https://liberika.aimes-soft.com/demo/), which loads the same package from an npm CDN.
+Vite and similar bundlers need no configuration. `@aimessoft/liberika-web-nofont`
+leaves out the fallback font, about 6 MB, for hosts that supply their own.
+You can also extract `liberika-web-0.3.8.zip` from the Release and host it
+yourself, or build from source:
 
 ```sh
 # Install Emscripten, wasm-bindgen and the other build prerequisites first.
@@ -61,11 +81,6 @@ cargo run -p xtask -- web build
 python3 scripts/serve_web.py
 ```
 
-Open `http://127.0.0.1:18765` for the demo. Deploy the runtime from `target/web/`
-and use `Player.create({ canvas })` and `player.open(fileOrURL)` in your own UI.
-The Release includes `liberika-web-0.3.7.zip` with a demo `index.html`.
-Extract the whole archive and serve it over HTTPS or localhost; source builds
-are also available. The Web package has not been published to npm.
 Audio/video codecs depend on browser WebCodecs support. See the [browser guide](../docs/web.md)
 for prerequisites, a complete example and the Erika integration.
 
@@ -90,7 +105,7 @@ platform-specific choices and lifecycle.
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.7" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.8" }
 ```
 
 ```rust

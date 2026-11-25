@@ -8,6 +8,13 @@ from pathlib import Path
 import re
 
 class Handler(SimpleHTTPRequestHandler):
+    cors = False
+    def end_headers(self):
+        # Lets a page on another origin load this directory, as from a CDN.
+        if self.cors:
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Expose-Headers', 'Content-Range')
+        super().end_headers()
     def send_head(self):
         self.range_end = None
         header = self.headers.get('Range')
@@ -46,7 +53,9 @@ if __name__ == '__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port',type=int,default=18765)
     parser.add_argument('--directory',default=str(Path(__file__).resolve().parents[1]/'target/web'))
+    parser.add_argument('--cors',action='store_true',help='allow pages on other origins to load the files')
     args=parser.parse_args()
+    Handler.cors=args.cors
     server=ThreadingHTTPServer(('127.0.0.1',args.port),partial(Handler,directory=args.directory))
     print(f'http://127.0.0.1:{server.server_port}',flush=True)
     server.serve_forever()

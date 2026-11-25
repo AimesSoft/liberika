@@ -124,6 +124,9 @@ export class Player extends EventTarget {
     fallbackFont?: { data: ArrayBuffer | Uint8Array; index?: number };
     /** Presentation backend: "auto" prefers WebGPU and falls back to WebGL2. */
     renderer?: RendererPreference;
+    /** Where the page hosts this package's `worker.js`, next to the other
+     * runtime files. Defaults to the copy beside `index.js`. */
+    workerURL?: string | URL;
   }): Promise<Player>;
   private constructor();
   readonly currentTime: number;
