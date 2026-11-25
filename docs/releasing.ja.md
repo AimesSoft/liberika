@@ -37,7 +37,7 @@ git push origin "v${VERSION}"
 - 内部 tag `erika_flutter-vX.Y.Z` を作成し、[Flutter OIDC 公開](../.github/workflows/pub-publish.yml)を開始。
 - ArkTS HAR を build し OHPM に upload。
 - Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。liberika-swift に更新・テスト・同じ version の公開を通知。
-- npm パッケージ `@liberika/web` と `@liberika/web-nofont` を公開します。`Release` が Web アーカイブのビルド時に作成した 2 つの tarball を使い、バージョンは Cargo workspace から取ります。
+- npm パッケージ `@aimessoft/liberika-web` と `@aimessoft/liberika-web-nofont` を公開します。`Release` が Web アーカイブのビルド時に作成した 2 つの tarball を使い、バージョンは Cargo workspace から取ります。
 
 Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが作成するのはコア tag だけです。別 repository の tag と Swift 公開には secret `ERIKA_SWIFT_RELEASE_TOKEN` を使います。
 
@@ -47,7 +47,7 @@ tag で build と GitHub Release の公開が始まります。手動の `workfl
 
 npm 公開は trusted publishing を使い、トークンを保存しません。リポジトリ変数 `NPM_PUBLISH` が `true` のときだけ実行されます。trusted publisher はパッケージの設定ページで構成するため、各パッケージの最初のバージョンは手動で公開します。
 
-1. npmjs.com で `liberika` 組織を作成し、アカウントの 2FA を有効にします。
+1. npmjs.com で `aimessoft` 組織を作成し、アカウントの 2FA を有効にします。
 2. `Release` 実行の `liberika-web-npm` artifact をダウンロードし、2 つの tarball それぞれに `npm publish <tarball> --access public --registry https://registry.npmjs.org/` を実行します。ローカルでは `web build` の後に `python3 scripts/web_npm_package.py` と `npm pack` で同じ tarball が得られます。
 3. 両パッケージの Settings → Trusted Publisher で GitHub Actions を選び、`AimesSoft/liberika` と workflow ファイル名 `release-ecosystem.yml` を入力します。
 4. リポジトリの Settings → Variables に `NPM_PUBLISH=true` を追加します。以後のリリースは自動でアップロードされ、既存のバージョンはスキップされます。

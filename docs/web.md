@@ -13,7 +13,7 @@ playback controls, track selection, chapters, screenshots and danmaku settings.
 Release 0.3.7 includes `liberika-web-0.3.7.zip`, a complete browser runtime and
 `index.html` demo with SHA-256 recorded in `SHA256SUMS`. Extract the whole archive
 and serve it over HTTPS or localhost. It is separate from the native bundles.
-The same runtime is published to npm as `@liberika/web`, and source builds
+The same runtime is published to npm as `@aimessoft/liberika-web`, and source builds
 remain available.
 
 The [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7)
@@ -101,16 +101,16 @@ the `liberika-web-nofont` package or `web build --without-fallback-font`, and ha
 With a bundler, install the package and import it by name:
 
 ```sh
-npm install @liberika/web
+npm install @aimessoft/liberika-web
 ```
 
 ```js
-import { Player } from '@liberika/web';
+import { Player } from '@aimessoft/liberika-web';
 ```
 
 Vite builds and serves it without configuration: the worker and both WASM
 files are referenced through `new URL(..., import.meta.url)`, which other
-bundlers that follow that form also pick up. `@liberika/web-nofont` is the
+bundlers that follow that form also pick up. `@aimessoft/liberika-web-nofont` is the
 same package without the fallback font.
 
 Without a bundler, copy the generated runtime, or the installed package

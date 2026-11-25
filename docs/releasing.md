@@ -37,7 +37,7 @@ git push origin "v${VERSION}"
 - Creates the internal `erika_flutter-vX.Y.Z` tag to trigger [Flutter OIDC publishing](../.github/workflows/pub-publish.yml).
 - Builds the ArkTS HAR and uploads it to OHPM.
 - Assembles the Swift XCFramework, appends it to the core Release and `SHA256SUMS`, and dispatches liberika-swift to update, test, and publish its matching version.
-- Publishes the npm packages `@liberika/web` and `@liberika/web-nofont` from the two tarballs `Release` packed while building the Web archives; their version comes from the Cargo workspace.
+- Publishes the npm packages `@aimessoft/liberika-web` and `@aimessoft/liberika-web-nofont` from the two tarballs `Release` packed while building the Web archives; their version comes from the Cargo workspace.
 
 Flutter, OHPM, and Swift publishing can run in parallel. Maintainers create only the core tag. Cross-repository tags and Swift publishing use the repository secret `ERIKA_SWIFT_RELEASE_TOKEN`.
 
@@ -47,7 +47,7 @@ A tag triggers the builds and the GitHub Release publish step. The manual `workf
 
 npm publishing uses trusted publishing, stores no token, and runs only while the repository variable `NPM_PUBLISH` is `true`. A trusted publisher is configured on a package's settings page, so the first version of each package is published by hand:
 
-1. Create the `liberika` organization on npmjs.com, with 2FA on the account.
+1. Create the `aimessoft` organization on npmjs.com, with 2FA on the account.
 2. Download the `liberika-web-npm` artifact of a `Release` run and run `npm publish <tarball> --access public --registry https://registry.npmjs.org/` for each of its two tarballs. Locally, `python3 scripts/web_npm_package.py` after `web build`, then `npm pack`, gives the same tarballs.
 3. Under Settings → Trusted Publisher of both packages, choose GitHub Actions and enter `AimesSoft/liberika` and the workflow file name `release-ecosystem.yml`.
 4. Add `NPM_PUBLISH=true` under the repository's Settings → Variables. Every later release uploads by itself and skips a version that already exists.

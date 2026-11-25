@@ -1,5 +1,5 @@
 {
-  "name": "@liberika/web",
+  "name": "@aimessoft/liberika-web",
   "version": "0.0.0",
   "description": "Play MKV in the browser with ASS subtitles, attached fonts and danmaku: WebCodecs, libass and a Rust danmaku engine in WASM",
   "keywords": [

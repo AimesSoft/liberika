@@ -19,7 +19,7 @@ RUNTIME = ['index.js', 'index.d.ts', 'worker.js', 'renderer.js', 'source.js', 'a
 DOCUMENTS = ['README.md', 'LICENSE', 'WEB-GUIDE.md', 'WEB-GUIDE.zh.md']
 NOFONT_NOTE = ('> This is the build without the fallback font. Hand one over with\n'
                '> `Player.create({ canvas, fallbackFont: { data, index } })`, or install\n'
-               '> `@liberika/web`, which carries its own.\n\n')
+               '> `@aimessoft/liberika-web`, which carries its own.\n\n')
 
 
 def workspace_version():
@@ -60,7 +60,7 @@ def main():
     parser.add_argument('--out', type=Path, help='defaults to target/npm/web or target/npm/web-nofont')
     parser.add_argument('--version', default=workspace_version(), help='defaults to the Cargo workspace version')
     parser.add_argument('--without-fallback-font', action='store_true',
-                        help='the runtime was built without the font; stage it as @liberika/web-nofont')
+                        help='the runtime was built without the font; stage it as @aimessoft/liberika-web-nofont')
     args = parser.parse_args()
     out = args.out or ROOT / 'target/npm' / ('web-nofont' if args.without_fallback_font else 'web')
     package = stage(args.source, out, args.version, args.without_fallback_font)

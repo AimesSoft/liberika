@@ -56,7 +56,7 @@ jobs:
           (cd target/npm/web && npm pack --pack-destination ..)
           rm -rf target/web-consumer
           cp -R packages/erika_web/tests/consumer target/web-consumer
-          (cd target/web-consumer && npm install --no-audit --no-fund ../npm/liberika-web-*.tgz && npm run build)
+          (cd target/web-consumer && npm install --no-audit --no-fund ../npm/aimessoft-liberika-web-*.tgz && npm run build)
           cp -R target/web/fixtures target/web-consumer/dist/fixtures
           cp -R target/npm/web target/web-consumer/dist/liberika
           python3 scripts/serve_web.py --port 18766 --directory target/web-consumer/dist > target/web-consumer-server.log 2>&1 &

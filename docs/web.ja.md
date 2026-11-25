@@ -4,7 +4,7 @@
 
 liberika のブラウザービルドには、既存の Rust 弾幕エンジン、リポジトリでパッチを適用した libass と FreeType/HarfBuzz/FriBidi、コンテナーのデマルチプレックス用に絞った FFmpeg が含まれます。`Player` がパイプライン全体を管理し、アプリは Canvas とメディアソースを渡します。別の字幕・弾幕ライブラリは不要です。
 
-このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.7 の `liberika-web-0.3.7.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別です。同じランタイムを npm の `@liberika/web` として公開しており、ソースからのビルドも可能です。
+このバックエンドは **Erika Web アプリ**の再生操作、トラック選択、チャプター、スクリーンショット、弾幕設定に統合されています。リリース 0.3.7 の `liberika-web-0.3.7.zip` は完全なブラウザーランタイムと `index.html` デモを含み、SHA-256 は `SHA256SUMS` に記録されています。アーカイブ全体を展開し、HTTPS または localhost で配信してください。ネイティブバンドルとは別です。同じランタイムを npm の `@aimessoft/liberika-web` として公開しており、ソースからのビルドも可能です。
 
 [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) は
 `liberika-web-nofont-0.3.7.zip` も提供します。この版では
@@ -56,14 +56,14 @@ python3 scripts/serve_web.py
 バンドラーを使う場合は、インストールしてパッケージ名でインポートします。
 
 ```sh
-npm install @liberika/web
+npm install @aimessoft/liberika-web
 ```
 
 ```js
-import { Player } from '@liberika/web';
+import { Player } from '@aimessoft/liberika-web';
 ```
 
-Vite は設定なしでビルド・開発できます。Worker と両 WASM は `new URL(..., import.meta.url)` で参照しており、この書き方を解釈する他のバンドラーでも同様です。`@liberika/web-nofont` はフォールバックフォントを含まない同じパッケージです。
+Vite は設定なしでビルド・開発できます。Worker と両 WASM は `new URL(..., import.meta.url)` で参照しており、この書き方を解釈する他のバンドラーでも同様です。`@aimessoft/liberika-web-nofont` はフォールバックフォントを含まない同じパッケージです。
 
 バンドラーを使わない場合は、生成したランタイム、またはインストールしたパッケージのディレクトリを、相対パスを保ってサイトの `liberika/` ディレクトリにコピーします。以下はユーザーがローカル MKV を選択し再生するページです。埋め込み ASS と添付フォントは自動で読み込まれます。
 

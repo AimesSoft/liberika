@@ -4,7 +4,7 @@ An embeddable browser player for MKV with ASS subtitles, attached fonts and
 danmaku. The backend is part of liberika and is integrated into Erika Web.
 
 ```sh
-npm install @liberika/web
+npm install @aimessoft/liberika-web
 ```
 
 Vite and other bundlers that follow `new URL(..., import.meta.url)` pick up the
@@ -31,7 +31,7 @@ subtitles and danmaku into one canvas. Embedded ASS fonts load automatically,
 and subtitle/danmaku supersampling is independent of the video resolution.
 The complete fallback font is embedded once in the Rust WASM and supplied to
 libass by the worker; no standalone font download is required.
-`@liberika/web-nofont`, about 6 MB smaller, or a build with `web build --without-fallback-font`,
+`@aimessoft/liberika-web-nofont`, about 6 MB smaller, or a build with `web build --without-fallback-font`,
 requires the host to supply font bytes instead; the WASM subtitle/text pipeline
 cannot load installed system font files automatically:
 `Player.create({ canvas, fallbackFont: { data, index } })`.
@@ -42,7 +42,7 @@ Color emoji danmaku arrived in 0.3.6 and uses the browser’s own color fonts
 through canvas text drawing; libass subtitle emoji remain monochrome.
 
 ```js
-import { AudioSession, Player } from '@liberika/web';
+import { AudioSession, Player } from '@aimessoft/liberika-web';
 
 const audioSession = new AudioSession(); // page setup, before the first click
 const player = await Player.create({ canvas, audioSession });
@@ -71,5 +71,5 @@ in the browser guide above.
 
 liberika is MPL-2.0. The WASM files also contain FFmpeg and FriBidi
 (LGPL-2.1-or-later), libass (ISC), HarfBuzz (MIT-style), FreeType (FTL) and,
-in `@liberika/web`, the Droid Sans Fallback font (Apache-2.0). Their texts are
+in `@aimessoft/liberika-web`, the Droid Sans Fallback font (Apache-2.0). Their texts are
 in `licenses/`.

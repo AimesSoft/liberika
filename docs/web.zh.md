@@ -9,7 +9,7 @@ libass、FreeType、HarfBuzz、FriBidi，以及负责解封装的精简 FFmpeg�
 这一后端已接入 **Erika Web 应用**，包括播放控件、轨道选择、章节、截图和弹幕设置。
 0.3.7 Release 提供独立的 `liberika-web-0.3.7.zip`，包含完整浏览器运行时和
 `index.html` 演示页，校验值记录在 `SHA256SUMS`。解压整个归档后通过 HTTPS 或本机
-HTTP 服务访问；也可从源码构建。同一运行时以 `@liberika/web` 发布到 npm。
+HTTP 服务访问；也可从源码构建。同一运行时以 `@aimessoft/liberika-web` 发布到 npm。
 
 [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) 还提供
 `liberika-web-nofont-0.3.7.zip`。此版本由宿主通过
@@ -80,16 +80,16 @@ python3 scripts/serve_web.py
 使用打包器时，安装后按包名导入：
 
 ```sh
-npm install @liberika/web
+npm install @aimessoft/liberika-web
 ```
 
 ```js
-import { Player } from '@liberika/web';
+import { Player } from '@aimessoft/liberika-web';
 ```
 
 Vite 不需要额外配置即可构建和开发：Worker 与两个 WASM 都通过
 `new URL(..., import.meta.url)` 引用，其他识别这种写法的打包器同样适用。
-`@liberika/web-nofont` 是不含回退字体的同一个包。
+`@aimessoft/liberika-web-nofont` 是不含回退字体的同一个包。
 
 不使用打包器时，将构建产物或已安装的包目录中的运行时资源复制到网站的 `liberika/` 目录，保持相对路径。
 下面的页面可选择本地 MKV，再点击播放；内嵌 ASS 和字体附件自动加载。

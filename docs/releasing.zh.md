@@ -37,7 +37,7 @@ git push origin "v${VERSION}"
 - 创建内部 `erika_flutter-vX.Y.Z` tag，触发 [Flutter OIDC 发布](../.github/workflows/pub-publish.yml)。
 - 构建 ArkTS HAR 并上传 OHPM。
 - 组装 Swift XCFramework，追加到核心 Release 和 `SHA256SUMS`，通知 liberika-swift 更新、测试并发布对应版本。
-- 发布 npm 包 `@liberika/web` 与 `@liberika/web-nofont`：使用 `Release` 在构建 Web 归档时打好的两个 tarball，版本取自 Cargo workspace。
+- 发布 npm 包 `@aimessoft/liberika-web` 与 `@aimessoft/liberika-web-nofont`：使用 `Release` 在构建 Web 归档时打好的两个 tarball，版本取自 Cargo workspace。
 
 Flutter、OHPM 和 Swift 发布可以并行进行。维护者只创建核心 tag；跨仓库 tag 和 Swift 发布使用仓库 secret `ERIKA_SWIFT_RELEASE_TOKEN`。
 
@@ -47,7 +47,7 @@ tag 触发构建和 GitHub Release 发布。手动的 `workflow_dispatch` 只用
 
 npm 发布使用 trusted publishing，不保存 token，仓库变量 `NPM_PUBLISH` 为 `true` 时才运行。trusted publisher 在包的设置页里配置，因此每个包的第一个版本需要手动发布一次：
 
-1. 在 npmjs.com 创建 `liberika` 组织，账号启用 2FA。
+1. 在 npmjs.com 创建 `aimessoft` 组织，账号启用 2FA。
 2. 从一次 `Release` 运行下载 `liberika-web-npm` artifact，对其中两个 tarball 分别执行 `npm publish <tarball> --access public --registry https://registry.npmjs.org/`。本地也可在 `web build` 后用 `python3 scripts/web_npm_package.py` 和 `npm pack` 得到同样的 tarball。
 3. 在两个包的 Settings → Trusted Publisher 选择 GitHub Actions，填写 `AimesSoft/liberika` 和 workflow 文件名 `release-ecosystem.yml`。
 4. 在仓库 Settings → Variables 添加 `NPM_PUBLISH=true`。此后每次发布自动上传，已存在的版本会跳过。

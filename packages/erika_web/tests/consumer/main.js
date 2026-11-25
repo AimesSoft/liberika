@@ -1,5 +1,5 @@
-// What a site does after `npm install @liberika/web`: a bare import, bundled.
-import { Player } from "@liberika/web";
+// What a site does after `npm install @aimessoft/liberika-web`: a bare import, bundled.
+import { Player } from "@aimessoft/liberika-web";
 
 window.playerReady = Player.create({
   canvas: document.querySelector("#video"),
