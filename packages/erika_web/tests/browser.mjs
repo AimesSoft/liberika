@@ -49,6 +49,24 @@ try {
   await page.locator("#file").setInputFiles("target/web/fixtures/test.mkv");
   await page.waitForFunction(() => player.info, null, { timeout: 30000 });
   assert.equal(await page.evaluate(() => player.info.backend), "webcodecs");
+  const activeRenderer = await page.evaluate(() => player.renderer);
+  assert.ok(
+    activeRenderer === "webgpu" || activeRenderer === "webgl2",
+    `unexpected renderer: ${activeRenderer}`,
+  );
+  report.renderer = activeRenderer;
+  if (activeRenderer === "webgpu") {
+    const srModes = await page.evaluate(async () => {
+      const results = [];
+      for (const mode of ["fsr1", "anime4k_s"]) {
+        results.push(await player.setUpscaler(mode));
+      }
+      return results;
+    });
+    report.upscalerInit = srModes;
+    assert.equal(srModes[0].activeBackend, "compute");
+    assert.equal(srModes[1].activeBackend, "compute");
+  }
   await page.evaluate(async () => {
     await player.addDanmaku(
       JSON.stringify(
@@ -79,6 +97,13 @@ try {
     wall: performance.now(),
   }));
   report.playback = { before, after };
+  if (activeRenderer === "webgpu") {
+    assert.ok(
+      after.upscaler && after.upscaler.upscaledFrames > 0,
+      `expected WebGPU SR upscaled frames, got ${JSON.stringify(after.upscaler)}`,
+    );
+    await page.evaluate(() => player.setUpscaler("off"));
+  }
   assert.ok(after.decodedVideo > before.decodedVideo);
   assert.ok(after.decodedAudio > before.decodedAudio);
   assert.ok(after.time > before.time);

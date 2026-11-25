@@ -6,8 +6,15 @@ use crate::danmaku::{
     DanmakuTimeline, DanmakuViewport, DfmLayoutEngine, DfmPreparedLayout,
 };
 use crate::font::{FallbackFont, SubtitleFontAttachment};
-use js_sys::{Float32Array, Object, Reflect, Uint8Array};
-use std::{sync::Arc, time::Duration};
+use crate::renderer::pipeline::{LumaUpscalerMode, UpscalerFamily};
+use crate::renderer::sr::{
+    catalog as sr_catalog, fold as sr_fold,
+    model::SrModel,
+    plan::{DeviceCapabilities, PARAMS_BYTES, SrPlan, WEB_UPSCALER_MODES},
+    reference::LumaRange,
+};
+use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array, Uint32Array};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use wasm_bindgen::prelude::*;
 
 thread_local! {
@@ -422,5 +429,306 @@ impl WebDanmaku {
 impl Default for WebDanmaku {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// WebGPU super-resolution shader compiler and tiled frame planner.
+///
+/// Reuses Erika's native SR network catalog, algebraic layer fusion, mpv hook
+/// shader parser, and WGSL code generator so the browser executes the exact
+/// same compute kernels as native wgpu/Metal/D3D11 builds.
+#[wasm_bindgen]
+pub struct WebSrPlanner {
+    caps: DeviceCapabilities,
+    custom: Option<Arc<SrModel>>,
+    plans: HashMap<u32, SrPlan>,
+    next_plan_id: u32,
+    active_plan_id: Option<u32>,
+}
+
+fn parse_device_capabilities(json: &str) -> Result<DeviceCapabilities, JsValue> {
+    let mut caps = DeviceCapabilities::default();
+    if !json.trim().is_empty() {
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        if let Some(f16) = v.get("shaderF16").and_then(|x| x.as_bool()) {
+            caps.shader_f16 = f16;
+        }
+        let u32_field = |key: &str, slot: &mut u32| {
+            if let Some(n) = v.get(key).and_then(|x| x.as_u64()) {
+                *slot = n.min(u32::MAX as u64) as u32;
+            }
+        };
+        let u64_field = |key: &str, slot: &mut u64| {
+            if let Some(n) = v.get(key).and_then(|x| x.as_u64()) {
+                *slot = n;
+            }
+        };
+        u32_field(
+            "maxComputeWorkgroupStorageSize",
+            &mut caps.max_compute_workgroup_storage_size,
+        );
+        u64_field(
+            "maxUniformBufferBindingSize",
+            &mut caps.max_uniform_buffer_binding_size,
+        );
+        u64_field(
+            "maxStorageBufferBindingSize",
+            &mut caps.max_storage_buffer_binding_size,
+        );
+        u64_field("maxBufferSize", &mut caps.max_buffer_size);
+        u32_field(
+            "maxComputeWorkgroupSizeX",
+            &mut caps.max_compute_workgroup_size_x,
+        );
+        u32_field(
+            "maxComputeWorkgroupSizeY",
+            &mut caps.max_compute_workgroup_size_y,
+        );
+        u32_field(
+            "maxComputeInvocationsPerWorkgroup",
+            &mut caps.max_compute_invocations_per_workgroup,
+        );
+        u32_field("maxTextureDimension2D", &mut caps.max_texture_dimension_2d);
+        u32_field(
+            "minUniformBufferOffsetAlignment",
+            &mut caps.min_uniform_buffer_offset_alignment,
+        );
+        u32_field(
+            "maxStorageBuffersPerShaderStage",
+            &mut caps.max_storage_buffers_per_shader_stage,
+        );
+    }
+    caps.validate()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(caps)
+}
+
+#[wasm_bindgen]
+impl WebSrPlanner {
+    #[wasm_bindgen(constructor)]
+    pub fn new(caps_json: &str) -> Result<WebSrPlanner, JsValue> {
+        let caps = parse_device_capabilities(caps_json)?;
+        Ok(Self {
+            caps,
+            custom: None,
+            plans: HashMap::new(),
+            next_plan_id: 1,
+            active_plan_id: None,
+        })
+    }
+
+    #[wasm_bindgen(js_name = availableModes)]
+    pub fn available_modes() -> Array {
+        let list = Array::new();
+        for mode in WEB_UPSCALER_MODES {
+            list.push(&JsValue::from_str(mode.label()));
+        }
+        list
+    }
+
+    #[wasm_bindgen(js_name = normalizeMode)]
+    pub fn normalize_mode(mode: &str) -> Result<String, JsValue> {
+        let parsed = LumaUpscalerMode::parse(mode)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown upscaler mode: {mode}")))?;
+        if parsed != LumaUpscalerMode::Off
+            && parsed != LumaUpscalerMode::Fsr1
+            && parsed.family() != UpscalerFamily::Network
+        {
+            return Err(JsValue::from_str(&format!(
+                "upscaler mode {} is platform-specific and unavailable on WebGPU",
+                parsed.label()
+            )));
+        }
+        Ok(parsed.label().to_string())
+    }
+
+    #[wasm_bindgen(js_name = loadCustomModel)]
+    pub fn load_custom_model(&mut self, name: &str, bytes: &[u8]) -> Result<JsValue, JsValue> {
+        let source =
+            sr_catalog::load_custom(name, bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let optimized = Arc::new(sr_fold::optimize(&source));
+        let info = Object::new();
+        set(&info, "name", JsValue::from_str(&optimized.name))?;
+        set(&info, "layers", (optimized.layers.len() as u32).into())?;
+        set(
+            &info,
+            "macsPerPixel",
+            (optimized.macs_per_pixel() as f64).into(),
+        )?;
+        set(
+            &info,
+            "parameters",
+            (optimized.parameter_count() as f64).into(),
+        )?;
+        self.custom = Some(optimized);
+        if self
+            .active_plan_id
+            .and_then(|id| self.plans.get(&id))
+            .is_some_and(|p| p.mode == LumaUpscalerMode::Custom)
+        {
+            self.active_plan_id = None;
+        }
+        Ok(info.into())
+    }
+
+    #[wasm_bindgen(js_name = clearCustomModel)]
+    pub fn clear_custom_model(&mut self) {
+        self.custom = None;
+        if self
+            .active_plan_id
+            .and_then(|id| self.plans.get(&id))
+            .is_some_and(|p| p.mode == LumaUpscalerMode::Custom)
+        {
+            self.active_plan_id = None;
+        }
+    }
+
+    #[wasm_bindgen(js_name = releasePlan)]
+    pub fn release_plan(&mut self, plan_id: u32) {
+        self.plans.remove(&plan_id);
+        if self.active_plan_id == Some(plan_id) {
+            self.active_plan_id = None;
+        }
+    }
+
+    pub fn compile(&mut self, mode: &str) -> Result<JsValue, JsValue> {
+        let parsed = LumaUpscalerMode::parse(mode)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown upscaler mode: {mode}")))?;
+        if parsed == LumaUpscalerMode::Off {
+            self.active_plan_id = None;
+            return Ok(JsValue::NULL);
+        }
+        let plan = SrPlan::compile(parsed, self.custom.clone(), self.caps)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let plan_id = loop {
+            let candidate = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
+            if !self.plans.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let result = Object::new();
+        set(&result, "planId", plan_id.into())?;
+        set(&result, "mode", JsValue::from_str(plan.mode.label()))?;
+        set(&result, "packed", plan.packed.into())?;
+        set(&result, "half", plan.half.into())?;
+        set(&result, "paramsBytesSize", (PARAMS_BYTES as u32).into())?;
+
+        let kernels = Array::new();
+        for kernel in &plan.kernels {
+            let entry = Object::new();
+            set(&entry, "source", JsValue::from_str(&kernel.source))?;
+            let flat_weights: Vec<f32> = if kernel.weights.is_empty() {
+                vec![0.0; 4]
+            } else {
+                kernel.weights.iter().flatten().copied().collect()
+            };
+            set(
+                &entry,
+                "weights",
+                Float32Array::from(flat_weights.as_slice()).into(),
+            )?;
+            set(&entry, "uniform", kernel.uniform.into())?;
+            set(&entry, "groupX", kernel.group[0].into())?;
+            set(&entry, "groupY", kernel.group[1].into())?;
+            set(&entry, "ring", kernel.ring.into())?;
+            set(&entry, "head", kernel.head.into())?;
+            set(&entry, "fused", kernel.fused.into())?;
+            kernels.push(&entry);
+        }
+        set(&result, "kernels", kernels.into())?;
+
+        self.plans.insert(plan_id, plan);
+        self.active_plan_id = Some(plan_id);
+        Ok(result.into())
+    }
+
+    #[wasm_bindgen(js_name = planFrame)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_frame(
+        &self,
+        width: u32,
+        height: u32,
+        target_width: u32,
+        target_height: u32,
+        luma_r: f32,
+        luma_g: f32,
+        luma_b: f32,
+        full_range: bool,
+    ) -> Result<JsValue, JsValue> {
+        let Some(plan_id) = self.active_plan_id else {
+            return Err(JsValue::from_str("no active upscaler mode compiled"));
+        };
+        self.plan_frame_for(
+            plan_id,
+            width,
+            height,
+            target_width,
+            target_height,
+            luma_r,
+            luma_g,
+            luma_b,
+            full_range,
+        )
+    }
+
+    #[wasm_bindgen(js_name = planFrameFor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_frame_for(
+        &self,
+        plan_id: u32,
+        width: u32,
+        height: u32,
+        target_width: u32,
+        target_height: u32,
+        luma_r: f32,
+        luma_g: f32,
+        luma_b: f32,
+        full_range: bool,
+    ) -> Result<JsValue, JsValue> {
+        let Some(plan) = self.plans.get(&plan_id) else {
+            return Err(JsValue::from_str("no compiled upscaler plan for planId"));
+        };
+        let frame = plan
+            .plan_frame(
+                width,
+                height,
+                target_width,
+                target_height,
+                [luma_r, luma_g, luma_b],
+                if full_range {
+                    LumaRange::Full
+                } else {
+                    LumaRange::Limited
+                },
+                self.caps,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let result = Object::new();
+        set(&result, "outputWidth", frame.output_width.into())?;
+        set(&result, "outputHeight", frame.output_height.into())?;
+        set(&result, "virtualWidth", frame.virtual_width.into())?;
+        set(&result, "virtualHeight", frame.virtual_height.into())?;
+        set(&result, "packed", frame.packed.into())?;
+        set(&result, "arenaBytes", (frame.arena_bytes as f64).into())?;
+        set(&result, "tileWidth", frame.tile_width.into())?;
+        set(&result, "tileHeight", frame.tile_height.into())?;
+        set(&result, "tiles", frame.tiles.into())?;
+        set(&result, "paramsStride", frame.params_stride.into())?;
+        set(
+            &result,
+            "paramsBytes",
+            Uint8Array::from(frame.params_bytes.as_slice()).into(),
+        )?;
+        set(
+            &result,
+            "dispatches",
+            Uint32Array::from(frame.dispatches.as_slice()).into(),
+        )?;
+        Ok(result.into())
     }
 }

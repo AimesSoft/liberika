@@ -12,7 +12,8 @@
 //!    per-border-class weights ([`ConvLayer::border`]); the result is exact.
 
 use super::model::{
-    Activation, ConvInput, ConvLayer, INPUT_TENSOR, InputTransform, LayerWeights, Padding, SrModel,
+    Activation, ConvInput, ConvLayer, INPUT_TENSOR, InputTransform, LayerWeights, MAX_CHANNELS,
+    MAX_KERNEL, Padding, SrModel,
 };
 
 /// Runs every optimization until none applies. The result is validated; if a
@@ -97,9 +98,13 @@ fn merge_siblings_except(model: &SrModel, apart: &[bool]) -> Result<SrModel, Vec
         };
         let first = &model.layers[index];
         let first_signature = signature(first);
+        let mut group_channels = first.out_channels;
         let mut end = index + 1;
         while end < model.layers.len() && !apart[first.output] {
             let candidate = &model.layers[end];
+            if group_channels.saturating_add(candidate.out_channels) > MAX_CHANNELS {
+                break;
+            }
             let same_inputs = signature(candidate) == first_signature;
             let same_activation = std::mem::discriminant(&candidate.activation)
                 == std::mem::discriminant(&first.activation);
@@ -121,6 +126,7 @@ fn merge_siblings_except(model: &SrModel, apart: &[bool]) -> Result<SrModel, Vec
             {
                 break;
             }
+            group_channels += candidate.out_channels;
             end += 1;
         }
         let mut group = &model.layers[index..end];
@@ -332,10 +338,15 @@ fn fold_one_linear(model: &SrModel) -> Option<SrModel> {
         // Each folding consumer may read the tensor once and must not have
         // border variants of its own.
         let mut seen = Vec::new();
-        let foldable = conv.iter().all(|&(layer, _)| {
+        let foldable = conv.iter().all(|&(layer, input_index)| {
             let fresh = !seen.contains(&layer);
             seen.push(layer);
-            fresh && model.layers[layer].border.is_none()
+            let kc = model.layers[layer].inputs[input_index].kernel;
+            let kernels_fit = producer
+                .inputs
+                .iter()
+                .all(|operand| operand.kernel + kc - 1 <= MAX_KERNEL);
+            fresh && model.layers[layer].border.is_none() && kernels_fit
         });
         if !foldable {
             continue;

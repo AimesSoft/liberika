@@ -7,6 +7,18 @@ pub mod audio;
 mod color_glyph;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod core;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod core {
+    use thiserror::Error;
+
+    #[derive(Debug, Error, Clone, PartialEq, Eq)]
+    pub enum PlayerError {
+        #[error("renderer error: {0}")]
+        Renderer(String),
+    }
+
+    pub type Result<T> = std::result::Result<T, PlayerError>;
+}
 #[cfg(target_vendor = "apple")]
 mod coretext;
 pub mod danmaku;
@@ -36,7 +48,6 @@ pub mod playback;
 pub mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod presenter;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod renderer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod source;

@@ -33,13 +33,15 @@ function crossOrigin(url) {
 }
 
 /** liberika browser backend: one player owns demux, WebCodecs, libass, danmaku
- * and WebGL presentation. Serve this package unchanged over HTTPS/localhost. */
+ * and WebGPU (with automatic WebGL2 fallback) presentation. Serve this package
+ * unchanged over HTTPS/localhost. */
 export class Player extends EventTarget {
   static async create({
     canvas,
     volume = 1,
     audioSession,
     fallbackFont,
+    renderer = "auto",
     workerURL,
   } = {}) {
     if (!canvas?.transferControlToOffscreen)
@@ -49,11 +51,17 @@ export class Player extends EventTarget {
     const player = new Player(canvas, volume, audioSession, workerURL);
     const offscreen = canvas.transferControlToOffscreen();
     try {
-      await player.request(
+      const initResult = await player.request(
         "init",
-        { canvas: offscreen, ...player.size(), font: fallbackFont },
+        {
+          canvas: offscreen,
+          ...player.size(),
+          font: fallbackFont,
+          renderer,
+        },
         [offscreen],
       );
+      player.renderer = initResult?.renderer || "webgl2";
       player.observe();
       return player;
     } catch (e) {
@@ -74,6 +82,7 @@ export class Player extends EventTarget {
     this.disposed = false;
     this.position = 0;
     this.info = null;
+    this.renderer = "webgl2";
     this.stats = {};
     this.audioBufferedUntil = 0;
     this.eof = false;
@@ -329,6 +338,22 @@ export class Player extends EventTarget {
   }
   sendDanmaku(text, color) {
     return this.request("sendDanmaku", { text, color, seconds: this.currentTime });
+  }
+  setUpscaler(mode) {
+    return this.request("setUpscaler", { mode });
+  }
+  loadUpscalerModel(name, data) {
+    const payload =
+      typeof data === "string"
+        ? new TextEncoder().encode(data)
+        : new Uint8Array(data);
+    return this.request("loadUpscalerModel", { name, data: payload });
+  }
+  clearUpscalerModel() {
+    return this.request("clearUpscalerModel");
+  }
+  getUpscalerStatus() {
+    return this.request("getUpscalerStatus");
   }
   capture(width) {
     return this.request("capture", { width, seconds: this.currentTime });

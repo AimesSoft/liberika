@@ -81,6 +81,11 @@
           id="subs"
           type="file"
           accept=".ass,.ssa,.srt,.vtt" /></label
+      ><label class="file"
+        >超分模型<input
+          id="srmodel"
+          type="file"
+          accept=".esr,.glsl,.hook" /></label
       ><span id="filename"></span>
     </section>
     <canvas id="video"></canvas>
@@ -116,6 +121,21 @@
       ><label><input id="subhd" type="checkbox" checked />高清字幕</label
       ><select id="tracks">
         <option value="-1">关闭字幕</option>
+      </select
+      ><select id="upscaler">
+        <option value="off">超分：关闭</option>
+        <option value="fsr1">超分：FSR 1.0</option>
+        <option value="anime4k_s">超分：Anime4K S</option>
+        <option value="anime4k_m">超分：Anime4K M</option>
+        <option value="anime4k_l">超分：Anime4K L</option>
+        <option value="anime4k_vl">超分：Anime4K VL</option>
+        <option value="anime4k_ul">超分：Anime4K UL</option>
+        <option value="anime4k_denoise_m">超分：Anime4K Denoise M</option>
+        <option value="artcnn_c4f16">超分：ArtCNN C4F16</option>
+        <option value="artcnn_c4f16_ds">超分：ArtCNN C4F16 DS</option>
+        <option value="artcnn_c4f16_dn">超分：ArtCNN C4F16 DN</option>
+        <option value="artcnn_c4f32">超分：ArtCNN C4F32</option>
+        <option value="custom">超分：自定义模型</option>
       </select>
     </section>
     <p id="status">正在初始化…</p>
@@ -129,15 +149,16 @@
       const player = (window.player = await Player.create({
         canvas: $("video"),
       }));
+      $("upscaler").disabled = player.renderer !== "webgpu";
       status.textContent =
-        "请选择本地视频；也可以使用 ?src=URL 打开支持 Range 的远程文件。";
+        `渲染后端：${player.renderer} · 请选择本地视频；也可以使用 ?src=URL 打开支持 Range 的远程文件。`;
       player.addEventListener(
         "error",
         (e) => (status.textContent = String(e.detail)),
       );
       player.addEventListener("loaded", (e) => {
         const i = e.detail;
-        summary = `${i.backend} · ${i.decoder} · ${Math.round(i.duration)} 秒`;
+        summary = `${i.backend} (${i.renderer}) · ${i.decoder} · ${Math.round(i.duration)} 秒`;
         $("seek").max = i.duration;
         $("tracks").replaceChildren(new Option("关闭字幕", "-1"));
         for (const t of i.tracks.filter(
@@ -151,7 +172,11 @@
       });
       player.addEventListener("stats", (e) => {
         const s = e.detail;
-        status.textContent = `${summary}\n视频解码 ${s.decodedVideo} 帧 · 绘制 ${s.rendered} 帧 · 弹幕字形 ${s.glyphs} · 图集上传 ${s.atlasUploads} 次`;
+        const sr =
+          s.upscaler && s.upscaler.mode !== "off"
+            ? ` · 超分 ${s.upscaler.mode} (${s.upscaler.backend}${s.upscaler.halfFloat ? "/f16" : "/f32"}, ${s.upscaler.upscaledFrames} 帧)`
+            : "";
+        status.textContent = `${summary}\n视频解码 ${s.decodedVideo} 帧 · 绘制 ${s.rendered} 帧 · 弹幕字形 ${s.glyphs} · 图集上传 ${s.atlasUploads} 次${sr}`;
       });
       player.addEventListener("timeupdate", (e) => {
         if (document.activeElement !== $("seek")) $("seek").value = e.detail;
@@ -200,6 +225,16 @@
       $("tracks").onchange = safe(() =>
         player.selectSubtitle(Number($("tracks").value)),
       );
+      $("upscaler").onchange = safe(() =>
+        player.setUpscaler($("upscaler").value),
+      );
+      $("srmodel").onchange = safe(async () => {
+        const f = $("srmodel").files[0];
+        if (!f) return;
+        await player.loadUpscalerModel(f.name, await f.arrayBuffer());
+        $("upscaler").value = "custom";
+        await player.setUpscaler("custom");
+      });
       const src = new URL(location.href).searchParams.get("src");
       if (src) await player.open(new URL(src, location.href).href);
       window.addEventListener("pagehide", () => player.destroy());

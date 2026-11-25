@@ -31,6 +31,7 @@ void main(){vec3 m=texture(image,(gl_FragCoord.xy-origin)/resolution).rgb;float 
 vec3 rgb=fillColor.rgb*m.r+outlineColor.rgb*m.g*(1.-m.r);pixel=vec4(rgb,a)*fillColor.a;}`;
 export class Renderer {
   constructor(canvas) {
+    this.backend = "webgl2";
     this.canvas = canvas;
     const gl = (this.gl = canvas.getContext("webgl2", {
       alpha: false,
@@ -367,6 +368,30 @@ export class Renderer {
       this.uniform(p, "opacity", a[n + 8]);
       g.drawArrays(g.TRIANGLES, 0, 6);
     }
+  }
+  end() {}
+  async setUpscaler(mode) {
+    const requested = mode == null ? "off" : String(mode).trim().toLowerCase();
+    if (requested === "off" || requested === "0") {
+      return this.getUpscalerStatus();
+    }
+    throw new Error("Super-resolution requires the WebGPU renderer");
+  }
+  async loadUpscalerModel() {
+    throw new Error("Super-resolution requires the WebGPU renderer");
+  }
+  clearUpscalerModel() {}
+  getUpscalerStatus() {
+    return {
+      requestedMode: "off",
+      activeBackend: "unsupported",
+      supported: false,
+      halfFloat: false,
+      fallbackCount: 0,
+      upscaledFrames: 0,
+      lastError: null,
+      availableModes: [],
+    };
   }
   destroy() {
     this.clearSubtitles();
