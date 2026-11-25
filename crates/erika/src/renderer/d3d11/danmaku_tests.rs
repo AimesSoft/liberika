@@ -44,11 +44,7 @@ impl Offscreen {
             feature_level.0
         );
         let (texture, render_target) = if linear {
-            let (rtv, srv) = create_linear_render_target(device, 32, 24).unwrap();
-            let texture = unsafe { srv.GetResource() }
-                .unwrap()
-                .cast::<ID3D11Texture2D>()
-                .unwrap();
+            let (texture, rtv, _) = create_linear_render_target(device, 32, 24).unwrap();
             (texture, rtv)
         } else {
             create_flutter_texture_target(device, 32, 24).unwrap()
