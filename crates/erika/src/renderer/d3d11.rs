@@ -1013,8 +1013,15 @@ struct AttachedSurface {
     // this resource again: opening its handle is not GPU consumer completion.
     published_texture: Option<ID3D11Texture2D>,
     render_target: Option<ID3D11RenderTargetView>,
+    linear_texture: Option<ID3D11Texture2D>,
     linear_render_target: Option<ID3D11RenderTargetView>,
     linear_shader_resource: Option<ID3D11ShaderResourceView>,
+    // Ping-pong GPU snapshots for alpha-blended composition surfaces while the
+    // host visual is translucent (`0 < Opacity < 1`). Dropped at full opacity.
+    blended_textures: [Option<ID3D11Texture2D>; 2],
+    blended_slot: usize,
+    blended_generation: u64,
+    blended_has_frame: bool,
 }
 
 impl AttachedSurface {
@@ -1494,6 +1501,7 @@ pub struct D3d11Renderer {
     /// Background generation for a cache miss; the fast `gamut_compress`
     /// path renders until the LUT lands.
     gamut_lut_job: Option<GamutLutJob>,
+    composition_blended: bool,
     stats: D3d11RendererStats,
 }
 
@@ -1561,6 +1569,7 @@ impl D3d11Renderer {
             hdr10_output_unavailable: false,
             gamut_lut: None,
             gamut_lut_job: None,
+            composition_blended: false,
             stats: D3d11RendererStats::default(),
         })
     }
@@ -1605,6 +1614,80 @@ impl D3d11Renderer {
         // opens this immutable snapshot. The extra GPU copy is texture-only.
         wait_for_gpu(&state.device, &state.context, self.handoff_timeout)?;
         surface.published_texture = Some(snapshot);
+        Ok(())
+    }
+
+    fn publish_composition_blended_texture(&mut self) -> Result<()> {
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(());
+        };
+        if !surface.composition {
+            return Ok(());
+        }
+        let state = self.state.as_ref().expect("device ensured");
+        let source: ID3D11Texture2D = if matches!(surface.output_mode, D3d11OutputMode::Hdr10) {
+            let Some(linear) = surface.linear_texture.as_ref() else {
+                return Ok(());
+            };
+            linear.clone()
+        } else {
+            let Some(swapchain) = surface.swapchain.as_ref() else {
+                return Ok(());
+            };
+            unsafe { swapchain.GetBuffer(0) }
+                .map_err(|error| d3d_error("IDXGISwapChain1::GetBuffer(blended)", error))?
+        };
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { source.GetDesc(&mut src_desc) };
+        let next_slot = (surface.blended_slot + 1) % surface.blended_textures.len();
+        let reuse = surface.blended_textures[next_slot]
+            .as_ref()
+            .is_some_and(|existing| {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { existing.GetDesc(&mut desc) };
+                desc.Width == src_desc.Width
+                    && desc.Height == src_desc.Height
+                    && desc.Format == src_desc.Format
+            });
+        if !reuse {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: src_desc.Width.max(1),
+                Height: src_desc.Height.max(1),
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: src_desc.Format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut texture = None;
+            unsafe {
+                state
+                    .device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))
+                    .map_err(|error| {
+                        d3d_error("ID3D11Device::CreateTexture2D(blended snapshot)", error)
+                    })?;
+            }
+            surface.blended_textures[next_slot] = Some(texture.ok_or_else(|| {
+                PlayerError::Renderer("d3d11: blended snapshot texture was null".to_string())
+            })?);
+        }
+        let target = surface.blended_textures[next_slot]
+            .as_ref()
+            .expect("blended snapshot ensured");
+        unsafe {
+            state.context.CopyResource(target, &source);
+            state.context.Flush();
+        }
+        surface.blended_slot = next_slot;
+        surface.blended_generation = surface.blended_generation.wrapping_add(1).max(1);
+        surface.blended_has_frame = true;
         Ok(())
     }
 
@@ -1931,8 +2014,9 @@ impl D3d11Renderer {
         surface.render_target = Some(create_render_target(&state.device, swapchain)?);
         if matches!(output_mode, D3d11OutputMode::Hdr10) {
             trace("recreate_surface_targets: create_linear_render_target");
-            let (render_target, shader_resource) =
+            let (texture, render_target, shader_resource) =
                 create_linear_render_target(&state.device, width, height)?;
+            surface.linear_texture = Some(texture);
             surface.linear_render_target = Some(render_target);
             surface.linear_shader_resource = Some(shader_resource);
         }
@@ -3128,7 +3212,18 @@ impl D3d11Renderer {
             self.current_video_fence = Some(fence);
         }
         draw_result?;
-        let submitted = match surface.swapchain.as_ref() {
+        let need_blended = surface.composition && self.composition_blended;
+        let _ = (state, surface);
+        if need_blended {
+            self.publish_composition_blended_texture()?;
+        }
+        let submitted = match self
+            .surface
+            .as_ref()
+            .expect("surface ensured")
+            .swapchain
+            .as_ref()
+        {
             Some(swapchain) => present_swapchain(swapchain, "IDXGISwapChain1::Present1")?,
             None => true,
         };
@@ -3219,6 +3314,9 @@ impl D3d11Renderer {
             }
         }
         self.publish_flutter_texture()?;
+        if let Some(surface) = self.surface.as_mut() {
+            surface.blended_has_frame = false;
+        }
         self.presented_scene = None;
         trace("render_clear: done");
         self.stats.rendered_frames += 1;
@@ -3276,17 +3374,34 @@ impl RendererBackend for D3d11Renderer {
             output_texture: None,
             published_texture: None,
             render_target: None,
+            linear_texture: None,
             linear_render_target: None,
             linear_shader_resource: None,
+            blended_textures: [None, None],
+            blended_slot: 0,
+            blended_generation: 0,
+            blended_has_frame: false,
         });
         self.hdr10_output_unavailable = false;
+        self.presented_scene = None;
         self.stats.attached = true;
         self.recreate_surface_targets()?;
         self.render_clear(0.0)
     }
 
     fn detach_surface(&mut self) -> Result<()> {
-        self.retire_current_video()?;
+        // Keep `current_video` alive across surface switches (matching Metal
+        // and Wgpu) so a paused video immediately redraws when re-attached to
+        // another view (for example full player <-> mini player). Wait on the
+        // last draw fence first so the retiring swapchain is no longer reading
+        // the frame textures before we drop the surface.
+        if self.current_video.is_some()
+            && let (Some(state), Some(fence)) =
+                (self.state.as_ref(), self.current_video_fence.as_ref())
+        {
+            wait_for_fence(&state.context, fence, self.handoff_timeout)?;
+        }
+        self.current_video_fence = None;
         self.presented_scene = None;
         self.surface = None;
         self.subtitle_alpha_cache = None;
@@ -3310,6 +3425,7 @@ impl RendererBackend for D3d11Renderer {
         }
         surface.metrics = metrics;
         self.hdr10_output_unavailable = false;
+        self.presented_scene = None;
         let flutter_texture = surface.flutter_texture;
         self.recreate_surface_targets()?;
         if flutter_texture && self.current_video.is_none() {
@@ -3552,6 +3668,30 @@ impl RendererBackend for D3d11Renderer {
         }
         let unknown: IUnknown = surface.published_texture.as_ref()?.cast().ok()?;
         Some(unknown.into_raw())
+    }
+
+    fn set_composition_blended(&mut self, enabled: bool) {
+        if self.composition_blended == enabled {
+            return;
+        }
+        self.composition_blended = enabled;
+        if enabled {
+            // Force the next render tick to redraw even when paused so the
+            // blended composition surface immediately receives the current frame.
+            self.presented_scene = None;
+        } else if let Some(surface) = self.surface.as_mut() {
+            surface.blended_textures = [None, None];
+            surface.blended_has_frame = false;
+        }
+    }
+
+    fn composition_blended_texture(&self) -> Option<(*mut std::ffi::c_void, u64)> {
+        let surface = self.surface.as_ref()?;
+        if !surface.composition || !surface.blended_has_frame {
+            return None;
+        }
+        let texture = surface.blended_textures[surface.blended_slot].as_ref()?;
+        Some((Interface::as_raw(texture), surface.blended_generation))
     }
 }
 
@@ -4126,8 +4266,11 @@ fn release_backbuffer_views(context: &ID3D11DeviceContext, surface: &mut Attache
     surface.render_target = None;
     surface.output_texture = None;
     surface.published_texture = None;
+    surface.linear_texture = None;
     surface.linear_render_target = None;
     surface.linear_shader_resource = None;
+    surface.blended_textures = [None, None];
+    surface.blended_has_frame = false;
 }
 
 fn create_d3d11_event_query(device: &ID3D11Device) -> Result<ID3D11Query> {
@@ -4266,7 +4409,11 @@ fn create_linear_render_target(
     device: &ID3D11Device,
     width: u32,
     height: u32,
-) -> Result<(ID3D11RenderTargetView, ID3D11ShaderResourceView)> {
+) -> Result<(
+    ID3D11Texture2D,
+    ID3D11RenderTargetView,
+    ID3D11ShaderResourceView,
+)> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width.max(1),
         Height: height.max(1),
@@ -4315,6 +4462,7 @@ fn create_linear_render_target(
             })?;
     }
     Ok((
+        texture,
         render_target.ok_or_else(|| {
             PlayerError::Renderer("d3d11: linear render target view was null".to_string())
         })?,

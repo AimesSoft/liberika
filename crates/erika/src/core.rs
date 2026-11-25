@@ -1171,6 +1171,17 @@ pub trait RendererBackend {
     fn windows_flutter_texture_iunknown(&self) -> Option<*mut std::ffi::c_void> {
         None
     }
+
+    /// Enables or disables maintaining a GPU snapshot of each rendered
+    /// composition frame for alpha-blended compositing (for example Windows
+    /// `CompositionDrawingSurface` while the host visual has `0 < Opacity < 1`).
+    fn set_composition_blended(&mut self, _enabled: bool) {}
+
+    /// Borrowed `ID3D11Texture2D` pointer and monotonic frame generation for
+    /// the latest blended composition snapshot. No `AddRef`.
+    fn composition_blended_texture(&self) -> Option<(*mut std::ffi::c_void, u64)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
