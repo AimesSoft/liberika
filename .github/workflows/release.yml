@@ -706,6 +706,12 @@ jobs:
           mkdir -p dist
           cd target/web
           zip -r "$GITHUB_WORKSPACE/dist/liberika-web-${VERSION}.zip" .
+      - name: Pack the npm package
+        run: |
+          set -euo pipefail
+          python3 scripts/web_npm_package.py
+          mkdir -p dist-npm
+          (cd target/npm/web && npm pack --pack-destination "$GITHUB_WORKSPACE/dist-npm")
       - name: Build browser package without the fallback font
         run: cargo run --locked -p xtask -- web build --skip-native --without-fallback-font
       - name: Package it
@@ -716,10 +722,20 @@ jobs:
           test -f target/web/erika_core_bg.wasm
           cd target/web
           zip -r "$GITHUB_WORKSPACE/dist/liberika-web-nofont-${VERSION}.zip" .
+          cd "$GITHUB_WORKSPACE"
+          python3 scripts/web_npm_package.py --without-fallback-font
+          (cd target/npm/web-nofont && npm pack --pack-destination "$GITHUB_WORKSPACE/dist-npm")
+          test "$(find dist-npm -name '*.tgz' | wc -l)" -eq 2
       - uses: actions/upload-artifact@v4
         with:
           name: liberika-web
           path: dist/liberika-web-*.zip
+          if-no-files-found: error
+      # Published by the ecosystem workflow, not attached to the Release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liberika-web-npm
+          path: dist-npm/*.tgz
           if-no-files-found: error
 
   linux:
