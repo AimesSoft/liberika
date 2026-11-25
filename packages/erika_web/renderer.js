@@ -217,8 +217,8 @@ export class Renderer {
   }
   danmaku(plan) {
     const g = this.gl,
-      w = this.width,
-      h = this.height;
+      w = this.canvas.width,
+      h = this.canvas.height;
     this.glyphs = plan.glyphs.length / 8;
     if (plan.fill) {
       for (const [texture, data] of [
@@ -267,6 +267,7 @@ export class Renderer {
         plan.pictureAtlas,
       );
     }
+    if (!w || !h) return;
     if (!plan.glyphs.length) return this.pictures(plan);
     if (this.scratchSize !== `${w}x${h}`) {
       this.bind(this.scratch);
@@ -335,13 +336,13 @@ export class Renderer {
       g.drawArraysInstanced(g.TRIANGLES, 0, 6, count);
       g.bindVertexArray(null);
       g.bindFramebuffer(g.FRAMEBUFFER, null);
-      g.viewport(this.x, this.y, w, h);
+      g.viewport(0, 0, w, h);
       g.disable(g.SCISSOR_TEST);
       g.blendEquation(g.FUNC_ADD);
       g.blendFunc(g.ONE, g.ONE_MINUS_SRC_ALPHA);
       g.useProgram(this.compose);
       this.uniform(this.compose, "resolution", w, h);
-      this.uniform(this.compose, "origin", this.x, this.y);
+      this.uniform(this.compose, "origin", 0, 0);
       this.uniform(this.compose, "rect", x, y, right - x, bottom - y);
       this.uniform(this.compose, "fillColor", ...a.subarray(2, 6));
       this.uniform(this.compose, "outlineColor", ...a.subarray(6, 10));
@@ -356,9 +357,17 @@ export class Renderer {
   pictures(plan) {
     if (!plan.pictures?.length) return;
     const g = this.gl,
-      p = this.picture;
+      p = this.picture,
+      w = this.canvas.width,
+      h = this.canvas.height;
+    if (!w || !h) return;
+    g.bindFramebuffer(g.FRAMEBUFFER, null);
+    g.viewport(0, 0, w, h);
+    g.disable(g.SCISSOR_TEST);
+    g.blendEquation(g.FUNC_ADD);
+    g.blendFunc(g.ONE, g.ONE_MINUS_SRC_ALPHA);
     g.useProgram(p);
-    this.uniform(p, "resolution", this.width, this.height);
+    this.uniform(p, "resolution", w, h);
     this.bind(this.emoji, 0);
     g.uniform1i(g.getUniformLocation(p, "image"), 0);
     for (let n = 0; n < plan.pictures.length; n += 9) {
