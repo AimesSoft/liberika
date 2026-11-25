@@ -2,6 +2,8 @@
 #include "erika.h"
 #include "native_video_surface.h"
 #include "presenter_worker.h"
+
+#pragma weak erika_presenter_capture_frame_rgba_with_danmaku
 #include <atomic>
 #include <functional>
 #include <deque>
@@ -519,8 +521,12 @@ static void method_call(FlMethodChannel*, FlMethodCall* call, gpointer data) {
     if (method == "screenshot") {
       uint32_t width = std::clamp(number(args, "width", 1280), 1.0, 8192.0);
       uint32_t height = std::clamp(number(args, "height", 720), 1.0, 8192.0);
+      const bool include_danmaku = boolean(args, "includeDanmaku");
       std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
-      check(erika_presenter_capture_frame_rgba(player.handle, width, height, rgba.data(), rgba.size()));
+      auto capture = include_danmaku && erika_presenter_capture_frame_rgba_with_danmaku
+                         ? erika_presenter_capture_frame_rgba_with_danmaku
+                         : erika_presenter_capture_frame_rgba;
+      check(capture(player.handle, width, height, rgba.data(), rgba.size()));
       // The Dart screenshot contract is tightly packed RGBA, not encoded PNG.
       return fl_value_new_uint8_list(rgba.data(), rgba.size());
     }

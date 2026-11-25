@@ -404,19 +404,32 @@ internal class AndroidPlayerHost(
         }
     }
 
-    fun captureFrame(width: Int, height: Int): ByteArray? {
+    fun captureFrame(
+        width: Int,
+        height: Int,
+        includeDanmaku: Boolean = false,
+    ): ByteArray? {
         check(!destroyed) { "Erika player $handle has been destroyed" }
         return presenterThread.call {
-            ErikaNative.nativeCaptureFrame(handle, width, height)
+            if (includeDanmaku) {
+                try {
+                    ErikaNative.nativeCaptureFrameWithDanmaku(handle, width, height)
+                } catch (_: UnsatisfiedLinkError) {
+                    ErikaNative.nativeCaptureFrame(handle, width, height)
+                }
+            } else {
+                ErikaNative.nativeCaptureFrame(handle, width, height)
+            }
         }
     }
 
     fun captureFrameAsync(
         width: Int,
         height: Int,
+        includeDanmaku: Boolean = false,
         onComplete: (Result<ByteArray?>) -> Unit,
     ): Boolean = presenterThread.post {
-        onComplete(runCatching { captureFrame(width, height) })
+        onComplete(runCatching { captureFrame(width, height, includeDanmaku) })
     }
 
     fun registerSubtitleMemoryFont(data: ByteArray): NativeResponse {

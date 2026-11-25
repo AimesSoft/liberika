@@ -10,6 +10,7 @@ export interface DanmakuOptions {
   blockTop?: boolean;
   blockBottom?: boolean;
   blockScroll?: boolean;
+  blockWords?: string[];
   mergeDuplicates?: boolean;
   /** Paint each comment in a stable color from the colorful sending palette. */
   randomColors?: boolean;
@@ -29,10 +30,15 @@ export interface Track {
   bitDepth: number;
   extra: Uint8Array;
 }
+export interface ContainerInfo {
+  format: string | null;
+  bitRate: number | null;
+}
 export interface MediaInfo {
   duration: number;
   tracks: Track[];
   chapters: { title: string; start: number; end: number | null }[];
+  container?: ContainerInfo | null;
   videoTrack: number;
   audioTrack: number | null;
   subtitleTrack: number | null;
@@ -81,6 +87,8 @@ export class Player extends EventTarget {
   private constructor();
   readonly currentTime: number;
   readonly playing: boolean;
+  readonly volume: number;
+  readonly muted: boolean;
   readonly info: MediaInfo | null;
   readonly stats: PlayerStats;
   open(source: File | Blob | string, options?: { hardwareDecode?: boolean }): Promise<MediaInfo>;
@@ -93,6 +101,7 @@ export class Player extends EventTarget {
   selectSubtitle(id: number | null): Promise<void>;
   addSubtitle(assSrtOrVtt: string): Promise<void>;
   addDanmaku(xmlOrJson: string): Promise<number>;
+  clearDanmaku(): Promise<void>;
   /** Shows the viewer's own comment, bordered; `color` is 0xRRGGBB (white by default). */
   sendDanmaku(text: string, color?: number): Promise<void>;
   capture(width?: number): Promise<Blob>;
@@ -102,8 +111,14 @@ export class Player extends EventTarget {
   configureSubtitles(options: {
     scale?: number;
     supersampling?: boolean;
+    delay?: number;
   }): Promise<void>;
+  /** Shows subtitles later (positive seconds) or earlier (negative); clamped to ±600 s. */
+  setSubtitleDelay(seconds: number): Promise<void>;
+  getSubtitleDelay(): number;
   setVolume(volume: number): void;
+  setMuted(muted: boolean): void;
+  getVolume(): { volume: number; muted: boolean };
   /** Changes playback speed; the current Web Audio path also changes pitch. */
   setRate(rate: number): Promise<void>;
   destroy(): Promise<void>;

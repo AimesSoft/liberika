@@ -723,7 +723,8 @@ class ErikaFlutterPlugin :
             )
             return
         }
-        val posted = host.captureFrameAsync(width, height) { captured ->
+        val includeDanmaku = arguments["includeDanmaku"] as? Boolean == true
+        val posted = host.captureFrameAsync(width, height, includeDanmaku) { captured ->
             postMainSafely(
                 source = "screenshot completion",
                 onFailure = { error ->
