@@ -1,0 +1,68 @@
+name: Select CI checks
+
+on:
+  workflow_call:
+    outputs:
+      quality:
+        value: ${{ jobs.paths.outputs.quality }}
+      macos:
+        value: ${{ jobs.paths.outputs.macos }}
+      ios:
+        value: ${{ jobs.paths.outputs.ios }}
+      tvos:
+        value: ${{ jobs.paths.outputs.tvos }}
+      windows:
+        value: ${{ jobs.paths.outputs.windows }}
+      linux:
+        value: ${{ jobs.paths.outputs.linux }}
+      android:
+        value: ${{ jobs.paths.outputs.android }}
+      ohos:
+        value: ${{ jobs.paths.outputs.ohos }}
+      web:
+        value: ${{ jobs.paths.outputs.web }}
+      macos_matrix:
+        value: ${{ jobs.paths.outputs.macos_matrix }}
+      windows_matrix:
+        value: ${{ jobs.paths.outputs.windows_matrix }}
+      linux_matrix:
+        value: ${{ jobs.paths.outputs.linux_matrix }}
+      android_matrix:
+        value: ${{ jobs.paths.outputs.android_matrix }}
+
+permissions:
+  contents: read
+
+jobs:
+  paths:
+    name: Select affected platforms
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      quality: ${{ steps.select.outputs.quality }}
+      macos: ${{ steps.select.outputs.macos }}
+      ios: ${{ steps.select.outputs.ios }}
+      tvos: ${{ steps.select.outputs.tvos }}
+      windows: ${{ steps.select.outputs.windows }}
+      linux: ${{ steps.select.outputs.linux }}
+      android: ${{ steps.select.outputs.android }}
+      ohos: ${{ steps.select.outputs.ohos }}
+      web: ${{ steps.select.outputs.web }}
+      macos_matrix: ${{ steps.select.outputs.macos_matrix }}
+      windows_matrix: ${{ steps.select.outputs.windows_matrix }}
+      linux_matrix: ${{ steps.select.outputs.linux_matrix }}
+      android_matrix: ${{ steps.select.outputs.android_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && '0' || '1' }}
+          persist-credentials: false
+      - id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF: ${{ github.ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: python3 -B scripts/ci_paths.py --github
