@@ -11,10 +11,13 @@ directory alone is not a deployable package, and no npm release is available.
 [Build, API and browser requirements](../../docs/web.md) ·
 [中文说明](../../docs/web.zh.md)
 
-The package includes the native Rust danmaku engine, patched libass, text
-libraries and FFmpeg demuxer as WASM. Browser WebCodecs decodes audio/video.
-Web Audio supplies audio output and the clock; WebGL2 composites video,
-subtitles and danmaku into one canvas. Embedded ASS fonts load automatically,
+The package includes the native Rust danmaku engine, portable WGSL
+super-resolution planner, patched libass, text libraries and FFmpeg demuxer as
+WASM. Browser WebCodecs decodes audio/video. Web Audio supplies audio output
+and the clock; WebGPU composites video, GPU-compute super-resolution (ArtCNN,
+Anime4K, FSR 1.0, and custom `.esr` / mpv hook shaders), subtitles and danmaku
+into one canvas, automatically falling back to WebGL2 where WebGPU is
+unavailable. Embedded ASS fonts load automatically,
 and subtitle/danmaku supersampling is independent of the video resolution.
 The complete fallback font is embedded once in the Rust WASM and supplied to
 libass by the worker; no standalone font download is required. The
@@ -49,7 +52,7 @@ media or `destroy()` when removing the player. See `index.d.ts` for the full API
 
 Serve over HTTPS or localhost. Remote media needs CORS when cross-origin;
 large files need HTTP Range and an exposed `Content-Range`. Playback requires
-WebCodecs video/audio decoding, OffscreenCanvas, WebGL2 and Web Audio.
+WebCodecs video/audio decoding, OffscreenCanvas, WebGPU or WebGL2, and Web Audio.
 Chrome regression and Safari 27.0.1 HEVC Main 10 / Opus / ASS playback and seeking
 have been verified; detailed codec requirements and current limits are
 in the browser guide above.

@@ -51,7 +51,7 @@ the current setting.
 | Decode audio/video | Browser WebCodecs receives compressed packets |
 | Render subtitles | Patched libass + FreeType/HarfBuzz/FriBidi in WASM, including MKV font attachments |
 | Render danmaku | Native Rust DFM engine compiled to WASM |
-| Synchronize and present | Web Audio output and media clock; WebGL2 composes video, subtitles and danmaku |
+| Synchronize and present | Web Audio output and media clock; WebGPU (with automatic WebGL2 fallback) composes video, compute super-resolution, subtitles and danmaku |
 
 Codec configuration is checked at runtime, including profile and dimensions.
 `open(source, { hardwareDecode: false })` requests `prefer-software`; the default
@@ -170,6 +170,7 @@ await player.configureSubtitles({ scale: 1, supersampling: true });
 | Danmaku files | `addDanmaku(text)` appends comments and returns the number added by that call |
 | Live local comment | `sendDanmaku(text)` inserts a comment at the current playback position; network publishing belongs to the host |
 | Danmaku timing | `configureDanmaku({ delay: seconds })`, from −60 to 60; positive values delay comments |
+| Super-resolution (WebGPU) | `setUpscaler(mode)` (`"off"`, `"fsr1"`, `"artcnn_c4f16"`, `"artcnn_c4f32"`, `"anime4k_s"`…`"anime4k_ul"`, `"custom"`), `loadUpscalerModel(name, bytesOrGlsl)`, `clearUpscalerModel()`, `getUpscalerStatus()` |
 | Screenshot | `capture(width?)` returns a PNG Blob of video with subtitles and danmaku |
 | Close / reuse | `close()` clears the current media; `open()` reuses the player for another source |
 | Dispose | `destroy()` releases the Worker, decoders, frames, GPU resources and AudioContext |
@@ -271,9 +272,11 @@ events. A first seek into a long event that began before the preroll window can
 miss that event; external full ASS scripts do not have this limitation.
 
 Bitmap subtitles, embedded non-ASS subtitle conversion, DRM, live sources with
-unknown length, desktop HDR/EDR/Dolby Vision processing and ArtCNN are not part
-of this backend. Output is SDR. Playback-rate changes currently change pitch
-through Web Audio.
+unknown length, and desktop HDR/EDR/Dolby Vision processing are not part of
+this backend. Output is SDR. Real-time luma super-resolution (ArtCNN C4,
+Anime4K CNN, FSR 1.0, and custom `.esr` / mpv hook shaders) runs via WebGPU
+compute shaders when WebGPU is active; browsers that fall back to WebGL2 render
+at native resolution. Playback-rate changes currently change pitch through Web Audio.
 
 ## Verification
 

@@ -1,11 +1,13 @@
 import init, {
   WebDanmaku,
+  WebSrPlanner,
   fallbackFont,
   setEmojiPainter,
   setFallbackFont,
 } from "./erika_core.js";
 import createMedia from "./media.js";
 import { Renderer } from "./renderer.js";
+import { WebGpuRenderer } from "./renderer_webgpu.js";
 import { Source } from "./source.js";
 import { supportedAudio, supportedVideo, videoPacketGate } from "./codecs.js";
 
@@ -320,30 +322,35 @@ function draw(t) {
     renderer.upload(currentFrame);
   }
   renderer.begin();
-  if (!demuxBusy) {
-    const head = media._erika_subtitle_render(
-      time,
-      Math.round(renderer.width * subtitleSampling),
-      Math.round(renderer.height * subtitleSampling),
-      subtitleScale,
-    );
-    if (subtitleDirty || media._erika_subtitle_changed()) {
-      renderer.updateSubtitles(media, head, subtitleSampling);
-      subtitleDirty = false;
+  try {
+    if (!demuxBusy) {
+      const head = media._erika_subtitle_render(
+        time,
+        Math.round(renderer.width * subtitleSampling),
+        Math.round(renderer.height * subtitleSampling),
+        subtitleScale,
+      );
+      if (subtitleDirty || media._erika_subtitle_changed()) {
+        renderer.updateSubtitles(media, head, subtitleSampling);
+        subtitleDirty = false;
+      }
     }
+    renderer.subtitles();
+    renderer.danmaku(
+      danmaku.frame(
+        Math.max(0, time - danmakuDelay),
+        renderer.width,
+        renderer.height,
+        dpr,
+        performance.now(),
+      ),
+    );
+  } finally {
+    renderer.end();
   }
-  renderer.subtitles();
-  renderer.danmaku(
-    danmaku.frame(
-      Math.max(0, time - danmakuDelay),
-      renderer.width,
-      renderer.height,
-      dpr,
-      performance.now(),
-    ),
-  );
   if (performance.now() - lastStats > 250) {
     lastStats = performance.now();
+    const upscaler = renderer.getUpscalerStatus();
     send("stats", {
       stats: {
         ...stats,
@@ -361,13 +368,21 @@ function draw(t) {
         subtitleImages: renderer.subtitleImages?.length || 0,
         hasVideo: !!currentFrame,
         eof,
+        renderer: renderer.backend,
+        upscaler: {
+          mode: upscaler.requestedMode,
+          backend: upscaler.activeBackend,
+          halfFloat: upscaler.halfFloat,
+          upscaledFrames: upscaler.upscaledFrames,
+          fallbackCount: upscaler.fallbackCount,
+        },
       },
     });
   }
   schedulePump();
 }
 const methods = {
-  async init({ canvas, width, height, scale, font }) {
+  async init({ canvas, width, height, scale, font, renderer: preference = "auto" }) {
     await init();
     setEmojiPainter(paintEmoji);
     if (font) {
@@ -378,10 +393,36 @@ const methods = {
       readSource: (offset, dest, length) =>
         source.read(media, offset, dest, length),
     });
-    renderer = new Renderer(canvas);
+    const mode = String(preference || "auto").toLowerCase();
+    if (mode !== "auto" && mode !== "webgpu" && mode !== "webgl2") {
+      throw new Error(`Unsupported renderer preference: ${preference}`);
+    }
+    if (mode !== "webgl2") {
+      try {
+        const availableModes = Array.from(WebSrPlanner.availableModes());
+        renderer = await WebGpuRenderer.create(canvas, {
+          srPlannerFactory: (capsJson) => new WebSrPlanner(capsJson),
+          availableModes,
+        });
+      } catch (error) {
+        if (mode === "webgpu") throw error;
+        send("log", { message: `WebGPU unavailable, falling back to WebGL2: ${error}` });
+        renderer = null;
+      }
+    }
+    if (!renderer) {
+      if (mode === "webgpu") {
+        throw new Error("WebGPU is unavailable in this browser");
+      }
+      renderer = new Renderer(canvas);
+    }
     danmaku = new WebDanmaku();
     dpr = scale;
     renderer.size(width, height, 16, 9);
+    return {
+      renderer: renderer.backend,
+      upscaler: renderer.getUpscalerStatus(),
+    };
   },
   async open({ input, epoch, hardwareDecode: hardware = true }) {
     hardwareDecode = hardware;
@@ -441,6 +482,7 @@ const methods = {
       subtitleTrack: sub?.id ?? null,
       decoder: videoConfig.codec,
       backend: "webcodecs",
+      renderer: renderer.backend,
       hardwarePreference: videoConfig.hardwareAcceleration,
     };
   },
@@ -502,6 +544,18 @@ const methods = {
       Number.isInteger(color) ? color & 0xffffff : undefined,
     );
   },
+  async setUpscaler({ mode }) {
+    return renderer.setUpscaler(mode);
+  },
+  async loadUpscalerModel({ name, data }) {
+    return renderer.loadUpscalerModel(name, data);
+  },
+  async clearUpscalerModel() {
+    renderer.clearUpscalerModel();
+  },
+  async getUpscalerStatus() {
+    return renderer.getUpscalerStatus();
+  },
   async capture({ width, seconds }) {
     if (!loaded) throw new Error("No media to capture");
     draw(seconds);
@@ -524,6 +578,7 @@ const methods = {
     renderer.clearSubtitles();
     renderer.hasVideo = false;
     renderer.begin();
+    renderer.end();
   },
   async destroy() {
     loaded = false;

@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
-import { initSync, WebDanmaku, fallbackFont } from "../../../target/web/erika_core.js";
+import {
+  initSync,
+  WebDanmaku,
+  WebSrPlanner,
+  fallbackFont,
+} from "../../../target/web/erika_core.js";
 import { supportedVideo, videoConfig, audioConfig, videoPacketGate } from "../codecs.js";
 import { toASS } from "../index.js";
 const wasmBytes = await readFile(
@@ -189,4 +194,78 @@ test('disabling hardware decode asks only for software decoding', async () => {
   }};
   await supportedVideo({codec:'vp8',extra:new Uint8Array(),width:640,height:360},decoder,false);
   assert.deepEqual(calls,['prefer-software']);
+});
+
+test('WebSrPlanner compiles portable WebGPU WGSL for FSR1, ArtCNN, Anime4K and custom shaders', () => {
+  const modes = Array.from(WebSrPlanner.availableModes());
+  assert.ok(modes.includes('fsr1'));
+  assert.ok(modes.includes('artcnn_c4f16'));
+  assert.ok(modes.includes('anime4k_m'));
+  assert.ok(modes.includes('custom'));
+
+  const planner = new WebSrPlanner(JSON.stringify({
+    shaderF16: true,
+    maxComputeWorkgroupStorageSize: 16384,
+    maxUniformBufferBindingSize: 65536,
+    maxStorageBufferBindingSize: 128 * 1024 * 1024,
+    maxBufferSize: 256 * 1024 * 1024,
+    maxComputeWorkgroupSizeX: 256,
+    maxComputeWorkgroupSizeY: 256,
+    maxComputeInvocationsPerWorkgroup: 256,
+    maxTextureDimension2D: 8192,
+    minUniformBufferOffsetAlignment: 256,
+    maxStorageBuffersPerShaderStage: 8,
+  }));
+  try {
+    assert.equal(planner.compile('off'), null);
+    for (const mode of ['fsr1', 'anime4k_s', 'artcnn_c4f16']) {
+      const compiled = planner.compile(mode);
+      assert.equal(compiled.mode, mode);
+      assert.equal(compiled.half, true);
+      assert.equal(compiled.packed, mode !== 'fsr1');
+      assert.ok(compiled.kernels.length >= 1);
+      for (const k of compiled.kernels) {
+        assert.match(k.source, /enable f16;/);
+        assert.doesNotMatch(k.source, /wgpu_cooperative_matrix/);
+        assert.ok(k.weights instanceof Float32Array);
+      }
+      const frame = planner.planFrame(640, 360, 1280, 720, 0.2126, 0.7152, 0.0722, true);
+      assert.ok(frame.paramsBytes instanceof Uint8Array);
+      assert.ok(frame.dispatches instanceof Uint32Array);
+      assert.equal(frame.dispatches.length % 5, 0);
+      assert.equal(frame.paramsStride % 256, 0);
+      assert.equal(frame.paramsBytes.length, (frame.dispatches.length / 5) * frame.paramsStride);
+      assert.equal(frame.virtualWidth, 1280);
+      assert.equal(frame.virtualHeight, 720);
+    }
+    assert.throws(() => planner.compile('custom'));
+    assert.throws(() => planner.compile('platform_video'));
+    assert.throws(() => planner.compile('not_a_mode'));
+  } finally {
+    planner.free();
+  }
+});
+
+test('WebSrPlanner loads custom .esr networks and clears them cleanly', async () => {
+  const esrBytes = await readFile(
+    new URL('../../../crates/erika/assets/anime4k/anime4k_upscale_s.esr', import.meta.url),
+  );
+  const planner = new WebSrPlanner('{}');
+  try {
+    const info = planner.loadCustomModel('custom_anime4k_s.esr', new Uint8Array(esrBytes));
+    assert.ok(info.layers > 0);
+    assert.ok(info.parameters > 0);
+    assert.ok(info.macsPerPixel > 0);
+    const compiled = planner.compile('custom');
+    assert.equal(compiled.mode, 'custom');
+    assert.equal(compiled.packed, true);
+    assert.equal(compiled.half, false);
+    const frame = planner.planFrame(320, 180, 640, 360, 0.2126, 0.7152, 0.0722, true);
+    assert.equal(frame.virtualWidth, 640);
+    assert.equal(frame.virtualHeight, 360);
+    planner.clearCustomModel();
+    assert.throws(() => planner.compile('custom'));
+  } finally {
+    planner.free();
+  }
 });
