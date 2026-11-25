@@ -3,34 +3,8 @@ name: Linux native
 on:
   pull_request:
     branches: [main]
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/linux.yml"
-      - ".github/workflows/release.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "examples/linux_native_demo/**"
-      - "packaging/**"
-      - "scripts/*linux*.sh"
-      - "xtask/**"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
   push:
     branches: [main]
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/linux.yml"
-      - ".github/workflows/release.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "examples/linux_native_demo/**"
-      - "packaging/**"
-      - "scripts/*linux*.sh"
-      - "xtask/**"
-      - "third_party/patches/**"
-      - "third_party/wgpu-hal/**"
   workflow_dispatch:
   workflow_call:
 
@@ -42,21 +16,19 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-select.yml
+
   native:
     name: Linux ${{ matrix.arch }} ${{ matrix.dependencies }}
+    needs: changes
+    if: needs.changes.outputs.linux == 'true'
     runs-on: ${{ matrix.runner }}
     container: ubuntu:22.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix:
-        arch: [x64, arm64]
-        dependencies: [bundled, system]
-        include:
-          - arch: x64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+      matrix: ${{ fromJSON(needs.changes.outputs.linux_matrix) }}
     defaults:
       run:
         shell: bash
@@ -97,6 +69,13 @@ jobs:
             third_party/build
             third_party/dist
           key: native-linux-v1-jammy-${{ matrix.arch }}-${{ matrix.dependencies }}-${{ hashFiles('xtask/**', 'scripts/*linux*.sh', 'third_party/patches/**', '.github/workflows/linux.yml') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          workspaces: . -> target/linux-${{ matrix.dependencies }}
+          key: ${{ matrix.target }}-lgpl-${{ matrix.dependencies }}-${{ hashFiles('Cargo.lock', '.github/workflows/linux.yml', 'xtask/**', 'scripts/*linux*.sh', 'scripts/with_linux_audio.sh', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'x64' && matrix.dependencies == 'bundled' }}
       - name: Build, test and package as an unprivileged desktop user
         run: |
           useradd --create-home erika-ci
@@ -135,20 +114,13 @@ jobs:
 
   runtime:
     name: Clean runtime ${{ matrix.arch }} ${{ matrix.dependencies }}
-    needs: native
+    needs: [changes, native]
     runs-on: ${{ matrix.runner }}
     container: ubuntu:22.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      matrix:
-        arch: [x64, arm64]
-        dependencies: [bundled, system]
-        include:
-          - arch: x64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+      matrix: ${{ fromJSON(needs.changes.outputs.linux_matrix) }}
     defaults:
       run:
         shell: bash
