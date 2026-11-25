@@ -372,8 +372,8 @@ API 34+ 上，Android 暴露有效 ratio 时，`activeHeadroom` 是当前显示�
 | 8 | `legacyAppleEdrUnsupported` | `legacy_apple_edr_unsupported` |
 
 `player.screenshot()` 返回当前合成帧（视频 + 字幕 + 弹幕）的原始 SDR RGBA8；即使显示为
-Apple EDR 或 Android extended-linear 也一样。Metal 与 Android/wgpu 已实现截图；当前
-Windows D3D11 Flutter 路径不返回截图字节。
+Apple EDR 或 Android extended-linear 也一样。Metal、Android/wgpu 与 Windows D3D11
+（自 0.3.8 起，返回含视频与字幕的 SDR PNG 字节）均已实现截图。
 
 非 HDR 模拟器/设备覆盖验证的是明确 SDR 回退及其 reason。Active extended-linear 尚不宣称
 已通过真机验证；仍需在 API 35 HDR 真机上验收 `Rgba16Float + SCRGB_LINEAR`、旋转/前后台

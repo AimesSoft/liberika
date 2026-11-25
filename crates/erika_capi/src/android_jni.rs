@@ -797,13 +797,12 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativePlayba
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptureFrame(
+fn capture_frame_jni(
     mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
     handle: jlong,
     width: jint,
     height: jint,
+    include_danmaku: bool,
 ) -> jbyteArray {
     let result = catch_unwind(AssertUnwindSafe(|| {
         with_registered_presenter(handle, "captureFrame", |presenter| {
@@ -818,7 +817,7 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptur
             }
             let handle = unsafe { presenter.handle.as_mut() }
                 .ok_or_else(|| "Android screenshot presenter handle is null".to_string())?;
-            capture_presenter_frame_rgba(handle, width, height, false)
+            capture_presenter_frame_rgba(handle, width, height, include_danmaku)
         })
     }));
 
@@ -840,6 +839,28 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptur
             ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptureFrame(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    width: jint,
+    height: jint,
+) -> jbyteArray {
+    capture_frame_jni(env, handle, width, height, false)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptureFrameWithDanmaku(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    width: jint,
+    height: jint,
+) -> jbyteArray {
+    capture_frame_jni(env, handle, width, height, true)
 }
 
 unsafe fn invoke_presenter(

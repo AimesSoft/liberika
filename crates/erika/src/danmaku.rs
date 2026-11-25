@@ -34,6 +34,10 @@ use typography::{
     effective_config_font_size, effective_font_size, px_scale_for_em,
 };
 
+/// Source font size of a viewer-sent comment: the size a comment file gives an
+/// ordinary comment, so it renders at the configured size.
+pub(crate) const LIVE_SOURCE_FONT_SIZE: f32 = DEFAULT_SOURCE_FONT_SIZE;
+
 const DEFAULT_SCROLL_DURATION: Duration = Duration::from_millis(9000);
 const DEFAULT_STATIC_DURATION: Duration = Duration::from_millis(3800);
 const DEFAULT_GENERATION: u64 = 1;
@@ -565,6 +569,10 @@ pub struct DanmakuTrack {
     timeline: DanmakuTimeline,
     enabled: bool,
     offset: i64,
+    /// Viewer-sent comments are written against this video's own timeline, so
+    /// the global offset, which aligns imported comment files, does not move
+    /// them. Their track offset still applies.
+    live: bool,
 }
 
 impl DanmakuTrack {
@@ -581,6 +589,7 @@ impl DanmakuTrack {
             timeline,
             enabled: true,
             offset: 0,
+            live: false,
         }
     }
 
@@ -692,6 +701,37 @@ impl DanmakuSession {
         self.tracks.clear();
         self.next_track_id = DEFAULT_DANMAKU_TRACK_ID + 1;
         self.add_track_with_id(DEFAULT_DANMAKU_TRACK_ID, timeline, name, source)
+    }
+
+    /// Appends a viewer-sent comment to the session's live track, creating it on
+    /// first use, and returns that track's id. The comment keeps its media time:
+    /// the live track ignores the global offset, which aligns imported files,
+    /// and a track the user turned off stays off.
+    pub fn push_live_item(&mut self, mut item: DanmakuItem) -> Result<u64> {
+        let existing_index = self.tracks.iter().position(|track| track.live);
+        if let Some(index) = existing_index {
+            let track = &mut self.tracks[index];
+            item.id = track
+                .timeline
+                .items()
+                .iter()
+                .map(|existing| existing.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            track.timeline.push(item)?;
+            let id = track.id;
+            self.mark_dirty();
+            Ok(id)
+        } else {
+            item.id = 1;
+            let timeline = DanmakuTimeline::new(vec![item])?;
+            let id = self.add_track(timeline, "live", DanmakuTrackSource::Manual);
+            if let Some(track) = self.tracks.iter_mut().find(|track| track.id == id) {
+                track.live = true;
+            }
+            Ok(id)
+        }
     }
 
     pub fn clear(&mut self) {
@@ -822,7 +862,8 @@ impl DanmakuSession {
                 continue;
             }
             for item in track.timeline.items() {
-                let offset = track.offset.saturating_add(self.global_offset);
+                let global = if track.live { 0 } else { self.global_offset };
+                let offset = track.offset.saturating_add(global);
                 let Some(pts) = apply_track_offset(item.pts, offset) else {
                     continue;
                 };
@@ -4162,6 +4203,54 @@ mod tests {
             }
         }
         collection
+    }
+
+    #[test]
+    fn live_comments_keep_media_time_and_respect_a_disabled_track() {
+        let mut session = DanmakuSession::new();
+        session.replace_default_track(
+            DanmakuTimeline::new(vec![item(1.0, "imported", DanmakuMode::Scroll)]).unwrap(),
+            "file",
+            DanmakuTrackSource::Json,
+        );
+        // The imported file starts 10 s late; a viewer sends at 5 s.
+        session.set_global_offset(10_000_000);
+        let live = session
+            .push_live_item(item(5.0, "sent", DanmakuMode::Scroll))
+            .unwrap();
+        let shown = |session: &mut DanmakuSession, text: &str| {
+            session
+                .active_timeline()
+                .items()
+                .iter()
+                .find(|item| item.text == text)
+                .map(|item| item.pts)
+        };
+        assert_eq!(
+            shown(&mut session, "imported"),
+            Some(Duration::from_secs(11))
+        );
+        assert_eq!(shown(&mut session, "sent"), Some(Duration::from_secs(5)));
+
+        // Changing the global offset later still leaves live comments in place.
+        session.set_global_offset(-500_000);
+        assert_eq!(shown(&mut session, "sent"), Some(Duration::from_secs(5)));
+        // An offset on the live track itself still applies.
+        assert!(session.set_track_offset(live, 1_000_000));
+        assert_eq!(shown(&mut session, "sent"), Some(Duration::from_secs(6)));
+
+        // Sending again keeps a track the user turned off hidden.
+        assert!(session.set_track_enabled(live, false));
+        assert_eq!(
+            session
+                .push_live_item(item(7.0, "later", DanmakuMode::Top))
+                .unwrap(),
+            live
+        );
+        assert_eq!(shown(&mut session, "sent"), None);
+        assert_eq!(shown(&mut session, "later"), None);
+        assert!(session.set_track_enabled(live, true));
+        assert_eq!(shown(&mut session, "later"), Some(Duration::from_secs(8)));
     }
 
     fn item(time: f64, text: &str, mode: DanmakuMode) -> DanmakuItem {

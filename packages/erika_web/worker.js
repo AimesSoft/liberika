@@ -68,6 +68,7 @@ let packet = null,
   subtitleDirty = true,
   subtitleScale = 1,
   subtitleSampling = 2,
+  subtitleDelay = 0,
   dpr = 1,
   danmakuDelay = 0,
   hardwareDecode = true;
@@ -339,7 +340,7 @@ function draw(t) {
   try {
     if (!demuxBusy) {
       const head = media._erika_subtitle_render(
-        time,
+        Math.max(0, time - subtitleDelay),
         Math.round(renderer.width * subtitleSampling),
         Math.round(renderer.height * subtitleSampling),
         subtitleScale,
@@ -500,6 +501,7 @@ const methods = {
     schedulePump();
     return {
       ...info,
+      container: info.container ?? null,
       videoTrack: videoTrack.id,
       audioTrack: audioTrack?.id ?? null,
       subtitleTrack: sub?.id ?? null,
@@ -550,14 +552,20 @@ const methods = {
   async danmaku({ text }) {
     return danmaku.append(text);
   },
+  async clearDanmaku() {
+    if (typeof danmaku.clear === "function") danmaku.clear();
+    else danmaku.load("[]");
+  },
   async configure({ config }) {
     if (Number.isFinite(config.delay)) danmakuDelay = Math.max(-60, Math.min(60, config.delay));
     danmaku.configure(JSON.stringify(config), performance.now());
   },
-  async subtitleOptions({ scale, supersampling }) {
+  async subtitleOptions({ scale, supersampling, delay }) {
     if (Number.isFinite(scale))
       subtitleScale = Math.max(0.25, Math.min(4, scale));
     if (supersampling !== undefined) subtitleSampling = supersampling ? 2 : 1;
+    if (Number.isFinite(delay))
+      subtitleDelay = Math.max(-600, Math.min(600, delay));
     subtitleDirty = true;
   },
   async sendDanmaku({ text, color, seconds }) {

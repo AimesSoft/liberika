@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 
 namespace erika_flutter {
 
@@ -611,12 +612,96 @@ class ErikaFlutterPluginTestPeer {
     std::cout << "overlay owner preservation, exclusive takeover and stale detach protection passed\n";
   }
 
+  static void RunJsonBridgeAndDiagnostics(
+      const std::shared_ptr<ErikaFlutterPlugin::ErikaNativeLibrary>& library) {
+    const EncodableMap payload{
+        {EncodableValue("muted"), EncodableValue(true)},
+        {EncodableValue("delayMicros"), EncodableValue(static_cast<int64_t>(-500000))},
+        {EncodableValue("label"), EncodableValue("line1\n\"quoted\"\\end")},
+        {EncodableValue("empty"), EncodableValue()},
+        {EncodableValue("items"), EncodableValue(EncodableList{
+            EncodableValue(1), EncodableValue(2.5), EncodableValue(false)})},
+    };
+    const std::string encoded = SerializeJsonObject(payload);
+    Require(encoded.find("\"muted\":true") != std::string::npos);
+    Require(encoded.find("\"delayMicros\":-500000") != std::string::npos);
+    Require(encoded.find("\"label\":\"line1\\n\\\"quoted\\\"\\\\end\"") != std::string::npos);
+    Require(encoded.find("\"empty\":null") != std::string::npos);
+    Require(encoded.find("\"items\":[1,2.5,false]") != std::string::npos);
+    Require(ParseLogLevel(nullptr) == -1);
+    const EncodableValue warn_level("warn");
+    Require(ParseLogLevel(&warn_level) == ErikaLogLevel_Warn);
+    const EncodableValue count_val(static_cast<int64_t>(42));
+    Require(ParseNonNegativeU64(&count_val, "limit", 200) == 42);
+    bool rejected_non_finite = false;
+    try {
+      SerializeJsonObject(EncodableMap{
+          {EncodableValue("bad"), EncodableValue(std::numeric_limits<double>::quiet_NaN())}});
+    } catch (const PluginError&) {
+      rejected_non_finite = true;
+    }
+    Require(rejected_non_finite);
+
+    const auto saved_invoke = library->invoke_json;
+    const auto saved_diag = library->get_diagnostics_json;
+    const auto saved_logs = library->log_read_json;
+
+    if (saved_invoke && saved_diag && saved_logs) {
+      const std::string logs_json = library->ReadLogsJson(10, -1, 0);
+      Require(logs_json.find("\"schema\"") != std::string::npos);
+      ErikaFlutterPlugin::PlayerHost player(73, library, ErikaPresenterConfig{}, Post);
+      Command(player, [&] {
+        const std::string snapshot = player.DiagnosticsSnapshotJson();
+        Require(snapshot.find("\"schema\"") != std::string::npos);
+        const std::string envelope = player.InvokeJson("volume", "{}");
+        Require(envelope.find("\"ok\":true") != std::string::npos);
+        const std::string muted = player.InvokeJson("setMuted", "{\"muted\":true}");
+        Require(muted.find("\"ok\":true") != std::string::npos);
+      });
+    }
+
+    library->invoke_json = nullptr;
+    library->get_diagnostics_json = nullptr;
+    library->log_read_json = nullptr;
+    bool logs_unsupported = false;
+    try {
+      (void)library->ReadLogsJson(10, -1, 0);
+    } catch (const UnsupportedPluginError&) {
+      logs_unsupported = true;
+    }
+    Require(logs_unsupported);
+    {
+      ErikaFlutterPlugin::PlayerHost player(74, library, ErikaPresenterConfig{}, Post);
+      Command(player, [&] {
+        bool diag_unsupported = false;
+        try {
+          (void)player.DiagnosticsSnapshotJson();
+        } catch (const UnsupportedPluginError&) {
+          diag_unsupported = true;
+        }
+        bool invoke_unsupported = false;
+        try {
+          (void)player.InvokeJson("listMethods", "{}");
+        } catch (const UnsupportedPluginError&) {
+          invoke_unsupported = true;
+        }
+        Require(diag_unsupported && invoke_unsupported);
+      });
+    }
+    Drain();
+    library->invoke_json = saved_invoke;
+    library->get_diagnostics_json = saved_diag;
+    library->log_read_json = saved_logs;
+    std::cout << "Windows JSON pass-through, diagnostics, logs and unsupported fallback passed\n";
+  }
+
   static void Run(const std::string& clip, bool native_surface = false) {
     auto library = ErikaFlutterPlugin::ErikaNativeLibrary::Shared();
     TrackOwners(library);
     RunSentMessageJoin(library);
     RunOverlayOwnership(library);
     RunScreenshotEncoding(library);
+    RunJsonBridgeAndDiagnostics(library);
     RunPlaybackSmoke(library, clip);
     if (native_surface) RunNativeSurfaceSmoke(library, clip);
     ErikaPresenterConfig config{};

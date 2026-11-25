@@ -393,8 +393,8 @@ ratio、`activeHeadroomKnown` は true です。ratio unavailable の場合、�
 
 `player.screenshot()` は current composited frame（video + subtitle + danmaku）の raw SDR
 RGBA8 を返し、display が Apple EDR / Android extended-linear の場合も SDR のままです。
-Metal と Android/wgpu は capture 実装済みですが、現在の Windows D3D11 Flutter path は
-screenshot byte を返しません。
+Metal、Android/wgpu、Windows D3D11（0.3.8 以降、映像と字幕を含む SDR PNG バイト）で
+capture を実装しています。
 
 non-HDR emulator/device coverage は明示的 SDR fallback と reason を検証します。Active
 extended-linear はまだ実機検証済みとは claim せず、API 35 HDR device で

@@ -76,4 +76,7 @@ internal object ErikaNative {
 
     @JvmStatic
     external fun nativeCaptureFrame(handle: Long, width: Int, height: Int): ByteArray?
+
+    @JvmStatic
+    external fun nativeCaptureFrameWithDanmaku(handle: Long, width: Int, height: Int): ByteArray?
 }

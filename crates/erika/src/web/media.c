@@ -130,7 +130,12 @@ const char *erika_info(void) {
         quote(&out, metadata(c->metadata, "title"));
         av_bprintf(&out, ",\"start\":%.6f,\"end\":%.6f}", start, end);
     }
-    av_bprintf(&out,"]}"); av_bprint_finalize(&out,&info); return info;
+    av_bprintf(&out, "],\"container\":{\"format\":");
+    if (format->iformat && format->iformat->name) quote(&out, format->iformat->name);
+    else av_bprintf(&out, "null");
+    if (format->bit_rate > 0) av_bprintf(&out, ",\"bitRate\":%lld}", (long long)format->bit_rate);
+    else av_bprintf(&out, ",\"bitRate\":null}");
+    av_bprintf(&out, "}"); av_bprint_finalize(&out,&info); return info;
 }
 int erika_subtitle_select(int stream) {
     if (subtitles) ass_free_track(subtitles);

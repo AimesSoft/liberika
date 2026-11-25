@@ -517,10 +517,13 @@ export default class ErikaFlutterPlugin implements FlutterPlugin, MethodCallHand
       return;
     }
 
+    const includeDanmakuValue: ESObject = args.get('includeDanmaku');
+    const includeDanmaku: boolean = includeDanmakuValue === true;
     const bytes = await erikaNative.nativeCaptureFrameAsync(
       playerId,
       width,
       height,
+      includeDanmaku,
     ) as Uint8Array | null;
     result.success(bytes);
   }
@@ -952,11 +955,11 @@ export default class ErikaFlutterPlugin implements FlutterPlugin, MethodCallHand
     return [
       'open', 'play', 'pause', 'stop', 'close', 'seek',
       'setPlaybackRate', 'setVolume', 'setUpscaler', 'clearUpscalerModel',
-      'setSubtitleScale',
+      'setSubtitleScale', 'setSubtitleStyle',
       'selectSubtitleMemoryFonts', 'clearSubtitleMemoryFonts',
       'getSubtitleMemoryFontStatus',
       'getUpscalerStatus', 'getOutputStatus', 'getPresenterStats',
-      'getResourceStatus',
+      'getResourceStatus', 'setDebugHudEnabled',
       'addExternalSubtitle', 'removeSubtitleTrack',
       'loadDanmakuFile', 'loadDanmakuJson',
       'addDanmakuTrackFile', 'addDanmakuTrackJson',
