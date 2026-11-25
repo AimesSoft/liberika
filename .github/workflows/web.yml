@@ -49,6 +49,19 @@ jobs:
           python3 scripts/web_test_fixtures.py
           python3 scripts/serve_web.py > target/web-server.log 2>&1 &
           PLAYWRIGHT_MODULE="$PWD/target/web-tests/node_modules/playwright/index.mjs" node packages/erika_web/tests/browser.mjs
+      - name: npm package in a Vite site
+        run: |
+          set -euo pipefail
+          python3 scripts/web_npm_package.py
+          (cd target/npm/web && npm pack --pack-destination ..)
+          rm -rf target/web-consumer
+          cp -R packages/erika_web/tests/consumer target/web-consumer
+          (cd target/web-consumer && npm install --no-audit --no-fund ../npm/liberika-web-*.tgz && npm run build)
+          cp -R target/web/fixtures target/web-consumer/dist/fixtures
+          cp -R target/npm/web target/web-consumer/dist/liberika
+          python3 scripts/serve_web.py --port 18766 --directory target/web-consumer/dist > target/web-consumer-server.log 2>&1 &
+          python3 scripts/serve_web.py --port 18767 --cors --directory target/npm/web > target/web-cdn-server.log 2>&1 &
+          PLAYWRIGHT_MODULE="$PWD/target/web-tests/node_modules/playwright/index.mjs" node packages/erika_web/tests/consumer.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -57,6 +70,8 @@ jobs:
             target/web-tests/*.json
             target/web-tests/*.png
             target/web-server.log
+            target/web-consumer-server.log
+            target/web-cdn-server.log
       - uses: actions/upload-artifact@v4
         with:
           name: liberika-web

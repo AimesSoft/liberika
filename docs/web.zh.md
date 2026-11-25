@@ -9,7 +9,7 @@ libass、FreeType、HarfBuzz、FriBidi，以及负责解封装的精简 FFmpeg�
 这一后端已接入 **Erika Web 应用**，包括播放控件、轨道选择、章节、截图和弹幕设置。
 0.3.7 Release 提供独立的 `liberika-web-0.3.7.zip`，包含完整浏览器运行时和
 `index.html` 演示页，校验值记录在 `SHA256SUMS`。解压整个归档后通过 HTTPS 或本机
-HTTP 服务访问；也可从源码构建。Web 包尚未发布到 npm。
+HTTP 服务访问；也可从源码构建。同一运行时以 `@liberika/web` 发布到 npm。
 
 [0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7) 还提供
 `liberika-web-nofont-0.3.7.zip`。此版本由宿主通过
@@ -73,10 +73,25 @@ python3 scripts/serve_web.py
 --without-fallback-font` 省去约 6 MB，再把字体传给 `Player.create({ canvas, fallbackFont: { data, index } })`。
 浏览器需要 HTTPS 或 localhost；本实现不依赖 SharedArrayBuffer 或跨源隔离。
 `build-manifest.json` 记录产物的 SHA-256。示例支持 `?src=URL` 打开远程媒体。
+`python3 scripts/web_npm_package.py` 从该目录在 `target/npm/web` 生成 npm 包。
 
 ## 接入
 
-将构建产物中的运行时资源复制到网站的 `liberika/` 目录，保持相对路径。
+使用打包器时，安装后按包名导入：
+
+```sh
+npm install @liberika/web
+```
+
+```js
+import { Player } from '@liberika/web';
+```
+
+Vite 不需要额外配置即可构建和开发：Worker 与两个 WASM 都通过
+`new URL(..., import.meta.url)` 引用，其他识别这种写法的打包器同样适用。
+`@liberika/web-nofont` 是不含回退字体的同一个包。
+
+不使用打包器时，将构建产物或已安装的包目录中的运行时资源复制到网站的 `liberika/` 目录，保持相对路径。
 下面的页面可选择本地 MKV，再点击播放；内嵌 ASS 和字体附件自动加载。
 
 ```html
@@ -170,6 +185,9 @@ await player.configureSubtitles({ scale: 1, supersampling: true });
 - 远程媒体需要允许浏览器请求。超过 8 MiB 的文件需要正确返回 HTTP `206` 和已知总长度，
   跨域时通过 `Access-Control-Expose-Headers` 暴露 `Content-Range`。
   本地测试可用支持 Range 的 `scripts/serve_web.py`。
+- 页面可以从其他源（例如 npm CDN）加载运行时，前提是该源返回 CORS 头。此时 Worker 通过同源
+  blob 模块启动，设置了 Content-Security-Policy 的页面需要允许 `worker-src blob:`。只想自行托管
+  `worker.js` 及其同目录文件时，用 `Player.create({ canvas, workerURL })` 指定地址。
 - 将整套运行时放在版本目录，或让入口与资源一同重新验证缓存，避免新旧 JS/WASM 混用。
 - 无需 SharedArrayBuffer 或跨源隔离。音频从用户点击启动，本地媒体通过用户选择的 File/Blob 传入。
 

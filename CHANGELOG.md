@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+### Browser
+
+- The Web runtime is published to npm as `@liberika/web`, and as `@liberika/web-nofont` without the fallback font; Vite bundles it without configuration.
+- A page can load the runtime from another origin, such as an npm CDN; `Player.create` takes `workerURL` for hosts that serve `worker.js` themselves.
+- `package.json` in the build output carries the Cargo workspace version (it had stayed at 0.1.8).
+
 ## 0.3.8 - 2026-11-20
 
 ### Windows

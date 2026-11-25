@@ -1,15 +1,52 @@
 import { AudioSession } from "./audio.js";
 export { AudioSession } from "./audio.js";
 
+// A page may only construct a worker from its own origin, so a worker script on
+// another origin (a CDN copy of this package) is started through a same-origin
+// blob module that imports it. The script still resolves its WASM files against
+// its real URL.
+function startWorker(workerURL) {
+  // Bundlers recognise exactly this expression and bundle the worker with its
+  // imports and WASM files; keep it in one piece.
+  if (!workerURL && !crossOrigin(import.meta.url))
+    return new Worker(new URL("./worker.js", import.meta.url), {
+      type: "module",
+    });
+  const base = import.meta.url,
+    url = new URL(workerURL ?? "./worker.js", workerURL ? document.baseURI : base);
+  if (!crossOrigin(url)) return new Worker(url, { type: "module" });
+  const shim = URL.createObjectURL(
+    new Blob([`import ${JSON.stringify(url.href)};`], {
+      type: "text/javascript",
+    }),
+  );
+  const worker = new Worker(shim, { type: "module" }),
+    release = () => URL.revokeObjectURL(shim);
+  // The script is fetched after this returns; release the blob once it ran.
+  worker.addEventListener("message", release, { once: true });
+  worker.addEventListener("error", release, { once: true });
+  return worker;
+}
+function crossOrigin(url) {
+  const { protocol, origin } = new URL(url);
+  return /^https?:$/.test(protocol) && origin !== globalThis.location?.origin;
+}
+
 /** liberika browser backend: one player owns demux, WebCodecs, libass, danmaku
  * and WebGL presentation. Serve this package unchanged over HTTPS/localhost. */
 export class Player extends EventTarget {
-  static async create({ canvas, volume = 1, audioSession, fallbackFont } = {}) {
+  static async create({
+    canvas,
+    volume = 1,
+    audioSession,
+    fallbackFont,
+    workerURL,
+  } = {}) {
     if (!canvas?.transferControlToOffscreen)
       throw new Error(
         "An HTML canvas with OffscreenCanvas support is required",
       );
-    const player = new Player(canvas, volume, audioSession);
+    const player = new Player(canvas, volume, audioSession, workerURL);
     const offscreen = canvas.transferControlToOffscreen();
     try {
       await player.request(
@@ -24,12 +61,10 @@ export class Player extends EventTarget {
       throw e;
     }
   }
-  constructor(canvas, volume, audioSession) {
+  constructor(canvas, volume, audioSession, workerURL) {
     super();
     this.canvas = canvas;
-    this.worker = new Worker(new URL("./worker.js", import.meta.url), {
-      type: "module",
-    });
+    this.worker = startWorker(workerURL);
     this.pending = new Map();
     this.nextId = 1;
     this.generation = 0;
