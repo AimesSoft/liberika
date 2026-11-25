@@ -375,23 +375,51 @@ jobs:
       - name: Install build tools (nasm, meson, ninja, LLVM/libclang)
         shell: pwsh
         run: |
-          choco install -y --no-progress zip
+          # The Chocolatey community feed answers 503/504 for minutes at a time,
+          # and choco can exit 0 without installing anything when it does.
+          function Install-ChocoPackage([string[]] $Arguments, [scriptblock] $Installed) {
+            foreach ($attempt in 1..4) {
+              choco @Arguments -y --no-progress | Out-Host
+              if ($LASTEXITCODE -eq 0 -and (& $Installed)) { return $true }
+              if ($attempt -lt 4) { Start-Sleep -Seconds (20 * $attempt) }
+            }
+            return $false
+          }
+          function Test-Command([string] $Name) { [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+          # A restored dependency cache may not need the tool; the step that
+          # does need it names it when it is missing.
+          function Expect([bool] $Ok, [string] $What) {
+            if (-not $Ok) { Write-Host "::warning::Could not install $What from Chocolatey after retries." }
+          }
+          $nasmDir = "C:\Program Files\NASM"
+          Expect (Install-ChocoPackage @("install", "zip") { Test-Command "zip" }) "zip"
           if ("${{ matrix.arch }}" -eq "x64") {
-            choco install -y --no-progress nasm
-          } elseif (-not (Get-Command make -ErrorAction SilentlyContinue)) {
-            choco install -y --no-progress make
+            Expect (Install-ChocoPackage @("install", "nasm") { Test-Path (Join-Path $nasmDir "nasm.exe") }) "nasm"
+          } elseif (-not (Test-Command "make")) {
+            Expect (Install-ChocoPackage @("install", "make") { Test-Command "make" }) "make"
           }
           pip install --quiet meson ninja
+          $llvmVersion = "22.1.8"
           $llvmBin = "C:\Program Files\LLVM\bin"
           $libclang = Join-Path $llvmBin "libclang.dll"
-          if ("${{ matrix.arch }}" -eq "x64" -and
-              (-not (Test-Path $libclang) -or [version](Get-Item $libclang).VersionInfo.ProductVersion -lt [version]"22.0")) {
-            # VS 2026's STL requires Clang 22 or newer when bindgen parses C++.
-            choco upgrade llvm --version=22.1.8 -y --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          } elseif (-not (Test-Path $libclang)) {
-            choco install llvm -y --no-progress
+          # VS 2026's STL requires Clang 22 or newer when bindgen parses C++.
+          $minimum = if ("${{ matrix.arch }}" -eq "x64") { [version]"22.0" } else { [version]"0.0" }
+          function Test-Libclang {
+            (Test-Path $libclang) -and [version](Get-Item $libclang).VersionInfo.ProductVersion -ge $minimum
           }
+          if (-not (Test-Libclang)) {
+            $choco = if ("${{ matrix.arch }}" -eq "x64") { @("upgrade", "llvm", "--version=$llvmVersion") } else { @("install", "llvm") }
+            if (-not (Install-ChocoPackage $choco { Test-Libclang })) {
+              # Same installer, straight from the LLVM release.
+              $asset = if ("${{ matrix.arch }}" -eq "x64") { "win64" } else { "woa64" }
+              $installer = Join-Path $env:RUNNER_TEMP "LLVM-$llvmVersion-$asset.exe"
+              curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 10 --output $installer `
+                "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/LLVM-$llvmVersion-$asset.exe"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+            }
+          }
+          if (-not (Test-Libclang)) { Write-Error "LLVM/libclang $minimum or newer is not installed."; exit 1 }
           "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
