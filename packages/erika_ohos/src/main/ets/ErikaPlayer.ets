@@ -452,16 +452,18 @@ export class ErikaPlayer {
     });
   }
 
-  exportGif(options: ErikaGifExportOptions): ESObject | null {
-    return this.invokeOrThrow('exportGif', options);
+  // Exports decode and encode a whole range, which takes seconds. They run on
+  // the player's worker and resolve later, so the calling (UI) thread is free.
+  async exportGif(options: ErikaGifExportOptions): Promise<ESObject | null> {
+    return await this.invokeAsyncOrThrow('exportGif', options);
   }
 
-  exportFrame(options: ErikaFrameExportOptions): ESObject | null {
-    return this.invokeOrThrow('exportFrame', options);
+  async exportFrame(options: ErikaFrameExportOptions): Promise<ESObject | null> {
+    return await this.invokeAsyncOrThrow('exportFrame', options);
   }
 
-  exportFrames(options: ErikaFramesExportOptions): ESObject | null {
-    return this.invokeOrThrow('exportFrames', options);
+  async exportFrames(options: ErikaFramesExportOptions): Promise<ESObject | null> {
+    return await this.invokeAsyncOrThrow('exportFrames', options);
   }
 
   attachSurface(options: ErikaSurfaceOptions): void {
@@ -555,6 +557,23 @@ export class ErikaPlayer {
 
   private invokeOrThrow(method: string, args: ESObject = {}): ESObject | null {
     const response: ErikaNativeResponse = this.invokeRaw(method, args);
+    if (!response.ok) {
+      throw new Error(response.error ?? ('Erika native method failed: ' + method));
+    }
+    return response.value ?? null;
+  }
+
+  private async invokeAsyncOrThrow(method: string, args: ESObject): Promise<ESObject | null> {
+    this.ensureAlive();
+    const raw: ESObject = await erikaNative.nativeInvokeAsync(
+      this.nativeId,
+      method,
+      JSON.stringify(args),
+    );
+    if (raw === null || raw === undefined) {
+      throw new Error('Erika player is closing: ' + method);
+    }
+    const response: ErikaNativeResponse = JSON.parse(raw as string) as ErikaNativeResponse;
     if (!response.ok) {
       throw new Error(response.error ?? ('Erika native method failed: ' + method));
     }

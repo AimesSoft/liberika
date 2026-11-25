@@ -4365,7 +4365,11 @@ void ErikaFlutterPlugin::HandleMethodCall(
       auto platform_result =
           std::shared_ptr<flutter::MethodResult<EncodableValue>>(
               std::move(result));
-      const bool posted = EnsureLogWorker().Post(
+      // `result` is empty from here on, so a failure to start the worker or
+      // queue the read must answer through platform_result, not the outer catch.
+      bool posted = false;
+      try {
+        posted = EnsureLogWorker().Post(
           [this, library = std::move(library), limit, min_level, since_seq,
            platform_result]() mutable {
             std::string json;
@@ -4391,6 +4395,10 @@ void ErikaFlutterPlugin::HandleMethodCall(
               }
             });
           });
+      } catch (const std::exception& error) {
+        platform_result->Error("ERIKA_ERROR", SafeUtf8Message(error.what()));
+        return;
+      }
       if (!posted) {
         platform_result->Error("ERIKA_ERROR",
                                "Erika log worker is shutting down.");

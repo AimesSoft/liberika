@@ -149,10 +149,15 @@ class ApiAlignmentTests(unittest.TestCase):
 
         # Every OHPM ArkTS SDK invokeOrThrow('<name>') target must exist in presenter_json.rs.
         ohos_sdk = read("packages/erika_ohos/src/main/ets/ErikaPlayer.ets")
-        ohos_sdk_targets = set(re.findall(r"invokeOrThrow\(\s*'([^']+)'", ohos_sdk))
+        ohos_sdk_targets = set(re.findall(r"invoke(?:Async)?OrThrow\(\s*'([^']+)'", ohos_sdk))
         self.assertTrue(ohos_sdk_targets)
         self.assertEqual(ohos_sdk_targets - json_methods, set())
         self.assertIn("invokeJson(method: string", ohos_sdk)
+        # Exports take seconds; they must not block the ArkTS caller's thread.
+        for export in ["exportGif", "exportFrame", "exportFrames"]:
+            with self.subTest(ohos_async_export=export):
+                self.assertRegex(ohos_sdk, rf"async {export}\([^)]*\): Promise<")
+                self.assertIn(f"invokeAsyncOrThrow('{export}'", ohos_sdk)
         for required_ohos_method in [
             "setMuted",
             "volume",
