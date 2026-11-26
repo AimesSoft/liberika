@@ -62,7 +62,7 @@ use crate::renderer::pipeline::{
     LumaUpscalerMode, SourceColorState, UpscalerCapabilities, VideoRenderPipeline,
 };
 use crate::renderer::post_process::{
-    PostProcessRuntimeInfo, PostProcessShader, PostProcessUniforms,
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
 };
 use crate::renderer::wgpu_post_process::WgpuPostProcess;
 
@@ -3349,8 +3349,15 @@ impl WgpuRenderer {
             .as_ref()
             .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?
             .format;
-        let post_w = viewport.width.round().max(1.0) as u32;
-        let post_h = viewport.height.round().max(1.0) as u32;
+        let post_stage = self.post_process.stage();
+        let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+            (target_width.max(1), target_height.max(1))
+        } else {
+            (
+                viewport.width.round().max(1.0) as u32,
+                viewport.height.round().max(1.0) as u32,
+            )
+        };
         let post_active = self
             .post_process
             .prepare(&self.device, post_w, post_h, video_format);
@@ -3402,44 +3409,120 @@ impl WgpuRenderer {
         } else {
             wgpu::Color::BLACK
         };
+        let mut overlays_composited = false;
         if post_active && let Some(post_src_view) = self.post_process.source_view() {
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("erika-wgpu-video-post-src-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: post_src_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(clear_color),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&pipeline.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.set_viewport(0.0, 0.0, post_w as f32, post_h as f32, 0.0, 1.0);
-                pass.draw(0..3, 0..1);
+            if post_stage == PostProcessStage::Output {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("erika-wgpu-output-post-src-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_src_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear_color),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.set_viewport(
+                        viewport.x,
+                        viewport.y,
+                        viewport.width,
+                        viewport.height,
+                        0.0,
+                        1.0,
+                    );
+                    pass.draw(0..3, 0..1);
+                    if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
+                        let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
+                            PlayerError::Renderer("overlay pipeline not initialized".to_string())
+                        })?;
+                        pass.set_pipeline(&overlay_pipeline.pipeline);
+                        pass.set_viewport(
+                            viewport.x,
+                            viewport.y,
+                            viewport.width,
+                            viewport.height,
+                            0.0,
+                            1.0,
+                        );
+                        for draw in &overlay_draws {
+                            pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
+                            pass.draw(0..4, 0..1);
+                        }
+                        pass.set_viewport(
+                            0.0,
+                            0.0,
+                            target_width as f32,
+                            target_height as f32,
+                            0.0,
+                            1.0,
+                        );
+                        self.encode_danmaku_draws(&mut pass, &danmaku_draws);
+                    }
+                }
+                overlays_composited = true;
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [0.0, 0.0, target_width as f32, target_height as f32],
+                    (target_width, target_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                self.post_process.encode_pass(
+                    &self.device,
+                    &mut encoder,
+                    target_view,
+                    clear_color,
+                    (0.0, 0.0, target_width as f32, target_height as f32),
+                    &post_uniforms,
+                );
+            } else {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("erika-wgpu-video-post-src-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_src_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear_color),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.set_viewport(0.0, 0.0, post_w as f32, post_h as f32, 0.0, 1.0);
+                    pass.draw(0..3, 0..1);
+                }
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [viewport.x, viewport.y, viewport.width, viewport.height],
+                    (target_width, target_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                self.post_process.encode_pass(
+                    &self.device,
+                    &mut encoder,
+                    target_view,
+                    clear_color,
+                    (viewport.x, viewport.y, viewport.width, viewport.height),
+                    &post_uniforms,
+                );
             }
-            let post_uniforms = PostProcessUniforms::new(
-                (post_w, post_h),
-                [viewport.x, viewport.y, viewport.width, viewport.height],
-                (target_width, target_height),
-                self.stats.rendered_frames as f64 / 60.0,
-                self.stats.rendered_frames,
-            );
-            self.post_process.encode_pass(
-                &self.device,
-                &mut encoder,
-                target_view,
-                clear_color,
-                (viewport.x, viewport.y, viewport.width, viewport.height),
-                &post_uniforms,
-            );
         } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("erika-wgpu-video-pass"),
@@ -3470,7 +3553,7 @@ impl WgpuRenderer {
             pass.draw(0..3, 0..1);
         }
 
-        if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
+        if !overlays_composited && (!overlay_draws.is_empty() || !danmaku_draws.is_empty()) {
             let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
                 PlayerError::Renderer("overlay pipeline not initialized".to_string())
             })?;

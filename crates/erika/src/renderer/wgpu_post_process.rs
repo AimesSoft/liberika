@@ -7,7 +7,8 @@ use wgpu::util::DeviceExt;
 
 use crate::core::{PlayerError, Result};
 use crate::renderer::post_process::{
-    PostProcessRuntimeInfo, PostProcessShader, PostProcessStatus, PostProcessUniforms,
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessStatus,
+    PostProcessUniforms,
 };
 
 struct CompiledPipeline {
@@ -48,6 +49,12 @@ impl Default for WgpuPostProcess {
 }
 
 impl WgpuPostProcess {
+    pub(crate) fn stage(&self) -> PostProcessStage {
+        self.shader
+            .as_ref()
+            .map_or(PostProcessStage::Main, |shader| shader.stage)
+    }
+
     #[cfg_attr(
         not(all(target_os = "linux", not(target_env = "ohos"))),
         allow(dead_code)

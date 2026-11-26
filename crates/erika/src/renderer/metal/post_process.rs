@@ -23,7 +23,8 @@ use objc2_metal::{
 
 use crate::core::{PlayerError, Result};
 use crate::renderer::post_process::{
-    PostProcessRuntimeInfo, PostProcessShader, PostProcessStatus, PostProcessUniforms,
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessStatus,
+    PostProcessUniforms,
 };
 
 struct CompiledPipeline {
@@ -58,6 +59,12 @@ impl Default for MetalPostProcess {
 impl MetalPostProcess {
     pub fn is_enabled(&self) -> bool {
         self.shader.is_some()
+    }
+
+    pub fn stage(&self) -> PostProcessStage {
+        self.shader
+            .as_ref()
+            .map_or(PostProcessStage::Main, |shader| shader.stage)
     }
 
     pub fn set_shader(&mut self, shader: Option<Arc<PostProcessShader>>) {

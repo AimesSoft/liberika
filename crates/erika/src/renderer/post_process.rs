@@ -104,12 +104,25 @@ pub enum ShaderSourceKind {
     Wgsl,
 }
 
+/// Where in the frame composition pipeline a post-processing shader runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostProcessStage {
+    /// Applies to the presented video picture before subtitles and danmaku
+    /// (`//!HOOK MAIN`, `POSTKERNEL`, `SCALED`, or direct WGSL).
+    #[default]
+    Main,
+    /// Applies to the composed output surface after video, subtitles, and
+    /// danmaku (`//!HOOK OUTPUT`).
+    Output,
+}
+
 /// A parsed and validated user post-processing shader ready for backend codegen.
 #[derive(Debug)]
 pub struct PostProcessShader {
     pub name: String,
     pub description: Option<String>,
     pub kind: ShaderSourceKind,
+    pub stage: PostProcessStage,
     #[cfg(not(target_arch = "wasm32"))]
     module: naga::Module,
     #[cfg(not(target_arch = "wasm32"))]
@@ -165,6 +178,7 @@ void main() {
 #[cfg(not(target_arch = "wasm32"))]
 struct ParsedMpvPost {
     description: Option<String>,
+    stage: PostProcessStage,
     body: String,
 }
 
@@ -222,7 +236,16 @@ fn preprocess_mpv_post_glsl(name: &str, source: &str) -> Result<ParsedMpvPost> {
         )));
     }
 
-    Ok(ParsedMpvPost { description, body })
+    let stage = match hooks.first().map(String::as_str) {
+        Some("OUTPUT") => PostProcessStage::Output,
+        _ => PostProcessStage::Main,
+    };
+
+    Ok(ParsedMpvPost {
+        description,
+        stage,
+        body,
+    })
 }
 
 impl PostProcessShader {
@@ -248,14 +271,14 @@ impl PostProcessShader {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn parse_str(name: &str, source: &str) -> Result<Self> {
         let is_wgsl = source.contains("@fragment") && !source.contains("//!HOOK");
-        let (kind, description, module) = if is_wgsl {
+        let (kind, description, stage, module) = if is_wgsl {
             let module = naga::front::wgsl::parse_str(source).map_err(|err| {
                 PlayerError::Renderer(format!(
                     "post-process WGSL parse failed for {name:?}: {}",
                     err.emit_to_string(source)
                 ))
             })?;
-            (ShaderSourceKind::Wgsl, None, module)
+            (ShaderSourceKind::Wgsl, None, PostProcessStage::Main, module)
         } else {
             let parsed = preprocess_mpv_post_glsl(name, source)?;
             let wrapped = format!("{GLSL_POST_HEADER}\n{}\n{GLSL_POST_FOOTER}", parsed.body);
@@ -266,7 +289,12 @@ impl PostProcessShader {
                     "post-process GLSL parse failed for {name:?}: {err}"
                 ))
             })?;
-            (ShaderSourceKind::MpvGlsl, parsed.description, module)
+            (
+                ShaderSourceKind::MpvGlsl,
+                parsed.description,
+                parsed.stage,
+                module,
+            )
         };
 
         let mut validator = naga::valid::Validator::new(
@@ -293,6 +321,7 @@ impl PostProcessShader {
             name: name.to_string(),
             description,
             kind,
+            stage,
             module,
             info,
         })
@@ -715,6 +744,7 @@ vec4 hook() {
         for (name, src) in [("crt_lite", CRT_LITE), ("crt_high", CRT_HIGH)] {
             let shader = PostProcessShader::parse_str(name, src).expect("parse crt");
             assert_eq!(shader.kind, ShaderSourceKind::MpvGlsl);
+            assert_eq!(shader.stage, PostProcessStage::Main);
             let (wgsl, wgsl_ep) = shader.to_wgsl().expect("wgsl");
             assert!(wgsl.contains("erika_post_vs"));
             assert!(!wgsl_ep.is_empty());
@@ -733,6 +763,10 @@ vec4 hook() {
             assert!(!hlsl.contains("space0"), "hlsl:\n{hlsl}");
             assert!(!hlsl_ep.is_empty());
         }
+
+        let output_crt = CRT_LITE.replace("//!HOOK MAIN", "//!HOOK OUTPUT");
+        let output_shader = PostProcessShader::parse_str("crt_output", &output_crt).unwrap();
+        assert_eq!(output_shader.stage, PostProcessStage::Output);
     }
 
     #[test]

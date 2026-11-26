@@ -65,7 +65,7 @@ use crate::renderer::pipeline::{
     primaries_coordinates,
 };
 use crate::renderer::post_process::{
-    PostProcessRuntimeInfo, PostProcessShader, PostProcessUniforms,
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
 };
 use crate::renderer::presentation::PresentationLayout;
 use crate::renderer::sr::reference::LumaRange;
@@ -3192,8 +3192,15 @@ impl D3d11Renderer {
         } else {
             SDR_SWAPCHAIN_FORMAT
         };
-        let post_w = target_rect.width.round().max(1.0) as u32;
-        let post_h = target_rect.height.round().max(1.0) as u32;
+        let post_stage = self.post_process.stage();
+        let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+            (physical.width.max(1), physical.height.max(1))
+        } else {
+            (
+                target_rect.width.round().max(1.0) as u32,
+                target_rect.height.round().max(1.0) as u32,
+            )
+        };
         let post_rtv = if self.post_process.is_enabled() {
             let device = self.state.as_ref().expect("device ensured").device.clone();
             self.post_process
@@ -3221,7 +3228,15 @@ impl D3d11Renderer {
             state.context.ClearRenderTargetView(scene_rtv, &clear_color);
         }
         let draw_result: Result<()> = (|| {
-            if let Some(post_rtv) = post_rtv.as_ref() {
+            let full_surface_rect = D3d11DrawRect {
+                x: 0.0,
+                y: 0.0,
+                width: physical.width.max(1) as f32,
+                height: physical.height.max(1) as f32,
+            };
+            if let Some(post_rtv) = post_rtv.as_ref()
+                && post_stage == PostProcessStage::Output
+            {
                 unsafe {
                     state.context.ClearRenderTargetView(post_rtv, &clear_color);
                 }
@@ -3231,62 +3246,94 @@ impl D3d11Renderer {
                     video_override.as_ref(),
                     gamut_lut.as_ref(),
                     post_rtv,
-                    D3d11DrawRect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: post_w as f32,
-                        height: post_h as f32,
-                    },
+                    target_rect,
                 )?;
+                if !overlay_draws.is_empty() {
+                    state.draw_overlays(&overlay_draws, post_rtv, target_rect)?;
+                }
+                if !danmaku_draws.is_empty() {
+                    state.draw_danmaku(&danmaku_draws, post_rtv, full_surface_rect)?;
+                }
                 let post_uniforms = PostProcessUniforms::new(
                     (post_w, post_h),
-                    [
-                        target_rect.x,
-                        target_rect.y,
-                        target_rect.width,
-                        target_rect.height,
-                    ],
+                    [0.0, 0.0, post_w as f32, post_h as f32],
                     (physical.width, physical.height),
                     self.stats.rendered_frames as f64 / 60.0,
                     self.stats.rendered_frames,
                 );
                 let post_viewport = D3D11_VIEWPORT {
-                    TopLeftX: target_rect.x,
-                    TopLeftY: target_rect.y,
-                    Width: target_rect.width.max(1.0),
-                    Height: target_rect.height.max(1.0),
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: post_w as f32,
+                    Height: post_h as f32,
                     MinDepth: 0.0,
                     MaxDepth: 1.0,
                 };
                 self.post_process
                     .draw(&state.context, scene_rtv, post_viewport, &post_uniforms);
             } else {
-                state.draw_video(
-                    video,
-                    video_constants,
-                    video_override.as_ref(),
-                    gamut_lut.as_ref(),
-                    scene_rtv,
-                    target_rect,
-                )?;
-            }
-            if !overlay_draws.is_empty() {
-                // Subtitle coordinates are produced in the video-frame viewport.
-                // Composite them through the same aspect-fit viewport as the video
-                // so resizing the window cannot stretch the subtitle independently.
-                state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
-            }
-            if !danmaku_draws.is_empty() {
-                state.draw_danmaku(
-                    &danmaku_draws,
-                    scene_rtv,
-                    D3d11DrawRect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: physical.width.max(1) as f32,
-                        height: physical.height.max(1) as f32,
-                    },
-                )?;
+                if let Some(post_rtv) = post_rtv.as_ref() {
+                    unsafe {
+                        state.context.ClearRenderTargetView(post_rtv, &clear_color);
+                    }
+                    state.draw_video(
+                        video,
+                        video_constants,
+                        video_override.as_ref(),
+                        gamut_lut.as_ref(),
+                        post_rtv,
+                        D3d11DrawRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: post_w as f32,
+                            height: post_h as f32,
+                        },
+                    )?;
+                    let post_uniforms = PostProcessUniforms::new(
+                        (post_w, post_h),
+                        [
+                            target_rect.x,
+                            target_rect.y,
+                            target_rect.width,
+                            target_rect.height,
+                        ],
+                        (physical.width, physical.height),
+                        self.stats.rendered_frames as f64 / 60.0,
+                        self.stats.rendered_frames,
+                    );
+                    let post_viewport = D3D11_VIEWPORT {
+                        TopLeftX: target_rect.x,
+                        TopLeftY: target_rect.y,
+                        Width: target_rect.width.max(1.0),
+                        Height: target_rect.height.max(1.0),
+                        MinDepth: 0.0,
+                        MaxDepth: 1.0,
+                    };
+                    self.post_process.draw(
+                        &state.context,
+                        scene_rtv,
+                        post_viewport,
+                        &post_uniforms,
+                    );
+                } else {
+                    state.draw_video(
+                        video,
+                        video_constants,
+                        video_override.as_ref(),
+                        gamut_lut.as_ref(),
+                        scene_rtv,
+                        target_rect,
+                    )?;
+                }
+                if !overlay_draws.is_empty() {
+                    // Subtitle coordinates are produced in the video-frame viewport.
+                    // Composite them through the same aspect-fit viewport as the video
+                    // so resizing the window cannot stretch the subtitle independently.
+                    state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
+                }
+                if !danmaku_draws.is_empty() {
+                    state.draw_danmaku(&danmaku_draws, scene_rtv, full_surface_rect)?;
+                }
             }
             if let Some((_, linear_srv)) = linear_target.as_ref() {
                 state.draw_encode(

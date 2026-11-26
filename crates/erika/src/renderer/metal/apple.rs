@@ -78,7 +78,7 @@ use crate::renderer::pipeline::{ColorRange, DoviUniforms, LumaUpscalerMode};
 use crate::renderer::pipeline::{SourceColorState, TargetColorState, VideoRenderPipeline};
 use crate::renderer::pipeline::{UpscalerCapabilities, UpscalerDescriptor};
 use crate::renderer::post_process::{
-    PostProcessRuntimeInfo, PostProcessShader, PostProcessUniforms,
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
 };
 use crate::renderer::presentation::PresentationLayout as VideoPresentationLayout;
 use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
@@ -1250,22 +1250,33 @@ impl MetalRendererImpl {
                 Some(lut) => lut,
                 None => self.dummy_gamut_lut_texture()?,
             };
-            let post_w =
-                (layout.target_rect[2].round().max(1.0) as usize).min(self.max_texture_dimension);
-            let post_h =
-                (layout.target_rect[3].round().max(1.0) as usize).min(self.max_texture_dimension);
+            let post_stage = self.post_process.stage();
+            let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+                (
+                    texture.width().max(1).min(self.max_texture_dimension),
+                    texture.height().max(1).min(self.max_texture_dimension),
+                )
+            } else {
+                (
+                    (layout.target_rect[2].round().max(1.0) as usize)
+                        .min(self.max_texture_dimension),
+                    (layout.target_rect[3].round().max(1.0) as usize)
+                        .min(self.max_texture_dimension),
+                )
+            };
             let post_pass = if self.post_process.is_enabled() {
                 self.post_process
                     .prepare(&self.device, post_w, post_h, texture.pixelFormat())
             } else {
                 None
             };
-            let video_rect = if post_pass.is_some() {
+            let post_main_active = post_pass.is_some() && post_stage == PostProcessStage::Main;
+            let video_rect = if post_main_active {
                 [0.0, 0.0, post_w as f32, post_h as f32]
             } else {
                 layout.target_rect
             };
-            let video_viewport = if post_pass.is_some() {
+            let video_viewport = if post_main_active {
                 [post_w as f32, post_h as f32, 0.0, 0.0]
             } else {
                 layout.video_viewport()
@@ -1377,19 +1388,45 @@ impl MetalRendererImpl {
                     0,
                     4,
                 );
+                let target_color = frame.pipeline.target;
+                let mut overlay = overlay;
+                if post_stage == PostProcessStage::Output {
+                    if let Some(overlay) = overlay.take() {
+                        self.draw_overlay_planes(&video_enc, overlay, layout, target_color)?;
+                    }
+                    if let Some(danmaku) = danmaku.as_ref() {
+                        self.draw_danmaku_plan(
+                            &video_enc,
+                            &command_buffer,
+                            danmaku.plan,
+                            layout,
+                            target_color,
+                        )?;
+                    }
+                }
                 video_enc.endEncoding();
 
-                // Pass 2: run the post-process shader onto the drawable, then
-                // composite crisp subtitles and danmaku on top.
+                // Pass 2: run the post-process shader onto the drawable. For
+                // `Main` shaders, composite crisp subtitles and danmaku after.
                 let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
                 else {
                     return Err(PlayerError::Renderer(
                         "renderCommandEncoderWithDescriptor returned nil".to_string(),
                     ));
                 };
+                let post_rect = if post_stage == PostProcessStage::Output {
+                    [
+                        0.0,
+                        0.0,
+                        self.stats.drawable_width.max(1) as f32,
+                        self.stats.drawable_height.max(1) as f32,
+                    ]
+                } else {
+                    layout.target_rect
+                };
                 let post_uniforms = PostProcessUniforms::new(
                     (post_w as u32, post_h as u32),
-                    layout.target_rect,
+                    post_rect,
                     (self.stats.drawable_width, self.stats.drawable_height),
                     self.stats.rendered_frames as f64 / 60.0,
                     self.stats.rendered_frames,
@@ -1402,18 +1439,19 @@ impl MetalRendererImpl {
                     &post_uniforms,
                 );
 
-                let target_color = frame.pipeline.target;
-                if let Some(overlay) = overlay {
-                    self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
-                }
-                if let Some(danmaku) = danmaku.as_ref() {
-                    self.draw_danmaku_plan(
-                        &encoder,
-                        &command_buffer,
-                        danmaku.plan,
-                        layout,
-                        target_color,
-                    )?;
+                if post_stage == PostProcessStage::Main {
+                    if let Some(overlay) = overlay.take() {
+                        self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                    }
+                    if let Some(danmaku) = danmaku.as_ref() {
+                        self.draw_danmaku_plan(
+                            &encoder,
+                            &command_buffer,
+                            danmaku.plan,
+                            layout,
+                            target_color,
+                        )?;
+                    }
                 }
                 encoder.endEncoding();
             } else {
