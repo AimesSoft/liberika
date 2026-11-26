@@ -11,11 +11,11 @@ use ::windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
 use ::windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use ::windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D11_SAMPLER_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIEWPORT, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState, ID3D11ShaderResourceView,
-    ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
+    ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
+    ID3D11Resource, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use ::windows::core::{Interface, PCSTR};
@@ -274,11 +274,10 @@ fn compile_hlsl(source: &[u8], entry: &str, target: &str) -> Result<Vec<u8>> {
         let blob = code.ok_or_else(|| {
             PlayerError::Renderer("d3d11 post-process D3DCompile returned null blob".into())
         })?;
-        Ok(std::slice::from_raw_parts(
-            blob.GetBufferPointer() as *const u8,
-            blob.GetBufferSize(),
+        Ok(
+            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
+                .to_vec(),
         )
-        .to_vec())
     }
 }
 
@@ -393,8 +392,8 @@ fn create_source_target(
                 PlayerError::Renderer(format!("d3d11 CreateTexture2D(post src): {error}"))
             })?;
     }
-    let texture =
-        texture.ok_or_else(|| PlayerError::Renderer("d3d11 post source texture was null".into()))?;
+    let texture = texture
+        .ok_or_else(|| PlayerError::Renderer("d3d11 post source texture was null".into()))?;
     let resource: ID3D11Resource = texture
         .cast()
         .map_err(|error| PlayerError::Renderer(format!("d3d11 post cast resource: {error}")))?;
@@ -402,14 +401,18 @@ fn create_source_target(
     unsafe {
         device
             .CreateRenderTargetView(&resource, None, Some(&mut rtv))
-            .map_err(|error| PlayerError::Renderer(format!("d3d11 CreateRTV(post src): {error}")))?;
+            .map_err(|error| {
+                PlayerError::Renderer(format!("d3d11 CreateRTV(post src): {error}"))
+            })?;
     }
     let rtv = rtv.ok_or_else(|| PlayerError::Renderer("d3d11 post RTV was null".into()))?;
     let mut srv = None;
     unsafe {
         device
             .CreateShaderResourceView(&resource, None, Some(&mut srv))
-            .map_err(|error| PlayerError::Renderer(format!("d3d11 CreateSRV(post src): {error}")))?;
+            .map_err(|error| {
+                PlayerError::Renderer(format!("d3d11 CreateSRV(post src): {error}"))
+            })?;
     }
     let srv = srv.ok_or_else(|| PlayerError::Renderer("d3d11 post SRV was null".into()))?;
     let _ = ptr::null::<c_void>();

@@ -217,7 +217,11 @@ impl LumaUpscalerMode {
             | Self::Anime4kDenoiseUl => true,
             Self::ArtCnnR8F64 => cfg!(all(
                 feature = "artcnn-r8f64",
-                any(target_os = "windows", target_os = "macos", target_os = "linux")
+                any(
+                    target_os = "windows",
+                    target_os = "macos",
+                    target_os = "linux"
+                )
             )),
             Self::Custom => false,
         }

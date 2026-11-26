@@ -66,10 +66,6 @@ use crate::renderer::gamut::{
 };
 use crate::renderer::metal::post_process::MetalPostProcess;
 use crate::renderer::metal::upscaler::LumaUpscaler;
-use crate::renderer::pipeline::{UpscalerCapabilities, UpscalerDescriptor};
-use crate::renderer::post_process::{
-    PostProcessRuntimeInfo, PostProcessShader, PostProcessUniforms,
-};
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
     ImportedVideoPlaneInfo, MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig,
@@ -80,6 +76,10 @@ use crate::renderer::metal::{
 use crate::renderer::output::negotiate_output_mode;
 use crate::renderer::pipeline::{ColorRange, DoviUniforms, LumaUpscalerMode};
 use crate::renderer::pipeline::{SourceColorState, TargetColorState, VideoRenderPipeline};
+use crate::renderer::pipeline::{UpscalerCapabilities, UpscalerDescriptor};
+use crate::renderer::post_process::{
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessUniforms,
+};
 use crate::renderer::presentation::PresentationLayout as VideoPresentationLayout;
 use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
 use crate::trace;
@@ -1250,10 +1250,10 @@ impl MetalRendererImpl {
                 Some(lut) => lut,
                 None => self.dummy_gamut_lut_texture()?,
             };
-            let post_w = (layout.target_rect[2].round().max(1.0) as usize)
-                .min(self.max_texture_dimension);
-            let post_h = (layout.target_rect[3].round().max(1.0) as usize)
-                .min(self.max_texture_dimension);
+            let post_w =
+                (layout.target_rect[2].round().max(1.0) as usize).min(self.max_texture_dimension);
+            let post_h =
+                (layout.target_rect[3].round().max(1.0) as usize).min(self.max_texture_dimension);
             let post_pass = if self.post_process.is_enabled() {
                 self.post_process
                     .prepare(&self.device, post_w, post_h, texture.pixelFormat())

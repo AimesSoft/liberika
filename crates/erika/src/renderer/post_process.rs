@@ -535,7 +535,8 @@ vertex ErikaPostVsOut erika_post_vs(
                 restrict_indexing: false,
             },
         );
-        let mut sampler_buffer_binding_map = naga::back::hlsl::SamplerIndexBufferBindingMap::default();
+        let mut sampler_buffer_binding_map =
+            naga::back::hlsl::SamplerIndexBufferBindingMap::default();
         sampler_buffer_binding_map.insert(
             naga::back::hlsl::SamplerIndexBufferKey { group: 0 },
             naga::back::hlsl::BindTarget {
@@ -556,12 +557,14 @@ vertex ErikaPostVsOut erika_post_vs(
         let pipeline_options = naga::back::hlsl::PipelineOptions::default();
         let mut raw = String::new();
         let mut writer = naga::back::hlsl::Writer::new(&mut raw, &options, &pipeline_options);
-        let reflection = writer.write(&self.module, &self.info, None).map_err(|err| {
-            PlayerError::Renderer(format!(
-                "post-process HLSL emit failed for {:?}: {err}",
-                self.name
-            ))
-        })?;
+        let reflection = writer
+            .write(&self.module, &self.info, None)
+            .map_err(|err| {
+                PlayerError::Renderer(format!(
+                    "post-process HLSL emit failed for {:?}: {err}",
+                    self.name
+                ))
+            })?;
         let out = lower_hlsl_sampler_heap_to_d3d11(&raw);
         let frag_index = self
             .module

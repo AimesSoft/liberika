@@ -3196,7 +3196,8 @@ impl D3d11Renderer {
         let post_h = target_rect.height.round().max(1.0) as u32;
         let post_rtv = if self.post_process.is_enabled() {
             let device = self.state.as_ref().expect("device ensured").device.clone();
-            self.post_process.prepare(&device, post_w, post_h, post_format)
+            self.post_process
+                .prepare(&device, post_w, post_h, post_format)
         } else {
             None
         };
@@ -5439,21 +5440,24 @@ mod tests {
         assert!(scene.matches(7, LumaUpscalerMode::Off, 0, context));
         assert!(!scene.matches(8, LumaUpscalerMode::Off, 0, context));
         assert!(!scene.matches(7, LumaUpscalerMode::Off, 1, context));
-        assert!(!scene.matches(7, LumaUpscalerMode::ArtCnnC4F16, context));
+        assert!(!scene.matches(7, LumaUpscalerMode::ArtCnnC4F16, 0, context));
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2).overlay(Some(&overlay))
         ));
         overlay.subtitle_planes[0].rgba[0] = 0; // Includes HUD pixel changes.
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay))
         ));
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1)
         ));
     }
@@ -5494,6 +5498,7 @@ mod tests {
         let mut scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan)),
@@ -5511,9 +5516,9 @@ mod tests {
             let context = RenderFrameContext::new(overlay.pts, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan));
-            assert!(!scene.matches(token, LumaUpscalerMode::Off, context));
-            scene.update(token, LumaUpscalerMode::Off, context, None);
-            assert!(scene.matches(token, LumaUpscalerMode::Off, context));
+            assert!(!scene.matches(token, LumaUpscalerMode::Off, 0, context));
+            scene.update(token, LumaUpscalerMode::Off, 0, context, None);
+            assert!(scene.matches(token, LumaUpscalerMode::Off, 0, context));
             assert_eq!(
                 scene.overlay.as_ref().unwrap().subtitle_planes[0]
                     .rgba
@@ -5534,9 +5539,9 @@ mod tests {
         let context = RenderFrameContext::new(overlay.pts, 1)
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
-        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context, None);
-        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, 0, context));
+        scene.update(121, LumaUpscalerMode::Off, 0, context, None);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, 0, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0].rgba[0],
             17
@@ -5551,9 +5556,9 @@ mod tests {
         let context = RenderFrameContext::new(overlay.pts, 1)
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
-        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context, None);
-        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, 0, context));
+        scene.update(121, LumaUpscalerMode::Off, 0, context, None);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, 0, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0]
                 .rgba
@@ -5565,6 +5570,7 @@ mod tests {
         scene.update(
             121,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2),
             None,
         );
@@ -5572,6 +5578,7 @@ mod tests {
         assert!(scene.matches(
             121,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2)
         ));
     }
@@ -5773,6 +5780,7 @@ mod tests {
         let scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan)),
             None,
         );
@@ -5780,18 +5788,21 @@ mod tests {
         assert!(scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
         plan.items[0].rect[0] = 2.0;
         assert!(!scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
         plan.items.clear();
         assert!(!scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
     }
