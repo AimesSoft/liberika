@@ -1135,6 +1135,25 @@ pub trait RendererBackend {
     ) {
     }
 
+    /// Reports the built-in upscaler modes, custom network support, and
+    /// post-processing shader support available on this backend and GPU device.
+    fn supported_upscalers(&self) -> crate::renderer::pipeline::UpscalerCapabilities {
+        crate::renderer::pipeline::UpscalerCapabilities::default()
+    }
+
+    /// Installs or clears the active RGB post-processing shader applied to the
+    /// rendered video picture before subtitle and danmaku overlays.
+    fn set_post_process_shader(
+        &mut self,
+        _shader: Option<std::sync::Arc<crate::renderer::post_process::PostProcessShader>>,
+    ) {
+    }
+
+    /// Current runtime status of the active RGB post-processing shader.
+    fn post_process_status(&self) -> crate::renderer::post_process::PostProcessRuntimeInfo {
+        crate::renderer::post_process::PostProcessRuntimeInfo::default()
+    }
+
     /// Publishes the display's current HDR/SDR headroom ratio. Android uses
     /// this for queryable runtime status; renderers that do not expose dynamic
     /// display headroom may ignore the update.

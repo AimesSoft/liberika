@@ -64,7 +64,12 @@ use crate::overlay::OverlayViewport;
 use crate::renderer::gamut::{
     GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
 };
+use crate::renderer::metal::post_process::MetalPostProcess;
 use crate::renderer::metal::upscaler::LumaUpscaler;
+use crate::renderer::pipeline::{UpscalerCapabilities, UpscalerDescriptor};
+use crate::renderer::post_process::{
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessUniforms,
+};
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
     ImportedVideoPlaneInfo, MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig,
@@ -207,6 +212,7 @@ pub struct MetalRendererImpl {
     danmaku_vertex_buffer_cursor: usize,
     danmaku_vertex_buffer_acquisitions: u64,
     upscaler: LumaUpscaler,
+    post_process: MetalPostProcess,
     last_submitted_command_buffer: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     pending_gpu_timing: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     stats: MetalRendererStats,
@@ -273,6 +279,33 @@ fn code_to_primaries(code: u32) -> ColorPrimaries {
     }
 }
 
+fn capabilities_for_device(device: &ProtocolObject<dyn MTLDevice>) -> UpscalerCapabilities {
+    let mut modes = UpscalerCapabilities::bundled_portable_modes();
+    if crate::renderer::metal::upscaler::metalfx::unavailable_reason(device).is_none() {
+        modes.push(UpscalerDescriptor::for_mode(
+            LumaUpscalerMode::MetalFxSpatial,
+        ));
+    }
+    if crate::renderer::metal::upscaler::video_toolbox::device_supported() {
+        modes.push(UpscalerDescriptor::for_mode_named(
+            LumaUpscalerMode::PlatformVideo,
+            "VideoToolbox",
+        ));
+    }
+    UpscalerCapabilities {
+        modes,
+        supports_custom_network: true,
+        supports_post_process: true,
+    }
+}
+
+pub fn probe_default_upscalers() -> UpscalerCapabilities {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return UpscalerCapabilities::default();
+    };
+    capabilities_for_device(&device)
+}
+
 impl MetalRendererImpl {
     pub fn new(config: MetalRendererConfig) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
@@ -311,6 +344,7 @@ impl MetalRendererImpl {
                 upscaler.set_mode(config.luma_upscaler);
                 upscaler
             },
+            post_process: MetalPostProcess::default(),
             last_submitted_command_buffer: None,
             pending_gpu_timing: None,
             stats: MetalRendererStats::default(),
@@ -466,7 +500,10 @@ impl MetalRendererImpl {
                             .map_or(0, |buffer| buffer.allocatedSize() as u64),
                     )
                 });
-        let upscaler_bytes = self.upscaler.allocated_bytes();
+        let upscaler_bytes = self
+            .upscaler
+            .allocated_bytes()
+            .saturating_add(self.post_process.allocated_bytes());
         let renderer_tracked_bytes = drawable_estimated_bytes
             .saturating_add(overlay_atlas_bytes)
             .saturating_add(overlay_key_bytes)
@@ -1202,29 +1239,6 @@ impl MetalRendererImpl {
                 ));
             };
 
-            let descriptor = MTLRenderPassDescriptor::new();
-            let attachments = descriptor.colorAttachments();
-            let attachment = attachments.objectAtIndexedSubscript(0);
-            attachment.setTexture(Some(&*texture));
-            attachment.setLoadAction(MTLLoadAction::Clear);
-            attachment.setStoreAction(MTLStoreAction::Store);
-            attachment.setClearColor(MTLClearColor {
-                red: 0.0,
-                green: 0.0,
-                blue: 0.0,
-                alpha: if self.video_alpha_mode.has_alpha() {
-                    0.0
-                } else {
-                    1.0
-                },
-            });
-
-            let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
-            else {
-                return Err(PlayerError::Renderer(
-                    "renderCommandEncoderWithDescriptor returned nil".to_string(),
-                ));
-            };
             // Resolve the LUT before building the uniforms: while a new key's
             // background generation is pending, the shader keeps the fast
             // gamut_compress path (the dummy texture holds texture 2).
@@ -1236,6 +1250,26 @@ impl MetalRendererImpl {
                 Some(lut) => lut,
                 None => self.dummy_gamut_lut_texture()?,
             };
+            let post_w = (layout.target_rect[2].round().max(1.0) as usize)
+                .min(self.max_texture_dimension);
+            let post_h = (layout.target_rect[3].round().max(1.0) as usize)
+                .min(self.max_texture_dimension);
+            let post_pass = if self.post_process.is_enabled() {
+                self.post_process
+                    .prepare(&self.device, post_w, post_h, texture.pixelFormat())
+            } else {
+                None
+            };
+            let video_rect = if post_pass.is_some() {
+                [0.0, 0.0, post_w as f32, post_h as f32]
+            } else {
+                layout.target_rect
+            };
+            let video_viewport = if post_pass.is_some() {
+                [post_w as f32, post_h as f32, 0.0, 0.0]
+            } else {
+                layout.video_viewport()
+            };
             let uniforms = VideoUniforms {
                 is_p010: matches!(frame.frame.info.format, ImportedVideoFormat::P010) as u32,
                 full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
@@ -1245,8 +1279,8 @@ impl MetalRendererImpl {
                 edr_output: self.output_mode.is_edr() as u32,
                 _reserved0: self.video_alpha_mode as u32,
                 _reserved1: 0,
-                rect: layout.target_rect,
-                viewport: layout.video_viewport(),
+                rect: video_rect,
+                viewport: video_viewport,
                 nits: [
                     frame.pipeline.source.nominal_peak_nits,
                     frame.pipeline.target.peak_nits,
@@ -1271,48 +1305,171 @@ impl MetalRendererImpl {
                     matches!(frame.frame.info.format, ImportedVideoFormat::P010),
                 ),
             };
-            encoder.setRenderPipelineState(&pipeline);
-            encoder.setFragmentTexture_atIndex(Some(luma), 0);
-            encoder.setFragmentTexture_atIndex(Some(chroma), 1);
-            encoder.setFragmentTexture_atIndex(Some(&gamut_lut), 2);
-            encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
-            encoder.setVertexBytes_length_atIndex(
-                NonNull::new(
-                    (&uniforms as *const VideoUniforms)
-                        .cast::<c_void>()
-                        .cast_mut(),
-                )
-                .expect("uniform pointer is non-null"),
-                mem::size_of::<VideoUniforms>(),
-                0,
-            );
-            encoder.setFragmentBytes_length_atIndex(
-                NonNull::new(
-                    (&uniforms as *const VideoUniforms)
-                        .cast::<c_void>()
-                        .cast_mut(),
-                )
-                .expect("uniform pointer is non-null"),
-                mem::size_of::<VideoUniforms>(),
-                0,
-            );
-            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
 
-            let target_color = frame.pipeline.target;
-            if let Some(overlay) = overlay {
-                self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
-            }
-            if let Some(danmaku) = danmaku.as_ref() {
-                self.draw_danmaku_plan(
+            let descriptor = MTLRenderPassDescriptor::new();
+            let attachments = descriptor.colorAttachments();
+            let attachment = attachments.objectAtIndexedSubscript(0);
+            attachment.setTexture(Some(&*texture));
+            attachment.setLoadAction(MTLLoadAction::Clear);
+            attachment.setStoreAction(MTLStoreAction::Store);
+            attachment.setClearColor(MTLClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: if self.video_alpha_mode.has_alpha() {
+                    0.0
+                } else {
+                    1.0
+                },
+            });
+
+            if let Some((post_src, post_pipeline, post_sampler)) = post_pass {
+                // Pass 1: render the decoded/upscaled video picture into the
+                // offscreen RGB source texture sized to the presented rect.
+                let offscreen = MTLRenderPassDescriptor::new();
+                let off_att = offscreen.colorAttachments().objectAtIndexedSubscript(0);
+                off_att.setTexture(Some(&*post_src));
+                off_att.setLoadAction(MTLLoadAction::Clear);
+                off_att.setStoreAction(MTLStoreAction::Store);
+                off_att.setClearColor(MTLClearColor {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: if self.video_alpha_mode.has_alpha() {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                });
+                let Some(video_enc) = command_buffer.renderCommandEncoderWithDescriptor(&offscreen)
+                else {
+                    return Err(PlayerError::Renderer(
+                        "renderCommandEncoderWithDescriptor(post_src) returned nil".to_string(),
+                    ));
+                };
+                video_enc.setRenderPipelineState(&pipeline);
+                video_enc.setFragmentTexture_atIndex(Some(luma), 0);
+                video_enc.setFragmentTexture_atIndex(Some(chroma), 1);
+                video_enc.setFragmentTexture_atIndex(Some(&gamut_lut), 2);
+                video_enc.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                video_enc.setVertexBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                video_enc.setFragmentBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                video_enc.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                );
+                video_enc.endEncoding();
+
+                // Pass 2: run the post-process shader onto the drawable, then
+                // composite crisp subtitles and danmaku on top.
+                let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
+                else {
+                    return Err(PlayerError::Renderer(
+                        "renderCommandEncoderWithDescriptor returned nil".to_string(),
+                    ));
+                };
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w as u32, post_h as u32),
+                    layout.target_rect,
+                    (self.stats.drawable_width, self.stats.drawable_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                MetalPostProcess::encode(
                     &encoder,
-                    &command_buffer,
-                    danmaku.plan,
-                    layout,
-                    target_color,
-                )?;
-            }
+                    &post_pipeline,
+                    &post_src,
+                    &post_sampler,
+                    &post_uniforms,
+                );
 
-            encoder.endEncoding();
+                let target_color = frame.pipeline.target;
+                if let Some(overlay) = overlay {
+                    self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                }
+                if let Some(danmaku) = danmaku.as_ref() {
+                    self.draw_danmaku_plan(
+                        &encoder,
+                        &command_buffer,
+                        danmaku.plan,
+                        layout,
+                        target_color,
+                    )?;
+                }
+                encoder.endEncoding();
+            } else {
+                let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
+                else {
+                    return Err(PlayerError::Renderer(
+                        "renderCommandEncoderWithDescriptor returned nil".to_string(),
+                    ));
+                };
+                encoder.setRenderPipelineState(&pipeline);
+                encoder.setFragmentTexture_atIndex(Some(luma), 0);
+                encoder.setFragmentTexture_atIndex(Some(chroma), 1);
+                encoder.setFragmentTexture_atIndex(Some(&gamut_lut), 2);
+                encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                encoder.setVertexBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                encoder.setFragmentBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                encoder.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                );
+
+                let target_color = frame.pipeline.target;
+                if let Some(overlay) = overlay {
+                    self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                }
+                if let Some(danmaku) = danmaku.as_ref() {
+                    self.draw_danmaku_plan(
+                        &encoder,
+                        &command_buffer,
+                        danmaku.plan,
+                        layout,
+                        target_color,
+                    )?;
+                }
+
+                encoder.endEncoding();
+            }
             if let Some(drawable) = &drawable {
                 let drawable_ref: &ProtocolObject<dyn MTLDrawable> =
                     ProtocolObject::from_ref(&**drawable);
@@ -1605,6 +1762,18 @@ impl MetalRendererImpl {
             self.upscaler.status_reason().map(str::to_string),
             self.upscaler.engine_label(),
         )
+    }
+
+    pub fn supported_upscalers(&self) -> UpscalerCapabilities {
+        capabilities_for_device(&self.device)
+    }
+
+    pub fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.post_process.set_shader(shader);
+    }
+
+    pub fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.post_process.status_info()
     }
 
     /// Records the GPU time of the previous frame's command buffer once it

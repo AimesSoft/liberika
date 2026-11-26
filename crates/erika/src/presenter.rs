@@ -1648,6 +1648,23 @@ impl PresenterRuntime {
         self.renderer.set_luma_upscaler(mode);
     }
 
+    /// Reports the upscaler modes and shader capabilities supported by the
+    /// active renderer and GPU device.
+    pub fn supported_upscalers(&self) -> crate::renderer::pipeline::UpscalerCapabilities {
+        self.renderer.supported_upscalers()
+    }
+
+    /// Diagnostics detail for the active luma upscaler: `(inactive_or_degraded_reason, engine_label)`.
+    pub fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        self.renderer.upscaler_status_detail()
+    }
+
+    /// Snapshot of renderer runtime counters including active upscaler backend
+    /// status and GPU duration.
+    pub fn renderer_runtime_stats(&self) -> crate::core::RendererRuntimeStats {
+        self.renderer.runtime_stats()
+    }
+
     /// Parses `bytes` (an Erika `.esr` network or an mpv hook shader such as
     /// FSRCNNX) and installs it for `LumaUpscalerMode::Custom`.
     pub fn load_custom_upscaler_model(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
@@ -1660,6 +1677,26 @@ impl PresenterRuntime {
 
     pub fn clear_custom_upscaler_model(&mut self) {
         self.renderer.set_custom_upscaler_model(None);
+    }
+
+    /// Parses `bytes` (mpv `//!HOOK MAIN` GLSL or WGSL) and installs it as the
+    /// active RGB post-processing filter applied to the video picture before
+    /// subtitle and danmaku overlays.
+    pub fn load_post_process_shader(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let shader = crate::renderer::post_process::PostProcessShader::parse(name, bytes)?;
+        self.renderer
+            .set_post_process_shader(Some(std::sync::Arc::new(shader)));
+        Ok(())
+    }
+
+    /// Disables the active RGB post-processing filter.
+    pub fn clear_post_process_shader(&mut self) {
+        self.renderer.set_post_process_shader(None);
+    }
+
+    /// Runtime status of the active RGB post-processing filter.
+    pub fn post_process_status(&self) -> crate::renderer::post_process::PostProcessRuntimeInfo {
+        self.renderer.post_process_status()
     }
 
     pub fn set_output_headroom(&mut self, headroom: f32, known: bool) {

@@ -105,6 +105,43 @@ pub(crate) enum VsrVendor {
     Intel,
 }
 
+impl VsrVendor {
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Nvidia => "NVIDIA RTX Video",
+            Self::Intel => "Intel VSR",
+        }
+    }
+}
+
+/// Detects whether `device` belongs to a GPU vendor with D3D11 VideoProcessor
+/// super resolution support (NVIDIA or Intel) and exposes `ID3D11VideoDevice`.
+pub(crate) fn detect_vendor(device: &ID3D11Device) -> Option<VsrVendor> {
+    let dxgi: IDXGIDevice = device.cast().ok()?;
+    let adapter = unsafe { dxgi.GetAdapter() }.ok()?;
+    let desc = unsafe { adapter.GetDesc() }.ok()?;
+    let vendor = match desc.VendorId {
+        VENDOR_ID_NVIDIA => VsrVendor::Nvidia,
+        VENDOR_ID_INTEL => VsrVendor::Intel,
+        _ => return None,
+    };
+    let _: ID3D11VideoDevice = device.cast().ok()?;
+    Some(vendor)
+}
+
+/// Probes the default DXGI adapter vendor when no D3D11 device exists yet.
+pub(crate) fn probe_default_vendor() -> Option<VsrVendor> {
+    use ::windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let adapter = unsafe { factory.EnumAdapters1(0) }.ok()?;
+    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    match desc.VendorId {
+        VENDOR_ID_NVIDIA => Some(VsrVendor::Nvidia),
+        VENDOR_ID_INTEL => Some(VsrVendor::Intel),
+        _ => None,
+    }
+}
+
 /// YCbCr matrix of the decoded stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VsrMatrix {

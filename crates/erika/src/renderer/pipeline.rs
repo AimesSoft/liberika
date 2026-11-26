@@ -697,7 +697,9 @@ pub enum ScalerKernel {
     Lanczos3,
 }
 
-pub use super::upscaler_mode::{LumaUpscalerMode, UpscalerFamily};
+pub use super::upscaler_mode::{
+    LumaUpscalerMode, UpscalerCapabilities, UpscalerDescriptor, UpscalerFamily,
+};
 
 impl Default for ScalerKernel {
     fn default() -> Self {

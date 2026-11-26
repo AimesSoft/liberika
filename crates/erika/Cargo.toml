@@ -44,6 +44,7 @@ crossbeam-channel.workspace = true
 memmap2 = "0.9"
 ab_glyph_rasterizer = "0.1"
 erika_ffmpeg_sys = { path = "../erika_ffmpeg_sys" }
+naga = { version = "29.0", features = ["glsl-in", "wgsl-in", "wgsl-out", "msl-out-if-target-apple", "hlsl-out-if-target-windows"] }
 png.workspace = true
 reqwest.workspace = true
 soundtouch.workspace = true
@@ -52,6 +53,9 @@ tokio-util.workspace = true
 wgpu = { version = "=29.0.3", optional = true }
 pollster = { version = "0.4.0", optional = true }
 bytemuck = { version = "1.25.0", features = ["derive"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+naga = { version = "29.0", features = ["glsl-in", "wgsl-in", "wgsl-out", "msl-out", "hlsl-out"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.130"

@@ -178,4 +178,183 @@ impl LumaUpscalerMode {
             Self::ArtCnnC4F16 | Self::ArtCnnC4F16Ds | Self::ArtCnnC4F32
         )
     }
+
+    /// Resolves a mode from its stable [`Self::label`] identifier.
+    pub fn from_label(label: &str) -> Option<Self> {
+        let normalized = label.trim();
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.label() == normalized)
+    }
+
+    /// Whether this mode's assets are bundled in the current build.
+    ///
+    /// Non-network modes (`Off`, `Fsr1`, `PlatformVideo`, `MetalFxSpatial`) do
+    /// not carry network weights and return `true`; platform/device availability
+    /// is checked separately by each renderer backend. `Custom` requires a
+    /// runtime-loaded network and returns `false`.
+    pub fn is_bundled(self) -> bool {
+        match self {
+            Self::Off
+            | Self::Fsr1
+            | Self::PlatformVideo
+            | Self::MetalFxSpatial
+            | Self::ArtCnnC4F16
+            | Self::ArtCnnC4F16Ds
+            | Self::ArtCnnC4F32
+            | Self::ArtCnnC4F16Dn
+            | Self::ArtCnnC4F32Ds
+            | Self::ArtCnnC4F32Dn
+            | Self::Anime4kS
+            | Self::Anime4kM
+            | Self::Anime4kL
+            | Self::Anime4kVl
+            | Self::Anime4kUl
+            | Self::Anime4kDenoiseS
+            | Self::Anime4kDenoiseM
+            | Self::Anime4kDenoiseL
+            | Self::Anime4kDenoiseVl
+            | Self::Anime4kDenoiseUl => true,
+            Self::ArtCnnR8F64 => cfg!(all(
+                feature = "artcnn-r8f64",
+                any(target_os = "windows", target_os = "macos", target_os = "linux")
+            )),
+            Self::Custom => false,
+        }
+    }
+
+    /// Stable group identifier for UI organization.
+    pub fn group_id(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ArtCnnC4F16
+            | Self::ArtCnnC4F16Ds
+            | Self::ArtCnnC4F32
+            | Self::ArtCnnC4F16Dn
+            | Self::ArtCnnC4F32Ds
+            | Self::ArtCnnC4F32Dn
+            | Self::ArtCnnR8F64 => "artcnn",
+            Self::Anime4kS
+            | Self::Anime4kM
+            | Self::Anime4kL
+            | Self::Anime4kVl
+            | Self::Anime4kUl => "anime4k",
+            Self::Anime4kDenoiseS
+            | Self::Anime4kDenoiseM
+            | Self::Anime4kDenoiseL
+            | Self::Anime4kDenoiseVl
+            | Self::Anime4kDenoiseUl => "anime4k_denoise",
+            Self::Fsr1 => "spatial",
+            Self::PlatformVideo | Self::MetalFxSpatial => "platform",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Default human-readable group name.
+    pub fn group_name(self) -> &'static str {
+        match self.group_id() {
+            "off" => "Off",
+            "artcnn" => "ArtCNN",
+            "anime4k" => "Anime4K",
+            "anime4k_denoise" => "Anime4K Denoise",
+            "spatial" => "Spatial",
+            "platform" => "System",
+            "custom" => "Custom",
+            other => other,
+        }
+    }
+
+    /// Default human-readable name for this upscaler mode.
+    pub fn default_display_name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::ArtCnnC4F16 => "ArtCNN C4F16",
+            Self::ArtCnnC4F16Ds => "ArtCNN C4F16 DS",
+            Self::ArtCnnC4F32 => "ArtCNN C4F32",
+            Self::ArtCnnC4F16Dn => "ArtCNN C4F16 DN",
+            Self::ArtCnnC4F32Ds => "ArtCNN C4F32 DS",
+            Self::ArtCnnC4F32Dn => "ArtCNN C4F32 DN",
+            Self::ArtCnnR8F64 => "ArtCNN R8F64",
+            Self::Anime4kS => "Anime4K S",
+            Self::Anime4kM => "Anime4K M",
+            Self::Anime4kL => "Anime4K L",
+            Self::Anime4kVl => "Anime4K VL",
+            Self::Anime4kUl => "Anime4K UL",
+            Self::Anime4kDenoiseS => "Anime4K Denoise S",
+            Self::Anime4kDenoiseM => "Anime4K Denoise M",
+            Self::Anime4kDenoiseL => "Anime4K Denoise L",
+            Self::Anime4kDenoiseVl => "Anime4K Denoise VL",
+            Self::Anime4kDenoiseUl => "Anime4K Denoise UL",
+            Self::Fsr1 => "AMD FSR 1.0",
+            Self::PlatformVideo => "Platform Video",
+            Self::MetalFxSpatial => "MetalFX Spatial",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
+/// Self-describing metadata for one upscaler mode supported on the active
+/// platform and GPU device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpscalerDescriptor {
+    /// Stable mode identifier (`LumaUpscalerMode::label()`).
+    pub id: &'static str,
+    pub mode: LumaUpscalerMode,
+    /// Stable group identifier for multi-level menus (e.g. `"artcnn"`, `"anime4k"`).
+    pub group_id: &'static str,
+    /// Default display name for the group.
+    pub group_name: &'static str,
+    /// Default display name for this mode (platform modes may include the
+    /// detected vendor name such as `"NVIDIA RTX Video"` or `"VideoToolbox"`).
+    pub name: String,
+    pub family: UpscalerFamily,
+}
+
+impl UpscalerDescriptor {
+    pub fn for_mode(mode: LumaUpscalerMode) -> Self {
+        Self::for_mode_named(mode, mode.default_display_name())
+    }
+
+    pub fn for_mode_named(mode: LumaUpscalerMode, name: impl Into<String>) -> Self {
+        Self {
+            id: mode.label(),
+            mode,
+            group_id: mode.group_id(),
+            group_name: mode.group_name(),
+            name: name.into(),
+            family: mode.family(),
+        }
+    }
+}
+
+/// Upscaling and post-processing capabilities probed for the active renderer
+/// backend and GPU device.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpscalerCapabilities {
+    /// Built-in enabled upscaler modes supported by this build and device
+    /// (excluding `Off` and `Custom`).
+    pub modes: Vec<UpscalerDescriptor>,
+    /// Whether the backend can execute runtime-loaded `.esr` / mpv CNN models
+    /// (`LumaUpscalerMode::Custom`).
+    pub supports_custom_network: bool,
+    /// Whether the backend supports general RGB post-processing shaders.
+    pub supports_post_process: bool,
+}
+
+impl UpscalerCapabilities {
+    /// Collects all bundled neural network modes and `Fsr1` in canonical
+    /// `LumaUpscalerMode::ALL` order.
+    pub fn bundled_portable_modes() -> Vec<UpscalerDescriptor> {
+        LumaUpscalerMode::ALL
+            .into_iter()
+            .filter(|mode| {
+                mode.is_bundled()
+                    && matches!(
+                        mode.family(),
+                        UpscalerFamily::Network | UpscalerFamily::Spatial
+                    )
+            })
+            .map(UpscalerDescriptor::for_mode)
+            .collect()
+    }
 }

@@ -633,11 +633,18 @@ fn resolve_operand(
     })
 }
 
-/// Extracts the integer tap offsets from `...(vec2(dx, dy))` or `go_N(dx, dy)`.
+/// Extracts the integer tap offsets from `...(vec2(dx, dy))`, `...(0)`, or `go_N(dx, dy)`.
 fn offsets(text: &str) -> Option<(i32, i32)> {
     let open = text.rfind('(')?;
     let close = text[open..].find(')')? + open;
-    let mut values = text[open + 1..close]
+    let inner = text[open + 1..close].trim();
+    if let Ok(single) = inner.parse::<f32>()
+        && single.fract() == 0.0
+    {
+        let value = single as i32;
+        return Some((value, value));
+    }
+    let mut values = inner
         .split(',')
         .map(|value| value.trim().parse::<f32>().ok());
     let dx = values.next()??;
@@ -757,6 +764,7 @@ vec4 hook()
 {
 vec4 res = vec4(0.0,0.0,0.0,0.0);
 res += mat4(1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0) * FEATURE1_texOff(vec2(-1,0));
+res += mat4(0.5,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.5) * FEATURE1_texOff(0);
 res += FEATURE1_texOff(0);
 res = max(res, vec4(0.0)) + vec4(0.5,0.25,0.125,1.0) * min(res, vec4(0.0));
 return res;
