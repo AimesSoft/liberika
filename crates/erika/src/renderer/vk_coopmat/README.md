@@ -14,11 +14,11 @@ for shader in conv resident; do
     glslc --target-env=vulkan1.3 -O -DDIRECT_LOAD -DELEMENT_EPILOGUE "$shader.comp" -o "${shader}_elements.spv"
     glslc --target-env=vulkan1.3 -O -DDIRECT_LOAD -DELEMENT_EPILOGUE -DHALF_ACCUM "$shader.comp" -o "${shader}_elements_half.spv"
 done
-for shader in input border border_specialized pad head head_point head_spatial head_spatial_half peak fused bandwidth; do
+glslc --target-env=vulkan1.3 -O -DDIRECT_LOAD -DELEMENT_EPILOGUE -DHALF_STORE resident.comp -o resident_elements_half_store.spv
+for shader in input border border_specialized pad head head_point head_spatial head_spatial_half peak bandwidth; do
     glslc --target-env=vulkan1.3 -O "$shader.comp" -o "$shader.spv"
 done
 glslc --target-env=vulkan1.3 -O -DHALF_ACCUM peak.comp -o peak_half.spv
-glslc --target-env=vulkan1.3 -O -DHALF_ACCUM fused.comp -o fused_half.spv
 ```
 
 `copy.hlsl` is the D3D11 luma copy, compiled with FXC at initialization.
@@ -27,19 +27,24 @@ Keep regenerated SPIR-V with the sources.
 
 Features are fp16 `[channel / 16][pixel][channel % 16]`; tensor bases align
 to at least 16 channels. Weights include padded per-tap output-by-input
-matrices and an OIHW copy for exact border correction. The resident kernel
-keeps A fragments in subgroup registers and reuses them across pixel strips.
+matrices and an OIHW copy for exact border correction. The multi-strip
+`resident` kernel streams one spatial tap's A fragments at a time (with
+`[[dont_unroll]]` across input-channel blocks and kernel rows to bound live
+register ranges) and reuses them across horizontal pixel strips.
 For K=16, column-major B loads come directly from feature buffers. Other K
 sizes retain shared staging with pitch K+8. Luma-only inputs flatten spatial
 taps into K, including the luma branch of a folded head.
 
 The element epilogue variant loads a coordinate matrix with exactly the
-accumulator's shape and type. Element-wise coordinate access identifies
-each implementation-defined accumulator component without assuming a
-vendor's register layout. It writes results directly, avoiding shared sums
-and their barrier. This is selected for graphs up to 32 channels. Wider
-graphs retain the previous kernel choices. Both variants fuse bias,
-residual and activation. Heads fuse depth-to-space, base reconstruction,
+accumulator's shape and type right before the epilogue. Element-wise coordinate
+access identifies each implementation-defined accumulator component without
+assuming a vendor's register layout. For interior strips when `M=16` and fp16
+cooperative-matrix accumulators are supported (`resident_elements_half.spv` and
+`resident_elements_half_store.spv`), `resident` loads any residual and stores
+the activated output tile directly via vectorized `coopMatLoad`/`coopMatStore`
+without shared sums or barriers; edge strips and non-fp16-accumulator adapters
+fall back cleanly to scalar writes. Both variants fuse bias, residual and
+activation. Heads fuse depth-to-space, base reconstruction,
 normalization inversion and clamp. Small heads use vector ALUs with a
 16 KiB coefficient buffer and specialized descriptors; 1x1 heads avoid
 shared staging entirely. NVIDIA defaults to the packed fp16 spatial head for
@@ -67,7 +72,6 @@ Common specialization IDs: 0..3 = M/N/K/subgroup width; 4 = maximum kernel;
 31 = single input. ID32 gives the coordinate-table offset for element
 epilogues. Specialized heads instead use IDs32..95 for up to 16 input
 descriptors (feature base, transform, actual channels, coefficient base).
-The experimental fused shader defines its own IDs32..50 in `fused.comp`.
 
 Fp16 operands/features are used with both matrix accumulation variants. Default
 matrix accumulation remains fp32. `ERIKA_VK_FP16_ACCUMULATION=1` selects fp16 when
@@ -76,7 +80,7 @@ are diagnostics, not additional renderer-facing API:
 
 - `ERIKA_VK_DIRECT_LOAD=0`: shared B staging.
 - `ERIKA_VK_ELEMENTS=0`: shared accumulator epilogues.
-- `ERIKA_VK_RESIDENT=0`: stream A fragments.
+- `ERIKA_VK_RESIDENT=0`: force `conv` kernel instead of multi-strip `resident`.
 - `ERIKA_VK_EDGE_GROUPS=1|2|4|8`: override stem/matrix-head subgroup count.
 - `ERIKA_VK_TENSOR_HEAD=1`: force matrix heads; `0`: request vector heads
   where coefficient/shared-memory limits permit.
@@ -88,19 +92,7 @@ are diagnostics, not additional renderer-facing API:
   widths (default specializes only graphs up to 32 channels).
 - `ERIKA_VK_BAND_MIB=N`: horizontal bands bounded by the requested working
   set where the minimum halo fits. Default uses the measured 240 MiB policy.
-- `ERIKA_VK_FUSION=2|3`: experimental shared convolution chains.
-  `ERIKA_VK_FUSE_STEM=1` also includes an eligible 5x5 stem; fusion value `1`
-  then tests just stem + first 3x3 layer. `ERIKA_VK_FUSION_TILE=32x8` and
-  `ERIKA_VK_FUSION_GROUPS=1|2|4|8` tune it. Fusion is disabled by default:
-  measured halo/register/shared-memory costs outweighed traffic savings.
-
-Fusion validates unbranched same-width chains, preserves outside consumers,
-and adjusts arena liveness so its final output never aliases a live input.
-The fused stem handles its exact folded border weights inside the workgroup.
-Intermediate fp16 tensors remain in shared memory; Clamp padding is applied
-between stages. No experimental path is selected for R8F64 by default.
 
 Ignored Rust tests provide end-to-end GPU benchmarks, per-layer convolution
 and correction timestamps, memory bandwidth, matrix throughput, and
-tile/strip sweeps. Run release with one test thread. See the **Round 3**
-section of `/tmp/sr/codex/vk_report.md` for results and limitations.
+tile/strip sweeps. Run release with one test thread.
