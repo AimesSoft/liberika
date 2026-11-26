@@ -439,23 +439,303 @@ mod layers {
             return None;
         }
         let units = f32::from(face.units_per_em()).max(1.0);
-        let ascender = f32::from(face.ascender());
-        let descender = f32::from(face.descender());
         let advance = f32::from(face.glyph_hor_advance(glyph)?);
-        let scale = PICTURE_HEIGHT as f32 / (ascender - descender).max(1.0);
-        let width = (advance * scale).ceil().max(1.0) as u32;
-        let height = PICTURE_HEIGHT;
-        let base = Transform::new(scale, 0.0, 0.0, -scale, 0.0, ascender * scale);
-        let mut canvas = Canvas::new(&face, width, height, base);
+        let bounds = measure_bounds(&face, glyph)?;
+        let frame = CanvasFrame::for_bounds(bounds, units)?;
+        let mut canvas = Canvas::new(&face, frame.width, frame.height, frame.transform);
         face.paint_color_glyph(glyph, 0, FOREGROUND, &mut canvas)?;
+        let rgba = canvas.finish();
+        crop_bitmap(
+            &rgba,
+            frame.width,
+            frame.height,
+            frame.origin_x,
+            units * frame.scale,
+            advance / units,
+        )
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) struct Bounds {
+        pub(super) min_x: f32,
+        pub(super) min_y: f32,
+        pub(super) max_x: f32,
+        pub(super) max_y: f32,
+    }
+
+    impl Bounds {
+        fn empty() -> Self {
+            Self {
+                min_x: f32::INFINITY,
+                min_y: f32::INFINITY,
+                max_x: f32::NEG_INFINITY,
+                max_y: f32::NEG_INFINITY,
+            }
+        }
+
+        fn include(&mut self, x: f32, y: f32) {
+            self.min_x = self.min_x.min(x);
+            self.min_y = self.min_y.min(y);
+            self.max_x = self.max_x.max(x);
+            self.max_y = self.max_y.max(y);
+        }
+
+        fn union(&mut self, other: Self) {
+            self.min_x = self.min_x.min(other.min_x);
+            self.min_y = self.min_y.min(other.min_y);
+            self.max_x = self.max_x.max(other.max_x);
+            self.max_y = self.max_y.max(other.max_y);
+        }
+
+        fn intersect(self, other: Self) -> Option<Self> {
+            let bounds = Self {
+                min_x: self.min_x.max(other.min_x),
+                min_y: self.min_y.max(other.min_y),
+                max_x: self.max_x.min(other.max_x),
+                max_y: self.max_y.min(other.max_y),
+            };
+            bounds.valid()
+        }
+
+        fn valid(self) -> Option<Self> {
+            (self.min_x.is_finite()
+                && self.min_y.is_finite()
+                && self.max_x.is_finite()
+                && self.max_y.is_finite()
+                && self.max_x > self.min_x
+                && self.max_y > self.min_y)
+                .then_some(self)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ShapeBounds {
+        Unbounded,
+        Empty,
+        Rect(Bounds),
+    }
+
+    impl ShapeBounds {
+        fn intersect(self, other: Self) -> Self {
+            match (self, other) {
+                (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
+                (Self::Unbounded, other) => other,
+                (this, Self::Unbounded) => this,
+                (Self::Rect(a), Self::Rect(b)) => a.intersect(b).map_or(Self::Empty, Self::Rect),
+            }
+        }
+    }
+
+    struct OutlineBounds {
+        transform: Transform,
+        bounds: Bounds,
+    }
+
+    impl OutlineBounds {
+        fn push(&mut self, x: f32, y: f32) {
+            let [x, y] = apply(self.transform, x, y);
+            self.bounds.include(x, y);
+        }
+    }
+
+    impl OutlineBuilder for OutlineBounds {
+        fn move_to(&mut self, x: f32, y: f32) {
+            self.push(x, y);
+        }
+
+        fn line_to(&mut self, x: f32, y: f32) {
+            self.push(x, y);
+        }
+
+        fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+            self.push(x1, y1);
+            self.push(x, y);
+        }
+
+        fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+            self.push(x1, y1);
+            self.push(x2, y2);
+            self.push(x, y);
+        }
+
+        fn close(&mut self) {}
+    }
+
+    struct BoundsPainter<'a, 'b> {
+        face: &'b Face<'a>,
+        transforms: Vec<Transform>,
+        shape: ShapeBounds,
+        clips: Vec<ShapeBounds>,
+        painted: Bounds,
+    }
+
+    impl<'a, 'b> BoundsPainter<'a, 'b> {
+        fn new(face: &'b Face<'a>) -> Self {
+            Self {
+                face,
+                transforms: vec![Transform::default()],
+                shape: ShapeBounds::Unbounded,
+                clips: Vec::new(),
+                painted: Bounds::empty(),
+            }
+        }
+
+        fn transform(&self) -> Transform {
+            *self.transforms.last().expect("the base transform stays")
+        }
+
+        fn active_clip(&self) -> ShapeBounds {
+            self.clips.last().copied().unwrap_or(ShapeBounds::Unbounded)
+        }
+    }
+
+    impl<'a> Painter<'a> for BoundsPainter<'a, '_> {
+        fn outline_glyph(&mut self, glyph: GlyphId) {
+            let mut collector = OutlineBounds {
+                transform: self.transform(),
+                bounds: Bounds::empty(),
+            };
+            self.face.outline_glyph(glyph, &mut collector);
+            self.shape = collector
+                .bounds
+                .valid()
+                .map_or(ShapeBounds::Empty, ShapeBounds::Rect);
+        }
+
+        fn paint(&mut self, _paint: Paint<'a>) {
+            if let ShapeBounds::Rect(bounds) = self.shape.intersect(self.active_clip()) {
+                self.painted.union(bounds);
+            }
+        }
+
+        fn push_clip(&mut self) {
+            let clip = self.shape.intersect(self.active_clip());
+            self.clips.push(clip);
+            self.shape = ShapeBounds::Unbounded;
+        }
+
+        fn push_clip_box(&mut self, clipbox: ClipBox) {
+            let transform = self.transform();
+            let mut box_bounds = Bounds::empty();
+            for (x, y) in [
+                (clipbox.x_min, clipbox.y_min),
+                (clipbox.x_max, clipbox.y_min),
+                (clipbox.x_max, clipbox.y_max),
+                (clipbox.x_min, clipbox.y_max),
+            ] {
+                let [tx, ty] = apply(transform, x, y);
+                box_bounds.include(tx, ty);
+            }
+            let shape = box_bounds
+                .valid()
+                .map_or(ShapeBounds::Empty, ShapeBounds::Rect);
+            let clip = shape.intersect(self.active_clip());
+            self.clips.push(clip);
+            self.shape = ShapeBounds::Unbounded;
+        }
+
+        fn pop_clip(&mut self) {
+            self.clips.pop();
+            self.shape = ShapeBounds::Unbounded;
+        }
+
+        fn push_layer(&mut self, _mode: CompositeMode) {}
+
+        fn pop_layer(&mut self) {}
+
+        fn push_transform(&mut self, transform: Transform) {
+            let combined = Transform::combine(self.transform(), transform);
+            self.transforms.push(combined);
+        }
+
+        fn pop_transform(&mut self) {
+            if self.transforms.len() > 1 {
+                self.transforms.pop();
+            }
+        }
+    }
+
+    fn measure_bounds(face: &Face<'_>, glyph: GlyphId) -> Option<Bounds> {
+        let mut painter = BoundsPainter::new(face);
+        face.paint_color_glyph(glyph, 0, FOREGROUND, &mut painter)?;
+        painter.painted.valid()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct CanvasFrame {
+        pub(super) width: u32,
+        pub(super) height: u32,
+        pub(super) origin_x: f32,
+        pub(super) scale: f32,
+        pub(super) transform: Transform,
+    }
+
+    impl CanvasFrame {
+        pub(super) fn for_bounds(bounds: Bounds, units: f32) -> Option<Self> {
+            let span_x = bounds.max_x - bounds.min_x;
+            let span_y = bounds.max_y - bounds.min_y;
+            if !(span_x > 0.0 && span_y > 0.0 && units > 0.0) {
+                return None;
+            }
+            let scale = (PICTURE_HEIGHT as f32 / units)
+                .min(PICTURE_HEIGHT as f32 / span_y)
+                .min(PICTURE_HEIGHT as f32 * 2.0 / span_x);
+            if !(scale.is_finite() && scale > 0.0) {
+                return None;
+            }
+            // Leave a 1px margin around the measured font bounds so antialiased
+            // edges never clip even when artwork exceeds `hhea.ascender`.
+            let origin_x = (bounds.min_x * scale).floor() - 1.0;
+            let right_x = (bounds.max_x * scale).ceil() + 1.0;
+            let origin_y = (-bounds.max_y * scale).floor() - 1.0;
+            let bottom_y = (-bounds.min_y * scale).ceil() + 1.0;
+            let width = (right_x - origin_x).max(1.0) as u32;
+            let height = (bottom_y - origin_y).max(1.0) as u32;
+            Some(Self {
+                width,
+                height,
+                origin_x,
+                scale,
+                transform: Transform::new(scale, 0.0, 0.0, -scale, -origin_x, -origin_y),
+            })
+        }
+    }
+
+    pub(super) fn crop_bitmap(
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        origin_x: f32,
+        px_per_em: f32,
+        advance: f32,
+    ) -> Option<ColorBitmap> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+            return None;
+        }
+        let painted = |x: usize, y: usize| rgba[(y * w + x) * 4 + 3] != 0;
+        let top = (0..h).find(|&y| (0..w).any(|x| painted(x, y)))?;
+        let bottom = (0..h).rev().find(|&y| (0..w).any(|x| painted(x, y)))?;
+        let left = (0..w).find(|&x| (top..=bottom).any(|y| painted(x, y)))?;
+        let right = (0..w)
+            .rev()
+            .find(|&x| (top..=bottom).any(|y| painted(x, y)))?;
+        let crop_w = right - left + 1;
+        let crop_h = bottom - top + 1;
+        let mut cropped = Vec::with_capacity(crop_w * crop_h * 4);
+        for y in top..=bottom {
+            let start = (y * w + left) * 4;
+            cropped.extend_from_slice(&rgba[start..start + crop_w * 4]);
+        }
+        let em = px_per_em.max(1.0);
         Some(ColorBitmap {
-            width,
-            height,
-            rgba: canvas.finish(),
-            left: 0.0,
-            em_width: advance / units,
-            em_height: (ascender - descender) / units,
-            advance: advance / units,
+            width: crop_w as u32,
+            height: crop_h as u32,
+            rgba: cropped,
+            left: (origin_x + left as f32) / em,
+            em_width: crop_w as f32 / em,
+            em_height: crop_h as f32 / em,
+            advance,
         })
     }
 
@@ -491,17 +771,32 @@ mod layers {
         }
 
         fn rasterize(&self, build: impl FnOnce(&mut Path)) -> Vec<f32> {
+            let width = self.width as usize;
+            let height = self.height as usize;
+            // `ab_glyph_rasterizer` accumulates scanlines across a flat buffer
+            // without horizontal clipping: edges at `x < 0` wrap into the
+            // previous row (or get dropped on row 0) and edges at `x >= width`
+            // spill into the next row. Shift x by +1 into a `width + 3` buffer
+            // (1 left guard + `width` pixels + 2 right sentinels) and project
+            // out-of-bounds edges onto `[0, width]` so every scanline's winding
+            // sum closes cleanly inside its own row.
+            let stride = width + 3;
             let mut path = Path {
                 transform: self.transform(),
-                rasterizer: Rasterizer::new(self.width as usize, self.height as usize),
+                rasterizer: Rasterizer::new(stride, height),
+                width: self.width as f32,
+                height: self.height as f32,
                 start: Point { x: 0.0, y: 0.0 },
                 pen: Point { x: 0.0, y: 0.0 },
             };
             build(&mut path);
-            let mut mask = vec![0.0; (self.width * self.height) as usize];
-            let width = self.width as usize;
-            path.rasterizer.for_each_pixel_2d(|x, y, coverage| {
-                mask[y as usize * width + x as usize] = coverage.abs().min(1.0);
+            let mut mask = vec![0.0; width * height];
+            path.rasterizer.for_each_pixel(|index, coverage| {
+                let x = index % stride;
+                if x >= 1 && x <= width {
+                    let y = index / stride;
+                    mask[y * width + (x - 1)] = coverage.abs().min(1.0);
+                }
             });
             mask
         }
@@ -514,6 +809,7 @@ mod layers {
                 }
             }
             self.clips.push(clip);
+            self.shape.fill(1.0);
         }
 
         fn finish(mut self) -> Vec<u8> {
@@ -572,6 +868,7 @@ mod layers {
 
         fn pop_clip(&mut self) {
             self.clips.pop();
+            self.shape.fill(1.0);
         }
 
         fn push_layer(&mut self, _mode: CompositeMode) {
@@ -603,9 +900,11 @@ mod layers {
     }
 
     /// Turns outline commands into pixels on the canvas.
-    struct Path {
+    pub(super) struct Path {
         transform: Transform,
         rasterizer: Rasterizer,
+        width: f32,
+        height: f32,
         start: Point,
         pen: Point,
     }
@@ -614,6 +913,207 @@ mod layers {
         fn map(&self, x: f32, y: f32) -> Point {
             let [x, y] = apply(self.transform, x, y);
             Point { x, y }
+        }
+
+        fn in_bounds(&self, points: &[Point]) -> bool {
+            points.iter().all(|p| {
+                p.x.is_finite()
+                    && p.y.is_finite()
+                    && p.x >= 0.0
+                    && p.x <= self.width
+                    && p.y >= 0.0
+                    && p.y <= self.height
+            })
+        }
+
+        fn shifted(p: Point) -> Point {
+            Point {
+                x: p.x + 1.0,
+                y: p.y,
+            }
+        }
+
+        fn lerp_point(t: f32, a: Point, b: Point) -> Point {
+            Point {
+                x: a.x + (b.x - a.x) * t,
+                y: a.y + (b.y - a.y) * t,
+            }
+        }
+
+        fn draw_clipped_line(&mut self, mut p0: Point, mut p1: Point) {
+            if !p0.x.is_finite() || !p0.y.is_finite() || !p1.x.is_finite() || !p1.y.is_finite() {
+                return;
+            }
+            if (p0.y - p1.y).abs() <= f32::EPSILON {
+                return;
+            }
+            let h = self.height;
+            if (p0.y <= 0.0 && p1.y <= 0.0) || (p0.y >= h && p1.y >= h) {
+                return;
+            }
+            let clip_y = |a: Point, b: Point, y: f32| -> Point {
+                let t = (y - a.y) / (b.y - a.y);
+                Point {
+                    x: a.x + (b.x - a.x) * t,
+                    y,
+                }
+            };
+            if p0.y < 0.0 {
+                p0 = clip_y(p0, p1, 0.0);
+            } else if p0.y > h {
+                p0 = clip_y(p0, p1, h);
+            }
+            if p1.y < 0.0 {
+                p1 = clip_y(p1, p0, 0.0);
+            } else if p1.y > h {
+                p1 = clip_y(p1, p0, h);
+            }
+            if (p0.y - p1.y).abs() <= f32::EPSILON {
+                return;
+            }
+
+            let w = self.width;
+            let emit = |rasterizer: &mut Rasterizer, a: Point, b: Point| {
+                if (a.y - b.y).abs() > f32::EPSILON {
+                    rasterizer.draw_line(
+                        Point {
+                            x: a.x.clamp(0.0, w) + 1.0,
+                            y: a.y,
+                        },
+                        Point {
+                            x: b.x.clamp(0.0, w) + 1.0,
+                            y: b.y,
+                        },
+                    );
+                }
+            };
+
+            let dx = p1.x - p0.x;
+            if dx.abs() <= f32::EPSILON
+                || (p0.x <= 0.0 && p1.x <= 0.0)
+                || (p0.x >= w && p1.x >= w)
+                || (p0.x >= 0.0 && p0.x <= w && p1.x >= 0.0 && p1.x <= w)
+            {
+                emit(&mut self.rasterizer, p0, p1);
+                return;
+            }
+
+            let mut ts = [0.0f32; 4];
+            let mut len = 0usize;
+            ts[len] = 0.0;
+            len += 1;
+            for bound in [0.0, w] {
+                let t = (bound - p0.x) / dx;
+                if t > 0.0 && t < 1.0 {
+                    ts[len] = t;
+                    len += 1;
+                }
+            }
+            ts[len] = 1.0;
+            len += 1;
+            ts[..len].sort_by(f32::total_cmp);
+
+            let mut prev = p0;
+            for &t in &ts[1..len] {
+                let next = if t == 1.0 {
+                    p1
+                } else {
+                    Point {
+                        x: p0.x + dx * t,
+                        y: p0.y + (p1.y - p0.y) * t,
+                    }
+                };
+                emit(&mut self.rasterizer, prev, next);
+                prev = next;
+            }
+        }
+
+        fn draw_clipped_quad(&mut self, p0: Point, p1: Point, p2: Point) {
+            if self.in_bounds(&[p0, p1, p2]) {
+                self.rasterizer
+                    .draw_quad(Self::shifted(p0), Self::shifted(p1), Self::shifted(p2));
+                return;
+            }
+            if (p0.y <= 0.0 && p1.y <= 0.0 && p2.y <= 0.0)
+                || (p0.y >= self.height && p1.y >= self.height && p2.y >= self.height)
+            {
+                return;
+            }
+            if (p0.x <= 0.0 && p1.x <= 0.0 && p2.x <= 0.0)
+                || (p0.x >= self.width && p1.x >= self.width && p2.x >= self.width)
+            {
+                self.draw_clipped_line(p0, p2);
+                return;
+            }
+            let devx = p0.x - 2.0 * p1.x + p2.x;
+            let devy = p0.y - 2.0 * p1.y + p2.y;
+            let devsq = devx * devx + devy * devy;
+            if !devsq.is_finite() || devsq < 0.333 {
+                self.draw_clipped_line(p0, p2);
+                return;
+            }
+            let n = (1 + (3.0 * devsq).sqrt().sqrt().floor() as usize).min(1024);
+            let mut p = p0;
+            let nrecip = (n as f32).recip();
+            let mut t = 0.0;
+            for _ in 0..n - 1 {
+                t += nrecip;
+                let pn =
+                    Self::lerp_point(t, Self::lerp_point(t, p0, p1), Self::lerp_point(t, p1, p2));
+                self.draw_clipped_line(p, pn);
+                p = pn;
+            }
+            self.draw_clipped_line(p, p2);
+        }
+
+        fn draw_clipped_cubic(&mut self, p0: Point, p1: Point, p2: Point, p3: Point, depth: u8) {
+            if self.in_bounds(&[p0, p1, p2, p3]) {
+                self.rasterizer.draw_cubic(
+                    Self::shifted(p0),
+                    Self::shifted(p1),
+                    Self::shifted(p2),
+                    Self::shifted(p3),
+                );
+                return;
+            }
+            if (p0.y <= 0.0 && p1.y <= 0.0 && p2.y <= 0.0 && p3.y <= 0.0)
+                || (p0.y >= self.height
+                    && p1.y >= self.height
+                    && p2.y >= self.height
+                    && p3.y >= self.height)
+            {
+                return;
+            }
+            if (p0.x <= 0.0 && p1.x <= 0.0 && p2.x <= 0.0 && p3.x <= 0.0)
+                || (p0.x >= self.width
+                    && p1.x >= self.width
+                    && p2.x >= self.width
+                    && p3.x >= self.width)
+            {
+                self.draw_clipped_line(p0, p3);
+                return;
+            }
+            const FLATNESS_SQUARED: f32 = 0.35 * 0.35;
+            const MAX_DEPTH: u8 = 16;
+            let dist = |a: Point, b: Point| (b.x - a.x).hypot(b.y - a.y);
+            let longlen = dist(p0, p1) + dist(p1, p2) + dist(p2, p3);
+            let shortlen = dist(p0, p3);
+            let flatness_squared = longlen * longlen - shortlen * shortlen;
+            if depth < MAX_DEPTH
+                && flatness_squared.is_finite()
+                && flatness_squared > FLATNESS_SQUARED
+            {
+                let p01 = Self::lerp_point(0.5, p0, p1);
+                let p12 = Self::lerp_point(0.5, p1, p2);
+                let p23 = Self::lerp_point(0.5, p2, p3);
+                let pa = Self::lerp_point(0.5, p01, p12);
+                let pb = Self::lerp_point(0.5, p12, p23);
+                let mp = Self::lerp_point(0.5, pa, pb);
+                self.draw_clipped_cubic(p0, p01, pa, mp, depth + 1);
+                self.draw_clipped_cubic(mp, pb, p23, p3, depth + 1);
+            } else {
+                self.draw_clipped_line(p0, p3);
+            }
         }
     }
 
@@ -625,26 +1125,60 @@ mod layers {
 
         fn line_to(&mut self, x: f32, y: f32) {
             let to = self.map(x, y);
-            self.rasterizer.draw_line(self.pen, to);
+            self.draw_clipped_line(self.pen, to);
             self.pen = to;
         }
 
         fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
             let (control, to) = (self.map(x1, y1), self.map(x, y));
-            self.rasterizer.draw_quad(self.pen, control, to);
+            self.draw_clipped_quad(self.pen, control, to);
             self.pen = to;
         }
 
         fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
             let (first, second, to) = (self.map(x1, y1), self.map(x2, y2), self.map(x, y));
-            self.rasterizer.draw_cubic(self.pen, first, second, to);
+            self.draw_clipped_cubic(self.pen, first, second, to, 0);
             self.pen = to;
         }
 
         fn close(&mut self) {
-            self.rasterizer.draw_line(self.pen, self.start);
+            self.draw_clipped_line(self.pen, self.start);
             self.pen = self.start;
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn rasterize_rect_for_test(
+        width: u32,
+        height: u32,
+        x_min: f32,
+        y_min: f32,
+        x_max: f32,
+        y_max: f32,
+    ) -> Vec<f32> {
+        let stride = width as usize + 3;
+        let mut path = Path {
+            transform: Transform::default(),
+            rasterizer: Rasterizer::new(stride, height as usize),
+            width: width as f32,
+            height: height as f32,
+            start: Point { x: 0.0, y: 0.0 },
+            pen: Point { x: 0.0, y: 0.0 },
+        };
+        path.move_to(x_min, y_min);
+        path.line_to(x_max, y_min);
+        path.line_to(x_max, y_max);
+        path.line_to(x_min, y_max);
+        path.close();
+        let mut mask = vec![0.0; (width * height) as usize];
+        path.rasterizer.for_each_pixel(|index, coverage| {
+            let x = index % stride;
+            if x >= 1 && x <= width as usize {
+                let y = index / stride;
+                mask[y * width as usize + (x - 1)] = coverage.abs().min(1.0);
+            }
+        });
+        mask
     }
 
     /// The color of a paint at a point on the canvas, not premultiplied.
@@ -867,5 +1401,150 @@ mod tests {
         assert_eq!((width, height), (200, 100));
         assert_eq!(rgba.len(), 200 * 100 * 4);
         assert!(rgba.iter().all(|channel| *channel == 255));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn colr_canvas_frame_keeps_artwork_above_hhea_ascender_inside_canvas() {
+        // Matches Windows 11 Segoe UI Emoji metrics (upem 2048, hhea ascender 1491,
+        // while emoji outlines extend up to ~1886 above the baseline).
+        let bounds = layers::Bounds {
+            min_x: 246.0,
+            min_y: -328.0,
+            max_x: 2542.0,
+            max_y: 1886.0,
+        };
+        let frame = layers::CanvasFrame::for_bounds(bounds, 2048.0).unwrap();
+        let corners = [
+            (bounds.min_x, bounds.min_y),
+            (bounds.max_x, bounds.min_y),
+            (bounds.max_x, bounds.max_y),
+            (bounds.min_x, bounds.max_y),
+        ];
+        for (x, y) in corners {
+            let t = frame.transform;
+            let px = t.a * x + t.c * y + t.e;
+            let py = t.b * x + t.d * y + t.f;
+            assert!(
+                px >= 1.0 && px <= frame.width as f32 - 1.0,
+                "x={x} mapped outside canvas: px={px}, width={}",
+                frame.width
+            );
+            assert!(
+                py >= 1.0 && py <= frame.height as f32 - 1.0,
+                "y={y} mapped outside canvas: py={py}, height={}",
+                frame.height
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn colr_crop_trims_asymmetric_margins_and_preserves_em_metrics() {
+        let (w, h) = (100u32, 100u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // Paint a 40x60 box offset near the top-right to mimic asymmetric padding.
+        for y in 4..64 {
+            for x in 20..60 {
+                let idx = ((y * w + x) * 4) as usize;
+                rgba[idx] = 255;
+                rgba[idx + 1] = 200;
+                rgba[idx + 2] = 0;
+                rgba[idx + 3] = 255;
+            }
+        }
+        let bitmap = layers::crop_bitmap(&rgba, w, h, 10.0, 80.0, 1.25).unwrap();
+        assert_eq!((bitmap.width, bitmap.height), (40, 60));
+        assert!((bitmap.left - (10.0 + 20.0) / 80.0).abs() < 1e-5);
+        assert!((bitmap.em_width - 40.0 / 80.0).abs() < 1e-5);
+        assert!((bitmap.em_height - 60.0 / 80.0).abs() < 1e-5);
+        assert!((bitmap.advance - 1.25).abs() < 1e-5);
+        // Top and bottom rows of the cropped picture both contain painted pixels.
+        assert!((0..bitmap.width).any(|x| bitmap.rgba[(x * 4 + 3) as usize] != 0));
+        assert!((0..bitmap.width).any(|x| bitmap.rgba
+            [(((bitmap.height - 1) * bitmap.width + x) * 4 + 3) as usize]
+            != 0));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn colr_rasterize_handles_clip_box_extending_outside_canvas() {
+        // A COLR v1 ClipBox is often larger than the tight painted outline bounds,
+        // so its edges can lie at x < 0, x > width, y < 0, or y > height.
+        for (x_min, y_min, x_max, y_max) in [
+            (-10.0, -5.0, 50.0, 45.0),
+            (-0.4, 0.3, 40.4, 39.7),
+            (-100.0, -100.0, 200.0, 200.0),
+        ] {
+            let mask = layers::rasterize_rect_for_test(40, 40, x_min, y_min, x_max, y_max);
+            for y in 1..39 {
+                for x in 0..40 {
+                    let coverage = mask[y * 40 + x];
+                    assert!(
+                        (coverage - 1.0).abs() < 1e-4,
+                        "rect ({x_min},{y_min})-({x_max},{y_max}) at ({x},{y}) got coverage {coverage}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_colr_emoji_renders_without_top_clipping_and_centered() {
+        let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") else {
+            return;
+        };
+        let font = ab_glyph::FontArc::try_from_vec(data).unwrap();
+        for text in [
+            "😀", "😂", "🎉", "🔥", "👍", "✨", "❤", "❤️", "😭", "💀", "🥰", "⭐",
+        ] {
+            let folded = fold(text);
+            let ch = folded.chars().next().unwrap();
+            let bitmap = render(&font, glyph_id(&font, ch))
+                .unwrap_or_else(|| panic!("{text}: missing COLR emoji bitmap"));
+            assert!(
+                bitmap.em_height >= 0.75 && bitmap.em_height <= 1.25,
+                "{text}: unexpected em_height={}",
+                bitmap.em_height
+            );
+            // Painted pixels reach both top and bottom rows after tight cropping,
+            // and the top row is not a flat wall of solid alpha across the full width.
+            let top_solid = (0..bitmap.width)
+                .filter(|&x| bitmap.rgba[(x * 4 + 3) as usize] >= 250)
+                .count();
+            assert!(
+                (top_solid as f32) < bitmap.width as f32 * 0.65,
+                "{text}: top row looks flat-clipped ({top_solid}/{} solid pixels)",
+                bitmap.width
+            );
+            // Solid opaque core: guard against out-of-bounds clip-box rasterization
+            // turning emoji translucent or hollow.
+            let opaque_px = bitmap
+                .rgba
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] >= 250)
+                .count();
+            assert!(
+                opaque_px * 100 >= (bitmap.width * bitmap.height) as usize * 25,
+                "{text}: too few opaque pixels ({opaque_px}/{}), bitmap looks translucent or hollow",
+                bitmap.width * bitmap.height
+            );
+            // Alpha-weighted vertical centroid sits near the middle of the cropped bitmap.
+            let mut sum_y = 0.0f64;
+            let mut sum_a = 0.0f64;
+            for y in 0..bitmap.height {
+                for x in 0..bitmap.width {
+                    let a = f64::from(bitmap.rgba[((y * bitmap.width + x) * 4 + 3) as usize]);
+                    sum_y += (y as f64 + 0.5) * a;
+                    sum_a += a;
+                }
+            }
+            let centroid = sum_y / sum_a / f64::from(bitmap.height);
+            assert!(
+                (0.35..=0.65).contains(&centroid),
+                "{text}: vertical centroid {centroid:.3} is off-center"
+            );
+        }
     }
 }
