@@ -151,18 +151,18 @@ publishes clock/device feedback, and commits rate changes independently of
 rendering. Queue admission uses the existing 250 ms rate-bridge target;
 mixed-rate observations remain suppressed during the bridge.
 
-Presenter controls use an acknowledged command channel. A transition first
-quiesces the audio consumer, then the playback producer; only after both
-boundaries may it reset the output and drain queues. The producer resumes before
-the consumer. No snapshot mutex is held during a backend call or while waiting
-for an acknowledgement. A generation-specific successful video present releases
-the audio-start gate. At natural EOF the owner sleeps once remaining PCM reaches
-the device; it does not equate an empty ring with a fully played hardware tail.
-Explicit reset/stop/close still release the output; destruction joins the thread.
-Host background-playback opt-in remains unchanged: `audio_only_tick` controls
-video suspension and foreground recovery, while audio delivery needs no host
-tick once started. Hosts must use pause/stop/close to stop audio; stopping their
-display timer alone no longer starves it.
+On a seek or track change, the presenter first asks the playback worker to stop
+sending frames. The audio thread can continue feeding the device until the
+worker acknowledges. The presenter then quiesces the audio thread and waits
+for any in-flight push. Both acknowledgements precede resetting output or
+draining the queues. The worker resumes before the audio thread.
+
+During foreground video playback, presenting a frame from the new generation
+releases the audio-start gate. Background audio-only playback can resume after
+a seek while video decoding is suspended. At natural EOF the audio thread
+hands the remaining PCM to the device and allows the hardware tail to play.
+Hosts use pause, stop or close when sound should stop. Suspending a display
+timer alone leaves an active audio stream running.
 
 - **macOS**: CoreAudio output with ring buffer and PTS-tracking clock snapshots.
   The audio owner feeds CoreAudio output snapshots back to the player worker for

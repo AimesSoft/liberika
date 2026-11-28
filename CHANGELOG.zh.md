@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### 播放
+
+- 原生播放器在独立线程上供给 PCM 并更新音频时钟。播放启动后，即使渲染 tick 延迟，音频设备仍可持续收到数据。
+
 ### 浏览器
 
 - Web 运行时以 `@aimessoft/liberika-web` 和不含回退字体的 `@aimessoft/liberika-web-nofont` 发布到 npm，Vite 无需配置即可打包。

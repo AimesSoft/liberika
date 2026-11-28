@@ -846,7 +846,7 @@ UI を独自に合成するホスト（Wayland 上の Dioxus など）は、同�
 事前の `render_tick` は不要です。debug HUD は含まず、SDR RGBA8、バッファとエラーの
 契約は screenshot API と同じです。短い時間窓を同期的に準備してキャッシュするため、
 リサイズ、seek、弾幕設定の変更後は次の呼び出しで再準備する場合があります。
-音声出力には通常の `render_tick` が必要です。`audio_only_tick` は映像デコードを停止します。
+再生中の音声は専用スレッドで継続します。バックグラウンドで音声のみを再生するときに `audio_only_tick` を呼びます。
 
 Rust の入口は `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)` です。
 

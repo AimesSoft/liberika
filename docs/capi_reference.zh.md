@@ -822,7 +822,7 @@ free(rgba);
 scale factor 为 1；捕获无需绑定 surface，也不要求先调用 `render_tick`。
 新接口不含调试 HUD，SDR RGBA8、缓冲区和错误约定与截图接口一致。
 捕获会同步准备并缓存短时间窗口；调整尺寸、seek 或修改弹幕配置后，下一次调用可能
-重新准备布局。音频输出仍需常规 `render_tick`；`audio_only_tick` 会暂停视频解码。
+重新准备布局。已启动的音频在独立线程上继续播放。进入后台纯音频模式时调用 `audio_only_tick`。
 
 Rust 对应入口为 `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`：
 

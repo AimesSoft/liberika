@@ -96,7 +96,6 @@ pub(super) enum AudioCommand {
     SetVolume(f32),
     VideoPresented(u64),
     SetAudioOnly(bool),
-    Shutdown,
 }
 
 struct Request {
@@ -106,7 +105,7 @@ struct Request {
 }
 
 pub(super) struct AudioService {
-    commands: Sender<Request>,
+    commands: Option<Sender<Request>>,
     snapshot: Arc<Mutex<AudioServiceSnapshot>>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -148,8 +147,7 @@ impl AudioService {
                     };
                     match request {
                         Ok(request) => {
-                            let shutdown = matches!(request.command, AudioCommand::Shutdown);
-                            if !shutdown && Instant::now() >= request.deadline {
+                            if Instant::now() >= request.deadline {
                                 let _ = request.reply.send(Err(PlayerError::Playback(
                                     "audio command expired before execution".into(),
                                 )));
@@ -164,9 +162,6 @@ impl AudioService {
                                 result.is_ok(), pump.player.playback_generation(), pump.quiesced,
                             ));
                             let _ = request.reply.send(result);
-                            if shutdown {
-                                break;
-                            }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -191,7 +186,7 @@ impl AudioService {
             .recv()
             .map_err(|_| PlayerError::Playback("audio owner failed to initialize".into()))?;
         Ok(Self {
-            commands,
+            commands: Some(commands),
             snapshot,
             worker: Some(worker),
         })
@@ -201,6 +196,8 @@ impl AudioService {
         let (reply, response) = bounded(1);
         let deadline = Instant::now() + AUDIO_COMMAND_TIMEOUT;
         self.commands
+            .as_ref()
+            .expect("command sender exists until drop")
             .send_timeout(
                 Request {
                     command,
@@ -226,7 +223,9 @@ impl AudioService {
 
 impl Drop for AudioService {
     fn drop(&mut self) {
-        let _ = self.command(AudioCommand::Shutdown);
+        // Disconnect before joining: even a full command queue must let the
+        // owner exit once an in-flight backend call returns.
+        drop(self.commands.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -317,7 +316,7 @@ impl AudioPump {
         // The worker owns EOF publication. Once all PCM has reached the device,
         // sleep until a replay/open/control command. Do not stop the backend
         // here: an empty ring does not prove its hardware tail has played.
-        if self.player.is_stopped_at_end()
+        if self.at_natural_end()
             && self.audio_frames.is_empty()
             && self
                 .audio_output
@@ -327,6 +326,13 @@ impl AudioPump {
             self.quiesced = true;
         }
         Ok(())
+    }
+
+    fn at_natural_end(&self) -> bool {
+        // The worker may still publish Stopped while a replay command is
+        // queued. Stay awake until the worker has processed that play intent.
+        self.player.is_stopped_at_end()
+            && self.player.playback_intent_state() == PlayerState::Stopped
     }
 
     fn pause_output(&mut self) -> Result<()> {
@@ -371,10 +377,6 @@ impl AudioPump {
             AudioCommand::SetAudioOnly(audio_only) => self.audio_only = audio_only,
             AudioCommand::VideoPresented(generation) => {
                 self.video_ready_generation = Some(generation)
-            }
-            AudioCommand::Shutdown => {
-                self.quiesced = true;
-                return self.reset_audio_output_with_committed_rate();
             }
         }
         Ok(())
@@ -504,9 +506,15 @@ impl AudioPump {
     }
 
     fn ensure_audio_started(&mut self) {
-        if !self.is_playing()
-            || self.audio_started
-            || !self.audio_output_ready_to_start()
+        if self.audio_started {
+            return;
+        }
+        let playing = self.is_playing();
+        let ended = !playing && self.at_natural_end();
+        // Once the worker has delivered the entire stream, a final short
+        // buffer cannot grow to the normal startup threshold.
+        if (!playing && !ended)
+            || !self.audio_output_ready_to_start(ended && self.audio_frames.is_empty())
             || !self.audio_start_allowed()
         {
             return;
@@ -523,11 +531,13 @@ impl AudioPump {
         self.last_audio_clock_report = None;
     }
 
-    fn audio_output_ready_to_start(&self) -> bool {
+    fn audio_output_ready_to_start(&self, final_buffer: bool) -> bool {
         self.audio_output
             .clock_snapshot()
             .and_then(|snapshot| snapshot.queued_duration)
-            .is_some_and(|queued| queued >= AUDIO_START_BUFFER)
+            .is_some_and(|queued| {
+                queued >= AUDIO_START_BUFFER || (final_buffer && !queued.is_zero())
+            })
     }
 
     fn audio_start_allowed(&self) -> bool {
@@ -737,11 +747,20 @@ mod tests {
 
     struct BlockingOutput {
         output: BufferedAudioOutput,
-        entered: Sender<()>,
+        entered: Sender<thread::ThreadId>,
+        dropped_on: Option<Sender<thread::ThreadId>>,
         release: Receiver<()>,
         block_next: bool,
         fail_stop: bool,
         recover_on_push: bool,
+    }
+
+    impl Drop for BlockingOutput {
+        fn drop(&mut self) {
+            if let Some(dropped_on) = &self.dropped_on {
+                let _ = dropped_on.send(thread::current().id());
+            }
+        }
     }
 
     impl AudioOutputBackend for BlockingOutput {
@@ -755,7 +774,7 @@ mod tests {
             self.output.pause()
         }
         fn stop(&mut self) -> crate::audio::Result<()> {
-            if self.fail_stop {
+            if std::mem::take(&mut self.fail_stop) {
                 return Err(crate::audio::AudioError::Backend(
                     "injected stop failure".into(),
                 ));
@@ -774,7 +793,7 @@ mod tests {
         ) -> crate::audio::Result<crate::audio::AudioPushResult> {
             if self.block_next {
                 self.block_next = false;
-                self.entered.send(()).unwrap();
+                self.entered.send(thread::current().id()).unwrap();
                 self.release.recv().unwrap();
             }
             self.output.push(frame)
@@ -829,6 +848,7 @@ mod tests {
             Box::new(BlockingOutput {
                 output: BufferedAudioOutput::new(AudioRingBufferConfig::default()),
                 entered,
+                dropped_on: None,
                 release: resume,
                 block_next: true,
                 fail_stop: false,
@@ -874,10 +894,12 @@ mod tests {
         let (frames, receiver) = bounded(1);
         let (entered, started) = bounded(1);
         let (release, resume) = bounded(1);
+        let (dropped_on, device_dropped) = bounded(1);
         let service = AudioService::with_factory(player, receiver, move || {
             Box::new(BlockingOutput {
                 output: BufferedAudioOutput::new(AudioRingBufferConfig::default()),
                 entered,
+                dropped_on: Some(dropped_on),
                 release: resume,
                 block_next: true,
                 fail_stop: false,
@@ -887,10 +909,10 @@ mod tests {
         .unwrap();
         frames.send(test_frame(generation)).unwrap();
         service.command(AudioCommand::Resume).unwrap();
-        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let owner_thread = started.recv_timeout(Duration::from_secs(1)).unwrap();
 
         // Simulate requests left queued by callers that have already timed out.
-        let commands = &service.commands;
+        let commands = service.commands.as_ref().unwrap();
         let (reply, _answers) = crossbeam_channel::unbounded();
         while !commands.is_full() {
             commands
@@ -920,6 +942,7 @@ mod tests {
             "dropping the last command sender must let the audio owner exit after push returns",
         );
         worker.join().unwrap();
+        assert_eq!(device_dropped.try_recv().unwrap(), owner_thread);
     }
 
     #[test]
@@ -933,6 +956,8 @@ mod tests {
         let (reply, result) = bounded(1);
         service
             .commands
+            .as_ref()
+            .unwrap()
             .send(Request {
                 command: AudioCommand::Resume,
                 reply,
@@ -958,6 +983,7 @@ mod tests {
         pump.audio_output = Box::new(BlockingOutput {
             output: BufferedAudioOutput::new(AudioRingBufferConfig::default()),
             entered,
+            dropped_on: None,
             release,
             block_next: false,
             fail_stop: true,
@@ -967,6 +993,48 @@ mod tests {
         assert!(pump.handle(AudioCommand::Reset).is_err());
         assert!(pump.audio_configured);
         assert_eq!(pump.stats.audio_failures, 1);
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn close_releases_the_media_when_audio_reset_fails() {
+        use crate::core::MediaRequest;
+        use crate::presenter::{PresenterConfig, PresenterRuntime};
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter
+            .open(MediaRequest::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/testdata/playback/playback-fixture.mkv"
+            )))
+            .unwrap();
+        assert_eq!(presenter.player.state(), PlayerState::Ready);
+
+        let (entered, _) = bounded(1);
+        let (_, release) = bounded(1);
+        presenter.audio = AudioService::with_factory(
+            presenter.player.clone(),
+            presenter.player.subscribe_audio_frames(),
+            move || {
+                Box::new(BlockingOutput {
+                    output: BufferedAudioOutput::new(AudioRingBufferConfig::default()),
+                    entered,
+                    dropped_on: None,
+                    release,
+                    block_next: false,
+                    fail_stop: true,
+                    recover_on_push: false,
+                })
+            },
+        )
+        .unwrap();
+        let result = presenter.close();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected stop failure")
+        );
+        assert_eq!(presenter.player.state(), PlayerState::Closed);
     }
 
     #[test]
@@ -983,6 +1051,7 @@ mod tests {
             Box::new(BlockingOutput {
                 output: BufferedAudioOutput::new(AudioRingBufferConfig::default()),
                 entered,
+                dropped_on: None,
                 release,
                 block_next: false,
                 fail_stop: false,
@@ -1262,7 +1331,7 @@ mod tests {
         // AUDIO_PUMP_TIME_BUDGET (4 ms) cannot flake (the legacy 16-frame cap
         // could pump at most 64 frames / 53 ms in 4 ticks).
         for _ in 0..3 {
-            if presenter.audio_output_ready_to_start() {
+            if presenter.audio_output_ready_to_start(false) {
                 break;
             }
             presenter.pump_audio();
@@ -1314,7 +1383,7 @@ mod tests {
 
         for _ in 0..8 {
             presenter.pump_audio();
-            if presenter.audio_output_ready_to_start() {
+            if presenter.audio_output_ready_to_start(false) {
                 break;
             }
         }

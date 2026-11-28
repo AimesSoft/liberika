@@ -201,6 +201,23 @@ impl Harness {
         self.ring.lock().unwrap().clock_snapshot()
     }
 
+    fn wait_for_background_audio(&self) -> AudioClockSnapshot {
+        let initial = self.snapshot().read_frames;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let current = self.snapshot();
+            if current.read_frames >= initial + 4800 {
+                assert_eq!(self.ring.lock().unwrap().state(), AudioOutputState::Playing);
+                return current;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "device did not consume PCM without display ticks: {current:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn start(&mut self) {
         self.presenter.play().unwrap();
         self.tick_for(Duration::from_millis(1000));
@@ -360,6 +377,8 @@ fn pause_seek_stop_and_replay_keep_audio_on_the_current_timeline() {
         .unwrap();
     h.presenter.set_playback_rate(2.0).unwrap();
     h.presenter.pause().unwrap();
+    // Sample after the worker has committed its final pause position.
+    h.presenter.player.set_frame_output_quiesced(false).unwrap();
     let paused = h.presenter.player.current_media_time();
     let read = h.snapshot().read_frames;
     h.tick_for(Duration::from_millis(60));
@@ -399,4 +418,61 @@ fn pause_seek_stop_and_replay_keep_audio_on_the_current_timeline() {
     assert_eq!(h.snapshot(), closed);
     assert_eq!(closed.queued_frames, 0);
     assert!(h.presenter.play().is_err());
+}
+
+#[test]
+fn background_seek_and_track_change_restart_audio_without_display_ticks() {
+    let mut h = Harness::new();
+    h.start();
+    h.presenter.audio_only_tick().unwrap();
+    let generation = h.presenter.player.playback_generation();
+    let target = Duration::from_secs(3);
+    h.presenter.seek(target).unwrap();
+    assert!(h.presenter.player.playback_generation() > generation);
+    assert!(h.wait_for_background_audio().media_time.unwrap() >= target);
+
+    h.presenter.pause().unwrap();
+    let target = Duration::from_secs(1);
+    h.presenter.seek(target).unwrap();
+    let read = h.snapshot().read_frames;
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(h.snapshot().read_frames, read);
+    assert_eq!(h.presenter.player.current_media_time(), target);
+    h.presenter.play().unwrap();
+    let resumed = h.wait_for_background_audio().media_time.unwrap();
+    assert!(resumed >= target && resumed < Duration::from_secs(3));
+
+    h.presenter.select_audio_track(Some(2)).unwrap();
+    assert_eq!(h.presenter.player.track_selection().audio, Some(2));
+    assert!(h.wait_for_background_audio().media_time.unwrap() >= resumed);
+}
+
+#[test]
+fn background_natural_eof_and_replay_do_not_require_display_ticks() {
+    let mut h = Harness::new();
+    h.start();
+    h.presenter.audio_only_tick().unwrap();
+    let end = h.presenter.player.duration().unwrap();
+    let before = h.snapshot().read_frames;
+    // The final 100 ms of this 48 kHz fixture is shorter than the usual
+    // 250 ms device startup threshold. It must still reach the callback.
+    h.presenter.seek(end - Duration::from_millis(100)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let snapshot = h.snapshot();
+        if h.presenter.player.is_stopped_at_end()
+            && snapshot.queued_frames == 0
+            && snapshot.read_frames >= before + 4_000
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short EOF tail did not play: {snapshot:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    h.presenter.play().unwrap();
+    let replay = h.wait_for_background_audio();
+    assert!(replay.media_time.unwrap() < Duration::from_secs(2));
 }

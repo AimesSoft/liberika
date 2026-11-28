@@ -102,16 +102,15 @@ background 再生と foreground の video 復帰中も、動作中の audio mast
 デバイスの報告、速度変更の確定を描画から独立して行います。キューへの追加には
 既存の 250 ms bridge の目標を使い、速度が混在する期間の観測抑制を維持します。
 
-Presenter は ACK 付きの command channel で制御します。切替時は音声の消費者、
-再生の生産者の順に静止させ、両方の確認後に出力とキューをリセットします。
-再開時は生産者を先に戻します。backend 呼び出しや ACK 待ちの間、共有 snapshot の
-mutex は保持しません。現在の generation の video が正常に表示されてから音声を
-開始します。自然な EOF では残りの PCM を device に渡して command を待ちます。
-空の ring を hardware の再生完了とは判断しません。明示的な reset/stop/close で
-出力を解放し、破棄時に thread を join します。background 再生の opt-in は
-維持します。`audio_only_tick` は video の停止と foreground 復帰を制御し、開始済み
-音声の継続には host tick は不要です。音声の停止には pause/stop/close を使います。
-display timer を止めるだけでは音声供給は止まりません。
+シークやトラック切り替えでは、Presenter がまず再生スレッドにフレーム送信の停止を要求します。
+その確認を待つ間も音声スレッドはデバイスに PCM を供給できます。次に音声スレッドを停止し、
+実行中の書き込みが完了するまで待ちます。双方の確認後に出力をリセットし、キューを空にします。
+再開時は再生スレッドを先に戻し、その後に音声スレッドを戻します。
+
+前景の映像再生では、新しい世代のフレームが表示されると音声が始まります。バックグラウンドの
+音声のみの再生では、シーク後も映像デコードを停止したまま音声を再開できます。
+自然な EOF では残りの PCM をデバイスに渡し、最後の音まで再生します。音声を止める場合は
+ホストから pause、stop、close を呼びます。表示タイマーを停止しても再生中の音声は継続します。
 
 - **macOS**: ring buffer と PTS-tracking clock snapshot を持つ CoreAudio 出力。音声の所有者は snapshot を player worker に返し、audio-master clock discipline を維持します。
 - **iOS**: 同じ ring buffer / clock snapshot model を持つ AudioQueue 出力。

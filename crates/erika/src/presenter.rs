@@ -1072,16 +1072,17 @@ impl PresenterRuntime {
     pub fn close(&mut self) -> Result<()> {
         self.quiesce_frame_output("close")?;
         self.reset_video_decode_resume_state();
-        self.audio.command(AudioCommand::SetAudioOnly(false))?;
-        self.reset_audio_output_with_committed_rate()?;
+        let mode = self.audio.command(AudioCommand::SetAudioOnly(false));
+        let reset = self.reset_audio_output_with_committed_rate();
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
-        self.drain_pending_player_frames()?;
+        let pending = self.drain_pending_player_frames();
         self.latest_video_decoder = None;
-        let result = self.player.close();
-        // Shutdown is joined at this point; no producer can refill a receiver.
-        self.drain_pending_player_frames()?;
-        result
+        // Retire the decoder even if device teardown fails, then discard any
+        // frames published during shutdown.
+        let close = self.player.close();
+        let remaining = self.drain_pending_player_frames();
+        mode.and(reset).and(pending).and(close).and(remaining)
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
