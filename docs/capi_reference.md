@@ -45,6 +45,8 @@ owner has yet to start the open. A committed open ignores later interrupts.
 The older `erika_cold_open_cancellation_cancel` only cancels retry windows.
 Release the ticket after the open and all signaling calls have returned.
 
+JSON hosts can pass the ticket to `erika_presenter_open_json_cancellable`. It accepts the arguments and returns the response envelope of the `open` JSON method. Only HTTP(S) opens consume the ticket.
+
 ### Linux Flutter frame readback
 
 After `erika_presenter_render_tick`, the Linux texture bridge calls

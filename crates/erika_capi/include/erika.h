@@ -1162,6 +1162,10 @@ void erika_cold_open_cancellation_cancel(const ErikaColdOpenCancellation *ticket
  * after it returns. An already committed open is unaffected. */
 void erika_cold_open_cancellation_interrupt(const ErikaColdOpenCancellation *ticket);
 void erika_cold_open_cancellation_release(ErikaColdOpenCancellation *ticket);
+/* Same arguments, ownership and response as invoke_json("open"). The ticket
+ * applies to HTTP opens only; the caller retains it until this call returns. */
+char *erika_presenter_open_json_cancellable(ErikaPresenterHandle *presenter,
+    const char *arguments_json, const ErikaColdOpenCancellation *ticket);
 ErikaStatus erika_presenter_open_with_options_cancellable(ErikaPresenterHandle *presenter,
     const char *uri, const ErikaOpenOptions *options, const ErikaColdOpenCancellation *ticket);
 

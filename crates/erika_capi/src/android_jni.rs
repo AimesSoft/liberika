@@ -58,6 +58,32 @@ impl OwnedAndroidPresenterAddress {
 struct AndroidPresenterEntry {
     owner_thread: ThreadId,
     presenter: Mutex<Option<OwnedAndroidPresenterAddress>>,
+    // Accessible while the owner is inside a synchronous presenter call.
+    http_open: Mutex<AndroidHttpOpen>,
+}
+
+#[derive(Default)]
+struct AndroidHttpOpen {
+    generation: jlong,
+    active: Option<erika::source::ColdOpenCancellation>,
+}
+
+impl AndroidHttpOpen {
+    fn begin(&mut self, generation: jlong) -> Result<ErikaColdOpenCancellation, String> {
+        if generation != self.generation {
+            return Err("HTTP open was interrupted before dispatch".into());
+        }
+        let ticket = erika::source::ColdOpenCancellation::default();
+        self.active = Some(ticket.clone());
+        Ok(ErikaColdOpenCancellation(ticket))
+    }
+
+    fn interrupt(&mut self, generation: jlong) {
+        self.generation = generation;
+        if let Some(ticket) = self.active.take() {
+            ticket.interrupt();
+        }
+    }
 }
 
 impl AndroidPresenterEntry {
@@ -65,6 +91,7 @@ impl AndroidPresenterEntry {
         Self {
             owner_thread: thread::current().id(),
             presenter: Mutex::new(Some(OwnedAndroidPresenterAddress::new(presenter))),
+            http_open: Mutex::default(),
         }
     }
 
@@ -455,12 +482,58 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeDestro
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeInvoke(
-    mut env: JNIEnv<'_>,
+    env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
     method: JString<'_>,
     arguments_json: JString<'_>,
     transferred_fd: jint,
+) -> jstring {
+    android_invoke(
+        env,
+        handle,
+        Some(method),
+        arguments_json,
+        transferred_fd,
+        None,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeOpenHttp(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    arguments_json: JString<'_>,
+    generation: jlong,
+) -> jstring {
+    android_invoke(env, handle, None, arguments_json, -1, Some(generation))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeInterruptHttpOpen(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    generation: jlong,
+) {
+    let entry = { lock_registry().get(handle) };
+    if let Ok(entry) = entry {
+        entry
+            .http_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .interrupt(generation);
+    }
+}
+
+fn android_invoke(
+    mut env: JNIEnv<'_>,
+    handle: jlong,
+    method: Option<JString<'_>>,
+    arguments_json: JString<'_>,
+    transferred_fd: jint,
+    http_generation: Option<jlong>,
 ) -> jstring {
     let mut owned_fd = (transferred_fd >= 0)
         .then(|| unsafe { OwnedFdCallGuard::from_transferred_fd(transferred_fd) });
@@ -469,10 +542,13 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeInvoke
         if invalid_transferred_fd {
             return Err(format!("invalid transferred fd {transferred_fd}"));
         }
-        let method: String = env
-            .get_string(&method)
-            .map(|value| value.into())
-            .map_err(|error| format!("invalid method string: {error}"))?;
+        let method: String = match method {
+            Some(method) => env
+                .get_string(&method)
+                .map(|value| value.into())
+                .map_err(|error| format!("invalid method string: {error}"))?,
+            None => "open".into(),
+        };
         let arguments_json: String = env
             .get_string(&arguments_json)
             .map(|value| value.into())
@@ -484,8 +560,25 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeInvoke
                 .map_err(|error| format!("invalid arguments JSON: {error}"))?
         };
         validate_owned_fd_invocation(&owned_fd, &method, &arguments)?;
-        with_registered_presenter(handle, &method, |presenter| unsafe {
-            invoke_presenter(presenter, &method, &arguments, &mut owned_fd)
+        with_registered_presenter_entry(handle, &method, |presenter, entry| {
+            let ticket = http_generation
+                .map(|generation| {
+                    entry
+                        .http_open
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .begin(generation)
+                })
+                .transpose()?;
+            unsafe {
+                invoke_presenter(
+                    presenter,
+                    &method,
+                    &arguments,
+                    &mut owned_fd,
+                    ticket.as_ref(),
+                )
+            }
         })
     }));
 
@@ -868,6 +961,7 @@ unsafe fn invoke_presenter(
     method: &str,
     arguments: &Value,
     owned_fd: &mut Option<OwnedFdCallGuard>,
+    http_ticket: Option<&ErikaColdOpenCancellation>,
 ) -> Result<Value, String> {
     let args = arguments
         .as_object()
@@ -887,8 +981,14 @@ unsafe fn invoke_presenter(
                 start_position_micros: optional_open_byte_count(args, "startPositionMicros")?,
                 reserved: [0; 1],
             };
-            let status =
-                unsafe { erika_presenter_open_with_options(handle, uri_c.as_ptr(), &options) };
+            let status = unsafe {
+                erika_presenter_open_with_options_cancellable(
+                    handle,
+                    uri_c.as_ptr(),
+                    &options,
+                    http_ticket.map_or(ptr::null(), ptr::from_ref),
+                )
+            };
             call_status(status)?;
             Ok(Value::Null)
         }
@@ -1455,6 +1555,14 @@ fn with_registered_presenter<R>(
     operation: &str,
     invoke: impl for<'presenter> FnOnce(&'presenter mut AndroidPresenter) -> Result<R, String>,
 ) -> Result<R, String> {
+    with_registered_presenter_entry(id, operation, |presenter, _| invoke(presenter))
+}
+
+fn with_registered_presenter_entry<R>(
+    id: jlong,
+    operation: &str,
+    invoke: impl FnOnce(&mut AndroidPresenter, &AndroidPresenterEntry) -> Result<R, String>,
+) -> Result<R, String> {
     let entry = {
         let registry = lock_registry();
         match registry.get(id) {
@@ -1476,7 +1584,7 @@ fn with_registered_presenter<R>(
     };
     // SAFETY: this closure cannot return a borrow of the presenter, and it runs
     // only on the creator thread while this entry's operation mutex is held.
-    invoke(unsafe { address.as_mut() })
+    invoke(unsafe { address.as_mut() }, &entry)
 }
 
 fn destroy_registered_presenter(id: jlong) -> Result<(), PresenterIdError> {
@@ -1901,6 +2009,22 @@ fn normalized_scale(scale: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupt_fences_queued_http_opens_for_one_presenter() {
+        let mut first = AndroidHttpOpen::default();
+        let mut second = AndroidHttpOpen::default();
+        let running = first.begin(0).unwrap();
+        let other = second.begin(0).unwrap();
+        first.interrupt(1);
+        assert!(running.0.is_cancelled());
+        assert!(first.begin(0).is_err());
+        assert!(!other.0.is_cancelled());
+        let next = first.begin(1).unwrap();
+        assert!(next.0.finish());
+        first.interrupt(2);
+        assert!(!next.0.is_cancelled());
+    }
 
     #[test]
     fn parses_http_byte_count_options() {

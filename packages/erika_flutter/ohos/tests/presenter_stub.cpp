@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,14 @@ struct ErikaPresenterHandle {
 static void Owner(ErikaPresenterHandle* p) {
   assert(p && p->owner == std::this_thread::get_id() && p->owner != platform);
 }
+#ifndef ERIKA_TEST_LEGACY_RUNTIME
+struct ErikaColdOpenCancellation {
+  mutable std::mutex mutex;
+  mutable std::condition_variable changed;
+  mutable bool interrupted = false;
+};
+static std::atomic<int> stalled_opens{0};
+#endif
 extern "C" {
 ErikaPresenterHandle* erika_presenter_create_with_config(ErikaPresenterConfig config) {
   auto* p = new ErikaPresenterHandle; Owner(p); p->config = config; return p;
@@ -32,6 +42,10 @@ char* erika_last_error_message() { return strdup("stub native error"); }
 void erika_string_free(char* p) { free(p); }
 char* erika_presenter_invoke_json(ErikaPresenterHandle* p, const char* method, const char*) {
   Owner(p);
+#ifndef ERIKA_TEST_LEGACY_RUNTIME
+  if (std::strcmp(method, "stalledOpens") == 0)
+    return strdup(std::to_string(stalled_opens.load()).c_str());
+#endif
   if (std::strcmp(method, "config") == 0) {
     // Echoes what reached erika_presenter_create_with_config.
     char json[160];
@@ -58,6 +72,27 @@ ErikaStatus erika_presenter_register_subtitle_memory_font(ErikaPresenterHandle* 
   Owner(p); assert(size == 3 && bytes[0] == 1 && bytes[2] == 3); *font = 42; return ErikaStatus_Ok;
 }
 #ifndef ERIKA_TEST_LEGACY_RUNTIME
+ErikaColdOpenCancellation* erika_cold_open_cancellation_create() {
+  return new ErikaColdOpenCancellation;
+}
+void erika_cold_open_cancellation_interrupt(const ErikaColdOpenCancellation* ticket) {
+  std::lock_guard<std::mutex> lock(ticket->mutex);
+  ticket->interrupted = true;
+  ticket->changed.notify_all();
+}
+void erika_cold_open_cancellation_release(ErikaColdOpenCancellation* ticket) { delete ticket; }
+char* erika_presenter_open_json_cancellable(ErikaPresenterHandle* p, const char* json,
+                                            const ErikaColdOpenCancellation* ticket) {
+  Owner(p);
+  if (std::strcmp(json, R"({"uri":"http://fixture/stall"})") != 0)
+    return erika_presenter_invoke_json(p, "open", json);
+  std::unique_lock<std::mutex> lock(ticket->mutex);
+  ++stalled_opens;
+  const bool interrupted = ticket->changed.wait_for(lock, std::chrono::seconds(3),
+      [&] { return ticket->interrupted; });
+  --stalled_opens;
+  return strdup(interrupted ? R"({"ok":false,"error":"interrupted"})" : R"({"ok":true})");
+}
 ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle* p, const char*, const uint8_t* bytes, size_t size) {
   Owner(p); assert(size == 3 && bytes[0] == 1 && bytes[2] == 3); return ErikaStatus_Ok;
 }

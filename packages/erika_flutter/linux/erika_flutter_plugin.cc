@@ -1,5 +1,6 @@
 #include "include/erika_flutter/erika_flutter_plugin.h"
 #include "erika.h"
+#include "erika_pending_opens.h"
 #include "native_video_surface.h"
 #include "presenter_worker.h"
 
@@ -85,6 +86,7 @@ struct Player {
   int64_t texture = 0, epoch = 0;
   std::unique_ptr<NativeVideoSurface> native;
   int64_t native_generation = 0, native_view_id = -1;
+  erika::PendingJsonOpens pending_opens;  // platform only
   erika::PresenterWorker worker;
   void DetachFence() {
     worker.Call([this] {
@@ -94,6 +96,7 @@ struct Player {
   }
   ~Player() {
     // Retain wl_surface until the native detach has drained prior rendering.
+    pending_opens.Interrupt();
     native.reset();
     worker.Stop([this] {
       if (handle) { erika_presenter_detach_surface(handle); erika_presenter_destroy(handle); }
@@ -479,8 +482,10 @@ static void method_call(FlMethodChannel*, FlMethodCall* call, gpointer data) {
     if (!bytes) throw std::runtime_error(error->message);
     gsize size; const auto* encoded = static_cast<const char*>(g_bytes_get_data(bytes, &size));
     std::string json(encoded, size);
+    if (method == "stop" || method == "close") player.pending_opens.Interrupt();
+    auto ticket = method == "open" ? player.pending_opens.Prepare() : nullptr;
     auto* owner = &player;
-    queue_method(plugin, owner, call, [owner, method, json, payload = std::move(payload),
+    queue_method(plugin, owner, call, [owner, method, json, ticket, payload = std::move(payload),
                                        payload_name = std::move(payload_name)]() -> FlValue* {
       g_autoptr(FlJsonMessageCodec) codec = fl_json_message_codec_new();
       g_autoptr(GBytes) bytes = g_bytes_new(json.data(), json.size());
@@ -530,6 +535,8 @@ static void method_call(FlMethodChannel*, FlMethodCall* call, gpointer data) {
       // The Dart screenshot contract is tightly packed RGBA, not encoded PNG.
       return fl_value_new_uint8_list(rgba.data(), rgba.size());
     }
+    if (ticket)
+      return decode_owned(take_json(erika_presenter_open_json_cancellable(player.handle, json.c_str(), ticket.get())));
     return decode_owned(take_json(erika_presenter_invoke_json(player.handle, method.c_str(), json.c_str())));
     });
   } catch (const std::exception& error) {

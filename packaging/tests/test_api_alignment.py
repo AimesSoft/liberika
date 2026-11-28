@@ -23,6 +23,10 @@ class ApiAlignmentTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(canonical, read(path))
 
+    def test_pending_json_opens_header_in_standalone_package(self):
+        self.assertEqual(read("packages/erika_flutter/native/include/erika_pending_opens.h"),
+                         read("packages/erika_ohos/src/main/cpp/include/erika_pending_opens.h"))
+
     def test_open_options_mirrors_match_header(self):
         # Hosts that cannot include erika.h mirror ErikaOpenOptions; a mirror
         # or a write past the header's reserved slots corrupts the caller.

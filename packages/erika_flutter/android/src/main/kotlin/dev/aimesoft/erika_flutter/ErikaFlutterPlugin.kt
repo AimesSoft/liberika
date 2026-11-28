@@ -893,6 +893,10 @@ class ErikaFlutterPlugin :
             prepared.detachedFd?.let(::closeDetachedFileDescriptor)
             throw error
         }
+        if (method == "stop" || method == "close") host.httpOpens.interrupt()
+        val httpOpenGeneration = if (method == "open" && prepared.detachedFd == null) {
+            host.httpOpens.generationFor(prepared.arguments["uri"])
+        } else null
         val completionAttempted = AtomicBoolean(false)
         val posted = presenterThread.post {
             playbackIntentGeneration?.let(host::markPlaybackIntentExecuted)
@@ -908,6 +912,7 @@ class ErikaFlutterPlugin :
                         method,
                         argumentsJson,
                         prepared.detachedFd ?: NO_OWNED_FD,
+                        httpOpenGeneration,
                     )
                 } catch (error: Throwable) {
                     // Disposal or symbol resolution can fail before Rust owns the fd.
@@ -947,18 +952,15 @@ class ErikaFlutterPlugin :
                     processPolledEvents(events)
                 }
                 val nativeResponse = response.getOrElse { error ->
-                    closeFailedNativeOpen(
-                        host,
-                        method,
-                        contentGeneration,
-                        "native_exception",
-                    )
+                    if (!host.httpOpens.wasInterrupted(httpOpenGeneration)) {
+                        closeFailedNativeOpen(host, method, contentGeneration, "native_exception")
+                    }
                     throw IllegalStateException(
                         error.message ?: "Erika Android method $method failed",
                         error,
                     )
                 }
-                if (!nativeResponse.ok) {
+                if (!nativeResponse.ok && !host.httpOpens.wasInterrupted(httpOpenGeneration)) {
                     closeFailedNativeOpen(
                         host,
                         method,
@@ -1370,6 +1372,7 @@ class ErikaFlutterPlugin :
         method: String,
         arguments: Map<String, Any?> = emptyMap(),
     ) {
+        if (method == "stop" || method == "close") host.httpOpens.interrupt()
         val playbackIntentGeneration = method
             .takeIf { it == "play" || it in PLAYBACK_INTENT_CANCEL_METHODS }
             ?.let { host.currentPlaybackIntentGeneration }

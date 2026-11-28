@@ -26,6 +26,28 @@ const keepAlive = setInterval(() => {}, 1000);
   assert.equal(await native.nativeAttachSurfaceAsync(id, 12n, 4, 4, 1), 0);
   assert.equal(await native.nativeResizeSurfaceAsync(id, 8, 8, 1), 0);
   assert.equal(JSON.parse(await native.nativeInvokeAsync(id, 'open', '{}')).value, 17);
+  if (!legacyRuntime) {
+    for (const exit of ['stop', 'close', 'destroy']) {
+      const a = await native.nativeCreateAsync(0, 1, 0, 0);
+      const b = await native.nativeCreateAsync(0, 1, 0, 0);
+      const args = '{"uri":"http://fixture/stall"}';
+      const aOpen = native.nativeInvokeAsync(a, 'open', args);
+      const aQueued = native.nativeInvokeAsync(a, 'open', args);
+      const bOpen = native.nativeInvokeAsync(b, 'open', args);
+      const stalled = () => Number(native.nativeInvoke(second, 'stalledOpens', '{}'));
+      const deadline = Date.now() + 1500;
+      while (stalled() !== 2 && Date.now() < deadline) await delay(5);
+      assert.equal(stalled(), 2);
+      if (exit === 'destroy') native.nativeDestroy(a);
+      else await native.nativeInvokeAsync(a, exit, '{}');
+      assert.equal(JSON.parse(await aOpen).error, 'interrupted');
+      assert.equal(JSON.parse(await aQueued).error, 'interrupted');
+      assert.equal(stalled(), 1, 'exiting a must leave b alone');
+      native.nativeDestroy(b);
+      assert.equal(JSON.parse(await bOpen).error, 'interrupted');
+      if (exit !== 'destroy') native.nativeDestroy(a);
+    }
+  }
   const modelStatus = legacyRuntime ? 3 : 0;
   assert.equal(native.nativeLoadUpscalerModel(second, 'test', new Uint8Array([1, 2, 3])), modelStatus);
   if (legacyRuntime) assert.match(native.nativeLastError(), /update the native library/);

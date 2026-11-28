@@ -47,9 +47,7 @@ pub unsafe extern "C" fn erika_presenter_invoke_json(
 ) -> *mut c_char {
     let parsed = catch_unwind(AssertUnwindSafe(|| {
         let method = read_c_string(method, "method")?;
-        let arguments_json = read_c_string(arguments_json, "arguments_json")?;
-        let arguments: Value = serde_json::from_str(&arguments_json)
-            .map_err(|error| format!("invalid presenter JSON arguments: {error}"))?;
+        let arguments = parse_arguments(arguments_json)?;
         Ok::<_, String>((method, arguments))
     }));
     let response = match parsed {
@@ -58,6 +56,58 @@ pub unsafe extern "C" fn erika_presenter_invoke_json(
         Err(_) => error_response("panic in Erika presenter JSON bridge"),
     };
     owned_json(response)
+}
+
+fn parse_arguments(arguments_json: *const c_char) -> Result<Value, String> {
+    let json = read_c_string(arguments_json, "arguments_json")?;
+    serde_json::from_str(&json)
+        .map_err(|error| format!("invalid presenter JSON arguments: {error}"))
+}
+
+/// Open with the same arguments and response envelope as the JSON bridge.
+/// Only HTTP requests consume a ticket. Local opens retain their FIFO semantics.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_open_json_cancellable(
+    handle: *mut ErikaPresenterHandle,
+    arguments_json: *const c_char,
+    ticket: *const ErikaColdOpenCancellation,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| match parse_arguments(arguments_json) {
+        Err(error) => coded_error_response("invalid_arguments", error),
+        Ok(Value::Object(args)) => match unsafe { open_json(handle, &args, ticket) } {
+            Ok(value) => success_response(value),
+            Err(error) => error_response(error),
+        },
+        Ok(_) => error_response("arguments must be a JSON object"),
+    }));
+    owned_json(result.unwrap_or_else(|_| error_response("panic in Erika presenter JSON bridge")))
+}
+
+unsafe fn open_json(
+    handle: *mut ErikaPresenterHandle,
+    args: &Map<String, Value>,
+    ticket: *const ErikaColdOpenCancellation,
+) -> Result<Value, String> {
+    let uri = required_string(args, "uri")?;
+    let ticket = if uri.starts_with("http://") || uri.starts_with("https://") {
+        ticket
+    } else {
+        ptr::null()
+    };
+    let uri = required_c_string(uri, "uri")?;
+    let headers = HttpHeaders::from_json(args)?;
+    let options = ErikaOpenOptions {
+        headers: headers.headers.as_ptr(),
+        header_count: headers.headers.len(),
+        http_read_ahead_bytes: optional_open_byte_count(args, "httpReadAheadBytes")?,
+        http_back_buffer_bytes: optional_open_byte_count(args, "httpBackBufferBytes")?,
+        start_position_micros: optional_open_byte_count(args, "startPositionMicros")?,
+        reserved: [0; 1],
+    };
+    call_status(unsafe {
+        erika_presenter_open_with_options_cancellable(handle, uri.as_ptr(), &options, ticket)
+    })?;
+    Ok(Value::Null)
 }
 
 /// Runs one table method and wraps the outcome in the response envelope:
@@ -730,23 +780,7 @@ pub(crate) unsafe fn invoke(
         .as_object()
         .ok_or_else(|| "arguments must be a JSON object".to_string())?;
     match method {
-        "open" => {
-            let uri = required_string(args, "uri")?;
-            let uri = required_c_string(uri, "uri")?;
-            let headers = HttpHeaders::from_json(args)?;
-            let options = ErikaOpenOptions {
-                headers: headers.headers.as_ptr(),
-                header_count: headers.headers.len(),
-                http_read_ahead_bytes: optional_open_byte_count(args, "httpReadAheadBytes")?,
-                http_back_buffer_bytes: optional_open_byte_count(args, "httpBackBufferBytes")?,
-                start_position_micros: optional_open_byte_count(args, "startPositionMicros")?,
-                reserved: [0; 1],
-            };
-            call_status(unsafe {
-                erika_presenter_open_with_options(handle, uri.as_ptr(), &options)
-            })?;
-            Ok(Value::Null)
-        }
+        "open" => unsafe { open_json(handle, args, ptr::null()) },
         "play" => status_value(unsafe { erika_presenter_play(handle) }),
         "pause" => status_value(unsafe { erika_presenter_pause(handle) }),
         "stop" => status_value(unsafe { erika_presenter_stop(handle) }),
@@ -1980,6 +2014,39 @@ mod tests {
                 let args = Map::from_iter([(name.to_string(), value)]);
                 assert!(optional_open_byte_count(&args, name).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn json_open_interrupts_only_the_http_request_using_its_ticket() {
+        let handle = erika_presenter_create();
+        let ticket = erika_cold_open_cancellation_create();
+        unsafe { erika_cold_open_cancellation_interrupt(ticket) };
+        let open = |args: &str| {
+            let args = CString::new(args).unwrap();
+            let raw =
+                unsafe { erika_presenter_open_json_cancellable(handle, args.as_ptr(), ticket) };
+            let response: Value =
+                serde_json::from_slice(unsafe { CStr::from_ptr(raw) }.to_bytes()).unwrap();
+            unsafe { erika_string_free(raw) };
+            response
+        };
+        assert_eq!(open("invalid")["code"], "invalid_arguments");
+        assert_eq!(
+            open(&json!({"uri": fixture_path()}).to_string())["ok"],
+            true
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let uri = format!("http://{}/media", listener.local_addr().unwrap());
+        assert_eq!(open(&json!({"uri": uri}).to_string())["ok"], false);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        unsafe {
+            erika_cold_open_cancellation_release(ticket);
+            erika_presenter_destroy(handle);
         }
     }
 

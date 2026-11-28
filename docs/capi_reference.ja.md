@@ -42,6 +42,8 @@ create 成功の両方を確認してください。
 `erika_cold_open_cancellation_cancel` はリトライのみをキャンセルします。
 オープンとすべての中断呼び出しが戻った後でチケットを解放してください。
 
+JSON を使うホストはチケットを `erika_presenter_open_json_cancellable` に渡せます。引数と戻り値は JSON の `open` メソッドと同じで、HTTP(S) のオープンのみがチケットを使用します。
+
 ### Linux Flutter のフレーム読み戻し
 
 ```c
