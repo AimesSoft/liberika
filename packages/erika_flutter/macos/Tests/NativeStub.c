@@ -24,6 +24,9 @@ static atomic_int creates, destroys, ticks, commands, entered, fail_detach;
 static atomic_int timed_ticks, last_delay_micros;
 static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t hold_ready = PTHREAD_COND_INITIALIZER;
+struct ErikaColdOpenCancellation {
+  bool interrupted;  // protected by hold_lock
+};
 static bool held;
 static int hold_kind;
 static pthread_mutex_t surface_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -235,6 +238,36 @@ ErikaStatus erika_presenter_open_with_options(
     ErikaPresenterHandle *handle,
     const char *uri,
     const ErikaOpenOptions *options) { check_owner(handle); return ErikaStatus_Ok; }
+ErikaStatus erika_open_validate(const char *uri, const ErikaOpenOptions *options) {
+  return uri && *uri ? ErikaStatus_Ok : ErikaStatus_PlayerError;
+}
+ErikaColdOpenCancellation *erika_cold_open_cancellation_create(void) {
+  return calloc(1, sizeof(ErikaColdOpenCancellation));
+}
+void erika_cold_open_cancellation_interrupt(const ErikaColdOpenCancellation *ticket) {
+  pthread_mutex_lock(&hold_lock);
+  ((ErikaColdOpenCancellation *)ticket)->interrupted = true;
+  pthread_cond_broadcast(&hold_ready);
+  pthread_mutex_unlock(&hold_lock);
+}
+void erika_cold_open_cancellation_release(ErikaColdOpenCancellation *ticket) {
+  free(ticket);
+}
+ErikaStatus erika_presenter_open_with_options_cancellable(
+    ErikaPresenterHandle *handle, const char *uri, const ErikaOpenOptions *options,
+    const ErikaColdOpenCancellation *ticket) {
+  check_owner(handle);
+  atomic_fetch_add(&commands, 1);
+  atomic_fetch_add(&entered, 1);
+  pthread_mutex_lock(&hold_lock);
+  while (held && hold_kind == 1 && !ticket->interrupted)
+    pthread_cond_wait(&hold_ready, &hold_lock);
+  bool interrupted = ticket->interrupted;
+  pthread_mutex_unlock(&hold_lock);
+  if (interrupted) return ErikaStatus_PlayerError;
+  handle->pending_event = 1;
+  return ErikaStatus_Ok;
+}
 ErikaStatus erika_presenter_pause(ErikaPresenterHandle *handle) { check_owner(handle); handle->playing = false; return ErikaStatus_Ok; }
 ErikaStatus erika_presenter_play(ErikaPresenterHandle *handle) { check_owner(handle); handle->playing = true; return ErikaStatus_Ok; }
 ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *handle, ErikaEvent *out_event) { check_owner(handle); if (!handle->pending_event) return ErikaStatus_NoEvent; handle->pending_event = 0; memset(out_event, 0, sizeof(*out_event)); out_event->kind = 3; out_event->position_micros = handle->position; return ErikaStatus_Ok; }
