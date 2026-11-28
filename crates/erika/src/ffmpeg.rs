@@ -6141,9 +6141,12 @@ unsafe fn mastering_display_metadata(
     let min_luminance_nits = has_luminance
         .then(|| rational_to_positive_f32(metadata.min_luminance))
         .flatten();
+    // Some decoders pass through implausibly dim mastering peaks. Using
+    // one as the HDR source peak suppresses tone mapping on SDR targets.
     let max_luminance_nits = has_luminance
         .then(|| rational_to_positive_f32(metadata.max_luminance))
-        .flatten();
+        .flatten()
+        .filter(|peak| *peak >= 1.0);
 
     if display_primaries.is_none()
         && white_point.is_none()
@@ -7479,6 +7482,33 @@ mod tests {
 
     fn rational(num: i32, den: i32) -> sys::AVRational {
         sys::AVRational { num, den }
+    }
+
+    #[test]
+    fn decoded_subnit_mastering_peak_preserves_pq_tone_mapping() {
+        use crate::renderer::pipeline::{SourceColorState, TargetColorState, VideoRenderPipeline};
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/software/av1-subnit.ivf");
+        let mut demuxer = Demuxer::open_path(path).unwrap();
+        let mut decoder = demuxer.open_decoder(0).unwrap();
+        let packet = demuxer.read_packet().unwrap().unwrap();
+        decoder.send_packet(&packet).unwrap();
+        decoder.send_eof().unwrap();
+        let DecoderOutputFrame::Frame(frame) = decoder.receive_frame().unwrap() else {
+            panic!("expected the PQ fixture's frame");
+        };
+        assert_eq!(frame.transfer_function(), TransferFunction::Pq);
+        let hdr = frame.hdr_metadata().unwrap();
+        let source = SourceColorState::new(frame.color_primaries(), frame.transfer_function())
+            .hdr_metadata(Some(hdr));
+        let target = TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709);
+        assert!(
+            VideoRenderPipeline::new(source, target).requires_tone_mapping(),
+            "a 0.5 nit mastering display must not disable PQ tone mapping"
+        );
+        let mastering = hdr.mastering_display.unwrap();
+        assert_eq!(mastering.max_luminance_nits, None);
+        assert_close(mastering.min_luminance_nits.unwrap(), 2.0 / 16384.0);
     }
 
     #[test]
