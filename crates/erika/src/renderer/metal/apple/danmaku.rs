@@ -46,6 +46,7 @@ mod gpu_tests {
                     plan,
                     VideoPresentationLayout::aspect_fit(w as u32, h as u32, w as u32, h as u32),
                     TargetColorState::sdr(ColorPrimaries::Bt709),
+                    renderer.output_mode,
                 )
                 .unwrap();
             encoder.endEncoding();

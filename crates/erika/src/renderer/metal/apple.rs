@@ -184,7 +184,16 @@ struct GamutLutCache {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
 }
 
+#[derive(Default)]
+struct MetalPipelines {
+    video: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    overlay: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    danmaku_batch: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+}
+
 pub struct MetalRendererImpl {
+    // Live EDR and SDR captures can alternate on the same device.
+    pipelines: [MetalPipelines; 2],
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     /// Widest and tallest 2D texture `device` accepts; see
     /// [`max_texture_dimension_2d`].
@@ -198,12 +207,9 @@ pub struct MetalRendererImpl {
     flutter_texture_attached: bool,
     flutter_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     texture_cache: Option<CFRetained<CVMetalTextureCache>>,
-    video_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     #[cfg(target_os = "macos")]
     sdr_pipeline_without_dovi:
         OnceCell<Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
-    overlay_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
-    danmaku_batch_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     video_sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
     overlay_alpha_atlas_cache: Option<OverlayAlphaAtlasCache>,
     danmaku_alpha_atlas_cache: Option<DanmakuAlphaAtlasCache>,
@@ -316,6 +322,7 @@ impl MetalRendererImpl {
             .ok_or_else(|| PlayerError::Renderer("newCommandQueue returned nil".to_string()))?;
         let initial_output_mode = config.output_mode.resolve_for_source(false);
         Ok(Self {
+            pipelines: Default::default(),
             max_texture_dimension: max_texture_dimension_2d(&device),
             device,
             queue,
@@ -327,11 +334,8 @@ impl MetalRendererImpl {
             flutter_texture_attached: false,
             flutter_texture: None,
             texture_cache: None,
-            video_pipeline: None,
             #[cfg(target_os = "macos")]
             sdr_pipeline_without_dovi: OnceCell::new(),
-            overlay_pipeline: None,
-            danmaku_batch_pipeline: None,
             video_sampler: None,
             overlay_alpha_atlas_cache: None,
             danmaku_alpha_atlas_cache: None,
@@ -389,9 +393,6 @@ impl MetalRendererImpl {
         self.flutter_texture = None;
         self.output_mode = MetalOutputMode::Sdr;
         self.drawable_pixel_format = MetalDrawablePixelFormat::Bgra8Unorm;
-        self.video_pipeline = None;
-        self.overlay_pipeline = None;
-        self.danmaku_batch_pipeline = None;
         self.resize_surface(metrics);
     }
 
@@ -649,9 +650,6 @@ impl MetalRendererImpl {
         if let Some(color_space) = CGColorSpace::with_name(color_space_name) {
             layer.setColorspace(Some(&color_space));
         }
-        self.video_pipeline = None;
-        self.overlay_pipeline = None;
-        self.danmaku_batch_pipeline = None;
         self.overlay_alpha_atlas_cache = None;
         self.danmaku_vertex_buffers.clear();
         self.danmaku_vertex_buffer_cursor = 0;
@@ -1034,6 +1032,7 @@ impl MetalRendererImpl {
                     self.output_mode,
                     crate::renderer::pipeline::SourceColorState::default(),
                 ),
+                self.output_mode,
             )?;
             encoder.endEncoding();
             if let Some(drawable) = &drawable {
@@ -1158,7 +1157,7 @@ impl MetalRendererImpl {
             #[cfg(target_os = "macos")]
             let pipeline = self.video_pipeline_for_playback(&frame, textures)?;
             #[cfg(not(target_os = "macos"))]
-            let pipeline = self.video_pipeline_state()?;
+            let pipeline = self.video_pipeline_state(self.drawable_pixel_format)?;
             let sampler = self.video_sampler_state()?;
             let Some(command_buffer) = self.queue.commandBuffer() else {
                 return Err(PlayerError::Renderer(
@@ -1392,7 +1391,13 @@ impl MetalRendererImpl {
                 let mut overlay = overlay;
                 if post_stage == PostProcessStage::Output {
                     if let Some(overlay) = overlay.take() {
-                        self.draw_overlay_planes(&video_enc, overlay, layout, target_color)?;
+                        self.draw_overlay_planes(
+                            &video_enc,
+                            overlay,
+                            layout,
+                            target_color,
+                            self.output_mode,
+                        )?;
                     }
                     if let Some(danmaku) = danmaku.as_ref() {
                         self.draw_danmaku_plan(
@@ -1401,6 +1406,7 @@ impl MetalRendererImpl {
                             danmaku.plan,
                             layout,
                             target_color,
+                            self.output_mode,
                         )?;
                     }
                 }
@@ -1441,7 +1447,13 @@ impl MetalRendererImpl {
 
                 if post_stage == PostProcessStage::Main {
                     if let Some(overlay) = overlay.take() {
-                        self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                        self.draw_overlay_planes(
+                            &encoder,
+                            overlay,
+                            layout,
+                            target_color,
+                            self.output_mode,
+                        )?;
                     }
                     if let Some(danmaku) = danmaku.as_ref() {
                         self.draw_danmaku_plan(
@@ -1450,6 +1462,7 @@ impl MetalRendererImpl {
                             danmaku.plan,
                             layout,
                             target_color,
+                            self.output_mode,
                         )?;
                     }
                 }
@@ -1494,7 +1507,13 @@ impl MetalRendererImpl {
 
                 let target_color = frame.pipeline.target;
                 if let Some(overlay) = overlay {
-                    self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                    self.draw_overlay_planes(
+                        &encoder,
+                        overlay,
+                        layout,
+                        target_color,
+                        self.output_mode,
+                    )?;
                 }
                 if let Some(danmaku) = danmaku.as_ref() {
                     self.draw_danmaku_plan(
@@ -1503,6 +1522,7 @@ impl MetalRendererImpl {
                         danmaku.plan,
                         layout,
                         target_color,
+                        self.output_mode,
                     )?;
                 }
 
@@ -1587,22 +1607,28 @@ impl MetalRendererImpl {
         };
 
         let source_color = frame.pipeline.source;
+        // Captures are 8-bit SDR RGBA. Render through the SDR target so an
+        // HDR source tone maps into [0,1] instead of writing extended-linear
+        // values that the readback would clamp, and keep the packed-alpha
+        // input mode so transparent-video captures rebuild their alpha.
+        let capture_output_mode = MetalOutputMode::Sdr;
         frame.pipeline = frame
             .pipeline
-            .with_target(metal_target_color(self.output_mode, source_color));
+            .with_target(metal_target_color(capture_output_mode, source_color));
 
         let layout = VideoPresentationLayout::aspect_fit(
-            frame.frame.info.width as u32,
+            self.video_alpha_mode
+                .logical_width(frame.frame.info.width as u32),
             frame.frame.info.height as u32,
             width,
             height,
         );
 
         unsafe {
-            let metal_format = metal_pixel_format(self.drawable_pixel_format);
+            let capture_format = metal_drawable_pixel_format(capture_output_mode);
             let descriptor =
                 MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                    metal_format,
+                    metal_pixel_format(capture_format),
                     width as usize,
                     height as usize,
                     false,
@@ -1622,7 +1648,7 @@ impl MetalRendererImpl {
                 ));
             };
 
-            let pipeline = self.video_pipeline_state()?;
+            let pipeline = self.video_pipeline_state(capture_format)?;
             let sampler = self.video_sampler_state()?;
             let pass_descriptor = MTLRenderPassDescriptor::new();
             let attachments = pass_descriptor.colorAttachments();
@@ -1634,7 +1660,11 @@ impl MetalRendererImpl {
                 red: 0.0,
                 green: 0.0,
                 blue: 0.0,
-                alpha: 1.0,
+                alpha: if self.video_alpha_mode.has_alpha() {
+                    0.0
+                } else {
+                    1.0
+                },
             });
 
             let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&pass_descriptor)
@@ -1658,8 +1688,8 @@ impl MetalRendererImpl {
                 source_transfer: transfer_code(frame.pipeline.source.transfer),
                 target_transfer: transfer_code(frame.pipeline.target.transfer),
                 tone_map: frame.pipeline.tone_map_uniform_code(),
-                edr_output: self.output_mode.is_edr() as u32,
-                _reserved0: 0,
+                edr_output: capture_output_mode.is_edr() as u32,
+                _reserved0: self.video_alpha_mode as u32,
                 _reserved1: 0,
                 rect: layout.target_rect,
                 viewport: layout.video_viewport(),
@@ -1716,7 +1746,13 @@ impl MetalRendererImpl {
 
             let target_color = frame.pipeline.target;
             if let Some(overlay) = overlay {
-                self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                self.draw_overlay_planes(
+                    &encoder,
+                    overlay,
+                    layout,
+                    target_color,
+                    capture_output_mode,
+                )?;
             }
             if let Some(danmaku) = danmaku.as_ref() {
                 self.draw_danmaku_plan(
@@ -1725,14 +1761,12 @@ impl MetalRendererImpl {
                     danmaku.plan,
                     layout,
                     target_color,
+                    capture_output_mode,
                 )?;
             }
             encoder.endEncoding();
 
-            let bytes_per_pixel = match self.drawable_pixel_format {
-                MetalDrawablePixelFormat::Bgra8Unorm => 4usize,
-                MetalDrawablePixelFormat::Rgba16Float => 8usize,
-            };
+            let bytes_per_pixel = 4usize; // capture target is BGRA8Unorm
             let row_bytes = width as usize * bytes_per_pixel;
             let buffer_len = row_bytes * height as usize;
             let readback = self
@@ -1773,12 +1807,11 @@ impl MetalRendererImpl {
 
             let raw =
                 std::slice::from_raw_parts(readback.contents().as_ptr().cast::<u8>(), buffer_len);
-            Ok(convert_capture_to_rgba8(
-                raw,
-                width as usize,
-                height as usize,
-                self.drawable_pixel_format,
-            ))
+            let mut rgba = raw.to_vec();
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            Ok(rgba)
         }
     }
 
@@ -1833,6 +1866,7 @@ impl MetalRendererImpl {
         overlay: OverlayRenderFrame<'_>,
         layout: VideoPresentationLayout,
         target: TargetColorState,
+        output_mode: MetalOutputMode,
     ) -> Result<()> {
         let _ = crate::renderer::metal::inspect_overlay_frame(overlay.frame)?;
         if overlay.frame.subtitle_planes.is_empty()
@@ -1841,12 +1875,12 @@ impl MetalRendererImpl {
             return Ok(());
         }
 
-        let pipeline = self.overlay_pipeline_state()?;
+        let pipeline = self.overlay_pipeline_state(metal_drawable_pixel_format(output_mode))?;
         let sampler = self.video_sampler_state()?;
         let viewport_width = overlay.frame.viewport.width;
         let viewport_height = overlay.frame.viewport.height;
         let layout = layout.with_source_size(viewport_width, viewport_height);
-        let edr = self.output_mode.is_edr();
+        let edr = output_mode.is_edr();
         unsafe {
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
@@ -1933,6 +1967,7 @@ impl MetalRendererImpl {
         plan: &DanmakuRenderPlan,
         layout: VideoPresentationLayout,
         target: TargetColorState,
+        output_mode: MetalOutputMode,
     ) -> Result<()> {
         if plan.is_empty() {
             return Ok(());
@@ -1951,7 +1986,8 @@ impl MetalRendererImpl {
                 atlas.stride
             )));
         }
-        let pipeline = self.danmaku_batch_pipeline_state()?;
+        let pipeline =
+            self.danmaku_batch_pipeline_state(metal_drawable_pixel_format(output_mode))?;
         let sampler = self.video_sampler_state()?;
         let atlas_started = Instant::now();
         let (fill_texture, outline_texture) = self.prepare_danmaku_alpha_atlas(atlas)?;
@@ -1966,8 +2002,9 @@ impl MetalRendererImpl {
             &outline_texture,
             layout,
             target,
+            output_mode,
         )?;
-        self.draw_danmaku_pictures(encoder, plan, layout, target)
+        self.draw_danmaku_pictures(encoder, plan, layout, target, output_mode)
     }
 
     /// Emoji go over the text of their comment, in their own colors.
@@ -1977,6 +2014,7 @@ impl MetalRendererImpl {
         plan: &DanmakuRenderPlan,
         layout: VideoPresentationLayout,
         target: TargetColorState,
+        output_mode: MetalOutputMode,
     ) -> Result<()> {
         let Some(atlas) = plan.color_atlas.as_ref() else {
             return Ok(());
@@ -1985,9 +2023,9 @@ impl MetalRendererImpl {
             return Ok(());
         }
         let texture = self.prepare_danmaku_color_atlas(atlas)?;
-        let pipeline = self.overlay_pipeline_state()?;
+        let pipeline = self.overlay_pipeline_state(metal_drawable_pixel_format(output_mode))?;
         let sampler = self.video_sampler_state()?;
-        let edr = self.output_mode.is_edr();
+        let edr = output_mode.is_edr();
         unsafe {
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
@@ -2124,13 +2162,14 @@ impl MetalRendererImpl {
         outline_texture: &ProtocolObject<dyn MTLTexture>,
         layout: VideoPresentationLayout,
         target: TargetColorState,
+        output_mode: MetalOutputMode,
     ) -> Result<()> {
         let build_started = Instant::now();
         let uniforms = DanmakuBatchUniforms {
             viewport: layout.overlay_viewport(),
             target_transfer: transfer_code(target.transfer),
             _reserved0: 0,
-            ui_nits: ui_output_nits(target, self.output_mode.is_edr()),
+            ui_nits: ui_output_nits(target, output_mode.is_edr()),
         };
         unsafe {
             encoder.setRenderPipelineState(pipeline);
@@ -2910,24 +2949,27 @@ impl MetalRendererImpl {
             && frame.frame.info.format == ImportedVideoFormat::Nv12
             && let Some(pipeline) = self.sdr_pipeline_without_dovi.get_or_init(|| {
                 let source = format!("#define ERIKA_NO_DOLBY_VISION\n{VIDEO_SHADER_SOURCE}");
-                self.build_video_pipeline(&source).ok()
+                self.build_video_pipeline(&source, MetalDrawablePixelFormat::Bgra8Unorm)
+                    .ok()
             })
         {
             // This specialization always targets BGRA8 and can coexist with
             // the general pipeline when frame metadata changes mid-stream.
             return Ok(pipeline.clone());
         }
-        self.video_pipeline_state()
+        self.video_pipeline_state(self.drawable_pixel_format)
     }
 
     fn video_pipeline_state(
         &mut self,
+        format: MetalDrawablePixelFormat,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-        if self.video_pipeline.is_none() {
-            self.video_pipeline = Some(self.build_video_pipeline(VIDEO_SHADER_SOURCE)?);
+        if self.pipelines[format as usize].video.is_none() {
+            self.pipelines[format as usize].video =
+                Some(self.build_video_pipeline(VIDEO_SHADER_SOURCE, format)?);
         }
-        Ok(self
-            .video_pipeline
+        Ok(self.pipelines[format as usize]
+            .video
             .as_ref()
             .expect("video pipeline exists")
             .clone())
@@ -2936,6 +2978,7 @@ impl MetalRendererImpl {
     fn build_video_pipeline(
         &self,
         source: &str,
+        format: MetalDrawablePixelFormat,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
         let library = self
             .device
@@ -2962,7 +3005,7 @@ impl MetalRendererImpl {
         descriptor.setFragmentFunction(Some(&*fragment));
         let attachments = descriptor.colorAttachments();
         let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
-        attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
+        attachment.setPixelFormat(metal_pixel_format(format));
         let pipeline = self
             .device
             .newRenderPipelineStateWithDescriptor_error(&descriptor)
@@ -2997,8 +3040,9 @@ impl MetalRendererImpl {
 
     fn overlay_pipeline_state(
         &mut self,
+        format: MetalDrawablePixelFormat,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-        if self.overlay_pipeline.is_none() {
+        if self.pipelines[format as usize].overlay.is_none() {
             let library = self
                 .device
                 .newLibraryWithSource_options_error(&NSString::from_str(VIDEO_SHADER_SOURCE), None)
@@ -3024,7 +3068,7 @@ impl MetalRendererImpl {
             descriptor.setFragmentFunction(Some(&*fragment));
             let attachments = descriptor.colorAttachments();
             let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
-            attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
+            attachment.setPixelFormat(metal_pixel_format(format));
             attachment.setBlendingEnabled(true);
             attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
             attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
@@ -3041,10 +3085,10 @@ impl MetalRendererImpl {
                         error.localizedDescription()
                     ))
                 })?;
-            self.overlay_pipeline = Some(pipeline);
+            self.pipelines[format as usize].overlay = Some(pipeline);
         }
-        Ok(self
-            .overlay_pipeline
+        Ok(self.pipelines[format as usize]
+            .overlay
             .as_ref()
             .expect("overlay pipeline exists")
             .clone())
@@ -3052,8 +3096,9 @@ impl MetalRendererImpl {
 
     fn danmaku_batch_pipeline_state(
         &mut self,
+        format: MetalDrawablePixelFormat,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-        if self.danmaku_batch_pipeline.is_none() {
+        if self.pipelines[format as usize].danmaku_batch.is_none() {
             let library = self
                 .device
                 .newLibraryWithSource_options_error(&NSString::from_str(VIDEO_SHADER_SOURCE), None)
@@ -3083,7 +3128,7 @@ impl MetalRendererImpl {
             descriptor.setFragmentFunction(Some(&*fragment));
             let attachments = descriptor.colorAttachments();
             let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
-            attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
+            attachment.setPixelFormat(metal_pixel_format(format));
             attachment.setBlendingEnabled(true);
             attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
             attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
@@ -3100,10 +3145,10 @@ impl MetalRendererImpl {
                         error.localizedDescription()
                     ))
                 })?;
-            self.danmaku_batch_pipeline = Some(pipeline);
+            self.pipelines[format as usize].danmaku_batch = Some(pipeline);
         }
-        Ok(self
-            .danmaku_batch_pipeline
+        Ok(self.pipelines[format as usize]
+            .danmaku_batch
             .as_ref()
             .expect("danmaku batch pipeline exists")
             .clone())
@@ -3185,37 +3230,7 @@ fn metal_pixel_format(format: MetalDrawablePixelFormat) -> MTLPixelFormat {
     }
 }
 
-fn convert_capture_to_rgba8(
-    raw: &[u8],
-    width: usize,
-    height: usize,
-    format: MetalDrawablePixelFormat,
-) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    match format {
-        MetalDrawablePixelFormat::Bgra8Unorm => {
-            for pixel in raw.chunks_exact(4).take(width * height) {
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-            }
-        }
-        MetalDrawablePixelFormat::Rgba16Float => {
-            for pixel in raw.chunks_exact(8).take(width * height) {
-                let r = half_to_unorm8(u16::from_le_bytes([pixel[0], pixel[1]]));
-                let g = half_to_unorm8(u16::from_le_bytes([pixel[2], pixel[3]]));
-                let b = half_to_unorm8(u16::from_le_bytes([pixel[4], pixel[5]]));
-                let a = half_to_unorm8(u16::from_le_bytes([pixel[6], pixel[7]]));
-                rgba.extend_from_slice(&[r, g, b, a]);
-            }
-        }
-    }
-    rgba
-}
-
-fn half_to_unorm8(bits: u16) -> u8 {
-    let value = half_to_f32(bits).clamp(0.0, 1.0);
-    (value * 255.0).round() as u8
-}
-
+#[cfg(test)]
 fn half_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 0x1) as u32;
     let exp = ((bits >> 10) & 0x1f) as i32;
@@ -5173,7 +5188,7 @@ mod tests {
             return;
         };
         renderer
-            .danmaku_batch_pipeline_state()
+            .danmaku_batch_pipeline_state(renderer.drawable_pixel_format)
             .expect("dual-atlas danmaku pipeline");
     }
 
@@ -5220,6 +5235,86 @@ mod tests {
     }
 
     #[test]
+    fn edr_capture_matches_sdr_pixels_with_packed_alpha_and_overlays() {
+        use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
+        use crate::overlay::{OverlayFrame, OverlayViewport};
+        use crate::renderer::danmaku_batch::test_support;
+        use crate::renderer::metal::{
+            DanmakuRenderFrame, ImportedVideoFrame, MetalOutputMode, MetalRendererConfig,
+            OverlayRenderFrame, VideoAlphaMode, VideoRenderFrame,
+        };
+        use crate::renderer::pipeline::SourceColorState;
+        use crate::subtitle::SubtitleBitmapPlane;
+
+        if objc2_metal::MTLCreateSystemDefaultDevice().is_none() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let pixels = PlanarFrame {
+            format: PlanarPixelFormat::Nv12,
+            width: 64,
+            height: 24,
+            luma: (0..64 * 24)
+                .map(|i| match i % 64 {
+                    0..24 => 100,
+                    24..32 => 200,
+                    32..48 => 0,
+                    _ => 255,
+                })
+                .collect(),
+            chroma: vec![128; 32 * 12 * 2],
+        };
+        let overlay = OverlayFrame {
+            pts: std::time::Duration::ZERO,
+            viewport: OverlayViewport::new(32, 24),
+            subtitle_planes: vec![SubtitleBitmapPlane::new(
+                12,
+                12,
+                4,
+                4,
+                [255, 0, 0, 255].repeat(16),
+            )],
+            subtitle_alpha_planes: vec![],
+            subtitle_changed: true,
+        };
+        let plan = test_support::plan(1, 1.0, [0.0, 1.0, 0.0]);
+        let capture = |mode| {
+            let mut renderer = super::MetalRendererImpl::new(MetalRendererConfig {
+                output_mode: mode,
+                video_alpha_mode: VideoAlphaMode::PackedAlphaRight,
+                ..Default::default()
+            })
+            .unwrap();
+            let upload = renderer.upload_planar_video_frame(&pixels, true).unwrap();
+            let frame = ImportedVideoFrame {
+                info: upload.info,
+                source_color: SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+                    .range(crate::renderer::pipeline::ColorRange::Full),
+                inner: Some(upload.textures),
+            };
+            let rgba = renderer
+                .capture_video_frame_rgba(
+                    VideoRenderFrame::new(&frame),
+                    Some(OverlayRenderFrame::new(&overlay)),
+                    Some(DanmakuRenderFrame::new(&plan)),
+                    32,
+                    24,
+                )
+                .unwrap();
+            assert_eq!(renderer.active_output_mode(), mode);
+            rgba
+        };
+        let reference = capture(MetalOutputMode::Sdr);
+        let actual = capture(MetalOutputMode::apple_edr(4.0));
+        assert_eq!(actual, reference);
+        let at = |x: usize, y: usize| &actual[(y * 32 + x) * 4..(y * 32 + x + 1) * 4];
+        assert_eq!(at(2, 1), [0, 0, 0, 0]);
+        assert_eq!(at(14, 14), [255, 0, 0, 255]);
+        assert!(at(18, 1)[0] > 0 && at(18, 1)[0] < at(28, 1)[0]);
+        assert!(at(28, 1)[0] > 100 && at(28, 1)[3] == 255);
+    }
+
+    #[test]
     fn video_shader_compiles() {
         // The video shader is the one carrying the tone-map curves, and it is
         // only compiled at runtime, so a syntax error there would reach users.
@@ -5230,7 +5325,9 @@ mod tests {
             eprintln!("skipping: no Metal device available");
             return;
         };
-        renderer.video_pipeline_state().expect("video pipeline");
+        renderer
+            .video_pipeline_state(renderer.drawable_pixel_format)
+            .expect("video pipeline");
     }
 
     #[test]
