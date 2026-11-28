@@ -34,94 +34,13 @@ const SUBGROUPS: u32 = 1;
 const HEADER: usize = 16;
 
 fn element_epilogues(gpu: &Gpu, model: &SrModel) -> bool {
+    resident_element_epilogues(gpu) && model.tensors.iter().all(|&c| c <= 32)
+}
+
+fn resident_element_epilogues(gpu: &Gpu) -> bool {
     gpu.shape[2] == 16
-        && model.tensors.iter().all(|&c| c <= 32)
         && std::env::var("ERIKA_VK_ELEMENTS").as_deref() != Ok("0")
         && std::env::var("ERIKA_VK_DIRECT_LOAD").as_deref() != Ok("0")
-}
-
-fn fusion_runs(model: &SrModel, shape: [u32; 4]) -> Vec<(usize, usize)> {
-    let stages = std::env::var("ERIKA_VK_FUSION")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    if !(1..=3).contains(&stages) || shape != [16, 16, 16, 32] {
-        return Vec::new();
-    }
-    let mut consumers = vec![0; model.tensors.len()];
-    for l in &model.layers {
-        for i in &l.inputs {
-            consumers[i.tensor] += 1;
-        }
-        if let Some(t) = l.residual {
-            consumers[t] += 1;
-        }
-    }
-    let eligible = |i: usize| {
-        let l = &model.layers[i];
-        [16, 32].contains(&l.out_channels)
-            && l.inputs.len() == 1
-            && l.inputs[0].kernel == 3
-            && l.inputs[0].transform == InputTransform::Identity
-            && model.tensors[l.inputs[0].tensor] == l.out_channels
-            && l.border.is_none()
-            && l.residual.is_none()
-            && matches!(l.activation, Activation::None | Activation::Relu)
-            && l.output != model.head.tensor
-    };
-    let mut runs = Vec::new();
-    let mut first = 0;
-    while first < model.layers.len() {
-        if !eligible(first) {
-            first += 1;
-            continue;
-        }
-        let mut end = first;
-        while end + 1 < model.layers.len()
-            && end + 1 - first < stages
-            && eligible(end + 1)
-            && model.layers[end + 1].inputs[0].tensor == model.layers[end].output
-            && model.layers[end + 1].out_channels == model.layers[first].out_channels
-            && consumers[model.layers[end].output] == 1
-        {
-            end += 1;
-        }
-        if end > first
-            || (stages == 1
-                && first == 1
-                && std::env::var("ERIKA_VK_FUSE_STEM").as_deref() == Ok("1"))
-        {
-            runs.push((first, end));
-        }
-        first = end + 1;
-    }
-    if std::env::var("ERIKA_VK_FUSE_STEM").as_deref() == Ok("1")
-        && !runs.is_empty()
-        && runs[0].0 == 1
-    {
-        let s = &model.layers[0];
-        if [16, 32].contains(&s.out_channels)
-            && s.inputs.len() == 1
-            && s.inputs[0].tensor == 0
-            && s.inputs[0].kernel == 5
-            && s.inputs[0].transform == InputTransform::Identity
-            && matches!(s.activation, Activation::Relu)
-            && s.residual.is_none()
-            && s.out_channels == model.layers[1].out_channels
-            && consumers[s.output] == 1
-        {
-            runs[0].0 = 0;
-        }
-    }
-    runs.retain(|&(first, last)| first < last);
-    runs
-}
-
-struct FusedPipeline {
-    first: usize,
-    last: usize,
-    pipeline: vk::Pipeline,
-    tile: [u32; 2],
 }
 
 fn vector_head(gpu: &Gpu, model: &SrModel) -> bool {
@@ -262,11 +181,6 @@ fn resident_tile(
     if std::env::var("ERIKA_VK_RESIDENT").as_deref() == Ok("0") {
         return None;
     }
-    // The 32-channel fp32 case benefits more from the streaming kernel's
-    // lower register pressure than from retaining nine weight fragments.
-    if layer.out_channels == 32 && !half {
-        return None;
-    }
     if layer.output == model.head.tensor || (layer.inputs.len() == 1 && layer.inputs[0].tensor == 0)
     {
         return None;
@@ -285,10 +199,10 @@ fn resident_tile(
             if strips > requested {
                 continue;
             }
-            let registers = blocks * (kernel * kernel * m * k / lanes + strips * m * n / lanes);
+            let registers = blocks * (m * k / lanes + strips * m * n / lanes);
             let shared = (k + 8) * kernel * (n * groups * strips + kernel - 1) * 2
                 + blocks * m * n * groups * strips * if half { 2 } else { 4 };
-            let elements = element_epilogues(gpu, model);
+            let elements = resident_element_epilogues(gpu);
             if registers <= if elements { 256 } else { 192 }
                 && (elements || shared <= gpu.limits.max_compute_shared_memory_size)
             {
@@ -887,7 +801,6 @@ struct Pipelines {
     blocks: Vec<u32>,
     vector_head: bool,
     strips: Vec<u32>,
-    fused: Vec<FusedPipeline>,
 }
 impl Drop for Pipelines {
     fn drop(&mut self) {
@@ -898,7 +811,6 @@ impl Drop for Pipelines {
                 .copied()
                 .chain(self.border.iter().copied())
                 .chain([self.input, self.pad])
-                .chain(self.fused.iter().map(|f| f.pipeline))
             {
                 self.gpu.device.destroy_pipeline(pipeline, None);
             }
@@ -931,7 +843,6 @@ impl Pipelines {
             blocks: Vec::new(),
             vector_head: vector_head(gpu, model),
             strips: Vec::new(),
-            fused: Vec::new(),
         };
         unsafe {
             let bindings: Vec<_> = (0..6)
@@ -969,7 +880,6 @@ impl Pipelines {
                     None,
                 )
                 .map_err(error)?;
-            let mut specializations = Vec::new();
             for (layer, &header) in model.layers.iter().zip(&packed.headers) {
                 let groups = if model.tensors.iter().all(|&c| c <= 32)
                     && ((layer.inputs.len() == 1 && layer.inputs[0].tensor == 0)
@@ -1034,7 +944,6 @@ impl Pipelines {
                 values.push(packed.coordinates[usize::from(half)]);
                 out.blocks.push(blocks);
                 out.strips.push(strips);
-                specializations.push(values.clone());
                 out.border.push(if layer.border.is_some() {
                     out.compile(
                         if std::env::var("ERIKA_VK_BORDER").as_deref() == Ok("1")
@@ -1087,9 +996,11 @@ impl Pipelines {
                         if gpu.shape[2] == 16
                             && std::env::var("ERIKA_VK_DIRECT_LOAD").as_deref() != Ok("0")
                         {
-                            if element_epilogues(gpu, model) {
+                            if resident_element_epilogues(gpu) {
                                 if half {
                                     include_bytes!("vk_coopmat/resident_elements_half.spv")
+                                } else if gpu.half_supported {
+                                    include_bytes!("vk_coopmat/resident_elements_half_store.spv")
                                 } else {
                                     include_bytes!("vk_coopmat/resident_elements.spv")
                                 }
@@ -1127,89 +1038,6 @@ impl Pipelines {
             }
             out.input = out.compile(include_bytes!("vk_coopmat/input.spv"), &[])?;
             out.pad = out.compile(include_bytes!("vk_coopmat/pad.spv"), &[])?;
-            for &(first, last) in &packed.fusions {
-                let channels = model.layers[first].out_channels as u32;
-                let stages = (last - first + 1) as u32;
-                let mut tile = if channels == 16 { [32, 8] } else { [32, 4] };
-                if let Ok(v) = std::env::var("ERIKA_VK_FUSION_TILE") {
-                    if let Some((w, h)) = v.split_once('x') {
-                        if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
-                            if w >= 16 && w <= 128 && w % 16 == 0 && h >= 1 && h <= 32 {
-                                tile = [w, h];
-                            }
-                        }
-                    }
-                }
-                let groups = std::env::var("ERIKA_VK_FUSION_GROUPS")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .filter(|v| [1, 2, 4, 8].contains(v))
-                    .unwrap_or(4);
-                let stem = first == 0 && model.layers[first].inputs[0].tensor == 0;
-                let sw = tile[0] + 2 * (stages - 1);
-                let sh = tile[1] + 2 * (stages - 1);
-                let shared = (sw * sh + 16) * channels * 2
-                    + if stages >= 3 {
-                        ((sw - 2) * (sh - 2) + 16) * channels * 2
-                    } else {
-                        0
-                    }
-                    + 256 * if half { 2 } else { 4 }
-                    + if stem {
-                        ((sw + 4) * (sh + 4) + 16 + groups * 256) * 2
-                    } else {
-                        0
-                    };
-                if shared > gpu.limits.max_compute_shared_memory_size {
-                    return Err(error("fused tile exceeds shared memory limit"));
-                }
-                let mut values = specializations[last].clone();
-                values.resize(51, 0);
-                values[26] = groups;
-                values[32..37].copy_from_slice(&[
-                    channels,
-                    stages,
-                    tile[0],
-                    tile[1],
-                    packed.metadata[packed.metadata[packed.headers[first] as usize + 13] as usize],
-                ]);
-                let mut relus = 0;
-                for (s, &header) in packed.headers[first..=last].iter().enumerate() {
-                    let h = header as usize;
-                    values[if s < 3 { 37 + s } else { 49 }] = if stem && s == 0 {
-                        packed.metadata[h + 3]
-                    } else {
-                        packed.metadata[packed.metadata[h + 13] as usize + 5]
-                    };
-                    values[if s < 3 { 40 + s } else { 50 }] = packed.metadata[h + 5];
-                    if matches!(model.layers[first + s].activation, Activation::Relu) {
-                        relus |= 1 << s;
-                    }
-                }
-                values[43] = relus;
-                let h = packed.headers[first] as usize;
-                values[44..49].copy_from_slice(&[
-                    u32::from(stem),
-                    packed.metadata[h + 2],
-                    packed.metadata[h + 10],
-                    packed.metadata[h + 11],
-                    packed.metadata[h + 9],
-                ]);
-                let pipeline = out.compile(
-                    if half {
-                        include_bytes!("vk_coopmat/fused_half.spv")
-                    } else {
-                        include_bytes!("vk_coopmat/fused.spv")
-                    },
-                    &values,
-                )?;
-                out.fused.push(FusedPipeline {
-                    first,
-                    last,
-                    pipeline,
-                    tile,
-                });
-            }
         }
         Ok(out)
     }
@@ -1276,14 +1104,12 @@ struct PackedModel {
     headers: Vec<u32>,
     channels: u32,
     head_weights: Vec<f32>,
-    fusions: Vec<(usize, usize)>,
     coordinates: [u32; 2],
 }
 
 fn pack_model(model: &SrModel, shape: [u32; 4]) -> PackedModel {
     let align = shape[0].max(shape[2]).max(16);
-    let fusions = fusion_runs(model, shape);
-    let (offsets, channels) = arena_layout(model, align, &fusions);
+    let (offsets, channels) = arena_layout(model, align);
     let mut weights = Vec::new();
     let mut metadata = Vec::new();
     let mut headers = Vec::new();
@@ -1446,14 +1272,13 @@ fn pack_model(model: &SrModel, shape: [u32; 4]) -> PackedModel {
         headers,
         channels,
         head_weights,
-        fusions,
         coordinates,
     }
 }
 
 /// Reuse dead tensors while preserving every DAG input/residual through its
 /// last consumer. A dispatch never aliases its output with a live input.
-fn arena_layout(model: &SrModel, align: u32, fusions: &[(usize, usize)]) -> (Vec<u32>, u32) {
+fn arena_layout(model: &SrModel, align: u32) -> (Vec<u32>, u32) {
     let mut last = vec![0usize; model.tensors.len()];
     for (index, layer) in model.layers.iter().enumerate() {
         for input in &layer.inputs {
@@ -1463,22 +1288,12 @@ fn arena_layout(model: &SrModel, align: u32, fusions: &[(usize, usize)]) -> (Vec
             last[t] = index;
         }
     }
-    for &(first, end) in fusions {
-        let input = model.layers[first].inputs[0].tensor;
-        last[input] = last[input].max(end);
-    }
     let padded = |c: usize| (c as u32).div_ceil(align) * align;
     let mut offsets = vec![0; model.tensors.len()];
     let mut channels = padded(model.tensors[0]);
     // (offset, capacity, last live layer); unused slots remain available.
     let mut slots = vec![(0, channels, last[0])];
     for (index, layer) in model.layers.iter().enumerate() {
-        if fusions
-            .iter()
-            .any(|&(first, last)| index >= first && index < last)
-        {
-            continue;
-        }
         if layer.output == model.head.tensor {
             continue;
         }
@@ -1544,7 +1359,6 @@ fn cache_tile(
     halo: u32,
     channels: u32,
     guard: u32,
-    guard_y: u32,
     budget: u64,
 ) -> Option<(u32, u32)> {
     let mut best = None;
@@ -1552,7 +1366,7 @@ fn cache_tile(
         for gy in 1..=height.min(64) {
             let cw = width.div_ceil(gx);
             let ch = height.div_ceil(gy);
-            let area = u64::from(cw + 2 * halo + guard) * u64::from(ch + 2 * halo + guard_y);
+            let area = u64::from(cw + 2 * halo + guard) * u64::from(ch + 2 * halo);
             if area * u64::from(channels) * 2 > budget {
                 continue;
             }
@@ -1587,7 +1401,7 @@ impl Pool {
         // Right guard for the final partial subgroup's contiguous matrix load.
         // Only valid output columns contribute; every loaded address still
         // belongs to its allocated feature plane, including the final row.
-        let guard = (gpu.shape[1]
+        let guard = gpu.shape[1]
             * prepared
                 .pipelines
                 .layer_groups
@@ -1595,36 +1409,12 @@ impl Pool {
                 .zip(&prepared.pipelines.strips)
                 .map(|(&g, &s)| g * s)
                 .max()
-                .unwrap_or(1))
-        .max(
-            prepared
-                .pipelines
-                .fused
-                .iter()
-                .map(|f| f.tile[0] + 32)
-                .max()
-                .unwrap_or(0),
-        );
-        let guard_y = prepared
-            .pipelines
-            .fused
-            .iter()
-            .map(|f| f.tile[1] + 8)
-            .max()
-            .unwrap_or(0);
+                .unwrap_or(1);
         let (mut cw, mut ch) = if prepared.tile[0] > 0 && prepared.tile[1] > 0 {
             (width.min(prepared.tile[0]), height.min(prepared.tile[1]))
         } else {
-            cache_tile(
-                width,
-                height,
-                halo,
-                prepared.packed.channels,
-                guard,
-                guard_y,
-                budget,
-            )
-            .unwrap_or((width.min(1024), height.min(256)))
+            cache_tile(width, height, halo, prepared.packed.channels, guard, budget)
+                .unwrap_or((width.min(1024), height.min(256)))
         };
         if let Some(mib) = std::env::var("ERIKA_VK_BAND_MIB")
             .ok()
@@ -1635,13 +1425,13 @@ impl Pool {
                 u64::from(width + 2 * halo + guard) * u64::from(prepared.packed.channels) * 2;
             cw = width;
             ch = (mib.saturating_mul(1024 * 1024).min(budget) / row_bytes)
-                .saturating_sub(u64::from(2 * halo + guard_y))
+                .saturating_sub(u64::from(2 * halo))
                 .max(1)
                 .min(u64::from(height)) as u32;
         }
         loop {
             let size = u64::from(cw + 2 * halo + guard)
-                * u64::from(ch + 2 * halo + guard_y)
+                * u64::from(ch + 2 * halo)
                 * u64::from(prepared.packed.channels)
                 * 2;
             if size <= budget {
@@ -1656,7 +1446,7 @@ impl Pool {
             }
         }
         let tw = cw + 2 * halo + guard;
-        let th = ch + 2 * halo + guard_y;
+        let th = ch + 2 * halo;
         let arena = Buffer::new(
             gpu,
             u64::from(tw) * u64::from(th) * u64::from(prepared.packed.channels) * 2,
@@ -1872,14 +1662,13 @@ impl VkCoopMatUpscaler {
 
     fn execution_settings(&self, model: &SrModel) -> (u32, u32) {
         let channels = model.tensors.iter().copied().max().unwrap_or(0);
-        let (mut groups, strips) = if element_epilogues(&self.gpu, model) {
-            if self.half_accumulation {
-                (1, if channels == 16 { 4 } else { 2 })
-            } else if channels < 16 {
-                (2, 1)
+        let (mut groups, strips) = if resident_element_epilogues(&self.gpu) {
+            let strips = if channels >= 64 || (self.half_accumulation && channels >= 32) {
+                4
             } else {
-                (4, 1)
-            }
+                2
+            };
+            (1, strips)
         } else {
             (1, 2)
         };
@@ -2107,13 +1896,7 @@ impl VkCoopMatUpscaler {
                                 })
                                 .sum();
                             let mut matrices = 0u64;
-                            if !vector
-                                && !prepared
-                                    .pipelines
-                                    .fused
-                                    .iter()
-                                    .any(|f| f.first <= i && i <= f.last)
-                            {
+                            if !vector {
                                 let span = n
                                     * prepared.pipelines.layer_groups[i]
                                     * prepared.pipelines.strips[i];
@@ -2426,25 +2209,6 @@ impl VkCoopMatUpscaler {
                                 profile_query,
                             );
                         }
-                        if prepared
-                            .pipelines
-                            .fused
-                            .iter()
-                            .any(|f| index >= f.first && index < f.last)
-                        {
-                            #[cfg(test)]
-                            if self.profile {
-                                for offset in 1..=2 {
-                                    d.cmd_write_timestamp(
-                                        cmd,
-                                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                                        flight.query,
-                                        profile_query + offset,
-                                    );
-                                }
-                            }
-                            continue;
-                        }
                         p.core[2] = header;
                         let halo = prepared.halos[layer.output] as u32;
                         p.active = [
@@ -2460,20 +2224,12 @@ impl VkCoopMatUpscaler {
                             0,
                             bytes(&[p]),
                         );
-                        let fused = prepared.pipelines.fused.iter().find(|f| f.last == index);
                         d.cmd_bind_pipeline(
                             cmd,
                             vk::PipelineBindPoint::COMPUTE,
-                            fused.map_or(prepared.pipelines.conv[index], |f| f.pipeline),
+                            prepared.pipelines.conv[index],
                         );
-                        if let Some(f) = fused {
-                            d.cmd_dispatch(
-                                cmd,
-                                p.active[2].div_ceil(f.tile[0]),
-                                p.active[3].div_ceil(f.tile[1]),
-                                1,
-                            );
-                        } else if layer.output == prepared.model.head.tensor
+                        if layer.output == prepared.model.head.tensor
                             && prepared.pipelines.vector_head
                         {
                             d.cmd_dispatch(
@@ -2675,23 +2431,73 @@ mod tests {
     }
 
     fn hardware() -> (ID3D11Device, ID3D11DeviceContext) {
-        let mut device = None;
-        let mut context = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                Default::default(),
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-            .unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter, IDXGIFactory1,
+        };
+
+        let create_for =
+            |adapter: Option<&IDXGIAdapter>| -> Option<(ID3D11Device, ID3D11DeviceContext)> {
+                let mut device = None;
+                let mut context = None;
+                unsafe {
+                    D3D11CreateDevice(
+                        adapter,
+                        if adapter.is_some() {
+                            D3D_DRIVER_TYPE_UNKNOWN
+                        } else {
+                            D3D_DRIVER_TYPE_HARDWARE
+                        },
+                        HMODULE::default(),
+                        Default::default(),
+                        Some(&[D3D_FEATURE_LEVEL_11_0]),
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )
+                    .ok()?;
+                }
+                Some((device?, context?))
+            };
+
+        if let Ok(factory) = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() } {
+            let requested = std::env::var("ERIKA_SR_ADAPTER").ok();
+            let mut index = 0;
+            while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
+                index += 1;
+                let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+                    continue;
+                };
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                    continue;
+                }
+                if let Some(ref name) = requested {
+                    let label = String::from_utf16_lossy(&desc.Description);
+                    if !label.to_lowercase().contains(&name.to_lowercase())
+                        && *name != (index - 1).to_string()
+                    {
+                        continue;
+                    }
+                    if let Ok(base) = adapter.cast::<IDXGIAdapter>()
+                        && let Some(pair) = create_for(Some(&base))
+                    {
+                        return pair;
+                    }
+                    panic!("requested DXGI adapter unavailable");
+                }
+                if let Ok(base) = adapter.cast::<IDXGIAdapter>()
+                    && let Some((device, context)) = create_for(Some(&base))
+                    && Gpu::new(&device).is_ok()
+                {
+                    return (device, context);
+                }
+            }
+            if requested.is_some() {
+                panic!("requested DXGI adapter unavailable");
+            }
         }
-        (device.unwrap(), context.unwrap())
+        create_for(None).unwrap()
     }
 
     #[test]
