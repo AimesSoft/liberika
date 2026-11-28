@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Result, SourceError};
 
-/// One open's optional retry capability. It never cancels healthy network I/O.
+/// One open's retry and interruption capability.
 /// Commit and cancellation are serialized; sealed handles cannot affect playback.
 #[derive(Clone, Debug, Default)]
 pub struct ColdOpenCancellation(Arc<Mutex<ColdOpenState>>);
@@ -52,11 +52,21 @@ impl ColdOpenCancellation {
         Some(ClaimedColdOpenCancellation(self.clone()))
     }
 
+    /// Cancel only a retry. Ordinary in-flight requests can still complete.
     pub fn cancel(&self) {
+        self.request_cancellation(false);
+    }
+
+    /// Abandon this open, including network I/O already in progress.
+    pub fn interrupt(&self) {
+        self.request_cancellation(true);
+    }
+
+    fn request_cancellation(&self, interrupt_io: bool) {
         let mut state = self.0.lock().unwrap();
         if !state.sealed {
             state.cancelled = true;
-            if state.claimed || state.metadata_backoff {
+            if interrupt_io || state.claimed || state.metadata_backoff {
                 state.claimed = true;
                 if let Some(source) = &state.source {
                     source.cancel();
@@ -79,7 +89,15 @@ impl ColdOpenCancellation {
     }
 
     pub(super) fn bind_source(&self, source: SourceCancellation) {
-        self.0.lock().unwrap().source = Some(source);
+        let mut state = self.0.lock().unwrap();
+        if state.sealed {
+            return;
+        }
+        if state.cancelled && state.claimed {
+            // Stop/replacement can arrive before the owner starts the open.
+            source.cancel();
+        }
+        state.source = Some(source);
     }
 
     /// Expose only the existing metadata sleep to cancellation, without

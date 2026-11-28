@@ -32,6 +32,18 @@ create 成功の両方を確認してください。
 2 つのファミリーは状態を共有しません。1 プロセスで両方使えますが、1 つのメディア
 セッションは正確に 1 つの handle に属します。
 
+### 進行中の HTTP オープンを中断する
+
+`erika_cold_open_cancellation_create` で一度だけ使えるチケットを作成し、presenter の所有スレッドで
+`erika_presenter_open_with_options_cancellable` に渡します。ユーザーが停止、終了、またはメディアを
+切り替えた場合、呼び出し側のスレッドで `erika_cold_open_cancellation_interrupt` を呼んでから
+次の presenter 操作をキューに追加します。HTTP I/O が中断され、所有スレッドでのオープン開始前にも
+中断を要求できます。オープンの確定後は中断要求を無視します。従来の
+`erika_cold_open_cancellation_cancel` はリトライのみをキャンセルします。
+オープンとすべての中断呼び出しが戻った後でチケットを解放してください。
+
+JSON を使うホストはチケットを `erika_presenter_open_json_cancellable` に渡せます。引数と戻り値は JSON の `open` メソッドと同じで、HTTP(S) のオープンのみがチケットを使用します。
+
 ### Linux Flutter のフレーム読み戻し
 
 ```c

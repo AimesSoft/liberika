@@ -232,6 +232,47 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(delivered, Array(0...101))
   }
 
+  func testStopCloseAndDisposeInterruptOnlyTheirOwnNetworkOpen() throws {
+    let control = try stub()
+    let plugin = plugin()
+    for method in ["stop", "close", "dispose"] {
+      let player = call(plugin, "create") as! Int64
+      let other = call(plugin, "create") as! Int64
+      let entered = control.count(4)
+      control.hold(1)
+      defer { control.hold(0) }
+
+      let interrupted = expectation(description: "network open interrupted by " + method)
+      let exitCompleted = expectation(description: method)
+      let otherOpened = expectation(description: "independent player opens")
+      var otherCompleted = false
+      for id in [player, other] {
+        let args: [String: Any] = ["playerId": id, "uri": "http://localhost/movie.mp4"]
+        plugin.handle(FlutterMethodCall(methodName: "open", arguments: args)) { value in
+          if id == player {
+            XCTAssertTrue(value is FlutterError)
+            interrupted.fulfill()
+          } else {
+            XCTAssertNil(value)
+            otherCompleted = true
+            otherOpened.fulfill()
+          }
+        }
+      }
+      eventually { control.count(4) >= entered + 2 }
+      plugin.handle(FlutterMethodCall(methodName: method, arguments: ["playerId": player])) { value in
+        XCTAssertNil(value)
+        exitCompleted.fulfill()
+      }
+      wait(for: [interrupted, exitCompleted], timeout: 3)
+      XCTAssertFalse(otherCompleted)
+      control.hold(0)
+      wait(for: [otherOpened], timeout: 3)
+      _ = call(plugin, "dispose", ["playerId": other])
+      if method != "dispose" { _ = call(plugin, "dispose", ["playerId": player]) }
+    }
+  }
+
   func testDisposeDuringNativeRender() throws {
     let control = try stub()
     let plugin = plugin()

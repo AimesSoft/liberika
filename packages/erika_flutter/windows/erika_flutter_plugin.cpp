@@ -1238,7 +1238,10 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
     cancellable_open = LoadOptional<CancellableOpenFn>("erika_presenter_open_with_options_cancellable");
     open_validate = LoadOptional<OpenValidateFn>("erika_open_validate");
     cold_open_create = LoadOptional<ColdOpenCreateFn>("erika_cold_open_cancellation_create");
-    cold_open_cancel = LoadOptional<ColdOpenCancelFn>("erika_cold_open_cancellation_cancel");
+    cold_open_cancel = LoadOptional<ColdOpenCancelFn>("erika_cold_open_cancellation_interrupt");
+    if (!cold_open_cancel) {
+      cold_open_cancel = LoadOptional<ColdOpenCancelFn>("erika_cold_open_cancellation_cancel");
+    }
     cold_open_release = LoadOptional<ColdOpenReleaseFn>("erika_cold_open_cancellation_release");
     play = LoadRequired<CommandFn>("erika_presenter_play");
     pause = LoadRequired<CommandFn>("erika_presenter_pause");

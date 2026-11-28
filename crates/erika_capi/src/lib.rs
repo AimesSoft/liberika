@@ -124,8 +124,8 @@ pub struct ErikaHttpHeader {
     pub value: *const c_char,
 }
 
-/// Independent, one-shot cold-open retry capability. No presenter pointer is
-/// retained. Cancel may run on any thread; release only after all users finish.
+/// Independent, one-shot cold-open capability. No presenter pointer is retained.
+/// Signal from any thread and release only after all users finish.
 pub struct ErikaColdOpenCancellation(erika::source::ColdOpenCancellation);
 
 #[unsafe(no_mangle)]
@@ -139,6 +139,15 @@ pub unsafe extern "C" fn erika_cold_open_cancellation_cancel(
 ) {
     if let Some(ticket) = unsafe { ticket.as_ref() } {
         ticket.0.cancel();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_cold_open_cancellation_interrupt(
+    ticket: *const ErikaColdOpenCancellation,
+) {
+    if let Some(ticket) = unsafe { ticket.as_ref() } {
+        ticket.0.interrupt();
     }
 }
 

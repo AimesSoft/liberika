@@ -12,6 +12,7 @@ internal class AndroidPlayerHost(
     val requiresExtendedLinearSurface: Boolean
         get() = requestedOutputMode == 2
     var attachedView: ErikaAndroidVideoView? = null
+    val httpOpens = AndroidHttpOpenCancellation(handle)
     private val playbackTracker = AndroidPlaybackTracker()
     private val contentGenerationTracker = AndroidContentGenerationTracker()
     private val contentPreparations = AndroidContentPreparationRegistry()
@@ -184,12 +185,17 @@ internal class AndroidPlayerHost(
         method: String,
         argumentsJson: String,
         ownedFd: Int = NO_OWNED_FD,
+        httpOpenGeneration: Long? = null,
     ): String {
         if (destroyed) {
             throw AndroidPlayerDestroyedException(handle)
         }
         return presenterThread.call {
-            ErikaNative.nativeInvoke(handle, method, argumentsJson, ownedFd)
+            if (httpOpenGeneration != null) {
+                httpOpens.open(argumentsJson, httpOpenGeneration)
+            } else {
+                ErikaNative.nativeInvoke(handle, method, argumentsJson, ownedFd)
+            }
         }
     }
 
@@ -472,6 +478,7 @@ internal class AndroidPlayerHost(
         }
         // Publish logical destruction before the queued native boundary so a render drain
         // requeued behind nativeDestroy cannot race the already-freed presenter handle.
+        httpOpens.interrupt()
         destroyed = true
         nativeDestroyPending = true
         val posted = presenterThread.post {

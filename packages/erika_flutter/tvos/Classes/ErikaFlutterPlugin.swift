@@ -427,6 +427,7 @@ private final class ErikaNativeLibrary {
   typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
   typealias OpenWithHeadersFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?, UInt) -> Int32
   typealias OpenWithOptionsFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?) -> Int32
+  typealias CancellableOpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
   typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
@@ -522,6 +523,10 @@ private final class ErikaNativeLibrary {
   let open: OpenFn
   let openWithHeaders: OpenWithHeadersFn?
   let openWithOptions: OpenWithOptionsFn?
+  let cancellableOpen: CancellableOpenFn?
+  let coldOpenCreate: CreateFn?
+  let coldOpenInterrupt: DestroyFn?
+  let coldOpenRelease: DestroyFn?
   let play: CommandFn
   let pause: CommandFn
   let stop: CommandFn
@@ -598,6 +603,10 @@ private final class ErikaNativeLibrary {
     open = try Self.load("erika_presenter_open", from: libraryHandle, as: OpenFn.self)
     openWithHeaders = Self.loadOptional("erika_presenter_open_with_headers", from: libraryHandle, as: OpenWithHeadersFn.self)
     openWithOptions = Self.loadOptional("erika_presenter_open_with_options", from: libraryHandle, as: OpenWithOptionsFn.self)
+    cancellableOpen = Self.loadOptional("erika_presenter_open_with_options_cancellable", from: libraryHandle, as: CancellableOpenFn.self)
+    coldOpenCreate = Self.loadOptional("erika_cold_open_cancellation_create", from: libraryHandle, as: CreateFn.self)
+    coldOpenInterrupt = Self.loadOptional("erika_cold_open_cancellation_interrupt", from: libraryHandle, as: DestroyFn.self)
+    coldOpenRelease = Self.loadOptional("erika_cold_open_cancellation_release", from: libraryHandle, as: DestroyFn.self)
     play = try Self.load("erika_presenter_play", from: libraryHandle, as: CommandFn.self)
     pause = try Self.load("erika_presenter_pause", from: libraryHandle, as: CommandFn.self)
     stop = try Self.load("erika_presenter_stop", from: libraryHandle, as: CommandFn.self)
@@ -762,6 +771,24 @@ private extension CAMetalLayer {
   }
 }
 
+// The owner holds the ticket until open returns. Main can interrupt it without
+// accessing the presenter or waiting for the owner to finish a network call.
+private final class ErikaColdOpenTicket {
+  let library: ErikaNativeLibrary
+  let handle: UnsafeMutableRawPointer
+
+  init?(_ library: ErikaNativeLibrary) {
+    guard library.openWithOptions != nil, library.cancellableOpen != nil,
+      library.coldOpenInterrupt != nil, library.coldOpenRelease != nil,
+      let handle = library.coldOpenCreate?() else { return nil }
+    self.library = library
+    self.handle = handle
+  }
+
+  func interrupt() { library.coldOpenInterrupt?(handle) }
+  deinit { library.coldOpenRelease?(handle) }
+}
+
 private final class ErikaPlayerHost {
   let id: Int64
 
@@ -769,6 +796,7 @@ private final class ErikaPlayerHost {
   private var creationError: Error?
   private var handle: UnsafeMutableRawPointer!
   let owner: ErikaPresenterOwner
+  private let pendingColdOpens = NSHashTable<ErikaColdOpenTicket>.weakObjects() // main only
   private var closed = false
   private var surfaceLease: ErikaSurfaceLease? // main only
   private var nativeLease: ErikaSurfaceLease? // owner only
@@ -811,12 +839,27 @@ private final class ErikaPlayerHost {
 
   }
 
+  func prepareColdOpen(uri: String) -> ErikaColdOpenTicket? {
+    precondition(Thread.isMainThread)
+    guard uri.hasPrefix("http://") || uri.hasPrefix("https://"),
+      let ticket = ErikaNativeLibrary.shared.flatMap(ErikaColdOpenTicket.init) else { return nil }
+    pendingColdOpens.add(ticket)
+    return ticket
+  }
+
+  func interruptPendingColdOpens() {
+    precondition(Thread.isMainThread)
+    for ticket in pendingColdOpens.allObjects { ticket.interrupt() }
+    pendingColdOpens.removeAllObjects()
+  }
+
   /// Main owns driver/UI bookkeeping; native state is released only after
   /// all accepted commands have drained. No join or main.sync is necessary.
   func shutdown(completion: (() -> Void)? = nil) {
     precondition(Thread.isMainThread)
     guard !closed else { completion?(); return }
     closed = true
+    interruptPendingColdOpens()
     displayLink?.invalidate()
     displayLink = nil
     displayLinkProxy = nil
@@ -928,7 +971,8 @@ private final class ErikaPlayerHost {
     uri: String,
     httpHeaders: [String: String],
     httpReadAheadBytes: UInt64 = 0,
-    httpBackBufferBytes: UInt64 = 0
+    httpBackBufferBytes: UInt64 = 0,
+    coldOpenTicket: ErikaColdOpenTicket? = nil
   ) throws {
     owner.assertCurrent()
     isPlaying = false
@@ -940,7 +984,7 @@ private final class ErikaPlayerHost {
       nowPlayingTitle = fallbackTitle.isEmpty ? "Erika" : fallbackTitle
     }
     try uri.withCString { cString in
-      guard !httpHeaders.isEmpty || httpReadAheadBytes > 0 || httpBackBufferBytes > 0 else {
+      guard coldOpenTicket != nil || !httpHeaders.isEmpty || httpReadAheadBytes > 0 || httpBackBufferBytes > 0 else {
         try check(library.open(handle, cString), operation: "open")
         return
       }
@@ -963,7 +1007,13 @@ private final class ErikaPlayerHost {
             httpBackBufferBytes: httpBackBufferBytes
           )
           try withUnsafePointer(to: &options) { optionsPtr in
-            try check(openWithOptions(handle, cString, UnsafeRawPointer(optionsPtr)), operation: "open")
+            let status: Int32
+            if let ticket = coldOpenTicket, let cancellableOpen = library.cancellableOpen {
+              status = cancellableOpen(handle, cString, UnsafeRawPointer(optionsPtr), ticket.handle)
+            } else {
+              status = openWithOptions(handle, cString, UnsafeRawPointer(optionsPtr))
+            }
+            try check(status, operation: "open")
           }
         }
         notifyNowPlayingChanged()
@@ -2305,14 +2355,11 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         } else {
           host.clearMediaMetadata()
         }
+        let ticket = host.prepareColdOpen(uri: uri)
         operations.append {
-          [
-            host, argument1 = uri, argument2 = headers, argument3 = readAhead,
-            argument4 = backBuffer
-          ] in
           try host.open(
-            uri: argument1, httpHeaders: argument2, httpReadAheadBytes: argument3,
-            httpBackBufferBytes: argument4);
+            uri: uri, httpHeaders: headers, httpReadAheadBytes: readAhead,
+            httpBackBufferBytes: backBuffer, coldOpenTicket: ticket)
           return nil
         }
         host.enqueue(operations: operations, result: result, label: call.method)
@@ -2344,6 +2391,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case "stop":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        host.interruptPendingColdOpens()
         var operations: [() throws -> Any?] = []
         operations.append { [host] in
           try host.stop(); return nil
@@ -2352,6 +2400,7 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
       case "close":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
+        host.interruptPendingColdOpens()
         var operations: [() throws -> Any?] = []
         operations.append { [host] in
           try host.close(); return nil

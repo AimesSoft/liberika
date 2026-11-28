@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use erika::playback::VideoDecodePreference;
-use erika::source::{ByteRange, HttpRangeSource, MediaSource, SourceError};
+use erika::source::{ByteRange, ColdOpenCancellation, HttpRangeSource, MediaSource, SourceError};
 use erika::{MediaRequest, MediaSourceHint, Player, PlayerConfig, PlayerState};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -364,6 +364,68 @@ impl Drop for MediaServer {
             result.unwrap();
         }
     }
+}
+
+#[test]
+fn interrupting_a_pending_open_closes_the_media_request_and_allows_replay() {
+    let server = MediaServer::start();
+    server.stall_next.store(true, Ordering::Release);
+    let request = server.request();
+    let ticket = ColdOpenCancellation::default();
+    let capability = ticket.claim().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let player = Player::new(PlayerConfig::default());
+        let result = player.open_with_cold_open_cancellation(request, Some(capability));
+        done_tx.send((player, result)).unwrap();
+    });
+    server.stalled.recv_timeout(WAIT).unwrap();
+    ticket.interrupt();
+    let (player, result) = done_rx
+        .recv_timeout(CANCEL_LIMIT)
+        .expect("open remained blocked");
+    assert!(result.is_err());
+    assert_eq!(player.state(), PlayerState::Stopped);
+    server
+        .cancelled
+        .recv_timeout(CANCEL_LIMIT)
+        .expect("media socket stayed open");
+    worker.join().unwrap();
+
+    let next = ColdOpenCancellation::default();
+    // The original retry-only signal still permits a healthy first request.
+    next.cancel();
+    player
+        .open_with_cold_open_cancellation(server.request(), next.claim())
+        .unwrap();
+    // A duplicate exit signal and a late interrupt after successful open must
+    // leave the new HTTP source usable.
+    ticket.interrupt();
+    next.interrupt();
+    let frames = player.subscribe_video_frames();
+    player.play().unwrap();
+    frames
+        .recv_timeout(WAIT)
+        .expect("sealed ticket affected playback");
+    player.close().unwrap();
+}
+
+#[test]
+fn interrupt_before_binding_an_http_source_skips_network_io() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut source =
+        HttpRangeSource::new(format!("http://{}/media", listener.local_addr().unwrap()));
+    let ticket = ColdOpenCancellation::default();
+    ticket.interrupt();
+    source.set_cold_open_cancellation(Some(ticket.clone()));
+    assert!(source.cancellation().unwrap().is_cancelled());
+    assert!(matches!(source.len(), Err(SourceError::Cancelled)));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(!ticket.finish());
 }
 
 #[test]

@@ -5,6 +5,7 @@
 #include <native_window/external_window.h>
 #include <hilog/log.h>
 #include "erika.h"
+#include "erika_pending_opens.h"
 #include "presenter_worker.h"
 #include <atomic>
 #include <cstdlib>
@@ -79,6 +80,7 @@ struct Player {
   std::string last_render = R"({"ok":true,"value":null})";
   std::shared_ptr<Subscription> subscription = std::make_shared<Subscription>(); // ArkUI only.
   std::shared_ptr<std::atomic<bool>> event_pending = std::make_shared<std::atomic<bool>>(false);
+  erika::PendingJsonOpens pending_opens; // ArkUI only.
   erika::PresenterWorker worker;
   explicit Player(int64_t value) : id(value) {}
   ErikaStatus Detach() {
@@ -87,6 +89,7 @@ struct Player {
     window = nullptr; return status;
   }
   void Stop() {
+    pending_opens.Interrupt();
     worker.Stop([this] { Detach(); if (presenter) erika_presenter_destroy(presenter); presenter = nullptr; });
   }
   ~Player() { Stop(); }
@@ -134,6 +137,7 @@ struct Request {
   uint64_t surface = 0;
   double a = 0, b = 0, c = 0, d = 0;
   std::string method, json;
+  erika::PendingJsonOpens::Ticket open_ticket;
   std::vector<uint8_t> bytes;
 };
 inline void ReadBytes(napi_env env, napi_value v, std::vector<uint8_t>& out) {
@@ -162,7 +166,10 @@ inline Reply Execute(Player& p, const Request& r) {
       reply.kind = Reply::Json; reply.text = R"({"ok":false,"status":1,"error":"unknown Erika player"})";
     } else if (r.op == Op::Capture || r.op == Op::Poll) reply.kind = Reply::Nil;
   } else if (r.op == Op::Invoke) {
-    reply.kind = Reply::Json; reply.text = Take(erika_presenter_invoke_json(p.presenter, r.method.c_str(), r.json.c_str()));
+    reply.kind = Reply::Json;
+    reply.text = r.open_ticket
+        ? Take(erika_presenter_open_json_cancellable(p.presenter, r.json.c_str(), r.open_ticket.get()))
+        : Take(erika_presenter_invoke_json(p.presenter, r.method.c_str(), r.json.c_str()));
   } else if (r.op == Op::Font) {
     uint64_t font = 0; reply.kind = Reply::Font;
     reply.number = erika_presenter_register_subtitle_memory_font(p.presenter, r.bytes.data(), r.bytes.size(), &font); reply.font = font;
@@ -288,7 +295,12 @@ inline napi_value Dispatch(napi_env env, napi_callback_info info) {
     }
     return Null(env);
   }
-  if (r.op == Op::Invoke && argc >= 3) { r.method = Text(env, args[1]); r.json = Text(env, args[2]); }
+  if (r.op == Op::Invoke && argc >= 3) {
+    r.method = Text(env, args[1]);
+    r.json = Text(env, args[2]);
+    if (p && r.method == "open") r.open_ticket = p->pending_opens.Prepare();
+    if (p && (r.method == "stop" || r.method == "close")) p->pending_opens.Interrupt();
+  }
   if (r.op == Op::Font && argc >= 2) ReadBytes(env, args[1], r.bytes);
   if (r.op == Op::Model && argc >= 3) { r.method = Text(env, args[1]); ReadBytes(env, args[2], r.bytes); }
   if (r.op == Op::Attach && argc >= 5) {

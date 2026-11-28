@@ -30,6 +30,12 @@ internal object ErikaNative {
     ): String
 
     @JvmStatic
+    external fun nativeOpenHttp(handle: Long, argsJson: String, generation: Long): String
+
+    @JvmStatic
+    external fun nativeInterruptHttpOpen(handle: Long, generation: Long)
+
+    @JvmStatic
     external fun nativeRegisterSubtitleMemoryFont(handle: Long, data: ByteArray): String
 
     @JvmStatic

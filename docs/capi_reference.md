@@ -34,6 +34,19 @@ usage by platform and by a successful create call.
 The two families do not share state; a process may use both, but a given media
 session lives in exactly one handle.
 
+### Interrupting a pending HTTP open
+
+Create a one-shot ticket with `erika_cold_open_cancellation_create` and pass it to
+`erika_presenter_open_with_options_cancellable` on the presenter owner thread.
+When the user stops, exits, or replaces the media, call
+`erika_cold_open_cancellation_interrupt` from the dispatching thread before
+queuing the next presenter operation. It interrupts HTTP I/O even when the
+owner has yet to start the open. A committed open ignores later interrupts.
+The older `erika_cold_open_cancellation_cancel` only cancels retry windows.
+Release the ticket after the open and all signaling calls have returned.
+
+JSON hosts can pass the ticket to `erika_presenter_open_json_cancellable`. It accepts the arguments and returns the response envelope of the `open` JSON method. Only HTTP(S) opens consume the ticket.
+
 ### Linux Flutter frame readback
 
 After `erika_presenter_render_tick`, the Linux texture bridge calls

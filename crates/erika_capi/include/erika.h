@@ -1156,8 +1156,16 @@ void erika_texture_frame_release(ErikaTextureFrame *frame);
 typedef struct ErikaColdOpenCancellation ErikaColdOpenCancellation;
 ErikaStatus erika_open_validate(const char *uri, const ErikaOpenOptions *options);
 ErikaColdOpenCancellation *erika_cold_open_cancellation_create(void);
+/* Cancel only the open's retry window. */
 void erika_cold_open_cancellation_cancel(const ErikaColdOpenCancellation *ticket);
+/* Abandon a pending open and interrupt its HTTP I/O. Safe before open starts or
+ * after it returns. An already committed open is unaffected. */
+void erika_cold_open_cancellation_interrupt(const ErikaColdOpenCancellation *ticket);
 void erika_cold_open_cancellation_release(ErikaColdOpenCancellation *ticket);
+/* Same arguments, ownership and response as invoke_json("open"). The ticket
+ * applies to HTTP opens only; the caller retains it until this call returns. */
+char *erika_presenter_open_json_cancellable(ErikaPresenterHandle *presenter,
+    const char *arguments_json, const ErikaColdOpenCancellation *ticket);
 ErikaStatus erika_presenter_open_with_options_cancellable(ErikaPresenterHandle *presenter,
     const char *uri, const ErikaOpenOptions *options, const ErikaColdOpenCancellation *ticket);
 
