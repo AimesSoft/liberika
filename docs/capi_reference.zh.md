@@ -29,6 +29,14 @@ HarmonyOS Flutter bridge 因 ArkTS 平台通道本身传递序列化结构化值
 
 两个族不共享状态；一个进程可同时使用两者，但单个媒体会话只活在一个 handle 里。
 
+### 中断尚未完成的 HTTP 打开操作
+
+调用 `erika_cold_open_cancellation_create` 创建一次性票据，在 presenter 所在线程把它传给
+`erika_presenter_open_with_options_cancellable`。用户停止、退出或切换媒体时，在分发线程调用
+`erika_cold_open_cancellation_interrupt`，再将后续 presenter 操作加入队列。
+它会中断当前打开操作的 HTTP I/O，也支持在打开操作开始前发出中断。已经提交的打开操作会忽略后续中断。
+旧接口 `erika_cold_open_cancellation_cancel` 只取消重试。打开操作和所有中断调用返回后即可释放票据。
+
 ### Linux Flutter 纹理读回
 
 ```c
