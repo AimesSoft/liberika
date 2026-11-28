@@ -19,14 +19,22 @@ pub mod wasapi {
     };
     use crate::ffmpeg::{PcmAudioFrame, PcmFormat, PcmSampleFormat};
 
+    use ::windows::Win32::Foundation::{E_POINTER, ERROR_TIMEOUT};
     use ::windows::Win32::Media::Audio::{
         AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioClient, IAudioRenderClient,
-        IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eConsole, eRender,
+        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, ActivateAudioInterfaceAsync,
+        DEVINTERFACE_AUDIO_RENDER, IActivateAudioInterfaceAsyncOperation,
+        IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+        IAudioClient, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
+        eConsole, eRender,
     };
     use ::windows::Win32::System::Com::{
         CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        StringFromGUID2,
     };
+
+    use windows_core::{HRESULT, Interface, PCWSTR};
+    use windows_version::OsVersion;
 
     const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
     const WASAPI_BUFFER_DURATION_HNS: i64 = 1_000_000;
@@ -745,16 +753,60 @@ pub mod wasapi {
         }
     }
 
-    fn initialize_render_client(format: PcmFormat) -> Result<WasapiRenderState> {
-        let _com = ComApartment::new()?;
-        let wave_format = wave_format(format)?;
+    #[windows_core::implement(IActivateAudioInterfaceCompletionHandler)]
+    struct ActivationCompleted(Sender<()>);
+
+    impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationCompleted_Impl {
+        fn ActivateCompleted(
+            &self,
+            _: windows_core::Ref<IActivateAudioInterfaceAsyncOperation>,
+        ) -> windows_core::Result<()> {
+            let _ = self.0.try_send(());
+            Ok(())
+        }
+    }
+
+    fn activate_routed_client() -> windows_core::Result<IAudioClient> {
+        // The virtual render interface opts into Windows automatic stream routing.
+        // A concrete IMMDevice remains bound to the original output while it is healthy.
+        let mut path = [0u16; 39]; // braced GUID and terminator
+        unsafe { StringFromGUID2(&DEVINTERFACE_AUDIO_RENDER, &mut path) };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let handler: IActivateAudioInterfaceCompletionHandler = ActivationCompleted(tx).into();
+        let operation = unsafe {
+            ActivateAudioInterfaceAsync(PCWSTR(path.as_ptr()), &IAudioClient::IID, None, &handler)?
+        };
+        // The MTA callback only signals. Read the interface on its owning render
+        // thread, and bound the wait so teardown can still join a stalled activation.
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| windows_core::Error::from_hresult(ERROR_TIMEOUT.into()))?;
+        let mut status = HRESULT::default();
+        let mut client = None;
+        unsafe { operation.GetActivateResult(&mut status, &mut client)? };
+        status.ok()?;
+        client.ok_or(E_POINTER)?.cast()
+    }
+
+    fn activate_default_client() -> Result<IAudioClient> {
+        if OsVersion::current() >= OsVersion::new(10, 0, 0, 14393) {
+            return activate_routed_client().map_err(|error| {
+                wasapi_error("ActivateAudioInterfaceAsync(default render)", error)
+            });
+        }
+        // Windows 10 before version 1607 only supports concrete endpoints here.
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .map_err(|error| wasapi_error("CoCreateInstance(MMDeviceEnumerator)", error))?;
         let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
             .map_err(|error| wasapi_error("IMMDeviceEnumerator::GetDefaultAudioEndpoint", error))?;
-        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
-            .map_err(|error| wasapi_error("IMMDevice::Activate(IAudioClient)", error))?;
+        unsafe { device.Activate(CLSCTX_ALL, None) }
+            .map_err(|error| wasapi_error("IMMDevice::Activate(IAudioClient)", error))
+    }
+
+    fn initialize_render_client(format: PcmFormat) -> Result<WasapiRenderState> {
+        let _com = ComApartment::new()?;
+        let wave_format = wave_format(format)?;
+        let client = activate_default_client()?;
         unsafe {
             client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -1049,6 +1101,22 @@ pub mod wasapi {
                 .endpoint_queued_frames
                 .store(queued.load(Ordering::Acquire), Ordering::Release);
             assert_eq!(output.queued_output_duration(), Duration::from_millis(100));
+        }
+
+        #[test]
+        #[ignore = "requires Windows 10 1607+ with Windows Audio running and no default output"]
+        fn routed_activation_reports_the_missing_endpoint_hresult() {
+            use ::windows::Win32::Foundation::ERROR_NOT_FOUND;
+
+            let mut output = WasapiAudioOutput::default();
+            let Err(WasapiAudioOutputError::Wasapi {
+                operation, code, ..
+            }) = output.configure(stereo_format())
+            else {
+                panic!("expected the default output to be unavailable");
+            };
+            assert_eq!(operation, "ActivateAudioInterfaceAsync(default render)");
+            assert_eq!(code, ERROR_NOT_FOUND.to_hresult().0);
         }
 
         #[test]
