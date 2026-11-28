@@ -15,8 +15,12 @@ pub const INPUT_TENSOR: usize = 0;
 
 const MAGIC: u32 = 0x4D52_5345; // "ESRM"
 const VERSION: u32 = 1;
-const MAX_CHANNELS: usize = 256;
-const MAX_KERNEL: usize = 9;
+pub(crate) const MAX_CHANNELS: usize = 256;
+pub(crate) const MAX_KERNEL: usize = 9;
+pub(crate) const MAX_TENSORS: usize = 512;
+pub(crate) const MAX_LAYERS: usize = 512;
+const MAX_INPUTS_PER_LAYER: usize = 64;
+const MAX_MODEL_BYTES: usize = 32 * 1024 * 1024;
 
 /// Value of a tensor outside the image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,36 +143,25 @@ pub struct SrModel {
 impl SrModel {
     /// Multiply-accumulates per input pixel, ignoring border re-evaluation.
     pub fn macs_per_pixel(&self) -> u64 {
-        self.layers
-            .iter()
-            .map(|layer| {
-                layer
-                    .inputs
-                    .iter()
-                    .map(|input| {
-                        (layer.out_channels
-                            * self.tensors[input.tensor]
-                            * input.kernel
-                            * input.kernel) as u64
-                    })
-                    .sum::<u64>()
+        self.layers.iter().fold(0u64, |total, layer| {
+            layer.inputs.iter().fold(total, |acc, input| {
+                let term = (layer.out_channels as u64)
+                    .saturating_mul(self.tensors[input.tensor] as u64)
+                    .saturating_mul(input.kernel as u64)
+                    .saturating_mul(input.kernel as u64);
+                acc.saturating_add(term)
             })
-            .sum()
+        })
     }
 
     /// Number of stored weights and biases.
     pub fn parameter_count(&self) -> usize {
-        self.layers
-            .iter()
-            .map(|layer| {
-                layer.bias.len()
-                    + layer
-                        .inputs
-                        .iter()
-                        .map(|input| input.weights.len())
-                        .sum::<usize>()
-            })
-            .sum()
+        self.layers.iter().fold(0usize, |total, layer| {
+            let layer_params = layer.inputs.iter().fold(layer.bias.len(), |acc, input| {
+                acc.saturating_add(input.weights.len())
+            });
+            total.saturating_add(layer_params)
+        })
     }
 
     /// Indices of the layers producing each tensor (`None` for the input).
@@ -212,6 +205,12 @@ impl SrModel {
         if self.tensors.first() != Some(&1) {
             return fail("tensor 0 must be the single-channel input".to_string());
         }
+        if self.tensors.len() > MAX_TENSORS {
+            return fail(format!("model exceeds maximum {MAX_TENSORS} tensors"));
+        }
+        if self.layers.len() > MAX_LAYERS {
+            return fail(format!("model exceeds maximum {MAX_LAYERS} layers"));
+        }
         if self.tensors.iter().any(|&c| c == 0 || c > MAX_CHANNELS) {
             return fail(format!("tensor channel counts must be 1..={MAX_CHANNELS}"));
         }
@@ -236,23 +235,38 @@ impl SrModel {
             if self.tensors[layer.output] != layer.out_channels {
                 return fail(format!("layer {index} output channel mismatch"));
             }
-            if layer.inputs.is_empty() || layer.bias.len() != layer.out_channels {
+            if layer.inputs.is_empty()
+                || layer.inputs.len() > MAX_INPUTS_PER_LAYER
+                || layer.bias.len() != layer.out_channels
+            {
                 return fail(format!(
-                    "layer {index} needs inputs and one bias per output"
+                    "layer {index} needs 1..={MAX_INPUTS_PER_LAYER} inputs and one bias per output"
                 ));
+            }
+            if !layer.bias.iter().all(|v| v.is_finite()) {
+                return fail(format!("layer {index} bias contains non-finite values"));
             }
             for input in &layer.inputs {
                 check_read(input.tensor)?;
                 if input.kernel % 2 == 0 || input.kernel > MAX_KERNEL {
                     return fail(format!("layer {index} has kernel {}", input.kernel));
                 }
-                let expected =
-                    layer.out_channels * self.tensors[input.tensor] * input.kernel * input.kernel;
+                let expected = layer
+                    .out_channels
+                    .checked_mul(self.tensors[input.tensor])
+                    .and_then(|n| n.checked_mul(input.kernel))
+                    .and_then(|n| n.checked_mul(input.kernel))
+                    .ok_or_else(|| {
+                        invalid(&self.name, format!("layer {index} weight count overflow"))
+                    })?;
                 if input.weights.len() != expected {
                     return fail(format!(
                         "layer {index} input weights are {} values, expected {expected}",
                         input.weights.len()
                     ));
+                }
+                if !input.weights.iter().all(|v| v.is_finite()) {
+                    return fail(format!("layer {index} weights contain non-finite values"));
                 }
             }
             if let Some(residual) = layer.residual {
@@ -261,22 +275,30 @@ impl SrModel {
                     return fail(format!("layer {index} residual channel mismatch"));
                 }
             }
-            if let Activation::Prelu(alpha) = &layer.activation
-                && alpha.len() != layer.out_channels
-            {
-                return fail(format!("layer {index} PReLU slope count mismatch"));
+            if let Activation::Prelu(alpha) = &layer.activation {
+                if alpha.len() != layer.out_channels {
+                    return fail(format!("layer {index} PReLU slope count mismatch"));
+                }
+                if !alpha.iter().all(|v| v.is_finite()) {
+                    return fail(format!(
+                        "layer {index} PReLU slopes contain non-finite values"
+                    ));
+                }
             }
             if let Some(border) = &layer.border {
-                let shapes_match = border.len() == 9
-                    && border.iter().all(|variant| {
-                        variant.bias.len() == layer.out_channels
-                            && variant.inputs.len() == layer.inputs.len()
-                            && variant
-                                .inputs
-                                .iter()
-                                .zip(&layer.inputs)
-                                .all(|(weights, input)| weights.len() == input.weights.len())
-                    });
+                let shapes_match =
+                    border.len() == 9
+                        && border.iter().all(|variant| {
+                            variant.bias.len() == layer.out_channels
+                                && variant.bias.iter().all(|v| v.is_finite())
+                                && variant.inputs.len() == layer.inputs.len()
+                                && variant.inputs.iter().zip(&layer.inputs).all(
+                                    |(weights, input)| {
+                                        weights.len() == input.weights.len()
+                                            && weights.iter().all(|v| v.is_finite())
+                                    },
+                                )
+                        });
                 if !shapes_match {
                     return fail(format!("layer {index} border variants are malformed"));
                 }
@@ -367,6 +389,11 @@ impl SrModel {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_MODEL_BYTES {
+            return Err(PlayerError::Renderer(
+                "upscaler model file exceeds maximum size".to_string(),
+            ));
+        }
         let mut input = Reader {
             bytes,
             cursor: 0,
@@ -398,10 +425,24 @@ impl SrModel {
                 _ => return None,
             };
             let tensor_count = input.u16()? as usize;
-            let tensors = (0..tensor_count)
-                .map(|_| input.u16().map(usize::from))
-                .collect::<Option<Vec<_>>>()?;
+            if tensor_count == 0
+                || tensor_count > MAX_TENSORS
+                || input.remaining() < tensor_count.checked_mul(2)?
+            {
+                return None;
+            }
+            let mut tensors = Vec::with_capacity(tensor_count);
+            for _ in 0..tensor_count {
+                let channels = usize::from(input.u16()?);
+                if channels == 0 || channels > MAX_CHANNELS {
+                    return None;
+                }
+                tensors.push(channels);
+            }
             let layer_count = input.u16()? as usize;
+            if layer_count > MAX_LAYERS || input.remaining() < layer_count {
+                return None;
+            }
             let mut layers = Vec::with_capacity(layer_count);
             for _ in 0..layer_count {
                 let output = input.u16()? as usize;
@@ -418,6 +459,12 @@ impl SrModel {
                     _ => return None,
                 };
                 let input_count = input.u8()? as usize;
+                if input_count == 0
+                    || input_count > MAX_INPUTS_PER_LAYER
+                    || input.remaining() < input_count
+                {
+                    return None;
+                }
                 let mut inputs = Vec::with_capacity(input_count);
                 for _ in 0..input_count {
                     let tensor = input.u16()? as usize;
@@ -428,11 +475,15 @@ impl SrModel {
                         _ => return None,
                     };
                     let kernel = input.u8()? as usize;
-                    if kernel == 0 || kernel > MAX_KERNEL {
+                    if kernel.is_multiple_of(2) || kernel > MAX_KERNEL {
                         return None;
                     }
                     let channels = *tensors.get(tensor)?;
-                    let weights = input.floats(out_channels * channels * kernel * kernel)?;
+                    let weight_count = out_channels
+                        .checked_mul(channels)?
+                        .checked_mul(kernel)?
+                        .checked_mul(kernel)?;
+                    let weights = input.floats(weight_count)?;
                     inputs.push(ConvInput {
                         tensor,
                         transform,
@@ -545,6 +596,10 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.cursor)
+    }
+
     fn take(&mut self, len: usize) -> Option<&[u8]> {
         let end = self.cursor.checked_add(len)?;
         let slice = self.bytes.get(self.cursor..end)?;
@@ -733,6 +788,43 @@ mod tests {
         let mut bad = bytes.clone();
         bad[0] ^= 1;
         assert!(SrModel::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn deserializer_rejects_huge_counts_overflow_and_non_finite_weights() {
+        // Claims 65535 tensors in a tiny payload: must reject without large preallocation.
+        let mut huge_tensors = Vec::new();
+        huge_tensors.extend_from_slice(&MAGIC.to_le_bytes());
+        huge_tensors.extend_from_slice(&VERSION.to_le_bytes());
+        huge_tensors.extend_from_slice(&[0, 0, 0, 0, 0]); // f32, empty name, Zero, Raw
+        huge_tensors.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert!(SrModel::from_bytes(&huge_tensors).is_err());
+
+        // Claims 65535 layers in a tiny payload.
+        let mut huge_layers = Vec::new();
+        huge_layers.extend_from_slice(&MAGIC.to_le_bytes());
+        huge_layers.extend_from_slice(&VERSION.to_le_bytes());
+        huge_layers.extend_from_slice(&[0, 0, 0, 0, 0]);
+        huge_layers.extend_from_slice(&1u16.to_le_bytes()); // tensor_count = 1
+        huge_layers.extend_from_slice(&1u16.to_le_bytes()); // tensor[0] = 1 ch
+        huge_layers.extend_from_slice(&u16::MAX.to_le_bytes()); // layer_count = 65535
+        assert!(SrModel::from_bytes(&huge_layers).is_err());
+
+        // Non-finite weights and biases are rejected by validate() and from_bytes().
+        let mut nan_model = tiny_model();
+        nan_model.layers[0].inputs[0].weights[0] = f32::NAN;
+        assert!(nan_model.validate().is_err());
+        assert!(SrModel::from_bytes(&nan_model.to_bytes(true)).is_err());
+
+        let mut inf_model = tiny_model();
+        inf_model.layers[0].bias[0] = f32::INFINITY;
+        assert!(inf_model.validate().is_err());
+        assert!(SrModel::from_bytes(&inf_model.to_bytes(true)).is_err());
+
+        let mut nan_prelu = tiny_model();
+        nan_prelu.layers[0].activation = Activation::Prelu(vec![0.1, f32::NAN, 0.2, 0.3]);
+        assert!(nan_prelu.validate().is_err());
+        assert!(SrModel::from_bytes(&nan_prelu.to_bytes(true)).is_err());
     }
 
     #[test]

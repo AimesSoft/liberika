@@ -13,7 +13,7 @@ import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = 'https://github.com/AimesSoft/liberika'
-RUNTIME = ['index.js', 'index.d.ts', 'worker.js', 'renderer.js', 'source.js', 'audio.js', 'codecs.js',
+RUNTIME = ['index.js', 'index.d.ts', 'worker.js', 'renderer.js', 'renderer_webgpu.js', 'source.js', 'audio.js', 'codecs.js',
            'erika_core.js', 'erika_core.d.ts', 'erika_core_bg.wasm', 'erika_core_bg.wasm.d.ts',
            'media.js', 'media.wasm']
 DOCUMENTS = ['README.md', 'LICENSE', 'WEB-GUIDE.md', 'WEB-GUIDE.zh.md']

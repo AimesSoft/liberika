@@ -13,8 +13,9 @@
 #include <unordered_map>
 #include <vector>
 
-// Released runtimes before custom-model support must still load this bridge.
+// Released runtimes before custom-model/danmaku-capture support must still load this bridge.
 #pragma weak erika_presenter_load_upscaler_model
+#pragma weak erika_presenter_capture_frame_rgba_with_danmaku
 
 namespace erika_ohos {
 using Task = std::function<void(napi_env)>;
@@ -199,7 +200,11 @@ inline Reply Execute(Player& p, const Request& r) {
     if (r.a >= 1 && r.b >= 1 && r.a <= 8192 && r.b <= 8192) {
       const auto w = static_cast<uint32_t>(r.a), h = static_cast<uint32_t>(r.b);
       reply.bytes.resize(static_cast<size_t>(w) * h * 4);
-      if (erika_presenter_capture_frame_rgba(p.presenter, w, h, reply.bytes.data(), reply.bytes.size()) == ErikaStatus_Ok)
+      const bool with_danmaku = r.c != 0.0 && erika_presenter_capture_frame_rgba_with_danmaku;
+      const ErikaStatus status = with_danmaku
+          ? erika_presenter_capture_frame_rgba_with_danmaku(p.presenter, w, h, reply.bytes.data(), reply.bytes.size())
+          : erika_presenter_capture_frame_rgba(p.presenter, w, h, reply.bytes.data(), reply.bytes.size());
+      if (status == ErikaStatus_Ok)
         reply.kind = Reply::Bytes;
       else reply.bytes.clear();
     }
@@ -294,7 +299,10 @@ inline napi_value Dispatch(napi_env env, napi_callback_info info) {
   }
   if (r.op == Op::Resize && argc >= 4) { r.a = Double(env, args[1]); r.b = Double(env, args[2]); r.c = Double(env, args[3]); }
   if (r.op == Op::Render && argc >= 2) r.a = Double(env, args[1]);
-  if (r.op == Op::Capture && argc >= 3) { r.a = Double(env, args[1]); r.b = Double(env, args[2]); }
+  if (r.op == Op::Capture && argc >= 3) {
+    r.a = Double(env, args[1]); r.b = Double(env, args[2]);
+    if (argc >= 4) { bool include = false; napi_get_value_bool(env, args[3], &include); r.c = include ? 1.0 : 0.0; }
+  }
   auto missing = [r] {
     Reply reply; reply.number = ErikaStatus_NullPointer; reply.kind = Reply::Int;
     if (r.op == Op::Invoke || r.op == Op::Render) {

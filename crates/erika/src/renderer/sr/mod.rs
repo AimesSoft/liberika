@@ -10,8 +10,10 @@ pub mod artcnn;
 pub mod catalog;
 pub mod fold;
 pub mod fsr1;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod hlsl;
 pub mod model;
 pub mod mpv;
+pub mod plan;
 pub mod reference;
 pub mod wgsl;

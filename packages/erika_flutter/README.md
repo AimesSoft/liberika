@@ -514,8 +514,8 @@ changes; duplicate listener notifications are ignored.
 
 `player.screenshot()` returns raw SDR RGBA8 for the current composited frame
 (video + subtitle + danmaku), even when the display is Apple EDR or Android
-extended-linear. Metal and Android/wgpu implement capture; the current Windows
-D3D11 Flutter path does not return screenshot bytes.
+extended-linear. Metal, Android/wgpu, and Windows D3D11 (since 0.3.8, encoded
+as SDR PNG with video and subtitles) implement capture.
 
 Non-HDR emulator/device coverage verifies the explicit SDR fallback and its
 reason. Active extended-linear output is not yet claimed as device-validated;

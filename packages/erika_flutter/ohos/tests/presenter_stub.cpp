@@ -62,6 +62,9 @@ ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle* p, const c
   Owner(p); assert(size == 3 && bytes[0] == 1 && bytes[2] == 3); return ErikaStatus_Ok;
 }
 ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle* p) { Owner(p); return ErikaStatus_Ok; }
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle* p, uint32_t w, uint32_t h, uint8_t* bytes, size_t size) {
+  Owner(p); assert(size == static_cast<size_t>(w) * h * 4); std::memset(bytes, 200, size); return ErikaStatus_Ok;
+}
 #endif
 ErikaStatus erika_presenter_attach_wgpu_surface(ErikaPresenterHandle* p, ErikaWgpuSurfaceKind, uint64_t, uint64_t, uint32_t w, uint32_t h, double) {
   Owner(p); p->attached = true; p->width = w; p->height = h; return ErikaStatus_Ok;

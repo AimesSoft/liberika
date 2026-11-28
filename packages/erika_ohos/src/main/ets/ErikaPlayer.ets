@@ -26,6 +26,113 @@ export interface ErikaOpenOptions {
   httpHeaders?: ESObject;
   httpReadAheadBytes?: number;
   httpBackBufferBytes?: number;
+  startPositionMicros?: number;
+}
+
+export interface ErikaSubtitleStyleOptions {
+  fontFamily?: string;
+  fontFilePath?: string;
+  primaryColorRgba?: number;
+  outlineColorRgba?: number;
+  fontSize?: number;
+  outlineWidth?: number;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strikeOut?: boolean;
+  spacing?: number;
+  scaleXPercent?: number;
+  scaleYPercent?: number;
+  borderStyle?: number;
+  shadowDepth?: number;
+  blur?: number;
+  alignment?: number;
+  marginLeft?: number;
+  marginRight?: number;
+  marginVertical?: number;
+  overrideMask?: number;
+}
+
+export interface ErikaDanmakuTrackOptions {
+  name?: string;
+  offsetMicros?: number;
+}
+
+export interface ErikaDanmakuConfig {
+  enabled?: boolean;
+  fontSize?: number;
+  opacity?: number;
+  displayArea?: number;
+  scrollDurationSeconds?: number;
+  scrollSpeedFactor?: number;
+  trackGapRatio?: number;
+  outlineWidth?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+  shadowStyle?: number;
+  customFontFamily?: string;
+  customFontFilePath?: string;
+  mergeDuplicates?: boolean;
+  allowStacking?: boolean;
+  allowScrollOverwrite?: boolean;
+  maxQuantity?: number;
+  maxLinesPerMode?: number;
+  blockTop?: boolean;
+  blockBottom?: boolean;
+  blockScroll?: boolean;
+  blockWordsJson?: string;
+  randomColors?: boolean;
+}
+
+export interface ErikaLogOptions {
+  limit?: number;
+  minLevel?: string;
+  sinceSeq?: number;
+}
+
+export interface ErikaSendDanmakuOptions {
+  color?: number;
+  mode?: string;
+  positionMicros?: number;
+}
+
+export interface ErikaGifExportOptions {
+  inputUri: string;
+  outputPath: string;
+  startMillis: number;
+  endMillis: number;
+  framesPerSecond: number;
+  outputWidth: number;
+  outputHeight: number;
+  quality?: number | string;
+  loopCount?: number;
+  overwrite?: boolean;
+  httpHeaders?: ESObject;
+  httpReadAheadBytes?: number;
+}
+
+export interface ErikaFrameExportOptions {
+  uri: string;
+  positionMillis: number;
+  width?: number;
+  height?: number;
+  format?: string;
+  outputPath?: string;
+  overwrite?: boolean;
+  httpHeaders?: ESObject;
+  httpReadAheadBytes?: number;
+}
+
+export interface ErikaFramesExportOptions {
+  uri: string;
+  positionsMillis: Array<number>;
+  outputDir: string;
+  width?: number;
+  height?: number;
+  format?: string;
+  overwrite?: boolean;
+  httpHeaders?: ESObject;
+  httpReadAheadBytes?: number;
 }
 
 /**
@@ -69,12 +176,19 @@ export class ErikaPlayer {
   open(uri: string, options: ErikaOpenOptions = {}): ESObject | null {
     const readAhead: number = byteCountOption(options.httpReadAheadBytes, 'httpReadAheadBytes');
     const backBuffer: number = byteCountOption(options.httpBackBufferBytes, 'httpBackBufferBytes');
+    const startPosition: number = byteCountOption(options.startPositionMicros, 'startPositionMicros');
     return this.invokeOrThrow('open', {
       uri: uri,
       httpHeaders: options.httpHeaders,
       httpReadAheadBytes: readAhead > 0 ? readAhead : undefined,
       httpBackBufferBytes: backBuffer > 0 ? backBuffer : undefined,
+      startPositionMicros: startPosition > 0 ? startPosition : undefined,
     });
+  }
+
+  setOpenStartPosition(positionMicros: number): ESObject | null {
+    const position: number = byteCountOption(positionMicros, 'positionMicros');
+    return this.invokeOrThrow('setOpenStartPosition', { positionMicros: position });
   }
 
   play(): ESObject | null {
@@ -105,6 +219,14 @@ export class ErikaPlayer {
     return this.invokeOrThrow('setVolume', { volume: volume });
   }
 
+  setMuted(muted: boolean): ESObject | null {
+    return this.invokeOrThrow('setMuted', { muted: muted });
+  }
+
+  getVolume(): ESObject | null {
+    return this.invokeOrThrow('volume');
+  }
+
   setUpscaler(mode: number): ESObject | null {
     return this.invokeOrThrow('setUpscaler', { mode: mode });
   }
@@ -121,9 +243,227 @@ export class ErikaPlayer {
     this.checkStatus(status, 'loadUpscalerModel');
   }
 
+  loadUpscalerModelFile(path: string, name?: string): ESObject | null {
+    return this.invokeOrThrow('loadUpscalerModelFile', {
+      path: path,
+      name: name,
+    });
+  }
+
   /** Unloads the network loaded by loadUpscalerModel(). */
   clearUpscalerModel(): ESObject | null {
     return this.invokeOrThrow('clearUpscalerModel');
+  }
+
+  getUpscalerStatus(): ESObject | null {
+    return this.invokeOrThrow('getUpscalerStatus');
+  }
+
+  setDebugHudEnabled(enabled: boolean): ESObject | null {
+    return this.invokeOrThrow('setDebugHudEnabled', { enabled: enabled });
+  }
+
+  setOutputHeadroom(headroom: number, known: boolean): ESObject | null {
+    return this.invokeOrThrow('setOutputHeadroom', {
+      headroom: headroom,
+      known: known,
+    });
+  }
+
+  getOutputStatus(): ESObject | null {
+    return this.invokeOrThrow('getOutputStatus');
+  }
+
+  getPresenterStats(): ESObject | null {
+    return this.invokeOrThrow('getPresenterStats');
+  }
+
+  getResourceStatus(): ESObject | null {
+    return this.invokeOrThrow('getResourceStatus');
+  }
+
+  getDiagnosticsSnapshot(): ESObject | null {
+    return this.invokeOrThrow('getDiagnosticsSnapshot');
+  }
+
+  getLogs(options: ErikaLogOptions = {}): ESObject | null {
+    return this.invokeOrThrow('getLogs', options);
+  }
+
+  listMethods(): ESObject | null {
+    return this.invokeOrThrow('listMethods');
+  }
+
+  /**
+   * Calls any method in liberika's JSON dispatch table and returns the raw
+   * response envelope `{ ok, status, value?, error? }` without throwing on
+   * native errors.
+   */
+  invokeJson(method: string, args: ESObject = {}): ErikaNativeResponse {
+    if (method.length === 0) {
+      throw new Error('method must not be empty');
+    }
+    return this.invokeRaw(method, args);
+  }
+
+  tracks(): ESObject | null {
+    return this.invokeOrThrow('tracks');
+  }
+
+  trackSelection(): ESObject | null {
+    return this.invokeOrThrow('trackSelection');
+  }
+
+  chapters(): ESObject | null {
+    return this.invokeOrThrow('chapters');
+  }
+
+  containerInfo(): ESObject | null {
+    return this.invokeOrThrow('container');
+  }
+
+  selectAudioTrack(trackId: number | null): ESObject | null {
+    return this.invokeOrThrow('selectAudioTrack', { trackId: trackId ?? -1 });
+  }
+
+  selectSubtitleTrack(trackId: number | null): ESObject | null {
+    return this.invokeOrThrow('selectSubtitleTrack', { trackId: trackId ?? -1 });
+  }
+
+  addExternalSubtitle(uri: string): ESObject | null {
+    return this.invokeOrThrow('addExternalSubtitle', { uri: uri });
+  }
+
+  removeSubtitleTrack(trackId: number): ESObject | null {
+    return this.invokeOrThrow('removeSubtitleTrack', { trackId: trackId });
+  }
+
+  setSubtitleScale(scale: number): ESObject | null {
+    return this.invokeOrThrow('setSubtitleScale', { scale: scale });
+  }
+
+  setSubtitleDelay(delayMicros: number): ESObject | null {
+    return this.invokeOrThrow('setSubtitleDelay', { delayMicros: delayMicros });
+  }
+
+  getSubtitleDelay(): ESObject | null {
+    return this.invokeOrThrow('subtitleDelay');
+  }
+
+  subtitleText(): ESObject | null {
+    return this.invokeOrThrow('subtitleText');
+  }
+
+  setSubtitleFont(fontFamily?: string, fontFilePath?: string): ESObject | null {
+    return this.invokeOrThrow('setSubtitleFont', {
+      fontFamily: fontFamily,
+      fontFilePath: fontFilePath,
+    });
+  }
+
+  setSubtitleStyle(style: ErikaSubtitleStyleOptions): ESObject | null {
+    return this.invokeOrThrow('setSubtitleStyle', style);
+  }
+
+  selectSubtitleMemoryFonts(fontIds: Array<number>): ESObject | null {
+    return this.invokeOrThrow('selectSubtitleMemoryFonts', { fontIds: fontIds });
+  }
+
+  clearSubtitleMemoryFonts(): ESObject | null {
+    return this.invokeOrThrow('clearSubtitleMemoryFonts');
+  }
+
+  getSubtitleMemoryFontStatus(): ESObject | null {
+    return this.invokeOrThrow('getSubtitleMemoryFontStatus');
+  }
+
+  loadDanmakuFile(uri: string): ESObject | null {
+    return this.invokeOrThrow('loadDanmakuFile', { uri: uri });
+  }
+
+  loadDanmakuJson(json: string): ESObject | null {
+    return this.invokeOrThrow('loadDanmakuJson', { json: json });
+  }
+
+  addDanmakuTrackFile(uri: string, options: ErikaDanmakuTrackOptions = {}): ESObject | null {
+    return this.invokeOrThrow('addDanmakuTrackFile', {
+      uri: uri,
+      name: options.name,
+      offsetMicros: options.offsetMicros,
+    });
+  }
+
+  addDanmakuTrackJson(json: string, options: ErikaDanmakuTrackOptions = {}): ESObject | null {
+    return this.invokeOrThrow('addDanmakuTrackJson', {
+      json: json,
+      name: options.name,
+      offsetMicros: options.offsetMicros,
+    });
+  }
+
+  removeDanmakuTrack(trackId: number): ESObject | null {
+    return this.invokeOrThrow('removeDanmakuTrack', { trackId: trackId });
+  }
+
+  setDanmakuTrackEnabled(trackId: number, enabled: boolean): ESObject | null {
+    return this.invokeOrThrow('setDanmakuTrackEnabled', {
+      trackId: trackId,
+      enabled: enabled,
+    });
+  }
+
+  setDanmakuTrackOffset(trackId: number, offsetMicros: number): ESObject | null {
+    return this.invokeOrThrow('setDanmakuTrackOffset', {
+      trackId: trackId,
+      offsetMicros: offsetMicros,
+    });
+  }
+
+  setDanmakuGlobalOffset(offsetMicros: number): ESObject | null {
+    return this.invokeOrThrow('setDanmakuGlobalOffset', { offsetMicros: offsetMicros });
+  }
+
+  danmakuTracks(): ESObject | null {
+    return this.invokeOrThrow('danmakuTracks');
+  }
+
+  clearDanmaku(): ESObject | null {
+    return this.invokeOrThrow('clearDanmaku');
+  }
+
+  setDanmakuEnabled(enabled: boolean): ESObject | null {
+    return this.invokeOrThrow('setDanmakuEnabled', { enabled: enabled });
+  }
+
+  setDanmakuConfig(config: ErikaDanmakuConfig): ESObject | null {
+    return this.invokeOrThrow('setDanmakuConfig', config);
+  }
+
+  getDanmakuConfig(): ESObject | null {
+    return this.invokeOrThrow('getDanmakuConfig');
+  }
+
+  sendDanmaku(text: string, options: ErikaSendDanmakuOptions = {}): ESObject | null {
+    return this.invokeOrThrow('sendDanmaku', {
+      text: text,
+      color: options.color,
+      mode: options.mode,
+      positionMicros: options.positionMicros,
+    });
+  }
+
+  // Exports decode and encode a whole range, which takes seconds. They run on
+  // the player's worker and resolve later, so the calling (UI) thread is free.
+  async exportGif(options: ErikaGifExportOptions): Promise<ESObject | null> {
+    return await this.invokeAsyncOrThrow('exportGif', options);
+  }
+
+  async exportFrame(options: ErikaFrameExportOptions): Promise<ESObject | null> {
+    return await this.invokeAsyncOrThrow('exportFrame', options);
+  }
+
+  async exportFrames(options: ErikaFramesExportOptions): Promise<ESObject | null> {
+    return await this.invokeAsyncOrThrow('exportFrames', options);
   }
 
   attachSurface(options: ErikaSurfaceOptions): void {
@@ -194,9 +534,9 @@ export class ErikaPlayer {
     return JSON.parse(raw as string) as ESObject;
   }
 
-  captureFrame(width: number, height: number): Uint8Array | null {
+  captureFrame(width: number, height: number, includeDanmaku: boolean = false): Uint8Array | null {
     this.ensureAlive();
-    return erikaNative.nativeCaptureFrame(this.nativeId, width, height) as Uint8Array | null;
+    return erikaNative.nativeCaptureFrame(this.nativeId, width, height, includeDanmaku) as Uint8Array | null;
   }
 
   registerSubtitleMemoryFont(bytes: Uint8Array): number {
@@ -217,6 +557,23 @@ export class ErikaPlayer {
 
   private invokeOrThrow(method: string, args: ESObject = {}): ESObject | null {
     const response: ErikaNativeResponse = this.invokeRaw(method, args);
+    if (!response.ok) {
+      throw new Error(response.error ?? ('Erika native method failed: ' + method));
+    }
+    return response.value ?? null;
+  }
+
+  private async invokeAsyncOrThrow(method: string, args: ESObject): Promise<ESObject | null> {
+    this.ensureAlive();
+    const raw: ESObject = await erikaNative.nativeInvokeAsync(
+      this.nativeId,
+      method,
+      JSON.stringify(args),
+    );
+    if (raw === null || raw === undefined) {
+      throw new Error('Erika player is closing: ' + method);
+    }
+    const response: ErikaNativeResponse = JSON.parse(raw as string) as ErikaNativeResponse;
     if (!response.ok) {
       throw new Error(response.error ?? ('Erika native method failed: ' + method));
     }

@@ -88,6 +88,17 @@ fn class(name: &CStr) -> std::result::Result<&'static AnyClass, String> {
     })
 }
 
+/// Whether this OS and device support `VTLowLatencySuperResolutionScaler`
+/// regardless of source dimensions.
+pub fn device_supported() -> bool {
+    let Ok(configuration) = class(c"VTLowLatencySuperResolutionScalerConfiguration") else {
+        return false;
+    };
+    // SAFETY: class property getter returning BOOL.
+    let supported: Bool = unsafe { msg_send![configuration, isSupported] };
+    supported.as_bool()
+}
+
 /// Why a `width x height` source cannot use the low-latency scaler, if it
 /// cannot. Cheap enough to call per size change.
 pub fn unsupported_reason(width: usize, height: usize) -> Option<String> {

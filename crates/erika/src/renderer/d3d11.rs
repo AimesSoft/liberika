@@ -61,7 +61,11 @@ use crate::renderer::output::{
 };
 use crate::renderer::pipeline::{
     Chromaticity, LumaUpscalerMode, PrimariesCoordinates, SourceColorState, TargetColorState,
-    UpscalerFamily, VideoRenderPipeline, VideoUniforms, primaries_coordinates,
+    UpscalerCapabilities, UpscalerDescriptor, UpscalerFamily, VideoRenderPipeline, VideoUniforms,
+    primaries_coordinates,
+};
+use crate::renderer::post_process::{
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
 };
 use crate::renderer::presentation::PresentationLayout;
 use crate::renderer::sr::reference::LumaRange;
@@ -71,7 +75,32 @@ mod alpha_atlas;
 mod capture;
 mod danmaku;
 mod p010_upload;
+mod post_process;
 use danmaku::{D3d11DanmakuBatch, D3d11DanmakuDraws, D3d11DanmakuPipeline};
+use post_process::D3d11PostProcess;
+
+/// Probes upscaler and post-processing capabilities for the default Windows
+/// DXGI adapter when no D3D11 device has been created yet.
+pub fn probe_default_upscalers() -> UpscalerCapabilities {
+    capabilities_for_vendor(crate::renderer::d3d11_vsr::probe_default_vendor())
+}
+
+fn capabilities_for_vendor(
+    vendor: Option<crate::renderer::d3d11_vsr::VsrVendor>,
+) -> UpscalerCapabilities {
+    let mut modes = UpscalerCapabilities::bundled_portable_modes();
+    if let Some(vendor) = vendor {
+        modes.push(UpscalerDescriptor::for_mode_named(
+            LumaUpscalerMode::PlatformVideo,
+            vendor.display_name(),
+        ));
+    }
+    UpscalerCapabilities {
+        modes,
+        supports_custom_network: true,
+        supports_post_process: true,
+    }
+}
 
 const SDR_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const HDR10_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -1141,6 +1170,7 @@ struct PresentedScene {
     frame_token: u64,
     generation: u64,
     upscaler: LumaUpscalerMode,
+    post_process_generation: u64,
     overlay: Option<PresentedOverlay>,
     danmaku: Option<DanmakuRenderPlan>,
 }
@@ -1149,6 +1179,7 @@ impl PresentedScene {
     fn new(
         frame_token: u64,
         upscaler: LumaUpscalerMode,
+        post_process_generation: u64,
         context: RenderFrameContext<'_>,
         alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
     ) -> Self {
@@ -1156,6 +1187,7 @@ impl PresentedScene {
             frame_token,
             generation: context.generation,
             upscaler,
+            post_process_generation,
             overlay: context
                 .overlay
                 .map(|frame| PresentedOverlay::new(frame, alpha)),
@@ -1167,11 +1199,13 @@ impl PresentedScene {
         &self,
         frame_token: u64,
         upscaler: LumaUpscalerMode,
+        post_process_generation: u64,
         context: RenderFrameContext<'_>,
     ) -> bool {
         self.frame_token == frame_token
             && self.generation == context.generation
             && self.upscaler == upscaler
+            && self.post_process_generation == post_process_generation
             && self.overlay_matches(context.overlay)
             && self.danmaku_matches(context.danmaku)
     }
@@ -1202,6 +1236,7 @@ impl PresentedScene {
         &mut self,
         frame_token: u64,
         upscaler: LumaUpscalerMode,
+        post_process_generation: u64,
         context: RenderFrameContext<'_>,
         alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
     ) {
@@ -1219,6 +1254,7 @@ impl PresentedScene {
         self.frame_token = frame_token;
         self.generation = context.generation;
         self.upscaler = upscaler;
+        self.post_process_generation = post_process_generation;
     }
 }
 
@@ -1487,6 +1523,7 @@ pub struct D3d11Renderer {
     upscaler_mode: LumaUpscalerMode,
     upscaler: D3d11Upscaler,
     fsr1: D3d11Fsr1,
+    post_process: D3d11PostProcess,
     /// NVIDIA RTX Video / Intel VSR, created on first use per device.
     /// `Err` keeps the reason it is unavailable.
     vsr: Option<std::result::Result<D3d11VideoSuperResolution, String>>,
@@ -1561,6 +1598,7 @@ impl D3d11Renderer {
             upscaler_mode: config.luma_upscaler,
             upscaler: D3d11Upscaler::new(sr_accelerators),
             fsr1: D3d11Fsr1::default(),
+            post_process: D3d11PostProcess::default(),
             vsr: None,
             vsr_frames: 0,
             vsr_last_error: None,
@@ -1745,6 +1783,7 @@ impl D3d11Renderer {
         self.danmaku_atlas_cache = None;
         self.danmaku_picture_cache = None;
         self.presented_scene = None;
+        self.post_process.reset_device();
         self.state = None;
     }
 
@@ -1911,6 +1950,7 @@ impl D3d11Renderer {
         let state = D3d11DeviceState::new(device, context)?;
         self.vsr = None;
         self.fsr1.reset();
+        self.post_process.reset_device();
         if self.upscaler_mode.family() == UpscalerFamily::Network {
             if let Err(error) = self
                 .upscaler
@@ -3065,11 +3105,11 @@ impl D3d11Renderer {
         // Keep pumping clocks/ASS/danmaku at display cadence; only suppress
         // draws whose complete visible scene already reached this surface.
         // Pending LUT work must still be polled on a paused frame.
+        let post_generation = self.post_process.generation();
         if self.gamut_lut_job.is_none()
-            && self
-                .presented_scene
-                .as_ref()
-                .is_some_and(|scene| scene.matches(frame_token, self.upscaler_mode, context))
+            && self.presented_scene.as_ref().is_some_and(|scene| {
+                scene.matches(frame_token, self.upscaler_mode, post_generation, context)
+            })
         {
             return Ok(true);
         }
@@ -3147,53 +3187,153 @@ impl D3d11Renderer {
         } else {
             None
         };
+        let post_format = if linear_target.is_some() {
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        } else {
+            SDR_SWAPCHAIN_FORMAT
+        };
+        let post_stage = self.post_process.stage();
+        let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+            (physical.width.max(1), physical.height.max(1))
+        } else {
+            (
+                target_rect.width.round().max(1.0) as u32,
+                target_rect.height.round().max(1.0) as u32,
+            )
+        };
+        let post_rtv = if self.post_process.is_enabled() {
+            let device = self.state.as_ref().expect("device ensured").device.clone();
+            self.post_process
+                .prepare(&device, post_w, post_h, post_format)
+        } else {
+            None
+        };
         let video = self.current_video.as_ref().expect("video checked");
         let state = self.state.as_ref().expect("device ensured");
         let surface = self.surface.as_ref().expect("surface ensured");
         let scene_rtv = linear_target
             .as_ref()
             .map_or(&rtv, |(linear_rtv, _)| linear_rtv);
+        let clear_color = [
+            0.0,
+            0.0,
+            0.0,
+            if self.video_alpha_mode.has_alpha() {
+                0.0
+            } else {
+                1.0
+            },
+        ];
         unsafe {
-            state.context.ClearRenderTargetView(
-                scene_rtv,
-                &[
-                    0.0,
-                    0.0,
-                    0.0,
-                    if self.video_alpha_mode.has_alpha() {
-                        0.0
-                    } else {
-                        1.0
-                    },
-                ],
-            );
+            state.context.ClearRenderTargetView(scene_rtv, &clear_color);
         }
         let draw_result: Result<()> = (|| {
-            state.draw_video(
-                video,
-                video_constants,
-                video_override.as_ref(),
-                gamut_lut.as_ref(),
-                scene_rtv,
-                target_rect,
-            )?;
-            if !overlay_draws.is_empty() {
-                // Subtitle coordinates are produced in the video-frame viewport.
-                // Composite them through the same aspect-fit viewport as the video
-                // so resizing the window cannot stretch the subtitle independently.
-                state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
-            }
-            if !danmaku_draws.is_empty() {
-                state.draw_danmaku(
-                    &danmaku_draws,
-                    scene_rtv,
-                    D3d11DrawRect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: physical.width.max(1) as f32,
-                        height: physical.height.max(1) as f32,
-                    },
+            let full_surface_rect = D3d11DrawRect {
+                x: 0.0,
+                y: 0.0,
+                width: physical.width.max(1) as f32,
+                height: physical.height.max(1) as f32,
+            };
+            if let Some(post_rtv) = post_rtv.as_ref()
+                && post_stage == PostProcessStage::Output
+            {
+                unsafe {
+                    state.context.ClearRenderTargetView(post_rtv, &clear_color);
+                }
+                state.draw_video(
+                    video,
+                    video_constants,
+                    video_override.as_ref(),
+                    gamut_lut.as_ref(),
+                    post_rtv,
+                    target_rect,
                 )?;
+                if !overlay_draws.is_empty() {
+                    state.draw_overlays(&overlay_draws, post_rtv, target_rect)?;
+                }
+                if !danmaku_draws.is_empty() {
+                    state.draw_danmaku(&danmaku_draws, post_rtv, full_surface_rect)?;
+                }
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [0.0, 0.0, post_w as f32, post_h as f32],
+                    (physical.width, physical.height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                let post_viewport = D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: post_w as f32,
+                    Height: post_h as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                };
+                self.post_process
+                    .draw(&state.context, scene_rtv, post_viewport, &post_uniforms);
+            } else {
+                if let Some(post_rtv) = post_rtv.as_ref() {
+                    unsafe {
+                        state.context.ClearRenderTargetView(post_rtv, &clear_color);
+                    }
+                    state.draw_video(
+                        video,
+                        video_constants,
+                        video_override.as_ref(),
+                        gamut_lut.as_ref(),
+                        post_rtv,
+                        D3d11DrawRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: post_w as f32,
+                            height: post_h as f32,
+                        },
+                    )?;
+                    let post_uniforms = PostProcessUniforms::new(
+                        (post_w, post_h),
+                        [
+                            target_rect.x,
+                            target_rect.y,
+                            target_rect.width,
+                            target_rect.height,
+                        ],
+                        (physical.width, physical.height),
+                        self.stats.rendered_frames as f64 / 60.0,
+                        self.stats.rendered_frames,
+                    );
+                    let post_viewport = D3D11_VIEWPORT {
+                        TopLeftX: target_rect.x,
+                        TopLeftY: target_rect.y,
+                        Width: target_rect.width.max(1.0),
+                        Height: target_rect.height.max(1.0),
+                        MinDepth: 0.0,
+                        MaxDepth: 1.0,
+                    };
+                    self.post_process.draw(
+                        &state.context,
+                        scene_rtv,
+                        post_viewport,
+                        &post_uniforms,
+                    );
+                } else {
+                    state.draw_video(
+                        video,
+                        video_constants,
+                        video_override.as_ref(),
+                        gamut_lut.as_ref(),
+                        scene_rtv,
+                        target_rect,
+                    )?;
+                }
+                if !overlay_draws.is_empty() {
+                    // Subtitle coordinates are produced in the video-frame viewport.
+                    // Composite them through the same aspect-fit viewport as the video
+                    // so resizing the window cannot stretch the subtitle independently.
+                    state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
+                }
+                if !danmaku_draws.is_empty() {
+                    state.draw_danmaku(&danmaku_draws, scene_rtv, full_surface_rect)?;
+                }
             }
             if let Some((_, linear_srv)) = linear_target.as_ref() {
                 state.draw_encode(
@@ -3241,11 +3381,18 @@ impl D3d11Renderer {
                 .as_ref()
                 .map(|cache| &cache.key.snapshot);
             if let Some(scene) = self.presented_scene.as_mut() {
-                scene.update(frame_token, self.upscaler_mode, context, alpha);
+                scene.update(
+                    frame_token,
+                    self.upscaler_mode,
+                    post_generation,
+                    context,
+                    alpha,
+                );
             } else {
                 self.presented_scene = Some(PresentedScene::new(
                     frame_token,
                     self.upscaler_mode,
+                    post_generation,
                     context,
                     alpha,
                 ));
@@ -3650,6 +3797,23 @@ impl RendererBackend for D3d11Renderer {
             Some(state) => self.upscaler.set_custom_model(&state.device, model),
             None => self.upscaler.store_custom_model(model),
         }
+    }
+
+    fn supported_upscalers(&self) -> UpscalerCapabilities {
+        let vendor = match self.state.as_ref() {
+            Some(state) => crate::renderer::d3d11_vsr::detect_vendor(&state.device),
+            None => crate::renderer::d3d11_vsr::probe_default_vendor(),
+        };
+        capabilities_for_vendor(vendor)
+    }
+
+    fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.presented_scene = None;
+        self.post_process.set_shader(shader);
+    }
+
+    fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.post_process.status_info()
     }
 
     fn composition_swapchain_ptr(&self) -> Option<*mut std::ffi::c_void> {
@@ -5313,29 +5477,34 @@ mod tests {
         let scene = PresentedScene::new(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay)),
             None,
         );
         overlay.pts = Duration::from_secs(2);
         overlay.subtitle_changed = false;
         let context = RenderFrameContext::new(Duration::from_secs(2), 1).overlay(Some(&overlay));
-        assert!(scene.matches(7, LumaUpscalerMode::Off, context));
-        assert!(!scene.matches(8, LumaUpscalerMode::Off, context));
-        assert!(!scene.matches(7, LumaUpscalerMode::ArtCnnC4F16, context));
+        assert!(scene.matches(7, LumaUpscalerMode::Off, 0, context));
+        assert!(!scene.matches(8, LumaUpscalerMode::Off, 0, context));
+        assert!(!scene.matches(7, LumaUpscalerMode::Off, 1, context));
+        assert!(!scene.matches(7, LumaUpscalerMode::ArtCnnC4F16, 0, context));
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2).overlay(Some(&overlay))
         ));
         overlay.subtitle_planes[0].rgba[0] = 0; // Includes HUD pixel changes.
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay))
         ));
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1)
         ));
     }
@@ -5376,6 +5545,7 @@ mod tests {
         let mut scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan)),
@@ -5393,9 +5563,9 @@ mod tests {
             let context = RenderFrameContext::new(overlay.pts, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan));
-            assert!(!scene.matches(token, LumaUpscalerMode::Off, context));
-            scene.update(token, LumaUpscalerMode::Off, context, None);
-            assert!(scene.matches(token, LumaUpscalerMode::Off, context));
+            assert!(!scene.matches(token, LumaUpscalerMode::Off, 0, context));
+            scene.update(token, LumaUpscalerMode::Off, 0, context, None);
+            assert!(scene.matches(token, LumaUpscalerMode::Off, 0, context));
             assert_eq!(
                 scene.overlay.as_ref().unwrap().subtitle_planes[0]
                     .rgba
@@ -5416,9 +5586,9 @@ mod tests {
         let context = RenderFrameContext::new(overlay.pts, 1)
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
-        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context, None);
-        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, 0, context));
+        scene.update(121, LumaUpscalerMode::Off, 0, context, None);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, 0, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0].rgba[0],
             17
@@ -5433,9 +5603,9 @@ mod tests {
         let context = RenderFrameContext::new(overlay.pts, 1)
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
-        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context, None);
-        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, 0, context));
+        scene.update(121, LumaUpscalerMode::Off, 0, context, None);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, 0, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0]
                 .rgba
@@ -5447,6 +5617,7 @@ mod tests {
         scene.update(
             121,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2),
             None,
         );
@@ -5454,6 +5625,7 @@ mod tests {
         assert!(scene.matches(
             121,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2)
         ));
     }
@@ -5655,6 +5827,7 @@ mod tests {
         let scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan)),
             None,
         );
@@ -5662,18 +5835,21 @@ mod tests {
         assert!(scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
         plan.items[0].rect[0] = 2.0;
         assert!(!scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
         plan.items.clear();
         assert!(!scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
     }

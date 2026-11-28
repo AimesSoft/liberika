@@ -100,6 +100,194 @@ class ApiAlignmentTests(unittest.TestCase):
                 checked.add(name)
         self.assertEqual(checked, set(declarations))
 
+    def test_swift_presenter_config_and_subtitle_style_mirrors_match_header(self):
+        header = re.sub(r"/\*.*?\*/", "", read("crates/erika_capi/include/erika.h"), flags=re.S)
+        struct_pairs = [
+            ("ErikaPresenterConfig", "ErikaPresenterConfigC"),
+            ("ErikaSubtitleStyle", "ErikaSubtitleStyleC"),
+        ]
+        for c_name, swift_name in struct_pairs:
+            c_body = re.search(rf"typedef struct {c_name} \{{(.*?)\}} {c_name};", header, re.S)[1]
+            c_fields = [
+                line.strip()
+                for line in c_body.splitlines()
+                if line.strip() and line.strip().endswith(";")
+            ]
+            for platform in ["ios", "macos", "tvos"]:
+                with self.subTest(struct=c_name, platform=platform):
+                    swift = read(f"packages/erika_flutter/{platform}/Classes/ErikaFlutterPlugin.swift")
+                    swift_body = re.search(rf"private struct {swift_name} \{{(.*?)\n\}}", swift, re.S)[1]
+                    swift_fields = re.findall(r"^\s*var\s+\w+\s*:", swift_body, re.M)
+                    self.assertEqual(len(c_fields), len(swift_fields))
+
+    def test_flutter_method_channel_coverage_and_json_bridges(self):
+        presenter_json = read("crates/erika_capi/src/presenter_json.rs")
+        json_table_block = re.search(
+            r"pub\(crate\) static JSON_METHODS: &\[JsonMethodSpec\] = &\[(.*?)\n\];",
+            presenter_json,
+            re.S,
+        )[1]
+        json_methods = set(re.findall(r'method\(\s*"([^"]+)"', json_table_block))
+
+        dart_files = sorted((ROOT / "packages/erika_flutter/lib/src").glob("*.dart"))
+        dart_source = "\n".join(path.read_text(encoding="utf-8") for path in dart_files)
+        dart_channel_methods = set(
+            re.findall(
+                r"(?:_channel\.invokeMethod(?:<[^>]+>)?|_invoke|_invokeForPlayer|_invokeOptional|_channelFrameExport(?:<[^>]+>)?)\(\s*'([^']+)'",
+                dart_source,
+            )
+        )
+        # attachOverlay is invoked through _channel.invokeMethod in erika_player.dart
+        self.assertIn("invokeJson", dart_channel_methods)
+        self.assertIn("getDiagnosticsSnapshot", dart_channel_methods)
+        self.assertIn("getLogs", dart_channel_methods)
+
+        # Every Dart invokeJson('<name>') target must exist in presenter_json.rs.
+        dart_json_targets = set(re.findall(r"invokeJson\(\s*'([^']+)'", dart_source))
+        self.assertTrue(dart_json_targets)
+        self.assertEqual(dart_json_targets - json_methods, set())
+
+        # Every OHPM ArkTS SDK invokeOrThrow('<name>') target must exist in presenter_json.rs.
+        ohos_sdk = read("packages/erika_ohos/src/main/ets/ErikaPlayer.ets")
+        ohos_sdk_targets = set(re.findall(r"invoke(?:Async)?OrThrow\(\s*'([^']+)'", ohos_sdk))
+        self.assertTrue(ohos_sdk_targets)
+        self.assertEqual(ohos_sdk_targets - json_methods, set())
+        self.assertIn("invokeJson(method: string", ohos_sdk)
+        # Exports take seconds; they must not block the ArkTS caller's thread.
+        for export in ["exportGif", "exportFrame", "exportFrames"]:
+            with self.subTest(ohos_async_export=export):
+                self.assertRegex(ohos_sdk, rf"async {export}\([^)]*\): Promise<")
+                self.assertIn(f"invokeAsyncOrThrow('{export}'", ohos_sdk)
+        for required_ohos_method in [
+            "setMuted",
+            "volume",
+            "tracks",
+            "trackSelection",
+            "chapters",
+            "container",
+            "setSubtitleStyle",
+            "setSubtitleDelay",
+            "subtitleDelay",
+            "subtitleText",
+            "loadDanmakuFile",
+            "addDanmakuTrackJson",
+            "setDanmakuConfig",
+            "sendDanmaku",
+            "exportGif",
+            "exportFrame",
+            "exportFrames",
+            "getDiagnosticsSnapshot",
+            "getLogs",
+            "listMethods",
+        ]:
+            with self.subTest(ohos_sdk_method=required_ohos_method):
+                self.assertIn(required_ohos_method, ohos_sdk_targets)
+
+        self.assertEqual(
+            read("packages/erika_flutter/ohos/src/main/cpp/presenter_bridge.h"),
+            read("packages/erika_ohos/src/main/cpp/presenter_bridge.h"),
+        )
+
+        web_dts = read("packages/erika_web/index.d.ts")
+        for token in [
+            "setMuted(muted: boolean)",
+            "getVolume():",
+            "setSubtitleDelay(seconds: number)",
+            "getSubtitleDelay(): number",
+            "clearDanmaku(): Promise<void>",
+            "blockWords?: string[]",
+            "container?: ContainerInfo | null",
+        ]:
+            with self.subTest(web_dts_token=token):
+                self.assertIn(token, web_dts)
+
+        def swift_methods(platform):
+            source = read(f"packages/erika_flutter/{platform}/Classes/ErikaFlutterPlugin.swift")
+            handled = set()
+            for line in re.findall(r"^\s*case\s+([^\n:]+):", source, re.M):
+                handled.update(re.findall(r'"([^"]+)"', line))
+            return handled
+
+        windows_source = read("packages/erika_flutter/windows/erika_flutter_plugin.cpp")
+        windows_methods = set(re.findall(r'method == "([^"]+)"', windows_source))
+
+        android_source = read(
+            "packages/erika_flutter/android/src/main/kotlin/dev/aimesoft/erika_flutter/ErikaFlutterPlugin.kt"
+        )
+        android_when = re.search(
+            r"when \(call\.method\) \{(.*?)else -> result\.notImplemented\(\)",
+            android_source,
+            re.S,
+        )[1]
+        android_native = re.search(
+            r"private val NATIVE_METHODS = setOf\((.*?)\)",
+            android_source,
+            re.S,
+        )[1]
+        android_methods = set(re.findall(r'"([^"]+)"', android_when)) | set(
+            re.findall(r'"([^"]+)"', android_native)
+        )
+
+        linux_source = read("packages/erika_flutter/linux/erika_flutter_plugin.cc")
+        linux_explicit = set(re.findall(r'method == "([^"]+)"', linux_source))
+        linux_methods = linux_explicit | json_methods
+
+        ohos_flutter_source = read(
+            "packages/erika_flutter/ohos/src/main/ets/components/plugin/ErikaFlutterPlugin.ets"
+        )
+        ohos_explicit = set(re.findall(r"call\.method === '([^']+)'", ohos_flutter_source))
+        ohos_native = re.search(
+            r"private isNativePlayerMethod\(method: string\): boolean \{(.*?)\}",
+            ohos_flutter_source,
+            re.S,
+        )[1]
+        ohos_flutter_methods = ohos_explicit | set(re.findall(r"'([^']+)'", ohos_native))
+
+        platform_handlers = {
+            "macos": swift_methods("macos"),
+            "ios": swift_methods("ios"),
+            "tvos": swift_methods("tvos"),
+            "windows": windows_methods,
+            "android": android_methods,
+            "linux": linux_methods,
+            "ohos": ohos_flutter_methods,
+        }
+
+        # Every platform must expose the shared JSON pass-through and diagnostics.
+        for platform, handled in platform_handlers.items():
+            for required in ("invokeJson", "getDiagnosticsSnapshot", "getLogs"):
+                with self.subTest(platform=platform, required=required):
+                    self.assertIn(required, handled)
+
+        # Platform-specific exemptions (e.g. FFI-based export off macOS,
+        # texture-only vs overlay-only embedders, two-step startPosition).
+        ffi_export_methods = {
+            "exportGif",
+            "exportFrame",
+            "openFrameExportSession",
+            "exportSessionFrame",
+            "closeFrameExportSession",
+        }
+        texture_methods = {"createTexture", "resizeTexture", "releaseTexture"}
+        overlay_methods = {"attachOverlay", "detachOverlay", "setOverlayFrame"}
+        intentionally_unsupported = {
+            "macos": set(),
+            "ios": ffi_export_methods | texture_methods | {"openWithStartPosition"},
+            "tvos": ffi_export_methods | texture_methods | {"openWithStartPosition"},
+            "windows": ffi_export_methods,
+            "android": ffi_export_methods | texture_methods | {"openWithStartPosition"},
+            "linux": (ffi_export_methods - {"exportFrame", "exportGif"}) | {"openWithStartPosition"},
+            "ohos": ffi_export_methods | overlay_methods | {"openWithStartPosition"},
+        }
+
+        for platform, handled in platform_handlers.items():
+            exempt = intentionally_unsupported[platform]
+            with self.subTest(platform=platform):
+                missing = dart_channel_methods - handled - exempt
+                self.assertEqual(missing, set(), f"{platform} missing Flutter channel handlers: {sorted(missing)}")
+                stale_exemptions = exempt & handled
+                self.assertEqual(stale_exemptions, set(), f"{platform} has stale exemptions: {sorted(stale_exemptions)}")
+
     @unittest.skipUnless(os.environ.get("CXX"), "Set CXX to a C++ compiler to execute NativeCreate with a fake N-API host")
     def test_native_create_preserves_config_and_legacy_default(self):
         # Load each package's actual N-API bridge into Node with an owner-checking

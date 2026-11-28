@@ -860,6 +860,7 @@ private final class ErikaNativeLibrary {
   let renderTick: RenderTickFn
   let renderTickWithTiming: RenderTickWithTimingFn?
   let captureFrameRgba: CaptureFrameRgbaFn?
+  let captureFrameRgbaWithDanmaku: CaptureFrameRgbaFn?
   let exportGif: ExportGifFn?
   let exportFrame: ExportFrameFn?
   let frameExportResultFree: FrameExportResultFreeFn?
@@ -951,6 +952,7 @@ private final class ErikaNativeLibrary {
     renderTick = try Self.load("erika_presenter_render_tick", from: libraryHandle, as: RenderTickFn.self)
     renderTickWithTiming = Self.loadOptional("erika_presenter_render_tick_with_timing", from: libraryHandle, as: RenderTickWithTimingFn.self)
     captureFrameRgba = Self.loadOptional("erika_presenter_capture_frame_rgba", from: libraryHandle, as: CaptureFrameRgbaFn.self)
+    captureFrameRgbaWithDanmaku = Self.loadOptional("erika_presenter_capture_frame_rgba_with_danmaku", from: libraryHandle, as: CaptureFrameRgbaFn.self)
     exportGif = Self.loadOptional("erika_export_gif", from: libraryHandle, as: ExportGifFn.self)
     exportFrame = Self.loadOptional("erika_export_frame", from: libraryHandle, as: ExportFrameFn.self)
     frameExportResultFree = Self.loadOptional(
@@ -2348,8 +2350,9 @@ private final class ErikaPlayerHost {
     return selection.toFlutterMap()
   }
 
-  func captureFrameRgba(width: Int, height: Int) -> Data? {
-    guard width > 0, height > 0, width <= 16384, height <= 16384, let captureFrameRgba = library.captureFrameRgba else {
+  func captureFrameRgba(width: Int, height: Int, includeDanmaku: Bool = false) -> Data? {
+    let capture = includeDanmaku ? (library.captureFrameRgbaWithDanmaku ?? library.captureFrameRgba) : library.captureFrameRgba
+    guard width > 0, height > 0, width <= 16384, height <= 16384, let captureFrameRgba = capture else {
       return nil
     }
     let byteCount = width * height * 4
@@ -2377,9 +2380,9 @@ private final class ErikaPlayerHost {
     return attachedView
   }
 
-  func screenshot(view: ErikaMetalSurfaceView? = nil, width: Int? = nil, height: Int? = nil) -> Data? {
+  func screenshot(view: ErikaMetalSurfaceView? = nil, width: Int? = nil, height: Int? = nil, includeDanmaku: Bool = false) -> Data? {
     owner.assertCurrent()
-    if let width, let height { return captureFrameRgba(width: width, height: height) }
+    if let width, let height { return captureFrameRgba(width: width, height: height, includeDanmaku: includeDanmaku) }
     return nil
   }
 
@@ -4155,12 +4158,13 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let view = try optionalVideoView(from: args, host: host)
         let width = int64Value(args["width"]).map(Int.init)
         let height = int64Value(args["height"]).map(Int.init)
+        let includeDanmaku = boolValue(args["includeDanmaku"]) ?? false
         host.enqueue(result: { [weak host, weak view] value in
           if let error = value as? FlutterError { result(error); return }
           let bytes = value as? Data ?? (view ?? host?.snapshotView())?.pngSnapshotData()
           result(bytes.map { FlutterStandardTypedData(bytes: $0) })
         }) {
-          host.screenshot(width: width, height: height)
+          host.screenshot(width: width, height: height, includeDanmaku: includeDanmaku)
         }
       case "exportGif":
         let args = try dictionaryArgs(call.arguments)

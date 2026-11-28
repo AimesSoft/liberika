@@ -1,11 +1,13 @@
 import init, {
   WebDanmaku,
+  WebSrPlanner,
   fallbackFont,
   setEmojiPainter,
   setFallbackFont,
 } from "./erika_core.js";
 import createMedia from "./media.js";
 import { Renderer } from "./renderer.js";
+import { WebGpuRenderer } from "./renderer_webgpu.js";
 import { Source } from "./source.js";
 import { supportedAudio, supportedVideo, videoPacketGate } from "./codecs.js";
 
@@ -55,6 +57,9 @@ let frames = [],
   loaded = false,
   demuxBusy = false,
   queue = Promise.resolve(),
+  srQueue = Promise.resolve(),
+  destroyed = false,
+  rendererLost = false,
   scheduled = false;
 let packet = null,
   seekTarget = 0,
@@ -63,6 +68,7 @@ let packet = null,
   subtitleDirty = true,
   subtitleScale = 1,
   subtitleSampling = 2,
+  subtitleDelay = 0,
   dpr = 1,
   danmakuDelay = 0,
   hardwareDecode = true;
@@ -80,6 +86,17 @@ const enqueue = (fn) => {
   queue = task.catch(() => {});
   return task;
 };
+const enqueueSr = (fn) => {
+  const task = srQueue.then(fn);
+  srQueue = task.catch(() => {});
+  return task;
+};
+const SR_METHODS = new Set([
+  "setUpscaler",
+  "loadUpscalerModel",
+  "clearUpscalerModel",
+  "getUpscalerStatus",
+]);
 const check = (result) => {
   if (result < 0)
     throw new Error(
@@ -296,7 +313,7 @@ async function pump() {
   } else schedulePump();
 }
 function draw(t) {
-  if (!loaded || !renderer) return;
+  if (!loaded || !renderer || rendererLost) return;
   time = Math.max(seekTarget, t);
   let chosen = null;
   while (frames.length && frames[0].timestamp / 1e6 <= time + 0.008) {
@@ -320,30 +337,35 @@ function draw(t) {
     renderer.upload(currentFrame);
   }
   renderer.begin();
-  if (!demuxBusy) {
-    const head = media._erika_subtitle_render(
-      time,
-      Math.round(renderer.width * subtitleSampling),
-      Math.round(renderer.height * subtitleSampling),
-      subtitleScale,
-    );
-    if (subtitleDirty || media._erika_subtitle_changed()) {
-      renderer.updateSubtitles(media, head, subtitleSampling);
-      subtitleDirty = false;
+  try {
+    if (!demuxBusy) {
+      const head = media._erika_subtitle_render(
+        Math.max(0, time - subtitleDelay),
+        Math.round(renderer.width * subtitleSampling),
+        Math.round(renderer.height * subtitleSampling),
+        subtitleScale,
+      );
+      if (subtitleDirty || media._erika_subtitle_changed()) {
+        renderer.updateSubtitles(media, head, subtitleSampling);
+        subtitleDirty = false;
+      }
     }
+    renderer.subtitles();
+    renderer.danmaku(
+      danmaku.frame(
+        Math.max(0, time - danmakuDelay),
+        renderer.width,
+        renderer.height,
+        dpr,
+        performance.now(),
+      ),
+    );
+  } finally {
+    renderer.end();
   }
-  renderer.subtitles();
-  renderer.danmaku(
-    danmaku.frame(
-      Math.max(0, time - danmakuDelay),
-      renderer.width,
-      renderer.height,
-      dpr,
-      performance.now(),
-    ),
-  );
   if (performance.now() - lastStats > 250) {
     lastStats = performance.now();
+    const upscaler = renderer.getUpscalerStatus();
     send("stats", {
       stats: {
         ...stats,
@@ -361,13 +383,24 @@ function draw(t) {
         subtitleImages: renderer.subtitleImages?.length || 0,
         hasVideo: !!currentFrame,
         eof,
+        renderer: renderer.backend,
+        rendererLost,
+        upscaler: {
+          mode: upscaler.requestedMode,
+          backend: upscaler.activeBackend,
+          halfFloat: upscaler.halfFloat,
+          upscaledFrames: upscaler.upscaledFrames,
+          fallbackCount: upscaler.fallbackCount,
+        },
       },
     });
   }
   schedulePump();
 }
 const methods = {
-  async init({ canvas, width, height, scale, font }) {
+  async init({ canvas, width, height, scale, font, renderer: preference = "auto" }) {
+    destroyed = false;
+    rendererLost = false;
     await init();
     setEmojiPainter(paintEmoji);
     if (font) {
@@ -378,10 +411,42 @@ const methods = {
       readSource: (offset, dest, length) =>
         source.read(media, offset, dest, length),
     });
-    renderer = new Renderer(canvas);
+    const mode = String(preference || "auto").toLowerCase();
+    if (mode !== "auto" && mode !== "webgpu" && mode !== "webgl2") {
+      throw new Error(`Unsupported renderer preference: ${preference}`);
+    }
+    if (mode !== "webgl2") {
+      try {
+        const availableModes = Array.from(WebSrPlanner.availableModes());
+        renderer = await WebGpuRenderer.create(canvas, {
+          srPlannerFactory: (capsJson) => new WebSrPlanner(capsJson),
+          availableModes,
+          onDeviceLost: ({ message }) => {
+            if (destroyed) return;
+            rendererLost = true;
+            loaded = false;
+            send("error", { message });
+          },
+        });
+      } catch (error) {
+        if (mode === "webgpu" || error?.canvasContextClaimed) throw error;
+        send("log", { message: `WebGPU unavailable, falling back to WebGL2: ${error}` });
+        renderer = null;
+      }
+    }
+    if (!renderer) {
+      if (mode === "webgpu") {
+        throw new Error("WebGPU is unavailable in this browser");
+      }
+      renderer = new Renderer(canvas);
+    }
     danmaku = new WebDanmaku();
     dpr = scale;
     renderer.size(width, height, 16, 9);
+    return {
+      renderer: renderer.backend,
+      upscaler: renderer.getUpscalerStatus(),
+    };
   },
   async open({ input, epoch, hardwareDecode: hardware = true }) {
     hardwareDecode = hardware;
@@ -436,11 +501,13 @@ const methods = {
     schedulePump();
     return {
       ...info,
+      container: info.container ?? null,
       videoTrack: videoTrack.id,
       audioTrack: audioTrack?.id ?? null,
       subtitleTrack: sub?.id ?? null,
       decoder: videoConfig.codec,
       backend: "webcodecs",
+      renderer: renderer.backend,
       hardwarePreference: videoConfig.hardwareAcceleration,
     };
   },
@@ -485,14 +552,20 @@ const methods = {
   async danmaku({ text }) {
     return danmaku.append(text);
   },
+  async clearDanmaku() {
+    if (typeof danmaku.clear === "function") danmaku.clear();
+    else danmaku.load("[]");
+  },
   async configure({ config }) {
     if (Number.isFinite(config.delay)) danmakuDelay = Math.max(-60, Math.min(60, config.delay));
     danmaku.configure(JSON.stringify(config), performance.now());
   },
-  async subtitleOptions({ scale, supersampling }) {
+  async subtitleOptions({ scale, supersampling, delay }) {
     if (Number.isFinite(scale))
       subtitleScale = Math.max(0.25, Math.min(4, scale));
     if (supersampling !== undefined) subtitleSampling = supersampling ? 2 : 1;
+    if (Number.isFinite(delay))
+      subtitleDelay = Math.max(-600, Math.min(600, delay));
     subtitleDirty = true;
   },
   async sendDanmaku({ text, color, seconds }) {
@@ -501,6 +574,22 @@ const methods = {
       Math.max(0, seconds + 0.2 - danmakuDelay),
       Number.isInteger(color) ? color & 0xffffff : undefined,
     );
+  },
+  async setUpscaler({ mode }) {
+    if (!renderer) throw new Error("Renderer is not initialized");
+    return renderer.setUpscaler(mode);
+  },
+  async loadUpscalerModel({ name, data }) {
+    if (!renderer) throw new Error("Renderer is not initialized");
+    return renderer.loadUpscalerModel(name, data);
+  },
+  async clearUpscalerModel() {
+    if (!renderer) throw new Error("Renderer is not initialized");
+    renderer.clearUpscalerModel();
+  },
+  async getUpscalerStatus() {
+    if (!renderer) throw new Error("Renderer is not initialized");
+    return renderer.getUpscalerStatus();
   },
   async capture({ width, seconds }) {
     if (!loaded) throw new Error("No media to capture");
@@ -524,8 +613,10 @@ const methods = {
     renderer.clearSubtitles();
     renderer.hasVideo = false;
     renderer.begin();
+    renderer.end();
   },
   async destroy() {
+    destroyed = true;
     loaded = false;
     generation++;
     disposeDecoders();
@@ -566,7 +657,13 @@ onmessage = ({ data }) => {
     });
     return;
   }
-  enqueue(() => method(data)).then(
+  const schedule = SR_METHODS.has(data.type) ? enqueueSr : enqueue;
+  schedule(() => {
+    if (destroyed && data.type !== "destroy") {
+      throw new Error("Player is disposed");
+    }
+    return method(data);
+  }).then(
     (result) => send("reply", { requestId: data.requestId, result }),
     (error) =>
       send("reply", { requestId: data.requestId, error: String(error) }),

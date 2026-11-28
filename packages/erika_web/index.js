@@ -33,13 +33,15 @@ function crossOrigin(url) {
 }
 
 /** liberika browser backend: one player owns demux, WebCodecs, libass, danmaku
- * and WebGL presentation. Serve this package unchanged over HTTPS/localhost. */
+ * and WebGPU (with automatic WebGL2 fallback) presentation. Serve this package
+ * unchanged over HTTPS/localhost. */
 export class Player extends EventTarget {
   static async create({
     canvas,
     volume = 1,
     audioSession,
     fallbackFont,
+    renderer = "auto",
     workerURL,
   } = {}) {
     if (!canvas?.transferControlToOffscreen)
@@ -49,11 +51,17 @@ export class Player extends EventTarget {
     const player = new Player(canvas, volume, audioSession, workerURL);
     const offscreen = canvas.transferControlToOffscreen();
     try {
-      await player.request(
+      const initResult = await player.request(
         "init",
-        { canvas: offscreen, ...player.size(), font: fallbackFont },
+        {
+          canvas: offscreen,
+          ...player.size(),
+          font: fallbackFont,
+          renderer,
+        },
         [offscreen],
       );
+      player.renderer = initResult?.renderer || "webgl2";
       player.observe();
       return player;
     } catch (e) {
@@ -74,6 +82,7 @@ export class Player extends EventTarget {
     this.disposed = false;
     this.position = 0;
     this.info = null;
+    this.renderer = "webgl2";
     this.stats = {};
     this.audioBufferedUntil = 0;
     this.eof = false;
@@ -87,8 +96,11 @@ export class Player extends EventTarget {
     });
     this.audio.addEventListener("error", (event) => this.fail(event.detail));
     this.audio.addEventListener("blocked", () => this.dispatchEvent(new Event("playblocked")));
+    this._volume = Math.max(0, Math.min(1, Number.isFinite(volume) ? volume : 1));
+    this._muted = false;
+    this._subtitleDelay = 0;
     this.gain = this.context.createGain();
-    this.gain.gain.value = Math.max(0, Math.min(1, volume));
+    this.gain.gain.value = this._volume;
     this.gain.connect(this.context.destination);
     this.resetClock(0);
     this.worker.onmessage = (event) => this.message(event.data);
@@ -321,8 +333,27 @@ export class Player extends EventTarget {
   addDanmaku(text) {
     return this.request("danmaku", { text });
   }
+  clearDanmaku() {
+    return this.request("clearDanmaku");
+  }
   sendDanmaku(text, color) {
     return this.request("sendDanmaku", { text, color, seconds: this.currentTime });
+  }
+  setUpscaler(mode) {
+    return this.request("setUpscaler", { mode });
+  }
+  loadUpscalerModel(name, data) {
+    const payload =
+      typeof data === "string"
+        ? new TextEncoder().encode(data)
+        : new Uint8Array(data);
+    return this.request("loadUpscalerModel", { name, data: payload });
+  }
+  clearUpscalerModel() {
+    return this.request("clearUpscalerModel");
+  }
+  getUpscalerStatus() {
+    return this.request("getUpscalerStatus");
   }
   capture(width) {
     return this.request("capture", { width, seconds: this.currentTime });
@@ -339,14 +370,39 @@ export class Player extends EventTarget {
     return this.request("configure", { config });
   }
   configureSubtitles(config) {
+    if (config && Number.isFinite(config.delay)) {
+      this._subtitleDelay = Math.max(-600, Math.min(600, config.delay));
+    }
     return this.request("subtitleOptions", config);
+  }
+  setSubtitleDelay(seconds) {
+    if (!Number.isFinite(seconds)) throw new Error("Invalid subtitle delay");
+    this._subtitleDelay = Math.max(-600, Math.min(600, seconds));
+    return this.request("subtitleOptions", { delay: this._subtitleDelay });
+  }
+  getSubtitleDelay() {
+    return this._subtitleDelay;
   }
   addFont(name, data) {
     return this.request("font", { name, data: new Uint8Array(data) });
   }
+  get volume() {
+    return this._volume;
+  }
+  get muted() {
+    return this._muted;
+  }
   setVolume(volume) {
     if (!Number.isFinite(volume)) throw new Error("Invalid volume");
-    this.gain.gain.value = Math.max(0, Math.min(1, volume));
+    this._volume = Math.max(0, Math.min(1, volume));
+    this.gain.gain.value = this._muted ? 0 : this._volume;
+  }
+  setMuted(muted) {
+    this._muted = Boolean(muted);
+    this.gain.gain.value = this._muted ? 0 : this._volume;
+  }
+  getVolume() {
+    return { volume: this._volume, muted: this._muted };
   }
   async setRate(rate) {
     if (!Number.isFinite(rate) || rate < 0.25 || rate > 4)

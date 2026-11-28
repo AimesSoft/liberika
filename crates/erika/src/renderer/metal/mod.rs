@@ -23,11 +23,20 @@ use crate::renderer::output::{
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 mod apple;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+mod post_process;
 // Public for integration tests (numeric verification against ONNX
 // references); not part of the stable API surface.
 #[doc(hidden)]
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub mod upscaler;
+
+/// Probes upscaler and post-processing capabilities for the default Metal GPU
+/// when no renderer instance has been created yet.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub fn probe_default_upscalers() -> crate::renderer::pipeline::UpscalerCapabilities {
+    apple::probe_default_upscalers()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClearColor {
@@ -1248,6 +1257,42 @@ impl RendererBackend for MetalRenderer {
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
             let _ = model;
+        }
+    }
+
+    fn supported_upscalers(&self) -> crate::renderer::pipeline::UpscalerCapabilities {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.supported_upscalers()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            crate::renderer::pipeline::UpscalerCapabilities::default()
+        }
+    }
+
+    fn set_post_process_shader(
+        &mut self,
+        shader: Option<std::sync::Arc<crate::renderer::post_process::PostProcessShader>>,
+    ) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.set_post_process_shader(shader);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let _ = shader;
+        }
+    }
+
+    fn post_process_status(&self) -> crate::renderer::post_process::PostProcessRuntimeInfo {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.post_process_status()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            crate::renderer::post_process::PostProcessRuntimeInfo::default()
         }
     }
 

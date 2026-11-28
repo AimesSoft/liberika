@@ -58,7 +58,25 @@ use crate::renderer::output::{
     ActiveOutputEncoding, OutputDescription, OutputFallbackReason, OutputMode, OutputRuntimeStatus,
     OutputSurfaceFormat,
 };
-use crate::renderer::pipeline::{LumaUpscalerMode, SourceColorState, VideoRenderPipeline};
+use crate::renderer::pipeline::{
+    LumaUpscalerMode, SourceColorState, UpscalerCapabilities, VideoRenderPipeline,
+};
+use crate::renderer::post_process::{
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
+};
+use crate::renderer::wgpu_post_process::WgpuPostProcess;
+
+/// Lightweight default capabilities reported on wgpu platforms before a
+/// `WgpuRenderer` adapter has been initialized. Once a renderer exists,
+/// [`RendererBackend::supported_upscalers`] reflects the probed adapter
+/// capabilities.
+pub fn probe_default_upscalers() -> UpscalerCapabilities {
+    UpscalerCapabilities {
+        modes: UpscalerCapabilities::bundled_portable_modes(),
+        supports_custom_network: true,
+        supports_post_process: true,
+    }
+}
 use crate::renderer::presentation::{PresentationLayout, PresentationRect};
 use crate::renderer::wgpu_sr::{
     Input as WgpuArtCnnInput, InputKind as WgpuArtCnnInputKind, Status as WgpuArtCnnStatus,
@@ -599,6 +617,7 @@ pub struct WgpuRenderer {
     upscaler_mode: LumaUpscalerMode,
     custom_upscaler_model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
     upscaler: WgpuArtCnn,
+    post_process: WgpuPostProcess,
     upscaler_failed_frame_token: Option<u64>,
     upscaler_active_frame_reported: bool,
     cpu_video_frame_fallback_reported: bool,
@@ -1831,6 +1850,7 @@ impl WgpuRenderer {
             gamut_lut_job: None,
             dummy_lut: None,
             upscaler,
+            post_process: WgpuPostProcess::default(),
             upscaler_failed_frame_token: None,
             upscaler_active_frame_reported: false,
             cpu_video_frame_fallback_reported: false,
@@ -1861,6 +1881,7 @@ impl WgpuRenderer {
         )?;
         replacement.set_custom_upscaler_model(self.custom_upscaler_model.clone());
         replacement.set_luma_upscaler(self.upscaler_mode);
+        replacement.set_post_process_shader(self.post_process.shader());
         replacement.upload_serial = self.upload_serial;
         if let Some((frame, uniforms, color)) = self.linux_frame.as_ref() {
             replacement.upload_planar_with_context(frame.clone(), *uniforms, *color)?;
@@ -3323,6 +3344,23 @@ impl WgpuRenderer {
             Some(view) => wgpu::BindingResource::TextureView(view),
             None => wgpu::BindingResource::TextureView(&dummy_lut_view.expect("dummy LUT view")),
         };
+        let video_format = self
+            .video_pipeline
+            .as_ref()
+            .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?
+            .format;
+        let post_stage = self.post_process.stage();
+        let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+            (target_width.max(1), target_height.max(1))
+        } else {
+            (
+                viewport.width.round().max(1.0) as u32,
+                viewport.height.round().max(1.0) as u32,
+            )
+        };
+        let post_active = self
+            .post_process
+            .prepare(&self.device, post_w, post_h, video_format);
         let pipeline = self
             .video_pipeline
             .as_ref()
@@ -3366,7 +3404,126 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("erika-wgpu-video-encoder"),
             });
-        {
+        let clear_color = if self.video_alpha_mode.has_alpha() {
+            wgpu::Color::TRANSPARENT
+        } else {
+            wgpu::Color::BLACK
+        };
+        let mut overlays_composited = false;
+        if post_active && let Some(post_src_view) = self.post_process.source_view() {
+            if post_stage == PostProcessStage::Output {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("erika-wgpu-output-post-src-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_src_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear_color),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.set_viewport(
+                        viewport.x,
+                        viewport.y,
+                        viewport.width,
+                        viewport.height,
+                        0.0,
+                        1.0,
+                    );
+                    pass.draw(0..3, 0..1);
+                    if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
+                        let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
+                            PlayerError::Renderer("overlay pipeline not initialized".to_string())
+                        })?;
+                        pass.set_pipeline(&overlay_pipeline.pipeline);
+                        pass.set_viewport(
+                            viewport.x,
+                            viewport.y,
+                            viewport.width,
+                            viewport.height,
+                            0.0,
+                            1.0,
+                        );
+                        for draw in &overlay_draws {
+                            pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
+                            pass.draw(0..4, 0..1);
+                        }
+                        pass.set_viewport(
+                            0.0,
+                            0.0,
+                            target_width as f32,
+                            target_height as f32,
+                            0.0,
+                            1.0,
+                        );
+                        self.encode_danmaku_draws(&mut pass, &danmaku_draws);
+                    }
+                }
+                overlays_composited = true;
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [0.0, 0.0, target_width as f32, target_height as f32],
+                    (target_width, target_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                self.post_process.encode_pass(
+                    &self.device,
+                    &mut encoder,
+                    target_view,
+                    clear_color,
+                    (0.0, 0.0, target_width as f32, target_height as f32),
+                    &post_uniforms,
+                );
+            } else {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("erika-wgpu-video-post-src-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_src_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear_color),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.set_viewport(0.0, 0.0, post_w as f32, post_h as f32, 0.0, 1.0);
+                    pass.draw(0..3, 0..1);
+                }
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [viewport.x, viewport.y, viewport.width, viewport.height],
+                    (target_width, target_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                self.post_process.encode_pass(
+                    &self.device,
+                    &mut encoder,
+                    target_view,
+                    clear_color,
+                    (viewport.x, viewport.y, viewport.width, viewport.height),
+                    &post_uniforms,
+                );
+            }
+        } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("erika-wgpu-video-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3374,11 +3531,7 @@ impl WgpuRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(if self.video_alpha_mode.has_alpha() {
-                            wgpu::Color::TRANSPARENT
-                        } else {
-                            wgpu::Color::BLACK
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3400,7 +3553,7 @@ impl WgpuRenderer {
             pass.draw(0..3, 0..1);
         }
 
-        if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
+        if !overlays_composited && (!overlay_draws.is_empty() || !danmaku_draws.is_empty()) {
             let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
                 PlayerError::Renderer("overlay pipeline not initialized".to_string())
             })?;
@@ -5387,6 +5540,27 @@ impl RendererBackend for WgpuRenderer {
         )
     }
 
+    fn supported_upscalers(&self) -> UpscalerCapabilities {
+        let supported = self.upscaler.capability().supported;
+        UpscalerCapabilities {
+            modes: if supported {
+                UpscalerCapabilities::bundled_portable_modes()
+            } else {
+                Vec::new()
+            },
+            supports_custom_network: supported,
+            supports_post_process: true,
+        }
+    }
+
+    fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.post_process.set_shader(shader);
+    }
+
+    fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.post_process.status_info()
+    }
+
     fn set_output_headroom(&mut self, headroom: f32, known: bool) {
         self.update_output_headroom_state(OutputHeadroomState::reported(headroom, known), true);
     }
@@ -5463,6 +5637,7 @@ pub struct AndroidRecoveringWgpuRenderer {
     upscaler_mode: LumaUpscalerMode,
     retired_stats: RendererRuntimeStats,
     custom_upscaler_model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    post_process_shader: Option<std::sync::Arc<PostProcessShader>>,
     retired_output_status: OutputRuntimeStatus,
     terminal_failure: Option<String>,
     recovery_sequence: u64,
@@ -5493,6 +5668,7 @@ impl AndroidRecoveringWgpuRenderer {
             upscaler_mode: LumaUpscalerMode::Off,
             retired_stats: RendererRuntimeStats::default(),
             custom_upscaler_model: None,
+            post_process_shader: None,
             retired_output_status: OutputRuntimeStatus::requested(config.output_mode),
             terminal_failure: None,
             recovery_sequence: 0,
@@ -5693,6 +5869,8 @@ impl AndroidRecoveringWgpuRenderer {
         self.active
             .set_custom_upscaler_model(self.custom_upscaler_model.clone());
         self.active.set_luma_upscaler(self.upscaler_mode);
+        self.active
+            .set_post_process_shader(self.post_process_shader.clone());
         self.active
             .update_output_headroom_state(self.output_headroom, false);
 
@@ -6006,6 +6184,19 @@ impl RendererBackend for AndroidRecoveringWgpuRenderer {
 
     fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
         self.active.upscaler_status_detail()
+    }
+
+    fn supported_upscalers(&self) -> UpscalerCapabilities {
+        self.active.supported_upscalers()
+    }
+
+    fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.post_process_shader = shader.clone();
+        self.active.set_post_process_shader(shader);
+    }
+
+    fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.active.post_process_status()
     }
 
     fn set_output_headroom(&mut self, headroom: f32, known: bool) {

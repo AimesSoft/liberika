@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <future>
 #include <iomanip>
+#include <locale>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -74,6 +75,12 @@ class PluginError : public std::runtime_error {
 
  private:
   std::string message_;
+};
+
+class UnsupportedPluginError : public PluginError {
+ public:
+  explicit UnsupportedPluginError(std::string message)
+      : PluginError(std::move(message)) {}
 };
 
 void CheckHResult(HRESULT result, const char* operation) {
@@ -589,6 +596,167 @@ std::string RequiredString(const EncodableMap& args, const char* name) {
   return *value;
 }
 
+uint64_t ParseNonNegativeU64(const EncodableValue* raw,
+                             const char* name,
+                             uint64_t default_value) {
+  if (raw == nullptr || std::holds_alternative<std::monostate>(*raw)) {
+    return default_value;
+  }
+  if (const auto* value = std::get_if<int32_t>(raw)) {
+    if (*value < 0) {
+      throw PluginError(std::string(name) + " must be non-negative.");
+    }
+    return static_cast<uint64_t>(*value);
+  }
+  if (const auto* value = std::get_if<int64_t>(raw)) {
+    if (*value < 0) {
+      throw PluginError(std::string(name) + " must be non-negative.");
+    }
+    return static_cast<uint64_t>(*value);
+  }
+  throw PluginError(std::string(name) + " must be a non-negative integer.");
+}
+
+int32_t ParseLogLevel(const EncodableValue* raw) {
+  if (raw == nullptr || std::holds_alternative<std::monostate>(*raw)) {
+    return -1;
+  }
+  const auto* level = std::get_if<std::string>(raw);
+  if (level == nullptr) {
+    throw PluginError("minLevel must be a string.");
+  }
+  if (*level == "trace") return ErikaLogLevel_Trace;
+  if (*level == "debug") return ErikaLogLevel_Debug;
+  if (*level == "info") return ErikaLogLevel_Info;
+  if (*level == "warn") return ErikaLogLevel_Warn;
+  if (*level == "error") return ErikaLogLevel_Error;
+  throw PluginError("minLevel must be one of trace, debug, info, warn, error.");
+}
+
+void AppendJsonString(std::string& out, const std::string& value) {
+  out.push_back('"');
+  static constexpr char kHex[] = "0123456789abcdef";
+  for (unsigned char byte : value) {
+    switch (byte) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (byte < 0x20) {
+          out += "\\u00";
+          out.push_back(kHex[(byte >> 4) & 0x0f]);
+          out.push_back(kHex[byte & 0x0f]);
+        } else {
+          out.push_back(static_cast<char>(byte));
+        }
+        break;
+    }
+  }
+  out.push_back('"');
+}
+
+void AppendJsonValue(std::string& out,
+                     const EncodableValue& value,
+                     int depth = 0) {
+  if (depth > 64) {
+    throw PluginError("arguments JSON nesting is too deep.");
+  }
+  if (std::holds_alternative<std::monostate>(value)) {
+    out += "null";
+    return;
+  }
+  if (const auto* b = std::get_if<bool>(&value)) {
+    out += *b ? "true" : "false";
+    return;
+  }
+  if (const auto* i32 = std::get_if<int32_t>(&value)) {
+    out += std::to_string(*i32);
+    return;
+  }
+  if (const auto* i64 = std::get_if<int64_t>(&value)) {
+    out += std::to_string(*i64);
+    return;
+  }
+  if (const auto* d = std::get_if<double>(&value)) {
+    if (!std::isfinite(*d)) {
+      throw PluginError("arguments must contain only finite numbers.");
+    }
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream << std::setprecision(17) << *d;
+    out += stream.str();
+    return;
+  }
+  if (const auto* s = std::get_if<std::string>(&value)) {
+    AppendJsonString(out, *s);
+    return;
+  }
+  if (const auto* list = std::get_if<EncodableList>(&value)) {
+    out.push_back('[');
+    for (size_t i = 0; i < list->size(); ++i) {
+      if (i > 0) out.push_back(',');
+      AppendJsonValue(out, (*list)[i], depth + 1);
+    }
+    out.push_back(']');
+    return;
+  }
+  if (const auto* map = std::get_if<EncodableMap>(&value)) {
+    out.push_back('{');
+    bool first = true;
+    for (const auto& entry : *map) {
+      const auto* key = std::get_if<std::string>(&entry.first);
+      if (key == nullptr) {
+        throw PluginError("arguments map keys must be strings.");
+      }
+      if (!first) out.push_back(',');
+      first = false;
+      AppendJsonString(out, *key);
+      out.push_back(':');
+      AppendJsonValue(out, entry.second, depth + 1);
+    }
+    out.push_back('}');
+    return;
+  }
+  throw PluginError("arguments must be JSON-compatible.");
+}
+
+std::string SerializeJsonObject(const EncodableMap& map) {
+  std::string out;
+  out.push_back('{');
+  bool first = true;
+  for (const auto& entry : map) {
+    const auto* key = std::get_if<std::string>(&entry.first);
+    if (key == nullptr) {
+      throw PluginError("arguments map keys must be strings.");
+    }
+    if (!first) out.push_back(',');
+    first = false;
+    AppendJsonString(out, *key);
+    out.push_back(':');
+    AppendJsonValue(out, entry.second, 1);
+  }
+  out.push_back('}');
+  return out;
+}
+
 int64_t OptionalTrackId(const EncodableValue* value) {
   const auto track_id = Int64Value(value);
   if (!track_id || *track_id < 0) {
@@ -887,6 +1055,11 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   using PollEventFn = ErikaStatus (*)(ErikaPresenterHandle*, ErikaEvent*);
   using CaptureFrameFn = ErikaStatus (*)(ErikaPresenterHandle*, uint32_t,
                                         uint32_t, uint8_t*, uintptr_t);
+  using InvokeJsonFn =
+      char* (*)(ErikaPresenterHandle*, const char*, const char*);
+  using GetDiagnosticsJsonFn = ErikaStatus (*)(ErikaPresenterHandle*, char**);
+  using LogReadJsonFn =
+      ErikaStatus (*)(uint32_t, int32_t, uint64_t, char**);
   using LastErrorMessageFn = char* (*)();
   using StringFreeFn = void (*)(char*);
 
@@ -922,6 +1095,33 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
       return create_with_output_mode(config.output_mode, config.edr_headroom);
     }
     return create();
+  }
+
+  std::string TakeOwnedString(char* raw) const {
+    if (raw == nullptr) {
+      return {};
+    }
+    std::string copy(raw);
+    if (string_free != nullptr) {
+      string_free(raw);
+    }
+    return copy;
+  }
+
+  std::string ReadLogsJson(uint32_t limit,
+                           int32_t min_level,
+                           uint64_t since_seq) const {
+    if (log_read_json == nullptr) {
+      throw UnsupportedPluginError(
+          "The loaded erika_capi.dll does not export erika_log_read_json.");
+    }
+    char* raw = nullptr;
+    Check(log_read_json(limit, min_level, since_seq, &raw),
+          "erika_log_read_json", TakeLastError());
+    if (raw == nullptr) {
+      throw PluginError("erika_log_read_json returned no JSON.");
+    }
+    return TakeOwnedString(raw);
   }
 
   std::string TakeLastError() const {
@@ -1013,6 +1213,10 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
   GetPresenterStatsFn get_presenter_stats = nullptr;
   PollEventFn poll_event = nullptr;
   CaptureFrameFn capture_frame = nullptr;
+  CaptureFrameFn capture_frame_with_danmaku = nullptr;
+  InvokeJsonFn invoke_json = nullptr;
+  GetDiagnosticsJsonFn get_diagnostics_json = nullptr;
+  LogReadJsonFn log_read_json = nullptr;
   LastErrorMessageFn last_error_message = nullptr;
   StringFreeFn string_free = nullptr;
 
@@ -1138,6 +1342,12 @@ struct ErikaFlutterPlugin::ErikaNativeLibrary {
     get_presenter_stats = LoadOptional<GetPresenterStatsFn>("erika_presenter_get_stats");
     poll_event = LoadRequired<PollEventFn>("erika_presenter_poll_event");
     capture_frame = LoadOptional<CaptureFrameFn>("erika_presenter_capture_frame_rgba");
+    capture_frame_with_danmaku = LoadOptional<CaptureFrameFn>(
+        "erika_presenter_capture_frame_rgba_with_danmaku");
+    invoke_json = LoadOptional<InvokeJsonFn>("erika_presenter_invoke_json");
+    get_diagnostics_json = LoadOptional<GetDiagnosticsJsonFn>(
+        "erika_presenter_get_diagnostics_json");
+    log_read_json = LoadOptional<LogReadJsonFn>("erika_log_read_json");
     last_error_message =
         LoadOptional<LastErrorMessageFn>("erika_last_error_message");
     string_free = LoadOptional<StringFreeFn>("erika_string_free");
@@ -2585,7 +2795,12 @@ struct ErikaFlutterPlugin::PlayerHost {
   }
 
   EncodableValue Screenshot(const EncodableMap& args) {
-    if (!library->capture_frame) return EncodableValue();
+    const bool include_danmaku =
+        BoolValue(FindArg(args, "includeDanmaku")).value_or(false);
+    const auto capture = include_danmaku && library->capture_frame_with_danmaku
+                             ? library->capture_frame_with_danmaku
+                             : library->capture_frame;
+    if (!capture) return EncodableValue();
     const int64_t width_arg = Int64Value(FindArg(args, "width")).value_or(native_width);
     const int64_t height_arg = Int64Value(FindArg(args, "height")).value_or(native_height);
     if (width_arg <= 0 || height_arg <= 0 || width_arg > UINT32_MAX ||
@@ -2596,7 +2811,7 @@ struct ErikaFlutterPlugin::PlayerHost {
     const auto width = static_cast<UINT>(width_arg);
     const auto height = static_cast<UINT>(height_arg);
     std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
-    const auto capture_status = library->capture_frame(
+    const auto capture_status = capture(
         handle, width, height, rgba.data(), rgba.size());
     if (capture_status != ErikaStatus_Ok) {
       // Some runtimes export capture while their D3D11 backend has no capture
@@ -2634,6 +2849,34 @@ struct ErikaFlutterPlugin::PlayerHost {
     CheckHResult(stream->Seek(start, STREAM_SEEK_SET, nullptr), "Rewind PNG stream");
     CheckHResult(stream->Read(png.data(), static_cast<ULONG>(png.size()), nullptr), "Read PNG");
     return EncodableValue(std::move(png));
+  }
+
+  std::string DiagnosticsSnapshotJson() {
+    if (!library->get_diagnostics_json) {
+      throw UnsupportedPluginError(
+          "The loaded erika_capi.dll does not export erika_presenter_get_diagnostics_json.");
+    }
+    char* raw = nullptr;
+    CheckNative(library->get_diagnostics_json(handle, &raw),
+                "erika_presenter_get_diagnostics_json");
+    if (raw == nullptr) {
+      throw PluginError("erika_presenter_get_diagnostics_json returned no JSON.");
+    }
+    return library->TakeOwnedString(raw);
+  }
+
+  std::string InvokeJson(const std::string& method_name,
+                         const std::string& arguments_json) {
+    if (!library->invoke_json) {
+      throw UnsupportedPluginError(
+          "The loaded erika_capi.dll does not export erika_presenter_invoke_json.");
+    }
+    char* raw = library->invoke_json(
+        handle, method_name.c_str(), arguments_json.c_str());
+    if (raw == nullptr) {
+      throw PluginError("erika_presenter_invoke_json returned no JSON.");
+    }
+    return library->TakeOwnedString(raw);
   }
 
   void PollEvents(std::vector<EncodableValue>& events) {
@@ -2917,6 +3160,7 @@ ErikaFlutterPlugin::~ErikaFlutterPlugin() {
   }
   joining_presenter_ = true;
   players_.clear();
+  log_worker_.reset();
   // At engine shutdown the raster thread has stopped and its registrar is no
   // longer callable. Keep publications alive through presenter detachment.
   textures_.clear();
@@ -3238,6 +3482,13 @@ LRESULT CALLBACK ErikaFlutterPlugin::FrameMessageWindowProc(HWND hwnd,
   return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
+ErikaPresenterWorker& ErikaFlutterPlugin::EnsureLogWorker() {
+  if (!log_worker_) {
+    log_worker_ = std::make_unique<ErikaPresenterWorker>();
+  }
+  return *log_worker_;
+}
+
 void ErikaFlutterPlugin::PostCompletion(std::function<void()> completion) {
   std::lock_guard<std::mutex> lock(completion_mutex_);
   completions_.push_back(std::move(completion));
@@ -3292,6 +3543,7 @@ std::optional<LRESULT> ErikaFlutterPlugin::OnTopLevelWindowProc(
     DebugLog("window shutdown presenters");
     joining_presenter_ = true;
     players_.clear();  // Join before the owning HWND is destroyed.
+    log_worker_.reset();
     DebugLog("window shutdown overlay");
     joining_presenter_ = false;
     overlay_window_.reset();
@@ -3641,8 +3893,14 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
   struct Reply {
     EncodableValue value;
     bool implemented = true;
+    std::string error_code;
+    std::string error_message;
     void Success(EncodableValue reply = EncodableValue()) { value = std::move(reply); }
     void NotImplemented() { implemented = false; }
+    void Unsupported(std::string message) {
+      error_code = "ERIKA_UNSUPPORTED";
+      error_message = std::move(message);
+    }
   };
   auto reply = std::make_shared<Reply>();
   const int64_t id = host.id;
@@ -3885,6 +4143,34 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
       result->Success(host.Tracks());
     } else if (method == "screenshot") {
       result->Success(host.Screenshot(args));
+    } else if (method == "getDiagnosticsSnapshot") {
+      try {
+        result->Success(EncodableValue(host.DiagnosticsSnapshotJson()));
+      } catch (const UnsupportedPluginError& error) {
+        result->Unsupported(SafeUtf8Message(error.what()));
+      }
+    } else if (method == "invokeJson") {
+      const std::string target_method = RequiredString(args, "method");
+      if (target_method.empty() ||
+          target_method.find('\0') != std::string::npos) {
+        throw PluginError("method is required.");
+      }
+      std::string arguments_json = "{}";
+      if (const auto* raw_args = FindArg(args, "arguments");
+          raw_args != nullptr &&
+          !std::holds_alternative<std::monostate>(*raw_args)) {
+        const auto* arg_map = std::get_if<EncodableMap>(raw_args);
+        if (arg_map == nullptr) {
+          throw PluginError("arguments must be a map.");
+        }
+        arguments_json = SerializeJsonObject(*arg_map);
+      }
+      try {
+        result->Success(
+            EncodableValue(host.InvokeJson(target_method, arguments_json)));
+      } catch (const UnsupportedPluginError& error) {
+        result->Unsupported(SafeUtf8Message(error.what()));
+      }
 
     } else {
       result->NotImplemented();
@@ -3896,6 +4182,10 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
     if (!error.empty()) {
       DebugLog("method " + method + " failed: " + error);
       platform_result->Error("ERIKA_ERROR", error);
+    } else if (!reply->error_code.empty()) {
+      DebugLog("method " + method + " unsupported: " + reply->error_message);
+      platform_result->Error(reply->error_code, reply->error_message);
+      return;
     } else if (!reply->implemented) {
       platform_result->NotImplemented();
       return;
@@ -3904,7 +4194,8 @@ void ErikaFlutterPlugin::DispatchNativeMethod(
         SetActivePlayer(id);
       platform_result->Success(value);
     }
-    if (method != "getPresenterStats") {
+    if (method != "getPresenterStats" && method != "getDiagnosticsSnapshot" &&
+        method != "getLogs") {
       OnFrameTimer();
     }
   });
@@ -4054,6 +4345,64 @@ void ErikaFlutterPlugin::HandleMethodCall(
       ResizeAttachedOverlay();
       OnFrameTimer();
       host.CompleteSurface(std::move(result));
+    } else if (method == "getLogs") {
+      // The log ring is process-wide; playerId is accepted but not required.
+      const uint64_t raw_limit =
+          ParseNonNegativeU64(FindArg(args, "limit"), "limit", 200);
+      const uint32_t limit = static_cast<uint32_t>(
+          std::min<uint64_t>(raw_limit, UINT32_MAX));
+      const uint64_t since_seq =
+          ParseNonNegativeU64(FindArg(args, "sinceSeq"), "sinceSeq", 0);
+      const int32_t min_level = ParseLogLevel(FindArg(args, "minLevel"));
+      auto library = ErikaNativeLibrary::Shared();
+      if (!library->log_read_json) {
+        result->Error(
+            "ERIKA_UNSUPPORTED",
+            "The loaded erika_capi.dll does not export erika_log_read_json.");
+        return;
+      }
+      EnsureFrameMessageWindow();
+      auto platform_result =
+          std::shared_ptr<flutter::MethodResult<EncodableValue>>(
+              std::move(result));
+      // `result` is empty from here on, so a failure to start the worker or
+      // queue the read must answer through platform_result, not the outer catch.
+      bool posted = false;
+      try {
+        posted = EnsureLogWorker().Post(
+          [this, library = std::move(library), limit, min_level, since_seq,
+           platform_result]() mutable {
+            std::string json;
+            std::string error_code;
+            std::string error_message;
+            try {
+              json = library->ReadLogsJson(limit, min_level, since_seq);
+            } catch (const UnsupportedPluginError& error) {
+              error_code = "ERIKA_UNSUPPORTED";
+              error_message = SafeUtf8Message(error.what());
+            } catch (const std::exception& error) {
+              error_code = "ERIKA_ERROR";
+              error_message = SafeUtf8Message(error.what());
+            }
+            PostCompletion([platform_result = std::move(platform_result),
+                            json = std::move(json),
+                            error_code = std::move(error_code),
+                            error_message = std::move(error_message)]() mutable {
+              if (!error_code.empty()) {
+                platform_result->Error(error_code, error_message);
+              } else {
+                platform_result->Success(EncodableValue(std::move(json)));
+              }
+            });
+          });
+      } catch (const std::exception& error) {
+        platform_result->Error("ERIKA_ERROR", SafeUtf8Message(error.what()));
+        return;
+      }
+      if (!posted) {
+        platform_result->Error("ERIKA_ERROR",
+                               "Erika log worker is shutting down.");
+      }
     } else {
       auto& host = PlayerFromArgs(args);
       std::shared_ptr<ColdOpenTicket> ticket;
@@ -4086,6 +4435,10 @@ void ErikaFlutterPlugin::HandleMethodCall(
       DispatchNativeMethod(host, method, args,
           std::shared_ptr<flutter::MethodResult<EncodableValue>>(std::move(result)), ticket);
     }
+  } catch (const UnsupportedPluginError& error) {
+    const auto message = SafeUtf8Message(error.what());
+    DebugLog("method " + method + " unsupported: " + message);
+    result->Error("ERIKA_UNSUPPORTED", message);
   } catch (const std::exception& error) {
     const auto message = SafeUtf8Message(error.what());
     DebugLog("method " + method + " failed: " + message);

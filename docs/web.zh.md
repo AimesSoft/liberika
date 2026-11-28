@@ -39,7 +39,7 @@ HTTP 服务访问；也可从源码构建。同一运行时以 `@aimessoft/liber
 | 音视频解码 | 浏览器 WebCodecs 接收压缩数据包 |
 | 字幕绘制 | WASM 内的补丁版 libass、FreeType、HarfBuzz、FriBidi，使用 MKV 附带字体 |
 | 弹幕绘制 | 编译为 WASM 的原生 Rust DFM 引擎 |
-| 同步与呈现 | Web Audio 输出声音并提供时钟，WebGL2 合成视频、字幕和弹幕 |
+| 同步与呈现 | Web Audio 输出声音并提供时钟，WebGPU（不可用时自动回退 WebGL2）合成视频、计算着色器超分、字幕和弹幕 |
 
 打开时会检测编码配置、profile 和尺寸是否受支持。
 默认向浏览器请求 `prefer-hardware`，再尝试 `no-preference`；
@@ -162,6 +162,7 @@ await player.configureSubtitles({ scale: 1, supersampling: true });
 | 弹幕文件 | `addDanmaku(text)` 追加弹幕，返回本次追加数量 |
 | 本地即时弹幕 | `sendDanmaku(text)` 在当前播放位置插入弹幕；网络发布由宿主处理 |
 | 弹幕偏移 | `configureDanmaku({ delay: seconds })`，范围 −60 到 60 秒，正值延后显示 |
+| 超分（WebGPU） | `setUpscaler(mode)`（`"off"`、`"fsr1"`、`"artcnn_c4f16"`、`"artcnn_c4f32"`、`"anime4k_s"`…`"anime4k_ul"`、`"custom"`）、`loadUpscalerModel(name, bytesOrGlsl)`、`clearUpscalerModel()`、`getUpscalerStatus()` |
 | 截图 | `capture(width?)` 返回含视频、字幕和弹幕的 PNG Blob |
 | 关闭与重用 | `close()` 清空当前媒体；`open()` 可在同一实例打开新源 |
 | 释放 | `destroy()` 释放 Worker、解码器、帧、GPU 资源和 AudioContext |
@@ -221,7 +222,7 @@ FFmpeg/libass WASM 模块的内存上限是 512 MiB。
 
 ## 支持边界
 
-需要浏览器同时提供 WebCodecs 视频／音频解码、OffscreenCanvas、WebGL2 和 Web Audio。
+需要浏览器同时提供 WebCodecs 视频／音频解码、OffscreenCanvas、WebGPU 或 WebGL2 和 Web Audio。
 容器包括 MP4/MOV、MKV/WebM、MPEG-TS、AVI、FLV 和 Ogg。
 编码适配涵盖 H.264/HEVC 配置记录、VP8/VP9/AV1，以及 AAC/Opus/Vorbis/MP3/FLAC/ALAC，
 具体播放能力由浏览器运行时查询决定。
@@ -231,8 +232,10 @@ FFmpeg/libass WASM 模块的内存上限是 512 MiB。
 可能暂时缺少该事件。外部完整 ASS 脚本没有这个限制。
 
 目前支持内嵌 ASS/SSA，以及外部 ASS/SSA、SRT、WebVTT；SRT/VTT 作为普通文本转为 ASS，
-不保留复杂 VTT 排版。暂不包含位图字幕、内嵌非 ASS 字幕转换、DRM、未知长度直播、
-桌面 HDR/EDR/Dolby Vision 和 ArtCNN。当前输出是 SDR，倍速也会改变音调。
+不保留复杂 VTT 排版。暂不包含位图字幕、内嵌非 ASS 字幕转换、DRM、未知长度直播及
+桌面 HDR/EDR/Dolby Vision。当前输出是 SDR，倍速也会改变音调。当浏览器启用 WebGPU
+渲染后端时，支持通过计算着色器实时运行 ArtCNN C4、Anime4K CNN、FSR 1.0 以及自定义
+`.esr` / mpv hook 超分模型；回退至 WebGL2 时以原始分辨率呈现。
 
 ## 验证
 

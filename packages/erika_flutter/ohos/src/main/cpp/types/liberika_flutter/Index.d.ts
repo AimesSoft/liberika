@@ -15,7 +15,7 @@ export const nativeLoadUpscalerModelAsync: (playerId: number, name: string, data
 export const nativeAttachSurfaceAsync: (playerId: number, surfaceId: number, width: number, height: number, scale: number) => Promise<number>;
 export const nativeResizeSurfaceAsync: (playerId: number, width: number, height: number, scale: number) => Promise<number>;
 export const nativeDetachSurfaceAsync: (playerId: number) => Promise<number>;
-export const nativeCaptureFrameAsync: (playerId: number, width: number, height: number) => Promise<Uint8Array | null>;
+export const nativeCaptureFrameAsync: (playerId: number, width: number, height: number, includeDanmaku?: boolean) => Promise<Uint8Array | null>;
 export const nativeStartFrames: (playerId: number, onEvent: (eventJson: string) => void) => void;
 export const nativeStopFrames: (playerId: number) => void;
 export const nativeSetFrameTrace: (enabled: boolean) => void;

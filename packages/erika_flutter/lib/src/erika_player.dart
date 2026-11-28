@@ -926,6 +926,50 @@ class ErikaDanmakuTrackInfo {
   }
 }
 
+class ErikaChapterInfo {
+  const ErikaChapterInfo({
+    required this.index,
+    this.title,
+    required this.start,
+    this.end,
+  });
+
+  final int index;
+  final String? title;
+  final Duration start;
+  final Duration? end;
+
+  factory ErikaChapterInfo.fromMap(Map<dynamic, dynamic> map) {
+    final endMs = (map['endMs'] as num?)?.toInt();
+    return ErikaChapterInfo(
+      index: (map['index'] as num?)?.toInt() ?? 0,
+      title: map['title'] as String?,
+      start: Duration(milliseconds: (map['startMs'] as num?)?.toInt() ?? 0),
+      end: endMs == null ? null : Duration(milliseconds: endMs),
+    );
+  }
+}
+
+class ErikaContainerInfo {
+  const ErikaContainerInfo({
+    this.format,
+    this.bitRate,
+    required this.mediaOpen,
+  });
+
+  final String? format;
+  final int? bitRate;
+  final bool mediaOpen;
+
+  factory ErikaContainerInfo.fromMap(Map<dynamic, dynamic> map) {
+    return ErikaContainerInfo(
+      format: map['format'] as String?,
+      bitRate: (map['bitRate'] as num?)?.toInt(),
+      mediaOpen: map['mediaOpen'] == true,
+    );
+  }
+}
+
 class _ErikaDanmakuConfigPatch {
   _ErikaDanmakuConfigPatch({
     this.enabled,
@@ -1466,6 +1510,21 @@ class ErikaPlayer {
     }
   }
 
+  /// The subtitle delay currently in force; null when this native library
+  /// cannot report it.
+  Future<Duration?> getSubtitleDelay() async {
+    try {
+      final reply = await invokeJson('subtitleDelay');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      if (value is! Map) return null;
+      final micros = value['delayMicros'];
+      return micros is num ? Duration(microseconds: micros.toInt()) : null;
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
   /// What the subtitles say now, the delay applied: the text cues showing
   /// (ASS dialogue without its override tags; bitmap subtitles have none),
   /// joined by line breaks. Null when this native library cannot tell.
@@ -1880,13 +1939,19 @@ class ErikaPlayer {
     });
   }
 
-  Future<Uint8List?> screenshot({int? viewId, int? width, int? height}) async {
+  Future<Uint8List?> screenshot({
+    int? viewId,
+    int? width,
+    int? height,
+    bool includeDanmaku = false,
+  }) async {
     final playerId = await ensureCreated();
     return _channel.invokeMethod<Uint8List>('screenshot', <String, Object?>{
       'playerId': playerId,
       if (viewId != null) 'viewId': viewId,
       if (width != null) 'width': width,
       if (height != null) 'height': height,
+      if (includeDanmaku) 'includeDanmaku': true,
     });
   }
 
@@ -2149,6 +2214,35 @@ class ErikaPlayer {
     await _invokeForPlayer('clearDanmaku');
   }
 
+  /// Inserts a viewer-sent bordered live danmaku comment at [position] (or the
+  /// current playback time when omitted). [color] is `0xRRGGBB` (white by
+  /// default) and [mode] is `'scroll'`, `'top'`, or `'bottom'`. Returns the
+  /// manual track ID, or null when the native library does not support it.
+  Future<int?> sendDanmaku(
+    String text, {
+    int color = 0xFFFFFF,
+    String mode = 'scroll',
+    Duration? position,
+  }) async {
+    if (text.trim().isEmpty) {
+      throw ArgumentError.value(text, 'text', 'must not be empty');
+    }
+    try {
+      final reply = await invokeJson('sendDanmaku', <String, Object?>{
+        'text': text,
+        'color': color & 0xFFFFFF,
+        'mode': mode,
+        if (position != null) 'positionMicros': position.inMicroseconds,
+      });
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      if (value is! Map) return null;
+      return (value['trackId'] as num?)?.toInt();
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
   Future<void> setDanmakuEnabled(bool enabled) async {
     final playerId = await ensureCreated();
     await _invoke('setDanmakuEnabled', <String, Object?>{
@@ -2323,6 +2417,55 @@ class ErikaPlayer {
         .whereType<Map<dynamic, dynamic>>()
         .map(ErikaTrackInfo.fromMap)
         .toList(growable: false);
+  }
+
+  /// Currently selected track IDs; null when this native library cannot report
+  /// them.
+  Future<ErikaTrackSelection?> trackSelection() async {
+    try {
+      final reply = await invokeJson('trackSelection');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      return value is Map<dynamic, dynamic>
+          ? ErikaTrackSelection.fromMap(value)
+          : null;
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
+  /// Container chapters on the playback timeline, or an empty list when no
+  /// media is open or the native library cannot report chapters.
+  Future<List<ErikaChapterInfo>> chapters() async {
+    try {
+      final reply = await invokeJson('chapters');
+      if (reply['ok'] != true) return const <ErikaChapterInfo>[];
+      final value = reply['value'];
+      if (value is! Map) return const <ErikaChapterInfo>[];
+      final rawChapters = value['chapters'];
+      if (rawChapters is! List) return const <ErikaChapterInfo>[];
+      return rawChapters
+          .whereType<Map<dynamic, dynamic>>()
+          .map(ErikaChapterInfo.fromMap)
+          .toList(growable: false);
+    } on UnsupportedError {
+      return const <ErikaChapterInfo>[];
+    }
+  }
+
+  /// Opened container format and overall bit rate; null when this native
+  /// library cannot report container metadata.
+  Future<ErikaContainerInfo?> containerInfo() async {
+    try {
+      final reply = await invokeJson('container');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      return value is Map<dynamic, dynamic>
+          ? ErikaContainerInfo.fromMap(value)
+          : null;
+    } on UnsupportedError {
+      return null;
+    }
   }
 
   Future<void> attachView(int viewId) async {
