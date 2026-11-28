@@ -63,6 +63,7 @@ static NSString *ErikaLabFormatTime(double seconds) {
     if ([self.metalLayer respondsToSelector:@selector(setDisplaySyncEnabled:)]) {
       self.metalLayer.displaySyncEnabled = !erika_perf_lab_uncapped();
     }
+    self.metalLayer.delegate = (id<CALayerDelegate>)self;
     self.layer = self.metalLayer;
     self.startTime = CACurrentMediaTime();
   }

@@ -1,8 +1,8 @@
-# Erika へのコントリビュート
+# liberika へのコントリビュート
 
 > [English](CONTRIBUTING.md) | [中文](CONTRIBUTING.zh.md)
 
-Erika は NipaPlay の自社開発再生コアです：demux/decode から GPU プレゼンテーション、
+liberika は NipaPlay の自社開発再生コアです：demux/decode から GPU プレゼンテーション、
 オーディオ、字幕、弾幕までを所有する Rust エンジンで、C ABI と Flutter プラグインを通じて
 ホストに公開されます。本書は作業のためのオリエンテーション地図です。
 
@@ -82,14 +82,13 @@ third_party/              ビルドされたネイティブ依存（gitignore �
 
 `crates/erika_capi` はすべての非 Rust ホストの安定面です。変更時：
 
-- **panic を内側に留める。** 各エクスポートは本体を `catch_unwind` で包み、panic を
-  `ErikaStatus_Panic` にマップします——unwind を境界の外へ出さないこと。
+- **panic を制御する。** 復帰をサポートする箇所では `catch_unwind` を使い、捕捉した panic を戻り値の型に合うエラーとメッセージに変換します。現在、一部のエクスポートは捕捉せず、abort ビルドでは復帰できません。[panic 安全性](docs/capi_reference.ja.md#panic-安全性)を参照してください。
 - **所有権を守る。** 渡す文字列は呼び出し側の所有で対応する `*_free` で解放。新しいものは
   [capi_reference.md](docs/capi_reference.md) に記載。
 - **`erika.h` を合わせて再生成 / 手編集**し、新関数に注釈を付ける。
 - **⚠️ Swift のミラー構造体を同期。** macOS/iOS/tvOS プラグインは C 構造体（例：
   `ErikaPresenterStats`）を Swift 側で手でミラーしています。`erika.h` の構造体を変更したら、
-  `packages/erika_flutter` 内の**両方**の Swift ミラーファイルを更新してください。不一致は
+  `packages/erika_flutter` 内のmacOS、iOS、tvOS の 3 つの Swift ミラーファイルを更新してください。不一致は
   スタックを破壊し、明白なレイアウトエラーではなく誤解を招く autorelease-pool クラッシュ
   として現れることがあります。
 
@@ -131,3 +130,7 @@ cargo fmt --all
 変更は焦点を絞る。ビルド/テストしたプラットフォームと、CI に残すプラットフォームを明記。
 関連ドキュメントは同じ PR で更新。大きな機能（新 backend、ABI 変更）は PR 説明に短い設計
 ノートを添えると、レビュアーがスレッドと所有権の含意を追いやすくなります。
+
+## ドキュメントの管理場所
+
+ドキュメントの入口は [docs/README.md](docs/README.md) です。 SDK の使用法は package README、接続・設計は `docs/`、日付付きの調査結果は `docs/investigations/` に保存します（結論、主要な数値、再現手順のみ。生のログ、スクリーンショット、取得データは含めません）。新しい topic を目次に追加し、API 変更と翻訳を同時に更新します。

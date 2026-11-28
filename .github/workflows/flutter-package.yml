@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/flutter-package.yml"
+      - "crates/erika_capi/include/**"
       - "packages/erika_flutter/**"
   push:
     branches: [main]
     paths:
       - ".github/workflows/flutter-package.yml"
+      - "crates/erika_capi/include/**"
       - "packages/erika_flutter/**"
   workflow_dispatch:
 
@@ -56,7 +58,6 @@ jobs:
 
   android:
     name: Android app from isolated package
-    needs: package
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -84,7 +85,6 @@ jobs:
 
   apple:
     name: ${{ matrix.name }} app from isolated package
-    needs: package
     runs-on: macos-26
     timeout-minutes: 120
     strategy:
@@ -123,7 +123,6 @@ jobs:
 
   tvos:
     name: tvOS runtime from isolated package
-    needs: package
     runs-on: macos-26
     timeout-minutes: 60
     steps:
@@ -147,7 +146,6 @@ jobs:
 
   windows:
     name: Windows app from isolated package
-    needs: package
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -186,7 +184,6 @@ jobs:
 
   openharmony:
     name: OpenHarmony bridge from isolated package
-    needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_PROFILE");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_TARGET");
     println!("cargo:rerun-if-env-changed=ERIKA_FFMPEG_DIR");
+    println!("cargo:rerun-if-env-changed=ERIKA_FFMPEG_SET");
     println!("cargo:rerun-if-env-changed=ERIKA_ZLIB_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_DAV1D_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_ALLOW_LEGACY_FFMPEG");
@@ -20,7 +21,56 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OHOS_NDK_HOME");
     println!("cargo:rerun-if-env-changed=OHOS_SDK_NATIVE");
     println!("cargo:rerun-if-env-changed=TVOS_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=ERIKA_USE_SYSTEM_LIBS");
 
+    let include_dirs = if use_system_libraries() {
+        configure_system_ffmpeg()
+    } else {
+        configure_bundled_ffmpeg()
+    };
+    generate_bindings(&include_dirs);
+}
+
+fn use_system_libraries() -> bool {
+    env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
+        && env::var("ERIKA_USE_SYSTEM_LIBS").as_deref() != Ok("0")
+        && env::var_os("ERIKA_FFMPEG_DIR").is_none()
+}
+
+fn configure_system_ffmpeg() -> Vec<PathBuf> {
+    let mut include_dirs = Vec::new();
+    for (library, version) in [
+        ("libavdevice", "62"),
+        ("libavfilter", "11"),
+        ("libavformat", "62"),
+        ("libavcodec", "62"),
+        ("libswresample", "6"),
+        ("libswscale", "9"),
+        ("libavutil", "60"),
+    ] {
+        let dependency = pkg_config::Config::new()
+            .atleast_version(version)
+            .statik(false)
+            .probe(library)
+            .unwrap_or_else(|error| {
+                panic!("Linux requires FFmpeg 8 development libraries ({library} >= {version}). Install the libav*-dev/libsw*-dev packages or set ERIKA_USE_SYSTEM_LIBS=0 for a bundled build: {error}")
+            });
+        for path in dependency.include_paths {
+            if !include_dirs.contains(&path) {
+                include_dirs.push(path);
+            }
+        }
+    }
+    let include_dir = include_dirs
+        .iter()
+        .find(|path| path.join("libavutil/version.h").is_file())
+        .expect("pkg-config did not provide the FFmpeg header directory");
+    emit_ffmpeg_version_cfg(include_dir);
+    include_dirs
+}
+
+fn configure_bundled_ffmpeg() -> Vec<PathBuf> {
     let dist_dir = ffmpeg_dist_dir();
     let zlib_dir = native_dep_dir("ERIKA_ZLIB_DIR", "zlib");
     let dav1d_dir = native_dep_dir("ERIKA_DAV1D_DIR", "dav1d");
@@ -71,21 +121,22 @@ fn main() {
             }
         }
     }
-    if matches!(
-        env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("android" | "macos" | "ios" | "tvos")
-    ) {
-        let dav1d_header = dav1d_dir.join("include/dav1d/dav1d.h");
-        let dav1d_archive = dav1d_dir.join("lib/libdav1d.a");
-        for path in [&dav1d_header, &dav1d_archive] {
-            println!("cargo:rerun-if-changed={}", path.display());
-            if !path.is_file() {
-                panic!(
-                    "dav1d dependency was not found at {}. Run `{}` first, or set ERIKA_DAV1D_DIR.",
-                    path.display(),
-                    xtask_build_hint()
-                );
-            }
+    let dav1d_header = dav1d_dir.join("include/dav1d/dav1d.h");
+    let dav1d_archive = if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && dav1d_dir.join("lib/dav1d.lib").is_file()
+    {
+        dav1d_dir.join("lib/dav1d.lib")
+    } else {
+        dav1d_dir.join("lib/libdav1d.a")
+    };
+    for path in [&dav1d_header, &dav1d_archive] {
+        println!("cargo:rerun-if-changed={}", path.display());
+        if !path.is_file() {
+            panic!(
+                "dav1d dependency was not found at {}. Run `{}` first, or set ERIKA_DAV1D_DIR.",
+                path.display(),
+                xtask_build_hint()
+            );
         }
     }
 
@@ -97,32 +148,26 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         zlib_dir.join("lib").display()
     );
-    if matches!(
-        env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("android" | "macos" | "ios" | "tvos")
-    ) {
-        println!(
-            "cargo:rustc-link-search=native={}",
-            dav1d_dir.join("lib").display()
-        );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        dav1d_dir.join("lib").display()
+    );
+    for library in [
+        "avdevice",
+        "avfilter",
+        "avformat",
+        "avcodec",
+        "swresample",
+        "swscale",
+        "avutil",
+    ] {
+        link_bundled_archive(&dist_dir, library);
     }
-    println!("cargo:rustc-link-lib=static=avdevice");
-    println!("cargo:rustc-link-lib=static=avfilter");
-    println!("cargo:rustc-link-lib=static=avformat");
-    println!("cargo:rustc-link-lib=static=avcodec");
-    println!("cargo:rustc-link-lib=static=swresample");
-    println!("cargo:rustc-link-lib=static=swscale");
-    println!("cargo:rustc-link-lib=static=avutil");
-    if matches!(
-        env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("android" | "macos" | "ios" | "tvos")
-    ) {
-        println!("cargo:rustc-link-lib=static=dav1d");
-    }
+    link_bundled_archive(&dav1d_dir, "dav1d");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-lib=static=zlib");
     } else {
-        println!("cargo:rustc-link-lib=static=z");
+        link_bundled_archive(&zlib_dir, "z");
     }
 
     if matches!(
@@ -135,6 +180,9 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=VideoToolbox");
         println!("cargo:rustc-link-lib=iconv");
         println!("cargo:rustc-link-lib=bz2");
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            link_macos_compiler_runtime();
+        }
     } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         for lib in [
             "bcrypt",
@@ -155,6 +203,23 @@ fn main() {
         ] {
             println!("cargo:rustc-link-lib={lib}");
         }
+    } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
+    {
+        // FFmpeg itself is bundled, not the distribution's driver interfaces.
+        // Match xtask's explicit VA-API/DRM configuration (Vulkan/CUDA load
+        // their driver entry points at runtime).
+        for library in ["libva", "libva-drm", "libdrm"] {
+            pkg_config::Config::new()
+                .statik(false)
+                .probe(library)
+                .unwrap_or_else(|error| {
+                    panic!("Linux FFmpeg driver dependency {library}: {error}")
+                });
+        }
+        for library in ["dl", "m", "pthread"] {
+            println!("cargo:rustc-link-lib={library}");
+        }
     } else if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         for lib in [
             "android",
@@ -169,11 +234,67 @@ fn main() {
         }
     }
 
+    vec![include_dir]
+}
+
+fn link_bundled_archive(prefix: &Path, library: &str) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
+    {
+        // System pkg-config search paths must not select a distro's older .a.
+        let archive = prefix.join(format!("lib/lib{library}.a"));
+        println!("cargo:rerun-if-changed={}", archive.display());
+        let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+        fs::copy(&archive, out.join(format!("liberika_bundled_{library}.a")))
+            .unwrap_or_else(|error| panic!("copy bundled {}: {error}", archive.display()));
+        println!("cargo:rustc-link-search=native={}", out.display());
+        println!("cargo:rustc-link-lib=static=erika_bundled_{library}");
+    } else {
+        println!("cargo:rustc-link-lib=static={library}");
+    }
+}
+
+/// FFmpeg's VideoToolbox availability checks call __isPlatformVersionAtLeast.
+/// Clang/Swift link compiler-rt automatically, but Rust's -nodefaultlibs does
+/// not. Carry this dependency with FFmpeg so standalone Rust hosts link too.
+fn link_macos_compiler_runtime() {
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    let output = std::process::Command::new("xcrun")
+        .args([
+            "--sdk",
+            "macosx",
+            "clang",
+            "--print-file-name=libclang_rt.osx.a",
+        ])
+        .output()
+        .expect("locate the macOS Clang runtime with xcrun");
+    assert!(
+        output.status.success(),
+        "cannot locate the macOS Clang runtime: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archive = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("Clang runtime path is UTF-8")
+            .trim(),
+    );
+    assert!(
+        archive.is_file(),
+        "macOS Clang runtime not found: {}",
+        archive.display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        archive.parent().expect("Clang runtime directory").display()
+    );
+    println!("cargo:rustc-link-lib=static=clang_rt.osx");
+}
+
+fn generate_bindings(include_dirs: &[PathBuf]) {
     ensure_libclang_path();
 
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
-        .clang_arg(format!("-I{}", include_dir.display()))
         .allowlist_function("av_.*")
         .allowlist_function("avio_.*")
         .allowlist_function("avcodec_.*")
@@ -192,6 +313,9 @@ fn main() {
         .generate_comments(false)
         .derive_debug(true)
         .derive_default(true);
+    for include_dir in include_dirs {
+        builder = builder.clang_arg(format!("-I{}", include_dir.display()));
+    }
     for argument in target_bindgen_clang_args() {
         builder = builder.clang_arg(argument);
     }
@@ -453,6 +577,17 @@ fn prepend_path_for_dlls(path: &Path) {
     }
 }
 
+/// `ffmpeg`, or the folder of the smaller set `ERIKA_FFMPEG_SET` names, as
+/// `xtask deps build --ffmpeg` builds it.
+fn ffmpeg_dir_name() -> String {
+    match env::var("ERIKA_FFMPEG_SET") {
+        Ok(set) if !set.is_empty() && set != "full" => {
+            format!("ffmpeg-{}", set.replace(',', "-"))
+        }
+        _ => "ffmpeg".to_string(),
+    }
+}
+
 fn ffmpeg_dist_dir() -> PathBuf {
     if let Ok(path) = env::var("ERIKA_FFMPEG_DIR") {
         return PathBuf::from(path);
@@ -461,14 +596,12 @@ fn ffmpeg_dist_dir() -> PathBuf {
         return workspace_root()
             .join("third_party/dist")
             .join(target)
-            .join(native_profile())
-            .join("ffmpeg");
+            .join(native_profile_dir())
+            .join(ffmpeg_dir_name());
     }
-    let mut dist = workspace_root().join("third_party/dist");
-    if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
-    }
-    dist.join(native_profile()).join("ffmpeg")
+    native_dist_root()
+        .join(native_profile_dir())
+        .join(ffmpeg_dir_name())
 }
 
 fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
@@ -479,26 +612,58 @@ fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
         return workspace_root()
             .join("third_party/dist")
             .join(target)
-            .join(native_profile())
+            .join(native_profile_dir())
             .join(name);
     }
-    let mut dist = workspace_root().join("third_party/dist");
+    native_dist_root().join(native_profile_dir()).join(name)
+}
+
+/// The dist directory `xtask deps build` filled for this target: the one
+/// named after the target triple when it was built (`--target
+/// aarch64-apple-darwin`), else the host build's.
+fn native_dist_root() -> PathBuf {
+    let dist = workspace_root().join("third_party/dist");
     if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
+        return dist.join(target);
     }
-    dist.join(native_profile()).join(name)
+    if let Ok(target) = env::var("TARGET") {
+        let built = dist.join(target);
+        if built.join(native_profile_dir()).is_dir() {
+            return built;
+        }
+    }
+    dist
 }
 
 fn native_profile() -> String {
     env::var("ERIKA_NATIVE_PROFILE").unwrap_or_else(|_| "lgpl".to_string())
 }
 
+/// Rust links the MSVC C runtime statically (`-C target-feature=+crt-static`),
+/// so the native libraries must too: `xtask deps build --crt static`.
+fn static_crt() -> bool {
+    env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+        && env::var("CARGO_CFG_TARGET_FEATURE")
+            .is_ok_and(|features| features.split(',').any(|feature| feature == "crt-static"))
+}
+
+/// The dist directory of the profile, which a static C runtime build keeps
+/// apart.
+fn native_profile_dir() -> String {
+    if static_crt() {
+        format!("{}-crt-static", native_profile())
+    } else {
+        native_profile()
+    }
+}
+
 fn xtask_build_hint() -> String {
     let profile = native_profile();
+    let crt = if static_crt() { " --crt static" } else { "" };
     if let Some(target) = inferred_native_target() {
-        format!("cargo run -p xtask -- deps build --profile {profile} --target {target}")
+        format!("cargo run -p xtask -- deps build --profile {profile} --target {target}{crt}")
     } else {
-        format!("cargo run -p xtask -- deps build --profile {profile}")
+        format!("cargo run -p xtask -- deps build --profile {profile}{crt}")
     }
 }
 

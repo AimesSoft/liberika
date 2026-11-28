@@ -4,6 +4,7 @@
 
 extern void erika_demo_attach_layer(void *layer, unsigned int width, unsigned int height, double scale);
 extern void erika_demo_resize_layer(unsigned int width, unsigned int height, double scale);
+extern void erika_demo_set_display_headroom(float headroom, bool known);
 extern void erika_demo_render_frame(double time_seconds);
 extern void erika_demo_toggle_play_pause(void);
 extern void erika_demo_seek_seconds(double seconds);
@@ -11,6 +12,23 @@ extern double erika_demo_position_seconds(void);
 extern double erika_demo_duration_seconds(void);
 extern bool erika_demo_is_playing(void);
 extern double erika_demo_smoke_seconds(void);
+
+/// Potential EDR headroom of a screen: what it can do regardless of the
+/// current brightness setting. 1.0 means no EDR. Main thread only.
+static float ErikaPotentialEdrHeadroom(NSScreen *screen) {
+  if (screen == nil) {
+    return 1.0f;
+  }
+  SEL selector = NSSelectorFromString(@"maximumPotentialExtendedDynamicRangeColorComponentValue");
+  if (![screen respondsToSelector:selector]) {
+    return 1.0f;
+  }
+  NSNumber *value = [screen valueForKey:@"maximumPotentialExtendedDynamicRangeColorComponentValue"];
+  if (![value isKindOfClass:[NSNumber class]]) {
+    return 1.0f;
+  }
+  return MAX(1.0f, value.floatValue);
+}
 
 static NSString *ErikaFormatTime(double seconds) {
   if (!isfinite(seconds) || seconds < 0.0) {
@@ -42,6 +60,7 @@ static NSString *ErikaFormatTime(double seconds) {
     self.metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     self.metalLayer.framebufferOnly = YES;
     self.metalLayer.opaque = YES;
+    self.metalLayer.delegate = (id<CALayerDelegate>)self;
     self.layer = self.metalLayer;
     self.startTime = CACurrentMediaTime();
   }
@@ -90,6 +109,11 @@ static NSString *ErikaFormatTime(double seconds) {
   self.metalLayer.frame = self.bounds;
   unsigned int pixelWidth = (unsigned int)MAX(1.0, round(drawableSize.width));
   unsigned int pixelHeight = (unsigned int)MAX(1.0, round(drawableSize.height));
+  // The renderer negotiates its output mode off the main thread and no longer
+  // reads AppKit itself, so publish the presenting screen's EDR capability
+  // from here: on attach, and again whenever the window moves to a screen with
+  // different backing properties.
+  erika_demo_set_display_headroom(ErikaPotentialEdrHeadroom(self.window.screen), true);
   if (attach) {
     erika_demo_attach_layer((__bridge void *)self.metalLayer, pixelWidth, pixelHeight, scale);
   } else {
@@ -282,6 +306,9 @@ static NSString *ErikaFormatTime(double seconds) {
   [self.window center];
   [self.window makeKeyAndOrderFront:nil];
   double smokeSeconds = erika_demo_smoke_seconds();
+  // Always activate: an inactive app gets App-Napped by macOS, which
+  // throttles the render timer and stalls the presentation-driven decode.
+  [NSApp activateIgnoringOtherApps:YES];
   if (smokeSeconds > 0.0) {
     self.smokeTimer = [NSTimer scheduledTimerWithTimeInterval:smokeSeconds
                                                        target:self
@@ -289,8 +316,6 @@ static NSString *ErikaFormatTime(double seconds) {
                                                      userInfo:nil
                                                       repeats:NO];
     [[NSRunLoop mainRunLoop] addTimer:self.smokeTimer forMode:NSRunLoopCommonModes];
-  } else {
-    [NSApp activateIgnoringOtherApps:YES];
   }
 }
 

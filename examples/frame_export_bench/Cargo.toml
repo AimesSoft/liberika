@@ -1,0 +1,12 @@
+[package]
+name = "frame_export_bench"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+erika = { path = "../../crates/erika", default-features = false }
+serde_json.workspace = true
+png = "0.17"

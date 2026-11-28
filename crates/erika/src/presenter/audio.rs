@@ -15,13 +15,19 @@ use crate::audio::AudioRingBufferConfig;
     target_os = "macos",
     any(target_os = "ios", target_os = "tvos"),
     target_os = "windows",
+    target_os = "linux",
     target_env = "ohos"
 )))]
 use crate::audio::BufferedAudioOutput;
 use crate::audio::{
     AUDIO_OUTPUT_QUEUE_HIGH_WATER, AudioClockSnapshot, AudioOutputBackend, AudioOutputRuntimeStats,
+    AudioOutputState, AudioRingBufferStats,
 };
-use crate::core::{AudioOutputEvent, Player, PlayerAudioFrame, PlayerState};
+use crate::core::{
+    AudioOutputEvent, Player, PlayerAudioFrame, PlayerState, pcm_audio_frame_playback_duration,
+};
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+use crate::linux::PulseAudioOutput;
 #[cfg(target_env = "ohos")]
 use crate::ohos::ohaudio::{OHAudioOutput, OHAudioOutputConfig};
 
@@ -35,11 +41,13 @@ use std::{
     time::{Duration, Instant},
 };
 const AUDIO_START_BUFFER: Duration = Duration::from_millis(250);
-const AUDIO_PUMP_FRAME_LIMIT: usize = 16;
+// Bound each audio-owner slice by decoded PCM playback duration rather than raw
+// frame count so short-frame codecs (such as 40-sample TrueHD) match the burst
+// headroom of 1024-sample AAC (~341 ms for 16 frames) and can refill the start
+// buffer, SoundTouch warmup, or buffering recovery in one slice while keeping
+// CPU time bounded to AUDIO_PUMP_TIME_BUDGET.
+const AUDIO_PUMP_DURATION_LIMIT: Duration = Duration::from_millis(350);
 const AUDIO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
-// Bound each slice so device commands remain responsive during SoundTouch warmup.
-const AUDIO_FAST_RATE_PUMP_FRAME_LIMIT: usize = 24;
-const AUDIO_FAST_RATE_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
 const PLAYBACK_RATE_EPSILON: f64 = 0.001;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AudioClockReportState {
@@ -62,6 +70,12 @@ const AUDIO_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) struct AudioServiceSnapshot {
     pub clock: Option<AudioClockSnapshot>,
     pub runtime: AudioOutputRuntimeStats,
+    pub state: AudioOutputState,
+    pub configured: bool,
+    pub started: bool,
+    pub ring: AudioRingBufferStats,
+    pub frames_queued: usize,
+    pub frames_capacity: Option<usize>,
     pub playback_rate: f64,
     pub volume: f32,
     pub pushed_audio_frames: u64,
@@ -81,6 +95,7 @@ pub(super) enum AudioCommand {
     SetRate(f64),
     SetVolume(f32),
     VideoPresented(u64),
+    SetAudioOnly(bool),
     Shutdown,
 }
 
@@ -236,6 +251,7 @@ struct AudioPump {
     playback_rate: f64,
     pending_playback_rate: Option<PendingPlaybackRate>,
     video_ready_generation: Option<u64>,
+    audio_only: bool,
     quiesced: bool,
     stats: AudioCounters,
 }
@@ -257,6 +273,7 @@ impl AudioPump {
             playback_rate: 1.0,
             pending_playback_rate: None,
             video_ready_generation: None,
+            audio_only: false,
             quiesced: true,
             stats: AudioCounters::default(),
         }
@@ -266,6 +283,12 @@ impl AudioPump {
         AudioServiceSnapshot {
             clock: self.audio_output.clock_snapshot(),
             runtime: self.audio_output.runtime_stats(),
+            state: self.audio_output.state(),
+            configured: self.audio_configured,
+            started: self.audio_started,
+            ring: self.audio_output.stats(),
+            frames_queued: self.audio_frames.len(),
+            frames_capacity: self.audio_frames.capacity(),
             playback_rate: self.playback_rate,
             volume: self.audio_output.volume(),
             pushed_audio_frames: self.stats.pushed_audio_frames,
@@ -311,9 +334,14 @@ impl AudioPump {
             self.reset_audio_output()?;
             return self.commit_pending_playback_rate_now();
         }
-        self.audio_output
-            .pause()
-            .map_err(|error| PlayerError::Playback(error.to_string()))?;
+        if let Err(error) = self.audio_output.pause() {
+            self.stats.audio_failures += 1;
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio pause failed: {error}"),
+            );
+            return Err(PlayerError::Playback(error.to_string()));
+        }
         self.audio_started = false;
         self.last_audio_clock_report = None;
         Ok(())
@@ -339,7 +367,8 @@ impl AudioPump {
             AudioCommand::CommitPendingRate => return self.commit_pending_playback_rate_now(),
             AudioCommand::Pause => return self.pause_output(),
             AudioCommand::SetRate(rate) => return self.set_playback_rate(rate),
-            AudioCommand::SetVolume(volume) => self.set_volume(volume as f64),
+            AudioCommand::SetVolume(volume) => self.audio_output.set_volume(volume),
+            AudioCommand::SetAudioOnly(audio_only) => self.audio_only = audio_only,
             AudioCommand::VideoPresented(generation) => {
                 self.video_ready_generation = Some(generation)
             }
@@ -352,10 +381,14 @@ impl AudioPump {
     }
     fn pump_audio(&mut self) {
         let started = Instant::now();
-        let mut pumped = 0usize;
-        let (frame_limit, time_budget) = self.audio_pump_limits();
+        let mut pumped_duration = Duration::ZERO;
+        let rate = self
+            .pending_playback_rate
+            .map_or(self.playback_rate, |pending| pending.rate);
         loop {
-            if pumped >= frame_limit || started.elapsed() >= time_budget {
+            if pumped_duration >= AUDIO_PUMP_DURATION_LIMIT
+                || started.elapsed() >= AUDIO_PUMP_TIME_BUDGET
+            {
                 break;
             }
             if !self.audio_output.can_accept_audio_frame()
@@ -372,8 +405,9 @@ impl AudioPump {
                     if frame.generation != self.player.playback_generation() {
                         continue;
                     }
+                    let frame_duration = pcm_audio_frame_playback_duration(&frame.frame, rate);
                     self.push_audio(frame);
-                    pumped += 1;
+                    pumped_duration = pumped_duration.saturating_add(frame_duration);
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
@@ -383,13 +417,6 @@ impl AudioPump {
         if self.audio_started {
             self.report_audio_clock_snapshot();
         }
-    }
-
-    fn audio_pump_limits(&self) -> (usize, Duration) {
-        let rate = self
-            .pending_playback_rate
-            .map_or(self.playback_rate, |pending| pending.rate);
-        audio_pump_limits_for_rate(rate)
     }
 
     fn report_audio_clock_snapshot(&mut self) {
@@ -452,7 +479,10 @@ impl AudioPump {
             self.player.invalidate_audio_clock();
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
-                eprintln!("Erika presenter audio configure failed: {error}");
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!("Erika presenter audio configure failed: {error}"),
+                );
                 return;
             }
             self.audio_configured = true;
@@ -462,7 +492,10 @@ impl AudioPump {
             Ok(_) => self.stats.pushed_audio_frames += 1,
             Err(error) => {
                 self.stats.audio_failures += 1;
-                eprintln!("Erika presenter audio push failed: {error}");
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!("Erika presenter audio push failed: {error}"),
+                );
                 return;
             }
         }
@@ -480,7 +513,10 @@ impl AudioPump {
         }
         if let Err(error) = self.audio_output.start() {
             self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio start failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio start failed: {error}"),
+            );
             return;
         }
         self.audio_started = true;
@@ -495,7 +531,8 @@ impl AudioPump {
     }
 
     fn audio_start_allowed(&self) -> bool {
-        self.player.track_selection().video.is_none()
+        self.audio_only
+            || self.player.track_selection().video.is_none()
             || self.video_ready_generation == Some(self.player.playback_generation())
     }
 
@@ -503,6 +540,10 @@ impl AudioPump {
         self.player.invalidate_audio_clock();
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio reset failed: {error}"),
+            );
             return Err(PlayerError::Playback(format!(
                 "audio reset failed: {error}"
             )));
@@ -599,10 +640,6 @@ impl AudioPump {
         self.pending_playback_rate = None;
         Ok(())
     }
-
-    pub fn set_volume(&mut self, volume: f64) {
-        self.audio_output.set_volume(volume as f32);
-    }
 }
 fn normalize_playback_rate(rate: f64) -> f64 {
     if rate.is_finite() && rate > 0.0 {
@@ -635,18 +672,11 @@ fn audio_transition_bridge(
         .filter(|duration| !duration.is_zero())
 }
 
-fn audio_pump_limits_for_rate(rate: f64) -> (usize, Duration) {
-    if (rate - 1.0).abs() > PLAYBACK_RATE_EPSILON {
-        (
-            AUDIO_FAST_RATE_PUMP_FRAME_LIMIT,
-            AUDIO_FAST_RATE_PUMP_TIME_BUDGET,
-        )
-    } else {
-        (AUDIO_PUMP_FRAME_LIMIT, AUDIO_PUMP_TIME_BUDGET)
-    }
-}
-
 fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBackend> {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        Box::new(PulseAudioOutput::new(config.ring_buffer))
+    }
     #[cfg(target_os = "macos")]
     {
         Box::new(CoreAudioOutput::new(CoreAudioOutputConfig {
@@ -683,6 +713,7 @@ fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBacken
         target_os = "macos",
         any(target_os = "ios", target_os = "tvos"),
         target_os = "windows",
+        target_os = "linux",
         target_env = "ohos"
     )))]
     {
@@ -744,7 +775,7 @@ mod tests {
             if self.block_next {
                 self.block_next = false;
                 self.entered.send(()).unwrap();
-                self.release.recv_timeout(Duration::from_secs(1)).unwrap();
+                self.release.recv().unwrap();
             }
             self.output.push(frame)
         }
@@ -834,6 +865,61 @@ mod tests {
         service.command(AudioCommand::Quiesce).unwrap();
         assert_eq!(service.snapshot().pushed_audio_frames, pushes);
         assert_eq!(service.snapshot().clock.unwrap().queued_frames, 0);
+    }
+
+    #[test]
+    fn drop_joins_after_a_stalled_push_even_with_a_full_command_queue() {
+        let player = Player::new(PlayerConfig::default());
+        let generation = player.playback_generation();
+        let (frames, receiver) = bounded(1);
+        let (entered, started) = bounded(1);
+        let (release, resume) = bounded(1);
+        let service = AudioService::with_factory(player, receiver, move || {
+            Box::new(BlockingOutput {
+                output: BufferedAudioOutput::new(AudioRingBufferConfig::default()),
+                entered,
+                release: resume,
+                block_next: true,
+                fail_stop: false,
+                recover_on_push: false,
+            })
+        })
+        .unwrap();
+        frames.send(test_frame(generation)).unwrap();
+        service.command(AudioCommand::Resume).unwrap();
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        // Simulate requests left queued by callers that have already timed out.
+        let commands = &service.commands;
+        let (reply, _answers) = crossbeam_channel::unbounded();
+        while !commands.is_full() {
+            commands
+                .try_send(Request {
+                    command: AudioCommand::Resume,
+                    reply: reply.clone(),
+                    deadline: Instant::now(),
+                })
+                .unwrap();
+        }
+
+        let (dropping, drop_started) = bounded(0);
+        let (done, dropped) = bounded(1);
+        let worker = thread::spawn(move || {
+            dropping.send(()).unwrap();
+            drop(service);
+            let _ = done.send(());
+        });
+        drop_started.recv().unwrap();
+        assert!(
+            dropped
+                .recv_timeout(AUDIO_COMMAND_TIMEOUT + Duration::from_millis(100))
+                .is_err()
+        );
+        release.send(()).unwrap();
+        dropped.recv_timeout(Duration::from_secs(1)).expect(
+            "dropping the last command sender must let the audio owner exit after push returns",
+        );
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1057,18 +1143,282 @@ mod tests {
     }
 
     #[test]
-    fn playback_rate_uses_fast_audio_pump_limits() {
+    fn audio_frame_pump_duration_uses_supported_rate_bounds() {
+        let frame = crate::ffmpeg::PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 48_000,
+            samples: vec![0.0; 96_000],
+        };
+
         assert_eq!(
-            audio_pump_limits_for_rate(1.0),
-            (AUDIO_PUMP_FRAME_LIMIT, AUDIO_PUMP_TIME_BUDGET)
+            pcm_audio_frame_playback_duration(&frame, f64::MIN_POSITIVE),
+            Duration::from_secs(4)
         );
         assert_eq!(
-            audio_pump_limits_for_rate(2.0),
-            (
-                AUDIO_FAST_RATE_PUMP_FRAME_LIMIT,
-                AUDIO_FAST_RATE_PUMP_TIME_BUDGET
-            )
+            pcm_audio_frame_playback_duration(&frame, 64.0),
+            Duration::from_secs_f64(1.0 / 16.0)
         );
+        assert_eq!(
+            pcm_audio_frame_playback_duration(&frame, f64::NAN),
+            Duration::from_secs(1)
+        );
+
+        let zero_rate = crate::ffmpeg::PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(0, 2),
+            pts: None,
+            frames: 40,
+            samples: Vec::new(),
+        };
+        assert_eq!(
+            pcm_audio_frame_playback_duration(&zero_rate, 1.0),
+            Duration::ZERO
+        );
+
+        let empty = crate::ffmpeg::PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 0,
+            samples: Vec::new(),
+        };
+        assert_eq!(
+            pcm_audio_frame_playback_duration(&empty, 1.0),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn audio_pump_duration_limit_reaches_start_buffer_for_short_and_common_frames() {
+        for (sample_rate, pcm_frames, playback_rate) in [
+            (48_000, 40, 1.0),    // TrueHD 48 kHz
+            (48_000, 40, 2.0),    // TrueHD 48 kHz @ 2x
+            (96_000, 80, 1.0),    // TrueHD 96 kHz
+            (48_000, 1_024, 1.0), // AAC 48 kHz
+            (44_100, 1_024, 1.0), // AAC 44.1 kHz
+            (48_000, 960, 1.0),   // Opus 20 ms
+            (48_000, 1_152, 1.0), // MP3 24 ms
+            (48_000, 1_536, 1.0), // AC-3 32 ms
+            (48_000, 1_024, 2.0), // AAC 48 kHz @ 2x
+        ] {
+            let frame = crate::ffmpeg::PcmAudioFrame {
+                format: crate::ffmpeg::PcmFormat::f32_interleaved(sample_rate, 2),
+                pts: None,
+                frames: pcm_frames,
+                samples: vec![0.0; pcm_frames * 2],
+            };
+            let frame_duration = pcm_audio_frame_playback_duration(&frame, playback_rate);
+            let mut pumped_duration = Duration::ZERO;
+            let mut pumped_frames = 0usize;
+            while pumped_duration < AUDIO_PUMP_DURATION_LIMIT {
+                pumped_duration = pumped_duration.saturating_add(frame_duration);
+                pumped_frames += 1;
+            }
+            assert!(
+                pumped_duration >= AUDIO_START_BUFFER,
+                "{sample_rate} Hz ({pcm_frames} samples) at {playback_rate}x only pumped {pumped_duration:?}"
+            );
+            if pcm_frames == 40 {
+                // Must dramatically exceed the legacy 16/24-frame limits.
+                assert!(pumped_frames >= 300);
+            }
+        }
+    }
+
+    #[test]
+    fn pump_audio_fills_start_buffer_with_short_truehd_frames_in_one_tick() {
+        use crate::audio::BufferedAudioOutput;
+        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
+
+        let mut presenter = test_pump();
+        presenter.audio_output =
+            Box::new(BufferedAudioOutput::new(AudioRingBufferConfig::default()));
+        let (tx, rx) = crossbeam_channel::bounded(600);
+        presenter.audio_frames = rx;
+
+        let format = PcmFormat::f32_interleaved(48_000, 2);
+        let generation = presenter.player.playback_generation();
+        // Queue 500 ms (600 x 40-sample frames) of TrueHD-sized PCM.
+        for index in 0..600usize {
+            tx.send(PlayerAudioFrame {
+                frame: PcmAudioFrame {
+                    format,
+                    pts: Some(Duration::from_secs_f64((index * 40) as f64 / 48_000.0)),
+                    frames: 40,
+                    samples: vec![0.0; 80],
+                },
+                generation,
+            })
+            .unwrap();
+        }
+
+        presenter.pump_audio();
+        // A single tick is bounded by AUDIO_PUMP_DURATION_LIMIT (350 ms = 420
+        // 40-sample frames) and leaves remaining frames queued for later ticks.
+        assert!(presenter.stats.pushed_audio_frames <= 421);
+        assert!(!presenter.audio_frames.is_empty());
+
+        // Under normal scheduling a single tick fills AUDIO_START_BUFFER; allow
+        // up to 3 extra ticks so an unoptimized CI host preempted past
+        // AUDIO_PUMP_TIME_BUDGET (4 ms) cannot flake (the legacy 16-frame cap
+        // could pump at most 64 frames / 53 ms in 4 ticks).
+        for _ in 0..3 {
+            if presenter.audio_output_ready_to_start() {
+                break;
+            }
+            presenter.pump_audio();
+        }
+
+        let queued = presenter
+            .audio_output
+            .clock_snapshot()
+            .and_then(|snapshot| snapshot.queued_duration)
+            .expect("queued audio duration");
+        assert!(
+            queued >= AUDIO_START_BUFFER,
+            "expected at least {:?} queued, got {:?}",
+            AUDIO_START_BUFFER,
+            queued
+        );
+    }
+
+    #[test]
+    fn pump_audio_refills_buffer_at_fast_rate_with_soundtouch_warmup() {
+        use crate::audio::BufferedAudioOutput;
+        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
+
+        let mut presenter = test_pump();
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+        output.set_playback_rate(2.0);
+        presenter.audio_output = Box::new(output);
+        presenter.playback_rate = 2.0;
+
+        let (tx, rx) = crossbeam_channel::bounded(128);
+        presenter.audio_frames = rx;
+        let format = PcmFormat::f32_interleaved(48_000, 2);
+        let generation = presenter.player.playback_generation();
+        // Queue ~1.7 s of source PCM (~850 ms at 2x). Unoptimized debug builds
+        // may hit AUDIO_PUMP_TIME_BUDGET (4 ms) inside SoundTouch, so allow a
+        // few back-to-back ticks without waiting for wall-clock intervals.
+        for index in 0..80usize {
+            tx.send(PlayerAudioFrame {
+                frame: PcmAudioFrame {
+                    format,
+                    pts: Some(Duration::from_secs_f64((index * 1_024) as f64 / 48_000.0)),
+                    frames: 1_024,
+                    samples: vec![0.0; 2_048],
+                },
+                generation,
+            })
+            .unwrap();
+        }
+
+        for _ in 0..8 {
+            presenter.pump_audio();
+            if presenter.audio_output_ready_to_start() {
+                break;
+            }
+        }
+
+        let queued = presenter
+            .audio_output
+            .clock_snapshot()
+            .and_then(|snapshot| snapshot.queued_duration)
+            .expect("queued audio duration at 2x");
+        assert!(
+            queued >= AUDIO_START_BUFFER,
+            "expected SoundTouch 2x refill to reach {:?}, got {:?}",
+            AUDIO_START_BUFFER,
+            queued
+        );
+    }
+
+    #[test]
+    fn pump_audio_counts_oversized_and_failed_frames_against_the_budget() {
+        use crate::audio::{
+            AudioError, AudioOutputState, AudioRingBufferStats, BufferedAudioOutput,
+        };
+        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
+
+        // 1. Oversized frame (> AUDIO_PUMP_DURATION_LIMIT) is admitted once per tick.
+        let mut presenter = test_pump();
+        presenter.audio_output =
+            Box::new(BufferedAudioOutput::new(AudioRingBufferConfig::default()));
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        presenter.audio_frames = rx;
+        let format = PcmFormat::f32_interleaved(48_000, 2);
+        let generation = presenter.player.playback_generation();
+        for index in 0..2usize {
+            tx.send(PlayerAudioFrame {
+                frame: PcmAudioFrame {
+                    format,
+                    pts: Some(Duration::from_millis((index * 500) as u64)),
+                    frames: 24_000,
+                    samples: vec![0.0; 48_000],
+                },
+                generation,
+            })
+            .unwrap();
+        }
+
+        presenter.pump_audio();
+        assert_eq!(presenter.stats.pushed_audio_frames, 1);
+        assert_eq!(presenter.audio_frames.len(), 1);
+
+        // A failing output drains two 200 ms frames before reaching the 350 ms limit.
+        struct FailingAudioOutput;
+        impl AudioOutputBackend for FailingAudioOutput {
+            fn configure(&mut self, _format: PcmFormat) -> crate::audio::Result<()> {
+                Ok(())
+            }
+            fn start(&mut self) -> crate::audio::Result<()> {
+                Ok(())
+            }
+            fn pause(&mut self) -> crate::audio::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) -> crate::audio::Result<()> {
+                Ok(())
+            }
+            fn set_volume(&mut self, _volume: f32) {}
+            fn volume(&self) -> f32 {
+                1.0
+            }
+            fn push(
+                &mut self,
+                _frame: PcmAudioFrame,
+            ) -> crate::audio::Result<crate::audio::AudioPushResult> {
+                Err(AudioError::Backend("simulated disconnect".to_string()))
+            }
+            fn state(&self) -> AudioOutputState {
+                AudioOutputState::Stopped
+            }
+            fn stats(&self) -> AudioRingBufferStats {
+                AudioRingBufferStats::default()
+            }
+        }
+
+        let mut failing_presenter = test_pump();
+        failing_presenter.audio_output = Box::new(FailingAudioOutput);
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        failing_presenter.audio_frames = rx;
+        let generation = failing_presenter.player.playback_generation();
+        for _ in 0..3 {
+            tx.send(PlayerAudioFrame {
+                frame: PcmAudioFrame {
+                    format,
+                    pts: Some(Duration::ZERO),
+                    frames: 9_600,
+                    samples: vec![0.0; 19_200],
+                },
+                generation,
+            })
+            .unwrap();
+        }
+
+        failing_presenter.pump_audio();
+        assert_eq!(failing_presenter.stats.audio_failures, 2);
+        assert_eq!(failing_presenter.stats.pushed_audio_frames, 0);
+        assert_eq!(failing_presenter.audio_frames.len(), 1);
     }
 
     #[test]

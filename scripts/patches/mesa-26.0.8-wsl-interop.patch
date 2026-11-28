@@ -1,0 +1,85 @@
+--- a/src/microsoft/vulkan/dzn_device.c
++++ b/src/microsoft/vulkan/dzn_device.c
+@@ -113,6 +113,7 @@
+       .KHR_driver_properties                 = true,
+       .KHR_dynamic_rendering                 = true,
+       .KHR_external_memory                   = true,
++      .KHR_format_feature_flags2             = true,
+       .KHR_external_semaphore                = true,
+ #ifdef _WIN32
+       .KHR_external_memory_win32             = true,
+@@ -1611,6 +1612,13 @@
+    VK_FROM_HANDLE(dzn_physical_device, pdev, physicalDevice);
+ 
+    dzn_physical_device_get_format_properties(pdev, format, pFormatProperties);
++   VkFormatProperties3 *props3 = vk_find_struct(pFormatProperties->pNext, FORMAT_PROPERTIES_3);
++   if (props3) {
++      props3->linearTilingFeatures = pFormatProperties->formatProperties.linearTilingFeatures;
++      props3->optimalTilingFeatures = pFormatProperties->formatProperties.optimalTilingFeatures;
++      props3->bufferFeatures = pFormatProperties->formatProperties.bufferFeatures;
++   }
++
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+--- a/src/gallium/frontends/va/surface.c
++++ b/src/gallium/frontends/va/surface.c
+@@ -1332,8 +1332,10 @@
+       return DRM_FORMAT_R8;
+    case PIPE_FORMAT_R8G8_UNORM:
+       return DRM_FORMAT_GR88;
++   case PIPE_FORMAT_X6R10_UNORM:
+    case PIPE_FORMAT_R16_UNORM:
+       return DRM_FORMAT_R16;
++   case PIPE_FORMAT_X6R10X6G10_UNORM:
+    case PIPE_FORMAT_R16G16_UNORM:
+       return DRM_FORMAT_GR1616;
+    case PIPE_FORMAT_B8G8R8A8_UNORM:
+@@ -1415,6 +1417,19 @@
+    }
+ 
+    surfaces = surf->buffer->get_surfaces(surf->buffer);
++   /* Export needs resources, not render-target views (P010 is sampleable). */
++   struct pipe_surface export_surfaces[VL_MAX_SURFACES] = {0};
++   if (!surfaces && surf->buffer->get_resources) {
++      struct pipe_resource *resources[VL_MAX_SURFACES] = {0};
++      surf->buffer->get_resources(surf->buffer, resources);
++      for (unsigned j = 0; j < VL_MAX_SURFACES; j++)
++         export_surfaces[j].texture = resources[j];
++      surfaces = export_surfaces;
++   }
++   if (!surfaces) {
++      mtx_unlock(&drv->mutex);
++      return VA_STATUS_ERROR_INVALID_SURFACE;
++   }
+ 
+    usage = 0;
+    if (flags & VA_EXPORT_SURFACE_WRITE_ONLY)
+--- a/src/gallium/drivers/d3d12/d3d12_video_buffer.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_video_buffer.cpp
+@@ -184,7 +184,7 @@
+    if ((dscreen->max_feature_level >= D3D_FEATURE_LEVEL_11_0) &&
+       ((pD3D12VideoBuffer->base.bind & PIPE_BIND_VIDEO_DECODE_DPB) == 0) &&
+       ((pD3D12VideoBuffer->base.bind & PIPE_BIND_VIDEO_ENCODE_DPB) == 0))
+-      pD3D12VideoBuffer->base.bind |= (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
++      pD3D12VideoBuffer->base.bind |= (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHARED);
+ #endif // HAVE_GALLIUM_D3D12_GRAPHICS
+ 
+    // Fill vtable
+--- a/src/gallium/drivers/d3d12/d3d12_video_dec.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_video_dec.cpp
+@@ -759,11 +759,9 @@
+    assert(fenceValueToWaitOn);
+ 
+    bool wait_res = d3d12_fence_finish(fenceValueToWaitOn, timeout);
+-   if (wait_res) {
+-      // Opportunistically reset batches
+-      for (uint32_t i = 0; i < D3D12_VIDEO_DEC_ASYNC_DEPTH; ++i)
+-         (void)d3d12_video_decoder_sync_completion(codec, i, 0);
+-   }
++   // vaSyncSurface may run while another thread records a newer picture.
++   // Waiting for an exported surface must not reset those command allocators.
++   // begin_frame already retires each pool entry before reusing it.
+ 
+    // Return semantics based on p_video_codec interface
+    // ret == 0 -> Decode in progress

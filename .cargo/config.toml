@@ -19,3 +19,9 @@ CFLAGS_i686_linux_android = "-fPIC"
 CXXFLAGS_i686_linux_android = "-fPIC"
 CFLAGS_aarch64_unknown_linux_ohos = "-fPIC"
 CXXFLAGS_aarch64_unknown_linux_ohos = "-fPIC"
+
+# The Linux C ABI is also a shared library containing bundled SoundTouch.
+CFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_x86_64_unknown_linux_gnu = "-fPIC"
+CFLAGS_aarch64_unknown_linux_gnu = "-fPIC"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-fPIC"

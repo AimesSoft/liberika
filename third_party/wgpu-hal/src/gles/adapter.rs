@@ -1267,7 +1267,7 @@ impl crate::Adapter for super::Adapter {
 
             Some(crate::SurfaceCapabilities {
                 formats,
-                present_modes: if cfg!(windows) {
+                present_modes: if cfg!(any(windows, target_os = "linux")) {
                     vec![wgt::PresentMode::Fifo, wgt::PresentMode::Immediate]
                 } else {
                     vec![wgt::PresentMode::Fifo] //TODO

@@ -1,3 +1,5 @@
+mod p010;
+
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomData;
@@ -8,14 +10,18 @@ use std::slice;
 use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
 
-use crate::core::{ColorPrimaries, FrameRate, TrackInfo, TrackKind, TransferFunction, VideoParams};
-use crate::renderer::pipeline::{
-    Chromaticity, ColorRange, ContentLightMetadata, HdrMetadata, MasteringDisplayMetadata,
-    MatrixCoefficients,
+use crate::core::{
+    ChapterInfo, ColorPrimaries, FrameRate, TrackInfo, TrackKind, TransferFunction, VideoParams,
 };
-use crate::source::{ByteRange, MediaSource};
+use crate::renderer::pipeline::{
+    Chromaticity, ColorRange, ContentLightMetadata, DoviComponentCurve, DoviFramePq,
+    DoviSourceMetadata, HdrMetadata, MasteringDisplayMetadata, MatrixCoefficients, RgbMatrix,
+};
+use crate::renderer::pipeline::{DOVI_MAX_MMR_ORDER, DOVI_MAX_PIECES};
+use crate::source::{ByteRange, MediaSource, SourceError};
 use crate::subtitle::{
     AssTrackResources, DecodedSubtitleFrame, SubtitleBitmapPlane, SubtitleFontAttachment,
     SubtitleTextFormat, SubtitleTextSegment, SubtitleTrackConfig,
@@ -30,11 +36,12 @@ use crate::android::mediacodec::{
 };
 #[cfg(target_env = "ohos")]
 use crate::ohos::avcodec::{
-    DecodedNv12FrameView, DecodedSurfaceFrame, OhosDecoderOutput, OhosNativeBufferImage,
+    DecodedSurfaceFrame, DecodedVideoFrameView, OhosDecoderOutput, OhosNativeBufferImage,
     OhosVideoCodec, OhosVideoDecoder,
 };
 
 const AVERROR_EOF: i32 = -541_478_725;
+const AVERROR_EXIT: i32 = -1_414_092_869;
 const MAX_SUBTITLE_FONT_ATTACHMENTS: usize = 256;
 const MAX_SUBTITLE_FONT_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SUBTITLE_FONT_TOTAL_BYTES: usize = 256 * 1024 * 1024;
@@ -85,6 +92,8 @@ pub enum FfmpegError {
     },
     #[error("source error: {0}")]
     Source(String),
+    #[error("source read cancelled")]
+    SourceCancelled,
 }
 
 impl FfmpegError {
@@ -181,6 +190,8 @@ pub struct MediaProbe {
     pub uri: String,
     pub duration: Option<Duration>,
     pub tracks: Vec<TrackInfo>,
+    pub chapters: Vec<ChapterInfo>,
+    pub container: crate::core::ContainerInfo,
     pub video: Vec<VideoProbe>,
     pub audio: Vec<AudioProbe>,
     pub subtitles: Vec<SubtitleTrackConfig>,
@@ -318,6 +329,19 @@ impl Demuxer {
         &self.probe
     }
 
+    pub(crate) fn release_source_buffer(&mut self) {
+        if let Some(avio) = &mut self.context.avio {
+            avio.source.release_buffer();
+        }
+    }
+
+    pub(crate) fn source_cancellation(&self) -> Option<crate::source::SourceCancellation> {
+        self.context
+            .avio
+            .as_ref()
+            .and_then(|avio| avio.source.cancellation())
+    }
+
     pub fn selection(&self) -> &StreamSelection {
         &self.selection
     }
@@ -396,10 +420,34 @@ impl Demuxer {
             let mut packet = Packet::alloc()?;
             let code =
                 unsafe { sys::av_read_frame(self.context.as_mut_ptr(), packet.as_mut_ptr()) };
+            // A demuxer may return a buffered packet or EOF after the AVIO
+            // callback was interrupted. Neither belongs to a completed read.
+            self.check_source_cancelled()?;
             if code == AVERROR_EOF {
                 return Ok(None);
             }
-            check(code, "av_read_frame")?;
+            if let Err(error) = check(code, "av_read_frame") {
+                // A read that failed because the media source could not deliver
+                // the bytes keeps its real reason on the AVIO (HTTP status,
+                // timeout, ...). Carry it into the terminal error: without it the
+                // error reads only "Input/output error (-5)" and the cause lives
+                // on stderr alone, which is why a report such as issue #1 needs a
+                // reproduction instead of a log line. When the failure surfaced
+                // only after further successful reads cleared `last_error`, the
+                // sticky read record still names the offset and the source's
+                // reason (issue #163).
+                return Err(
+                    match self
+                        .context
+                        .avio
+                        .as_ref()
+                        .and_then(|avio| avio.terminal_source_note(&error))
+                    {
+                        Some(source_note) => FfmpegError::Source(format!("{error}; {source_note}")),
+                        None => error,
+                    },
+                );
+            }
 
             let stream_index = packet.stream_index();
             packet.time_base = self.stream_time_base(stream_index);
@@ -411,6 +459,12 @@ impl Demuxer {
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
+        if let Some(avio) = &mut self.context.avio {
+            // avio_seek clears EOF but can retain a previous callback error.
+            // Start the explicit seek with fresh AVIO state after the worker
+            // has resumed its source, including for seeks within the buffer.
+            avio.clear_terminal_error();
+        }
         let relative_target = position.as_micros().min(i64::MAX as u128) as i64;
         let absolute_target =
             absolute_seek_target_micros(relative_target, self.timeline_origin_micros);
@@ -457,6 +511,7 @@ impl Demuxer {
                 sys::AVSEEK_FLAG_BACKWARD as i32,
             )
         };
+        self.check_source_cancelled()?;
         if backward < 0 {
             // Queue-backed subtitle demuxers reject a backward seek before the
             // first cue (for example target 0 with the first SRT cue at 500 ms).
@@ -473,6 +528,7 @@ impl Demuxer {
                     0,
                 )
             };
+            self.check_source_cancelled()?;
             if fallback < 0 {
                 check(backward, "av_seek_frame")?;
             }
@@ -495,6 +551,61 @@ impl Demuxer {
             "avformat_flush",
         )?;
         Ok(())
+    }
+
+    fn check_source_cancelled(&self) -> Result<()> {
+        if self
+            .context
+            .avio
+            .as_ref()
+            .is_some_and(|avio| avio.read_cancelled)
+        {
+            Err(FfmpegError::SourceCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Media time of the last keyframe at or before `position` on the
+    /// selected video stream, from the demuxer's seek index. `None` when the
+    /// index has no entry there (no index, or not read yet: Matroska reads
+    /// its cues at the first seek). Times are relative to the timeline origin,
+    /// like packet and frame timestamps.
+    pub fn keyframe_at_or_before(&self, position: Duration) -> Option<Duration> {
+        let stream_index = self.selected_video_seek_stream()?;
+        let time_base = self.stream_time_base(stream_index)?;
+        let raw = self.context.as_ptr();
+        let stream = unsafe { *(*raw).streams.add(usize::try_from(stream_index).ok()?) };
+        if stream.is_null() || unsafe { sys::avformat_index_get_entries_count(stream) } <= 0 {
+            return None;
+        }
+        let relative = position.as_micros().min(i64::MAX as u128) as i64;
+        let target = rescale_microseconds_to_time_base(
+            absolute_seek_target_micros(relative, self.timeline_origin_micros),
+            time_base,
+        );
+        let index = unsafe {
+            sys::av_index_search_timestamp(stream, target, sys::AVSEEK_FLAG_BACKWARD as i32)
+        };
+        if index < 0 {
+            return None;
+        }
+        let entry = unsafe { sys::avformat_index_get_entry(stream, index) };
+        if entry.is_null() {
+            return None;
+        }
+        let micros = unsafe {
+            sys::av_rescale_q(
+                (*entry).timestamp,
+                time_base.to_av_rational(),
+                sys::AVRational {
+                    num: 1,
+                    den: sys::AV_TIME_BASE as i32,
+                },
+            )
+        }
+        .saturating_sub(self.timeline_origin_micros);
+        Some(Duration::from_micros(micros.max(0) as u64))
     }
 
     fn selected_video_seek_stream(&self) -> Option<i32> {
@@ -544,6 +655,13 @@ impl CodecParameters<'_> {
     pub fn kind(self) -> Option<TrackKind> {
         unsafe { track_kind((*self.ptr).codec_type) }
     }
+
+    /// Container-signalled Dolby Vision configuration profile (`dvcC`/`dvvC`
+    /// carried as `AV_PKT_DATA_DOVI_CONF` codec parameters side data), used to
+    /// steer decode backend selection.
+    pub fn dolby_vision_profile(self) -> Option<u8> {
+        unsafe { codec_parameters_dolby_vision_profile(self.ptr) }
+    }
 }
 
 pub struct OwnedCodecParameters {
@@ -555,6 +673,13 @@ pub struct OwnedCodecParameters {
 unsafe impl Send for OwnedCodecParameters {}
 
 impl OwnedCodecParameters {
+    /// Container-signalled Dolby Vision configuration profile (`dvcC`/`dvvC`
+    /// carried as `AV_PKT_DATA_DOVI_CONF` codec parameters side data), used to
+    /// steer decode backend selection.
+    pub fn dolby_vision_profile(&self) -> Option<u8> {
+        unsafe { codec_parameters_dolby_vision_profile(self.ptr) }
+    }
+
     fn copy_from(parameters: CodecParameters<'_>) -> Result<Self> {
         let ptr = unsafe { sys::avcodec_parameters_alloc() };
         if ptr.is_null() {
@@ -700,6 +825,12 @@ impl SubtitleDecoder {
         self.stream_index
     }
 
+    /// Draws through the same ASS resources as [`other`]: frames of this
+    /// decoder and of `other` belong to one track.
+    pub fn share_ass_track_with(&mut self, other: &SubtitleDecoder) {
+        self.ass_track = other.ass_track.clone();
+    }
+
     pub fn time_base(&self) -> TimeBase {
         self.time_base
     }
@@ -790,6 +921,8 @@ pub enum DecoderOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderBackend {
     Software,
+    Cuda,
+    Vaapi,
     VideoToolbox,
     D3d11va,
     MediaCodec,
@@ -800,6 +933,8 @@ impl DecoderBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Software => "software",
+            Self::Cuda => "cuda",
+            Self::Vaapi => "vaapi",
             Self::VideoToolbox => "videotoolbox",
             Self::D3d11va => "d3d11va",
             Self::MediaCodec => "mediacodec",
@@ -815,6 +950,20 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
+    pub fn cuda() -> Self {
+        Self {
+            backend: DecoderBackend::Cuda,
+            mediacodec_surface: false,
+        }
+    }
+
+    pub fn vaapi() -> Self {
+        Self {
+            backend: DecoderBackend::Vaapi,
+            mediacodec_surface: false,
+        }
+    }
+
     pub fn software() -> Self {
         Self {
             backend: DecoderBackend::Software,
@@ -868,6 +1017,79 @@ struct HardwareDecoderState {
     device_ref: *mut sys::AVBufferRef,
     frames_ref: *mut sys::AVBufferRef,
     pixel_format: sys::AVPixelFormat,
+    /// What FFmpeg's pixel-format negotiation last chose; see [`HardwareRoute`].
+    route: HardwareRoute,
+}
+
+impl HardwareDecoderState {
+    fn new(
+        device_ref: *mut sys::AVBufferRef,
+        frames_ref: *mut sys::AVBufferRef,
+        pixel_format: sys::AVPixelFormat,
+    ) -> Self {
+        Self {
+            device_ref,
+            frames_ref,
+            pixel_format,
+            route: HardwareRoute::default(),
+        }
+    }
+}
+
+/// FFmpeg negotiates a hardware decoder's output format in `get_format`,
+/// again after every stream parameter change. When the hwaccel fails to
+/// initialise (or is not offered for the stream), FFmpeg asks once more
+/// without the hardware format and, for VideoToolbox and D3D11VA, decodes in
+/// software from then on while `avcodec_open2` had succeeded. The callback
+/// records each choice here so the decoder reports the backend that is
+/// actually decoding.
+#[derive(Default)]
+struct HardwareRoute {
+    /// `ROUTE_*`: nothing negotiated yet, hardware, or software.
+    state: AtomicU8,
+    /// The hardware format was handed to FFmpeg by the previous call.
+    hardware_offered: AtomicBool,
+    /// The previous call returned the hardware format and FFmpeg then asked
+    /// without it: its hwaccel failed to initialise.
+    init_failed: AtomicBool,
+    software_format: AtomicI32,
+}
+
+const ROUTE_UNKNOWN: u8 = 0;
+const ROUTE_HARDWARE: u8 = 1;
+const ROUTE_SOFTWARE: u8 = 2;
+
+impl HardwareRoute {
+    fn chose_hardware(&self) {
+        self.hardware_offered.store(true, Ordering::Relaxed);
+        self.init_failed.store(false, Ordering::Relaxed);
+        self.state.store(ROUTE_HARDWARE, Ordering::Release);
+    }
+
+    fn chose_software(&self, format: sys::AVPixelFormat) {
+        let after_hardware = self.hardware_offered.swap(false, Ordering::Relaxed);
+        self.init_failed.store(after_hardware, Ordering::Relaxed);
+        self.software_format.store(format, Ordering::Relaxed);
+        self.state.store(ROUTE_SOFTWARE, Ordering::Release);
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+}
+
+/// A change in how a hardware decoder is actually decoding, seen after FFmpeg
+/// renegotiated its output format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderRouteChange {
+    /// The backend the decoder was opened with.
+    pub configured: DecoderBackend,
+    /// The backend decoding now: `configured`, or `Software`.
+    pub active: DecoderBackend,
+    /// The software pixel format FFmpeg chose instead, when it fell back.
+    pub pixel_format: Option<String>,
+    /// Why, when it fell back.
+    pub reason: Option<String>,
 }
 
 #[cfg(target_os = "android")]
@@ -900,6 +1122,9 @@ pub struct Decoder {
     eof_sent: bool,
     end_of_stream: bool,
     hw_state: Option<Box<HardwareDecoderState>>,
+    /// The negotiated route last returned by [`Decoder::take_route_change`];
+    /// opening reports the configured backend.
+    reported_route: u8,
     #[cfg(target_os = "android")]
     mediacodec_source: Option<Arc<AndroidMediaCodecFrameSource>>,
     #[cfg(target_env = "ohos")]
@@ -968,11 +1193,37 @@ impl Decoder {
         )
     }
 
+    /// Opens a software decoder that decodes on several threads (FFmpeg
+    /// picks the count), for one-off work such as a frame export. Software
+    /// video decoders opened for playback follow
+    /// [`software_video_decode_threads`].
+    pub fn open_software_threaded(parameters: CodecParameters<'_>) -> Result<Self> {
+        Self::open_raw_with_threads(
+            parameters.ptr,
+            parameters.stream_index,
+            parameters.time_base,
+            DecoderConfig::software(),
+            Some(0),
+        )
+    }
+
     fn open_raw(
         parameters_ptr: *const sys::AVCodecParameters,
         stream_index: i32,
         time_base: TimeBase,
         config: DecoderConfig,
+    ) -> Result<Self> {
+        Self::open_raw_with_threads(parameters_ptr, stream_index, time_base, config, None)
+    }
+
+    /// `threads`: the codec context's thread count; `None` keeps FFmpeg's
+    /// default of one.
+    fn open_raw_with_threads(
+        parameters_ptr: *const sys::AVCodecParameters,
+        stream_index: i32,
+        time_base: TimeBase,
+        config: DecoderConfig,
+        threads: Option<i32>,
     ) -> Result<Self> {
         configure_ffmpeg_debug_logging();
         let codec_id = unsafe { (*parameters_ptr).codec_id };
@@ -992,11 +1243,10 @@ impl Decoder {
                 mediacodec_decoder(codec_id),
                 "avcodec_find_decoder_by_name(MediaCodec)",
             ),
-            DecoderBackend::VideoToolbox => videotoolbox_decoder(codec_id),
-            DecoderBackend::D3d11va => (
-                unsafe { sys::avcodec_find_decoder(codec_id) },
-                "avcodec_find_decoder",
-            ),
+            DecoderBackend::VideoToolbox
+            | DecoderBackend::D3d11va
+            | DecoderBackend::Cuda
+            | DecoderBackend::Vaapi => ffmpeg_hardware_decoder(codec_id),
             DecoderBackend::AvCodec => (
                 ptr::null(),
                 "HarmonyOS AVCodec is unavailable on this target",
@@ -1018,6 +1268,7 @@ impl Decoder {
             eof_sent: false,
             end_of_stream: false,
             hw_state: None,
+            reported_route: ROUTE_HARDWARE,
             #[cfg(target_os = "android")]
             mediacodec_source: None,
             #[cfg(target_env = "ohos")]
@@ -1035,6 +1286,25 @@ impl Decoder {
             unsafe { sys::avcodec_parameters_to_context(decoder.context, parameters_ptr) },
             "avcodec_parameters_to_context",
         )?;
+        // Packets are normalized to the stream time base before being sent
+        // (Packet::normalize_timeline), so declare that base the way the
+        // subtitle decoder does. Decoders that pass timestamps through are
+        // unaffected; a decoder that rescales packet timestamps gets frame pts
+        // back in the stream time base the rest of the engine expects instead
+        // of an undefined base.
+        unsafe {
+            (*decoder.context).pkt_timebase = time_base.to_av_rational();
+        }
+        let threads = threads.or_else(|| {
+            let video =
+                unsafe { (*parameters_ptr).codec_type } == sys::AVMediaType_AVMEDIA_TYPE_VIDEO;
+            (video && config.backend == DecoderBackend::Software)
+                .then(software_video_decode_threads)
+        });
+        if let Some(threads) = threads {
+            // 0: as many threads as FFmpeg finds useful for this codec.
+            unsafe { (*decoder.context).thread_count = threads };
+        }
         let mut decoder = decoder;
         match config.backend {
             DecoderBackend::Software => {}
@@ -1047,6 +1317,18 @@ impl Decoder {
             }
             DecoderBackend::VideoToolbox => decoder.configure_videotoolbox(codec)?,
             DecoderBackend::D3d11va => decoder.configure_d3d11va(codec)?,
+            DecoderBackend::Cuda => decoder.configure_hardware(
+                codec,
+                sys::AVHWDeviceType_AV_HWDEVICE_TYPE_CUDA,
+                "CUDA/NVDEC codec hardware configuration",
+                "create CUDA/NVDEC device",
+            )?,
+            DecoderBackend::Vaapi => decoder.configure_hardware(
+                codec,
+                sys::AVHWDeviceType_AV_HWDEVICE_TYPE_VAAPI,
+                "VA-API codec hardware configuration",
+                "create VA-API device",
+            )?,
             DecoderBackend::AvCodec => {}
         }
         let mut codec_options = ptr::null_mut();
@@ -1128,6 +1410,7 @@ impl Decoder {
                 }
                 .is_null());
         unsafe { sys::av_dict_free(&mut codec_options) };
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
         let mut open_result = check(open_code, "avcodec_open2");
         #[cfg(target_os = "android")]
         if open_result.is_ok()
@@ -1192,6 +1475,25 @@ impl Decoder {
             }
         }
         open_result?;
+        if threads.is_some() {
+            let (count, kind) = unsafe {
+                (
+                    (*decoder.context).thread_count,
+                    (*decoder.context).active_thread_type,
+                )
+            };
+            crate::trace::diagnostic(
+                serde_json::json!({
+                    "event": "video_decoder",
+                    "stage": "software_threads",
+                    "codec": codec_name_for_id(codec_id),
+                    "requestedThreads": threads,
+                    "threads": count,
+                    "threadType": thread_type_label(kind),
+                })
+                .to_string(),
+            );
+        }
         if config.backend == DecoderBackend::Software && codec_id == sys::AVCodecID_AV_CODEC_ID_AV1
         {
             crate::trace::diagnostic(
@@ -1199,11 +1501,7 @@ impl Decoder {
                     "event": "video_decoder",
                     "stage": "software_decoder_selected",
                     "codec": "av1",
-                    "decoder": if cfg!(target_os = "windows") {
-                        "avcodec_find_decoder"
-                    } else {
-                        "libdav1d"
-                    },
+                    "decoder": "libdav1d",
                 })
                 .to_string(),
             );
@@ -1219,8 +1517,63 @@ impl Decoder {
         self.time_base
     }
 
+    /// The backend the decoder was opened with. See [`Decoder::active_backend`]
+    /// for the one decoding now.
     pub fn backend(&self) -> DecoderBackend {
         self.backend
+    }
+
+    /// The backend actually decoding: the configured one, or `Software` when
+    /// FFmpeg's last format negotiation dropped the hardware format (its
+    /// hwaccel failed to initialise or does not take this stream).
+    pub fn active_backend(&self) -> DecoderBackend {
+        match &self.hw_state {
+            Some(state) if state.route.state() == ROUTE_SOFTWARE => DecoderBackend::Software,
+            _ => self.backend,
+        }
+    }
+
+    /// Returns the route FFmpeg settled on when it differs from the one last
+    /// returned here (opening counts as the configured hardware backend):
+    /// a fallback to software, or hardware again after one.
+    pub fn take_route_change(&mut self) -> Option<DecoderRouteChange> {
+        let state = self.hw_state.as_ref()?;
+        let route = state.route.state();
+        if route == ROUTE_UNKNOWN || route == self.reported_route {
+            return None;
+        }
+        self.reported_route = route;
+        if route == ROUTE_HARDWARE {
+            return Some(DecoderRouteChange {
+                configured: self.backend,
+                active: self.backend,
+                pixel_format: unsafe { pixel_format_name(state.pixel_format) },
+                reason: None,
+            });
+        }
+        let software =
+            unsafe { pixel_format_name(state.route.software_format.load(Ordering::Relaxed)) };
+        let hardware = unsafe { pixel_format_name(state.pixel_format) }
+            .unwrap_or_else(|| self.backend.as_str().to_string());
+        let reason = if state.route.init_failed.load(Ordering::Relaxed) {
+            format!(
+                "FFmpeg could not initialise the {} hwaccel ({hardware}) for this stream and decodes it in software ({}); its log has the cause",
+                self.backend.as_str(),
+                software.as_deref().unwrap_or("unknown format"),
+            )
+        } else {
+            format!(
+                "FFmpeg did not offer the {} hwaccel ({hardware}) for this stream and decodes it in software ({})",
+                self.backend.as_str(),
+                software.as_deref().unwrap_or("unknown format"),
+            )
+        };
+        Some(DecoderRouteChange {
+            configured: self.backend,
+            active: DecoderBackend::Software,
+            pixel_format: software,
+            reason: Some(reason),
+        })
     }
 
     pub fn uses_mediacodec_surface(&self) -> bool {
@@ -1326,7 +1679,7 @@ impl Decoder {
             }
             return match decoder
                 .receive_frame(|decoded| {
-                    Frame::from_ohos_nv12(decoded, time_base, color)
+                    Frame::from_ohos_video_frame(decoded, time_base, color)
                         .map_err(|error| error.to_string())
                 })
                 .map_err(FfmpegError::OhosAvCodec)?
@@ -1339,6 +1692,7 @@ impl Decoder {
                 }
             };
         }
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
         let mut frame = Frame::alloc(self.time_base)?;
         let code = unsafe { sys::avcodec_receive_frame(self.context, frame.ptr) };
         if code == av_error(EAGAIN) {
@@ -1419,7 +1773,7 @@ impl Decoder {
         let output_mode = if ohos_decoder.uses_surface() {
             "surface_native_buffer"
         } else {
-            "buffer_nv12_direct_frame_copy"
+            "buffer_planar_direct_frame_copy"
         };
         crate::trace::diagnostic(
             serde_json::json!({
@@ -1442,6 +1796,7 @@ impl Decoder {
             eof_sent: false,
             end_of_stream: false,
             hw_state: None,
+            reported_route: ROUTE_HARDWARE,
             #[cfg(target_os = "android")]
             mediacodec_source: None,
             ohos_decoder: Some(ohos_decoder),
@@ -1553,11 +1908,11 @@ impl Decoder {
                     "av_buffer_ref(MediaCodec hw_device_ctx)",
                 ));
             }
-            let mut hw_state = Box::new(HardwareDecoderState {
+            let mut hw_state = Box::new(HardwareDecoderState::new(
                 device_ref,
-                frames_ref: ptr::null_mut(),
+                ptr::null_mut(),
                 pixel_format,
-            });
+            ));
             unsafe {
                 (*self.context).hw_device_ctx = context_device_ref;
                 (*self.context).opaque = (&mut *hw_state) as *mut HardwareDecoderState as *mut _;
@@ -1594,13 +1949,24 @@ impl Decoder {
     ) -> Result<()> {
         let pixel_format = hardware_pixel_format(codec, device_type)
             .ok_or_else(|| FfmpegError::NullPointer(hw_config_operation))?;
+        // FFmpeg selects a default device when unset. A render-node path lets
+        // Intel/AMD multi-GPU systems choose the desired VA-API device; CUDA
+        // accepts an ordinal such as 0. No vendor driver is bundled here.
+        let device = match self.backend {
+            DecoderBackend::Cuda => std::env::var("ERIKA_CUDA_DEVICE").ok(),
+            DecoderBackend::Vaapi => std::env::var("ERIKA_VAAPI_DEVICE").ok(),
+            _ => None,
+        }
+        .map(std::ffi::CString::new)
+        .transpose()
+        .map_err(|_| FfmpegError::InteriorNul)?;
         let mut device_ref = ptr::null_mut();
         check(
             unsafe {
                 sys::av_hwdevice_ctx_create(
                     &mut device_ref,
                     device_type,
-                    ptr::null(),
+                    device.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
                     ptr::null_mut(),
                     0,
                 )
@@ -1617,11 +1983,11 @@ impl Decoder {
             return Err(FfmpegError::NullPointer("av_buffer_ref(hw_device_ctx)"));
         }
 
-        let mut hw_state = Box::new(HardwareDecoderState {
+        let mut hw_state = Box::new(HardwareDecoderState::new(
             device_ref,
-            frames_ref: ptr::null_mut(),
+            ptr::null_mut(),
             pixel_format,
-        });
+        ));
 
         unsafe {
             (*self.context).hw_device_ctx = context_device_ref;
@@ -1633,8 +1999,51 @@ impl Decoder {
     }
 }
 
+/// Environment override for [`software_video_decode_threads`]: a positive
+/// thread count, or `0`/`auto` for FFmpeg's choice.
+pub const VIDEO_DECODE_THREADS_ENV: &str = "ERIKA_VIDEO_DECODE_THREADS";
+
+/// Thread count for software video decoders, playback included.
+///
+/// FFmpeg's own default is one thread, which leaves a 4K stream that falls
+/// back to software short of real time. `0` lets libavcodec pick: frame plus
+/// slice threading with one thread per core plus one, capped at 16 (its
+/// `MAX_AUTO_THREADS`); libdav1d takes 1.5 threads per core. mpv's
+/// `vd-lavc-threads` defaults to the same. Frame threading delays the first
+/// picture after open or seek by up to that many packets, which a local file
+/// or a buffered stream supplies at once. `ERIKA_VIDEO_DECODE_THREADS`
+/// overrides it (`1` restores single-threaded decoding).
+pub fn software_video_decode_threads() -> i32 {
+    software_video_decode_threads_from(std::env::var(VIDEO_DECODE_THREADS_ENV).ok().as_deref())
+}
+
+/// [`software_video_decode_threads`] for a given override value.
+pub(crate) fn software_video_decode_threads_from(value: Option<&str>) -> i32 {
+    match value.map(str::trim) {
+        Some(value) if !value.is_empty() && !value.eq_ignore_ascii_case("auto") => value
+            .parse::<i32>()
+            .ok()
+            .filter(|threads| (0..=64).contains(threads))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn thread_type_label(active_thread_type: i32) -> &'static str {
+    if active_thread_type & sys::FF_THREAD_FRAME as i32 != 0 {
+        "frame"
+    } else if active_thread_type & sys::FF_THREAD_SLICE as i32 != 0 {
+        "slice"
+    } else {
+        "none"
+    }
+}
+
+fn codec_name_for_id(codec_id: sys::AVCodecID) -> Option<String> {
+    unsafe { codec_name(codec_id) }
+}
+
 fn software_decoder(codec_id: sys::AVCodecID) -> (*const sys::AVCodec, &'static str) {
-    #[cfg(not(target_os = "windows"))]
     if codec_id == sys::AVCodecID_AV_CODEC_ID_AV1 {
         return (
             unsafe { sys::avcodec_find_decoder_by_name(c"libdav1d".as_ptr()) },
@@ -1647,7 +2056,9 @@ fn software_decoder(codec_id: sys::AVCodecID) -> (*const sys::AVCodec, &'static 
     )
 }
 
-fn videotoolbox_decoder(codec_id: sys::AVCodecID) -> (*const sys::AVCodec, &'static str) {
+fn ffmpeg_hardware_decoder(codec_id: sys::AVCodecID) -> (*const sys::AVCodec, &'static str) {
+    // FFmpeg prefers libdav1d when both AV1 decoders are installed. Select
+    // its hardware wrapper explicitly for VideoToolbox and D3D11VA.
     if codec_id == sys::AVCodecID_AV_CODEC_ID_AV1 {
         return (
             unsafe { sys::avcodec_find_decoder_by_name(c"av1".as_ptr()) },
@@ -1778,9 +2189,80 @@ fn align_i32(value: i32, alignment: i32) -> i32 {
 }
 
 fn configure_ffmpeg_debug_logging() {
+    install_ffmpeg_log_capture();
     if std::env::var_os("ERIKA_FFMPEG_DEBUG").is_some() {
         unsafe { sys::av_log_set_level(sys::AV_LOG_DEBUG as c_int) };
     }
+}
+
+type FfmpegLogSink = unsafe extern "C" fn(level: c_int, line: *const c_char);
+
+unsafe extern "C" {
+    fn erika_ffmpeg_install_log_bridge(sink: FfmpegLogSink);
+}
+
+/// Copies FFmpeg warnings and errors into the diagnostics log ring.
+///
+/// `av_log_set_callback` is process-wide, so this runs once for every player.
+/// The C bridge still forwards each message to FFmpeg's default callback,
+/// leaving stderr output unchanged. `ERIKA_FFMPEG_LOG_CAPTURE=0` disables
+/// capture; with a shared system FFmpeg (Linux distro build) capture is opt-in
+/// via `ERIKA_FFMPEG_LOG_CAPTURE=1` because other libraries in the process may
+/// own the callback.
+pub(crate) fn install_ffmpeg_log_capture() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        use crate::trace::{FfmpegLogCapture, set_ffmpeg_log_capture};
+        let requested = std::env::var("ERIKA_FFMPEG_LOG_CAPTURE").ok();
+        let disabled = matches!(
+            requested.as_deref(),
+            Some("0" | "false" | "FALSE" | "off" | "OFF")
+        );
+        let forced = requested.as_deref().is_some_and(|value| {
+            !value.is_empty() && !matches!(value, "0" | "false" | "FALSE" | "off" | "OFF")
+        });
+        if disabled {
+            set_ffmpeg_log_capture(FfmpegLogCapture::Disabled);
+            return;
+        }
+        if cfg!(erika_shared_ffmpeg) && !forced {
+            set_ffmpeg_log_capture(FfmpegLogCapture::SharedLibrary);
+            return;
+        }
+        unsafe { erika_ffmpeg_install_log_bridge(ffmpeg_log_sink) };
+        set_ffmpeg_log_capture(FfmpegLogCapture::Active);
+    });
+}
+
+fn ffmpeg_log_level(level: c_int) -> crate::trace::LogLevel {
+    use crate::trace::LogLevel;
+    if level <= sys::AV_LOG_ERROR as c_int {
+        LogLevel::Error
+    } else if level <= sys::AV_LOG_WARNING as c_int {
+        LogLevel::Warn
+    } else if level <= sys::AV_LOG_INFO as c_int {
+        LogLevel::Info
+    } else if level <= sys::AV_LOG_DEBUG as c_int {
+        LogLevel::Debug
+    } else {
+        LogLevel::Trace
+    }
+}
+
+/// Receives a formatted FFmpeg line from the C bridge. It runs on FFmpeg's
+/// logging thread, so it only borrows the line (no copy unless it is stored or
+/// is not UTF-8) and never blocks on the ring.
+unsafe extern "C" fn ffmpeg_log_sink(level: c_int, line: *const c_char) {
+    if line.is_null() {
+        return;
+    }
+    let bytes = unsafe { CStr::from_ptr(line) }.to_bytes();
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    crate::trace::record_ffmpeg(ffmpeg_log_level(level), text);
 }
 
 /// Registers the process Java VM used by FFmpeg's MediaCodec bridge.
@@ -1980,8 +2462,8 @@ impl Frame {
     }
 
     #[cfg(target_env = "ohos")]
-    fn from_ohos_nv12(
-        decoded: DecodedNv12FrameView<'_>,
+    fn from_ohos_video_frame(
+        decoded: DecodedVideoFrameView<'_>,
         time_base: TimeBase,
         color: OhosFrameColorProperties,
     ) -> Result<Self> {
@@ -1992,31 +2474,40 @@ impl Frame {
             || decoded.height > i32::MAX as u32
         {
             return Err(FfmpegError::OhosAvCodec(format!(
-                "invalid decoded NV12 dimensions {}x{}",
+                "invalid decoded OHOS video dimensions {}x{}",
                 decoded.width, decoded.height
             )));
         }
         let width = decoded.width as usize;
         let height = decoded.height as usize;
-        let chroma_width = width.div_ceil(2) * 2;
+        let luma_row_bytes = decoded
+            .pixel_format
+            .luma_row_bytes(width)
+            .map_err(FfmpegError::OhosAvCodec)?;
+        let chroma_width = decoded
+            .pixel_format
+            .chroma_row_bytes(width)
+            .map_err(FfmpegError::OhosAvCodec)?;
         let chroma_rows = height.div_ceil(2);
         let expected_luma_size = decoded.luma_stride.checked_mul(height).ok_or_else(|| {
-            FfmpegError::OhosAvCodec("decoded NV12 luma size overflowed".to_string())
+            FfmpegError::OhosAvCodec("decoded OHOS video luma size overflowed".to_string())
         })?;
         let expected_chroma_size =
             decoded
                 .chroma_stride
                 .checked_mul(chroma_rows)
                 .ok_or_else(|| {
-                    FfmpegError::OhosAvCodec("decoded NV12 chroma size overflowed".to_string())
+                    FfmpegError::OhosAvCodec(
+                        "decoded OHOS video chroma size overflowed".to_string(),
+                    )
                 })?;
-        if decoded.luma_stride < width
+        if decoded.luma_stride < luma_row_bytes
             || decoded.chroma_stride < chroma_width
             || decoded.luma.len() < expected_luma_size
             || decoded.chroma.len() < expected_chroma_size
         {
             return Err(FfmpegError::OhosAvCodec(format!(
-                "decoded NV12 frame has invalid source layout: luma {}/{expected_luma_size} bytes (stride {}), chroma {}/{expected_chroma_size} bytes (stride {})",
+                "decoded OHOS video frame has invalid source layout: luma {}/{expected_luma_size} bytes (stride {}), chroma {}/{expected_chroma_size} bytes (stride {})",
                 decoded.luma.len(),
                 decoded.luma_stride,
                 decoded.chroma.len(),
@@ -2025,7 +2516,11 @@ impl Frame {
         }
 
         unsafe {
-            (*frame.ptr).format = sys::AVPixelFormat_AV_PIX_FMT_NV12 as i32;
+            (*frame.ptr).format = if decoded.pixel_format.bytes_per_sample() == 2 {
+                sys::AVPixelFormat_AV_PIX_FMT_P010LE as i32
+            } else {
+                sys::AVPixelFormat_AV_PIX_FMT_NV12 as i32
+            };
             (*frame.ptr).width = decoded.width as i32;
             (*frame.ptr).height = decoded.height as i32;
             (*frame.ptr).pts = rescale_microseconds_to_time_base(decoded.pts_micros, time_base);
@@ -2037,7 +2532,7 @@ impl Frame {
         }
         check(
             unsafe { sys::av_frame_get_buffer(frame.ptr, 32) },
-            "av_frame_get_buffer(OHOS NV12)",
+            "av_frame_get_buffer(OHOS video)",
         )?;
 
         let source_luma = decoded.luma.as_ptr();
@@ -2049,18 +2544,18 @@ impl Frame {
             let destination_chroma_stride = (*frame.ptr).linesize[1].max(0) as usize;
             if destination_luma.is_null()
                 || destination_chroma.is_null()
-                || destination_luma_stride < width
+                || destination_luma_stride < luma_row_bytes
                 || destination_chroma_stride < chroma_width
             {
                 return Err(FfmpegError::OhosAvCodec(
-                    "FFmpeg allocated an invalid NV12 frame layout".to_string(),
+                    "FFmpeg allocated an invalid OHOS video frame layout".to_string(),
                 ));
             }
             for row in 0..height {
                 ptr::copy_nonoverlapping(
                     source_luma.add(row * decoded.luma_stride),
                     destination_luma.add(row * destination_luma_stride),
-                    width,
+                    luma_row_bytes,
                 );
             }
             for row in 0..chroma_rows {
@@ -2075,6 +2570,10 @@ impl Frame {
     }
 
     pub fn try_clone_ref(&self) -> Result<Self> {
+        #[cfg_attr(
+            not(any(target_os = "android", target_env = "ohos")),
+            allow(unused_mut)
+        )]
         let mut frame = Frame::alloc(self.time_base)?;
         check(
             unsafe { sys::av_frame_ref(frame.ptr, self.ptr) },
@@ -2146,6 +2645,53 @@ impl Frame {
         unsafe {
             let linesize = (*self.ptr).linesize;
             [linesize[0], linesize[1], linesize[2], linesize[3]]
+        }
+    }
+
+    /// Zero-copy view of a software frame's luma plane.
+    ///
+    /// `yuv420p10le` and `p010le` both store two bytes per sample but pack
+    /// the 10-bit code differently: software Main10 (`yuv420p10le`) keeps the
+    /// code in bits `[9:0]`, while P010 left-aligns it in bits `[15:6]`.
+    /// Callers must respect [`LumaPlaneView::sample_layout`] — treating both
+    /// as P010 silently mis-measures software HDR10.
+    pub fn luma_plane_view(&self) -> Option<LumaPlaneView<'_>> {
+        let width = self.width() as usize;
+        let height = self.height() as usize;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let format = self.raw_pixel_format();
+        let (bytes_per_sample, layout) = if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P
+            || format == sys::AVPixelFormat_AV_PIX_FMT_NV12
+        {
+            (1, LumaSampleLayout::U8)
+        } else if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+            (2, LumaSampleLayout::Packed10)
+        } else if format == sys::AVPixelFormat_AV_PIX_FMT_P010LE {
+            (2, LumaSampleLayout::P010)
+        } else {
+            return None;
+        };
+        unsafe {
+            let frame = &*self.ptr;
+            let data = frame.data[0] as *const u8;
+            if data.is_null() {
+                return None;
+            }
+            let stride = usize::try_from(frame.linesize[0]).ok()?;
+            if stride < width.checked_mul(bytes_per_sample)? {
+                return None;
+            }
+            Some(LumaPlaneView {
+                data,
+                stride,
+                width,
+                height,
+                bytes_per_sample,
+                layout,
+                _frame: std::marker::PhantomData,
+            })
         }
     }
 
@@ -2386,6 +2932,61 @@ impl Frame {
         unsafe { frame_hdr_metadata(self.ptr) }
     }
 
+    /// Per-frame Dolby Vision RPU metadata parsed by the HEVC decoder
+    /// (`AV_FRAME_DATA_DOVI_METADATA`). Present on RPU-carrying streams such
+    /// as profiles 5, 7, and 8, on both software and hardware decoded frames
+    /// (FFmpeg parses the RPU on the CPU and attaches it regardless).
+    pub fn dovi_metadata(&self) -> Option<DoviSourceMetadata> {
+        unsafe {
+            frame_dovi_metadata_result(self.ptr)
+                .ok()
+                .map(|(metadata, _)| metadata)
+        }
+    }
+
+    /// Reports the enhancement-layer residual an RPU asks for but this renderer
+    /// cannot compose (Profile 7 FEL/MEL). The base-layer mapping still applies
+    /// to such frames, so this is diagnostic signal rather than a rejection.
+    /// Returns `None` when the frame carries no usable RPU at all.
+    pub fn dovi_el_status(&self) -> Option<DoviElStatus> {
+        unsafe { frame_dovi_metadata_result(self.ptr).ok().map(|(_, el)| el) }
+    }
+
+    /// Returns `None` when this frame's Dolby Vision metadata can feed the
+    /// mapping path. Otherwise reports why it cannot. Frames without any RPU
+    /// side data report [`DoviRejectReason::MissingSideData`], which callers
+    /// must interpret against the stream's Dolby Vision profile: absent RPUs
+    /// are normal on Profile 8, but Profile 5 has no HDR10-compatible base
+    /// layer, so a missing RPU leaves the frame unmappable.
+    pub fn dovi_unavailable_reason(&self) -> Option<DoviRejectReason> {
+        match self.dovi_mapping_probe() {
+            Ok(_) => None,
+            Err(reason) => Some(reason),
+        }
+    }
+
+    /// One-pass probe of this frame's RPU: `Ok` carries the enhancement-layer
+    /// status when the mapping path can consume the RPU, `Err` reports why it
+    /// cannot. Prefer this over calling [`Frame::dovi_unavailable_reason`]
+    /// and [`Frame::dovi_el_status`] back-to-back, which re-parses the side
+    /// data.
+    pub fn dovi_mapping_probe(&self) -> std::result::Result<DoviElStatus, DoviRejectReason> {
+        if self.ptr.is_null() {
+            return Err(DoviRejectReason::MissingSideData);
+        }
+        let has_side_data = unsafe {
+            !sys::av_frame_get_side_data(
+                self.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+            )
+            .is_null()
+        };
+        if !has_side_data {
+            return Err(DoviRejectReason::MissingSideData);
+        }
+        unsafe { frame_dovi_metadata_result(self.ptr).map(|(_, el)| el) }
+    }
+
     pub fn transfer_to_system_memory(&self) -> Result<Frame> {
         let frame = Frame::alloc(self.time_base)?;
         check(
@@ -2515,23 +3116,15 @@ impl Frame {
         unsafe {
             let frame = &*self.ptr;
             if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
-                let luma =
-                    read_10bit_plane_as_p010(frame.data[0], frame.linesize[0], width, height)?;
-                let chroma = read_10bit_chroma_as_p010(
-                    frame.data[1],
-                    frame.linesize[1],
-                    frame.data[2],
-                    frame.linesize[2],
-                    chroma_width,
-                    chroma_height,
-                )?;
-                Some(PlanarFrame {
+                let mut output = PlanarFrame {
                     format: PlanarPixelFormat::P010,
                     width: width as u32,
                     height: height as u32,
-                    luma,
-                    chroma,
-                })
+                    luma: Vec::new(),
+                    chroma: Vec::new(),
+                };
+                self.write_planar_frame(&mut output)?;
+                Some(output)
             } else if format == sys::AVPixelFormat_AV_PIX_FMT_P010LE {
                 let luma = copy_16bit_rows(frame.data[0], frame.linesize[0], width, height)?;
                 let chroma = copy_16bit_rows(
@@ -2551,6 +3144,117 @@ impl Frame {
                 self.to_nv12_with_swscale()
             }
         }
+    }
+
+    /// Reuses renderer-owned CPU storage for 10-bit planar software frames and
+    /// exact-layout 8-bit NV12 output. Other layouts retain the allocating path.
+    /// No AVFrame pointers escape: CreateTexture2D copies the planes synchronously.
+    pub(crate) fn write_planar_frame(&self, output: &mut PlanarFrame) -> Option<()> {
+        let format = self.raw_pixel_format();
+        if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P
+            || format == sys::AVPixelFormat_AV_PIX_FMT_NV12
+        {
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            if width != 0
+                && height != 0
+                && output.format == PlanarPixelFormat::Nv12
+                && output.width as usize == width
+                && output.height as usize == height
+                && width.checked_mul(height) == Some(output.luma.len())
+                && cw.checked_mul(ch).and_then(|len| len.checked_mul(2))
+                    == Some(output.chroma.len())
+            {
+                // Validate ALL source planes before changing either output.
+                // A failed source validation leaves bytes and metadata intact.
+                let validate_plane =
+                    |data: *const u8, stride: i32, row_bytes: usize, rows: usize| {
+                        let stride = usize::try_from(stride).ok()?;
+                        let span = rows
+                            .checked_sub(1)?
+                            .checked_mul(stride)?
+                            .checked_add(row_bytes)?;
+                        if data.is_null() || stride < row_bytes || span > isize::MAX as usize {
+                            return None;
+                        }
+                        (data as usize).checked_add(span)?;
+                        Some(stride)
+                    };
+                // SAFETY: the Frame owns each software plane. The checks above
+                // bound the visible layout; checked spans below bound every row
+                // offset. No borrowed source pointer survives this synchronous copy.
+                unsafe {
+                    let frame = &*self.ptr;
+                    let y_stride = validate_plane(frame.data[0], frame.linesize[0], width, height)?;
+                    let uv_row_bytes = cw.checked_mul(2)?;
+                    let source_chroma_bytes = if format == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                        uv_row_bytes
+                    } else {
+                        cw
+                    };
+                    let u_stride =
+                        validate_plane(frame.data[1], frame.linesize[1], source_chroma_bytes, ch)?;
+                    let v_stride = if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+                        validate_plane(frame.data[2], frame.linesize[2], cw, ch)?
+                    } else {
+                        0
+                    };
+                    for (row, dst) in output.luma.chunks_exact_mut(width).enumerate() {
+                        let src = slice::from_raw_parts(frame.data[0].add(row * y_stride), width);
+                        dst.copy_from_slice(src);
+                    }
+                    for (row, dst) in output.chroma.chunks_exact_mut(uv_row_bytes).enumerate() {
+                        let u = slice::from_raw_parts(
+                            frame.data[1].add(row * u_stride),
+                            source_chroma_bytes,
+                        );
+                        if format == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                            dst.copy_from_slice(u);
+                        } else {
+                            let v = slice::from_raw_parts(frame.data[2].add(row * v_stride), cw);
+                            for col in 0..cw {
+                                dst[col * 2] = u[col];
+                                dst[col * 2 + 1] = v[col];
+                            }
+                        }
+                    }
+                }
+                return Some(());
+            }
+        }
+        if format != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+            *output = self.to_planar_frame()?;
+            return Some(());
+        }
+        let (width, height) = (self.width() as usize, self.height() as usize);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // SAFETY: the AVFrame owns these strided 16-bit LE planes. Helpers
+        // validate visible row sizes and write only initialized output storage.
+        unsafe {
+            let frame = &*self.ptr;
+            read_10bit_plane_as_p010(
+                frame.data[0],
+                frame.linesize[0],
+                width,
+                height,
+                &mut output.luma,
+            )?;
+            read_10bit_chroma_as_p010(
+                frame.data[1],
+                frame.linesize[1],
+                frame.data[2],
+                frame.linesize[2],
+                width.div_ceil(2),
+                height.div_ceil(2),
+                &mut output.chroma,
+            )?;
+        }
+        output.format = PlanarPixelFormat::P010;
+        output.width = width as u32;
+        output.height = height as u32;
+        Some(())
     }
 
     fn to_nv12_with_swscale(&self) -> Option<PlanarFrame> {
@@ -2625,6 +3329,378 @@ impl Frame {
     }
 }
 
+// Views internal to native uploads. Public packed conversion APIs and fallback
+// formats remain independent.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "windows",
+    test
+))]
+mod software_planar_upload {
+    use super::{Frame, PhantomData, slice, sys};
+
+    pub(crate) struct StridedPlane<'a> {
+        ptr: *const u8,
+        stride: usize,
+        row_bytes: usize,
+        rows: usize,
+        span: usize,
+        _frame: PhantomData<&'a Frame>,
+    }
+
+    impl<'a> StridedPlane<'a> {
+        fn from_frame(
+            frame: &'a Frame,
+            plane: usize,
+            row_bytes: usize,
+            rows: usize,
+        ) -> Option<Self> {
+            let raw = unsafe { &*frame.ptr };
+            let ptr = raw.data[plane] as *const u8;
+            let stride = usize::try_from(raw.linesize[plane]).ok()?;
+            let span = rows
+                .checked_sub(1)?
+                .checked_mul(stride)?
+                .checked_add(row_bytes)?;
+            if ptr.is_null() || row_bytes == 0 || stride < row_bytes || span > isize::MAX as usize {
+                return None;
+            }
+            (ptr as usize).checked_add(span)?;
+            Some(Self {
+                ptr,
+                stride,
+                row_bytes,
+                rows,
+                span,
+                _frame: PhantomData,
+            })
+        }
+
+        pub(crate) fn as_ptr(&self) -> *const u8 {
+            self.ptr
+        }
+        pub(crate) fn stride(&self) -> usize {
+            self.stride
+        }
+
+        pub(crate) fn visible_row(&self, row: usize) -> Option<&[u8]> {
+            let offset = row.checked_mul(self.stride)?;
+            if row >= self.rows || offset.checked_add(self.row_bytes)? > self.span {
+                return None;
+            }
+            // Only visible bytes form a Rust slice. Decoder row padding need
+            // not be initialized and is never covered by a &[u8].
+            Some(unsafe { slice::from_raw_parts(self.ptr.add(offset), self.row_bytes) })
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) struct SoftwareYuv420pUpload<'a> {
+        width: usize,
+        height: usize,
+        y: StridedPlane<'a>,
+        u: StridedPlane<'a>,
+        v: StridedPlane<'a>,
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl SoftwareYuv420pUpload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.y
+        }
+
+        pub(crate) fn write_chroma_into(&self, uv: &mut [u8], uv_pitch: usize) -> Option<()> {
+            let cw = self.width.div_ceil(2);
+            let uv_row_bytes = cw.checked_mul(2)?;
+            if uv_pitch < uv_row_bytes || uv_pitch.checked_mul(self.height.div_ceil(2))? != uv.len()
+            {
+                return None;
+            }
+            for (row, dst) in uv.chunks_exact_mut(uv_pitch).enumerate() {
+                let (u, v) = (self.u.visible_row(row)?, self.v.visible_row(row)?);
+                // Keep the ordinary interleave loop available to the compiler's
+                // vectorizer; only visible bytes enter the new immutable backing.
+                for col in 0..cw {
+                    dst[col * 2] = u[col];
+                    dst[col * 2 + 1] = v[col];
+                }
+            }
+            Some(())
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl Frame {
+        pub(crate) fn software_yuv420p_upload(&self) -> Option<SoftwareYuv420pUpload<'_>> {
+            if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            let y = StridedPlane::from_frame(self, 0, width, height)?;
+            let u = StridedPlane::from_frame(self, 1, cw, ch)?;
+            let v = StridedPlane::from_frame(self, 2, cw, ch)?;
+            Some(SoftwareYuv420pUpload {
+                width,
+                height,
+                y,
+                u,
+                v,
+            })
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) struct SoftwareP010Upload<'a> {
+        width: usize,
+        height: usize,
+        y: StridedPlane<'a>,
+        u: StridedPlane<'a>,
+        v: StridedPlane<'a>,
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl SoftwareP010Upload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+
+        #[cfg(target_os = "windows")]
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.y
+        }
+
+        #[cfg(target_os = "windows")]
+        pub(crate) fn write_d3d11_chroma(&self, output: &mut Vec<u8>) -> Option<()> {
+            // SAFETY: These strided planes borrow the software AVFrame, and
+            // their visible layout has been checked. The CPU helper accesses
+            // only visible U/V bytes and accepts different source pitches.
+            unsafe {
+                super::read_10bit_chroma_as_p010(
+                    self.u.as_ptr().cast_mut(),
+                    self.u.stride() as i32,
+                    self.v.as_ptr().cast_mut(),
+                    self.v.stride() as i32,
+                    self.width.div_ceil(2),
+                    self.height.div_ceil(2),
+                    output,
+                )
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        pub(crate) fn write_mapped_d3d11_chroma(
+            &self,
+            output: &mut [std::mem::MaybeUninit<u8>],
+            pitch: usize,
+        ) -> Option<()> {
+            let row_bytes = self.width.div_ceil(2).checked_mul(4)?;
+            let rows = self.height.div_ceil(2);
+            let span = rows
+                .checked_sub(1)?
+                .checked_mul(pitch)?
+                .checked_add(row_bytes)?;
+            if pitch < row_bytes || span != output.len() {
+                return None;
+            }
+            for (row, dst) in output.chunks_mut(pitch).enumerate() {
+                super::p010::chroma_row_write_only(
+                    self.u.visible_row(row)?,
+                    self.v.visible_row(row)?,
+                    &mut dst[..row_bytes],
+                );
+            }
+            Some(())
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        pub(crate) fn write_into(
+            &self,
+            y: &mut [u8],
+            y_pitch: usize,
+            uv: &mut [u8],
+            uv_pitch: usize,
+        ) -> Option<()> {
+            let y_row_bytes = self.width.checked_mul(2)?;
+            let uv_row_bytes = self.width.div_ceil(2).checked_mul(4)?;
+            let ch = self.height.div_ceil(2);
+            // Check the entire destination before writing either plane. The
+            // caller initializes the backing memory before creating these slices.
+            if y_pitch < y_row_bytes
+                || uv_pitch < uv_row_bytes
+                || y_pitch.checked_mul(self.height)? != y.len()
+                || uv_pitch.checked_mul(ch)? != uv.len()
+            {
+                return None;
+            }
+            for (row, dst) in y.chunks_exact_mut(y_pitch).enumerate() {
+                super::p010::luma_row(self.y.visible_row(row)?, &mut dst[..y_row_bytes]);
+            }
+            for (row, dst) in uv.chunks_exact_mut(uv_pitch).enumerate() {
+                super::p010::chroma_row(
+                    self.u.visible_row(row)?,
+                    self.v.visible_row(row)?,
+                    &mut dst[..uv_row_bytes],
+                );
+            }
+            Some(())
+        }
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    impl Frame {
+        pub(crate) fn software_p010_upload(&self) -> Option<SoftwareP010Upload<'_>> {
+            if self.raw_pixel_format() != sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            // All three source planes are checked before any GPU allocation
+            // or destination write; each slice later covers visible bytes only.
+            let y = StridedPlane::from_frame(self, 0, width.checked_mul(2)?, height)?;
+            let u = StridedPlane::from_frame(self, 1, cw.checked_mul(2)?, ch)?;
+            let v = StridedPlane::from_frame(self, 2, cw.checked_mul(2)?, ch)?;
+            Some(SoftwareP010Upload {
+                width,
+                height,
+                y,
+                u,
+                v,
+            })
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    enum Chroma<'a> {
+        Borrowed(StridedPlane<'a>),
+        Packed(Vec<u8>),
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    pub(crate) struct SoftwareNv12Upload<'a> {
+        width: usize,
+        height: usize,
+        luma: StridedPlane<'a>,
+        chroma: Chroma<'a>,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    impl SoftwareNv12Upload<'_> {
+        pub(crate) fn dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+        pub(crate) fn luma(&self) -> &StridedPlane<'_> {
+            &self.luma
+        }
+        pub(crate) fn chroma_parts(&self) -> (*const u8, usize) {
+            match &self.chroma {
+                Chroma::Borrowed(plane) => (plane.as_ptr(), plane.stride()),
+                Chroma::Packed(bytes) => (bytes.as_ptr(), self.width.div_ceil(2) * 2),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", test))]
+    impl Frame {
+        pub(crate) fn is_8bit_420_software(&self) -> bool {
+            matches!(
+                self.raw_pixel_format(),
+                sys::AVPixelFormat_AV_PIX_FMT_YUV420P | sys::AVPixelFormat_AV_PIX_FMT_NV12
+            )
+        }
+
+        pub(crate) fn software_nv12_upload(&self) -> Option<SoftwareNv12Upload<'_>> {
+            if !self.is_8bit_420_software() {
+                return None;
+            }
+            let (width, height) = (self.width() as usize, self.height() as usize);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+            let uv_row_bytes = cw.checked_mul(2)?;
+            let uv_len = uv_row_bytes.checked_mul(ch)?;
+            let luma = StridedPlane::from_frame(self, 0, width, height)?;
+            let chroma = if self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                let uv = StridedPlane::from_frame(self, 1, uv_row_bytes, ch)?;
+                // RG8 requires a row pitch divisible by two. Keep the packed
+                // row-copy path for an otherwise valid odd source UV stride.
+                if uv.stride() % 2 == 0 {
+                    Chroma::Borrowed(uv)
+                } else {
+                    let mut bytes = Vec::with_capacity(uv_len);
+                    for row in 0..ch {
+                        bytes.extend_from_slice(uv.visible_row(row)?);
+                    }
+                    Chroma::Packed(bytes)
+                }
+            } else {
+                let u = StridedPlane::from_frame(self, 1, cw, ch)?;
+                let v = StridedPlane::from_frame(self, 2, cw, ch)?;
+                // All source planes have been checked before packing UV, and
+                // the complete packed UV exists before Metal creates textures.
+                let mut bytes = vec![0; uv_len];
+                for (row, dst) in bytes.chunks_exact_mut(uv_row_bytes).enumerate() {
+                    let (u, v) = (u.visible_row(row)?, v.visible_row(row)?);
+                    for col in 0..cw {
+                        dst[col * 2] = u[col];
+                        dst[col * 2 + 1] = v[col];
+                    }
+                }
+                Chroma::Packed(bytes)
+            };
+            Some(SoftwareNv12Upload {
+                width,
+                height,
+                luma,
+                chroma,
+            })
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub(crate) use software_planar_upload::SoftwareNv12Upload;
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) use software_planar_upload::SoftwareP010Upload;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use software_planar_upload::SoftwareYuv420pUpload;
+
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
 /// (`width * height`) and an interleaved Cb/Cr plane at half resolution
 /// (`ceil(width / 2) * ceil(height / 2) * 2`).
@@ -2635,6 +3711,169 @@ pub struct Nv12Frame {
     pub luma: Vec<u8>,
     pub chroma: Vec<u8>,
 }
+
+/// How a luma plane stores each sample. 10-bit frames share two bytes per
+/// sample but not the same bit packing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LumaSampleLayout {
+    /// 8-bit `yuv420p` / `nv12`.
+    U8,
+    /// 10-bit packed LE (`yuv420p10le`): code lives in bits `[9:0]`.
+    Packed10,
+    /// 10-bit P010 LE: code left-aligned in bits `[15:6]`.
+    P010,
+}
+
+impl LumaSampleLayout {
+    /// Decode one little-endian sample into a 10-bit code in `[0, 1023]`.
+    /// Returns `None` for the 8-bit layout.
+    pub fn decode_10bit(self, sample: u16) -> Option<u16> {
+        match self {
+            Self::U8 => None,
+            Self::Packed10 => Some(sample & 0x03FF),
+            Self::P010 => Some(sample >> 6),
+        }
+    }
+}
+
+/// Strided, zero-copy view of a software frame's luma plane (see
+/// [`Frame::luma_plane_view`]).
+#[derive(Clone, Copy)]
+pub struct LumaPlaneView<'a> {
+    data: *const u8,
+    stride: usize,
+    width: usize,
+    height: usize,
+    bytes_per_sample: usize,
+    layout: LumaSampleLayout,
+    _frame: std::marker::PhantomData<&'a Frame>,
+}
+
+impl<'a> LumaPlaneView<'a> {
+    pub fn width(&self) -> u32 {
+        self.width as u32
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height as u32
+    }
+
+    /// 10-bit samples (two bytes per sample)?
+    pub fn is_10bit(&self) -> bool {
+        self.bytes_per_sample == 2
+    }
+
+    pub fn sample_layout(&self) -> LumaSampleLayout {
+        self.layout
+    }
+
+    /// Test-only view over a packed luma buffer: `stride == width *
+    /// bytes_per_sample`. Tests that care about stride padding lay the rows
+    /// out manually and point `data` at row 0.
+    #[cfg(test)]
+    pub(crate) fn from_packed(
+        data: &'a [u8],
+        width: u32,
+        height: u32,
+        is_10bit: bool,
+    ) -> Option<Self> {
+        let layout = if is_10bit {
+            LumaSampleLayout::P010
+        } else {
+            LumaSampleLayout::U8
+        };
+        Self::from_packed_with_layout(data, width, height, layout)
+    }
+
+    /// Test-only view with an explicit sample layout.
+    #[cfg(test)]
+    pub(crate) fn from_packed_with_layout(
+        data: &'a [u8],
+        width: u32,
+        height: u32,
+        layout: LumaSampleLayout,
+    ) -> Option<Self> {
+        let width = width as usize;
+        let height = height as usize;
+        let bytes_per_sample = match layout {
+            LumaSampleLayout::U8 => 1,
+            LumaSampleLayout::Packed10 | LumaSampleLayout::P010 => 2,
+        };
+        if width == 0 || height == 0 || data.len() < width * height * bytes_per_sample {
+            return None;
+        }
+        let stride = width * bytes_per_sample;
+        Some(Self::from_strided_with_layout(
+            data,
+            stride,
+            width as u32,
+            height as u32,
+            layout,
+        ))
+    }
+
+    /// Test-only view over rows of `width` samples separated by `stride`
+    /// bytes (the decoder-alignment layout `Frame::luma_plane_view` exposes).
+    #[cfg(test)]
+    pub(crate) fn from_strided(
+        data: &'a [u8],
+        stride: usize,
+        width: u32,
+        height: u32,
+        is_10bit: bool,
+    ) -> Self {
+        let layout = if is_10bit {
+            LumaSampleLayout::P010
+        } else {
+            LumaSampleLayout::U8
+        };
+        Self::from_strided_with_layout(data, stride, width, height, layout)
+    }
+
+    /// Test-only view with an explicit sample layout.
+    #[cfg(test)]
+    pub(crate) fn from_strided_with_layout(
+        data: &'a [u8],
+        stride: usize,
+        width: u32,
+        height: u32,
+        layout: LumaSampleLayout,
+    ) -> Self {
+        assert!(data.len() >= stride * height as usize);
+        Self {
+            data: data.as_ptr(),
+            stride,
+            width: width as usize,
+            height: height as usize,
+            bytes_per_sample: match layout {
+                LumaSampleLayout::U8 => 1,
+                LumaSampleLayout::Packed10 | LumaSampleLayout::P010 => 2,
+            },
+            layout,
+            _frame: std::marker::PhantomData,
+        }
+    }
+
+    /// Row `index` of the luma plane: `width` samples of 1 or 2 bytes each.
+    /// `None` when the index is out of bounds.
+    pub fn row(&self, index: usize) -> Option<&'a [u8]> {
+        if index >= self.height {
+            return None;
+        }
+        let row_bytes = self.width.checked_mul(self.bytes_per_sample)?;
+        let offset = index.checked_mul(self.stride)?.checked_add(row_bytes)?;
+        let total = self.stride.checked_mul(self.height)?;
+        if offset > total {
+            return None;
+        }
+        // SAFETY: `data` points at a valid luma plane whose rows hold at
+        // least `row_bytes` bytes every `stride` bytes (validated when the
+        // view was built), and the frame outlives `'a`.
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(index * self.stride), row_bytes) })
+    }
+}
+
+unsafe impl Send for LumaPlaneView<'_> {}
 
 /// GPU upload format for a repacked planar frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2764,26 +4003,21 @@ unsafe fn read_10bit_plane_as_p010(
     stride: i32,
     width: usize,
     height: usize,
-) -> Option<Vec<u8>> {
-    let ptr = ptr as *const u8;
-    if ptr.is_null() {
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let row_bytes = width.checked_mul(2)?;
+    let len = row_bytes.checked_mul(height)?;
+    let stride = usize::try_from(stride).ok()?;
+    if ptr.is_null() || row_bytes == 0 || stride < row_bytes {
         return None;
     }
-    let stride = stride.max(0) as usize;
-    if stride < width * 2 {
-        return None;
+    stride.checked_mul(height)?;
+    out.resize(len, 0);
+    for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+        let src = unsafe { std::slice::from_raw_parts(ptr.add(row * stride), row_bytes) };
+        p010::luma_row(src, dst);
     }
-    let mut out = Vec::with_capacity(width * height * 2);
-    for row in 0..height {
-        let row_ptr = unsafe { ptr.add(row * stride) };
-        for col in 0..width {
-            let lo = unsafe { *row_ptr.add(col * 2) };
-            let hi = unsafe { *row_ptr.add(col * 2 + 1) };
-            let sample = (u16::from_le_bytes([lo, hi]) & 0x03FF) << 6;
-            out.extend_from_slice(&sample.to_le_bytes());
-        }
-    }
-    Some(out)
+    Some(())
 }
 
 /// Interleaves two 10-bit LE chroma planes (Cb, Cr) into P010 (`value << 6`) order.
@@ -2798,35 +4032,30 @@ unsafe fn read_10bit_chroma_as_p010(
     v_stride: i32,
     cw: usize,
     ch: usize,
-) -> Option<Vec<u8>> {
-    let u_ptr = u_ptr as *const u8;
-    let v_ptr = v_ptr as *const u8;
-    if u_ptr.is_null() || v_ptr.is_null() {
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let source_row_bytes = cw.checked_mul(2)?;
+    let row_bytes = cw.checked_mul(4)?;
+    let len = row_bytes.checked_mul(ch)?;
+    let u_stride = usize::try_from(u_stride).ok()?;
+    let v_stride = usize::try_from(v_stride).ok()?;
+    if u_ptr.is_null()
+        || v_ptr.is_null()
+        || row_bytes == 0
+        || u_stride < source_row_bytes
+        || v_stride < source_row_bytes
+    {
         return None;
     }
-    let u_stride = u_stride.max(0) as usize;
-    let v_stride = v_stride.max(0) as usize;
-    if u_stride < cw * 2 || v_stride < cw * 2 {
-        return None;
+    u_stride.checked_mul(ch)?;
+    v_stride.checked_mul(ch)?;
+    out.resize(len, 0);
+    for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+        let u = unsafe { std::slice::from_raw_parts(u_ptr.add(row * u_stride), source_row_bytes) };
+        let v = unsafe { std::slice::from_raw_parts(v_ptr.add(row * v_stride), source_row_bytes) };
+        p010::chroma_row(u, v, dst);
     }
-    let mut out = Vec::with_capacity(cw * ch * 4);
-    for row in 0..ch {
-        let u_row = unsafe { u_ptr.add(row * u_stride) };
-        let v_row = unsafe { v_ptr.add(row * v_stride) };
-        for col in 0..cw {
-            let u = (u16::from_le_bytes([unsafe { *u_row.add(col * 2) }, unsafe {
-                *u_row.add(col * 2 + 1)
-            }]) & 0x03FF)
-                << 6;
-            let v = (u16::from_le_bytes([unsafe { *v_row.add(col * 2) }, unsafe {
-                *v_row.add(col * 2 + 1)
-            }]) & 0x03FF)
-                << 6;
-            out.extend_from_slice(&u.to_le_bytes());
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    Some(out)
+    Some(())
 }
 
 /// Copies `samples_per_row` 16-bit samples per row for `rows` rows, resolving stride.
@@ -3418,6 +4647,13 @@ struct CustomAvio {
     source: Box<dyn MediaSource>,
     offset: u64,
     last_error: Option<String>,
+    read_cancelled: bool,
+    /// The most recent read that returned an I/O error, with its offset.
+    /// `last_error` is cleared by the next successful read or seek, yet a
+    /// demuxer can surface an earlier read failure only after those, so the
+    /// terminal `av_read_frame` error falls back to this record to keep the
+    /// offset and the source's reason in the message (issue #163).
+    last_read_failure: Option<(u64, String)>,
 }
 
 fn normalize_avio_seek_whence(whence: c_int) -> c_int {
@@ -3438,6 +4674,8 @@ impl CustomAvio {
             source,
             offset: 0,
             last_error: None,
+            read_cancelled: false,
+            last_read_failure: None,
         });
         let context = unsafe {
             sys::avio_alloc_context(
@@ -3462,6 +4700,38 @@ impl CustomAvio {
         self.context
     }
 
+    fn clear_terminal_error(&mut self) {
+        self.last_error = None;
+        self.last_read_failure = None;
+        self.read_cancelled = false;
+        unsafe {
+            (*self.context).error = 0;
+            (*self.context).eof_reached = 0;
+        }
+    }
+
+    /// Source-side reason for a terminal FFmpeg failure: the freshest error
+    /// when the last source interaction failed, otherwise -- because
+    /// `last_error` is cleared by successful reads and seeks, while FFmpeg
+    /// can surface an earlier read failure only after those (issue #163) --
+    /// the most recent read that returned an I/O error, with its offset.
+    ///
+    /// The fallback is offered only when FFmpeg itself reports an I/O error:
+    /// only that failure can trace back to the source, and appending a stale
+    /// record to a demuxer-side failure would misattribute it.
+    fn terminal_source_note(&self, ffmpeg: &FfmpegError) -> Option<String> {
+        if let Some(last_error) = self.last_error.as_deref() {
+            return Some(format!("custom AVIO: {last_error}"));
+        }
+        let is_io_error = matches!(ffmpeg, FfmpegError::Api { code, .. } if *code == av_error(EIO));
+        if !is_io_error {
+            return None;
+        }
+        self.last_read_failure.as_ref().map(|(offset, reason)| {
+            format!("custom AVIO read at offset {offset} failed earlier: {reason}")
+        })
+    }
+
     fn read_packet(&mut self, buffer: *mut u8, buffer_size: c_int) -> c_int {
         if buffer.is_null() || buffer_size <= 0 {
             return av_error(EINVAL);
@@ -3471,15 +4741,29 @@ impl CustomAvio {
             start: self.offset,
             length: Some(length),
         }) {
-            Ok(bytes) if bytes.is_empty() => AVERROR_EOF,
+            Ok(bytes) if bytes.is_empty() => {
+                // A source that answered is not the cause of any later failure:
+                // a sticky `last_error` would be appended to an unrelated one.
+                self.last_error = None;
+                AVERROR_EOF
+            }
             Ok(bytes) => {
+                self.last_error = None;
                 let copy_len = bytes.len().min(buffer_size as usize);
                 unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len) };
                 self.offset = self.offset.saturating_add(copy_len as u64);
                 copy_len as c_int
             }
+            Err(SourceError::Cancelled) => {
+                // Control-plane interruption is not an I/O failure. Keep its
+                // identity even when libavformat translates the return code,
+                // and let the demux owner process the pending seek or stop.
+                self.read_cancelled = true;
+                AVERROR_EXIT
+            }
             Err(error) => {
                 self.last_error = Some(error.to_string());
+                self.last_read_failure = Some((self.offset, error.to_string()));
                 crate::trace::log(format!(
                     "Erika custom AVIO read failed at offset {} for {} bytes: {error}",
                     self.offset, length
@@ -3498,6 +4782,10 @@ impl CustomAvio {
             return match self.source.len() {
                 Ok(Some(length)) => length.min(i64::MAX as u64) as i64,
                 Ok(None) => av_error(ESPIPE) as i64,
+                Err(SourceError::Cancelled) => {
+                    self.read_cancelled = true;
+                    AVERROR_EXIT as i64
+                }
                 Err(error) => {
                     self.last_error = Some(error.to_string());
                     av_error(EIO) as i64
@@ -3511,6 +4799,10 @@ impl CustomAvio {
             SEEK_END => match self.source.len() {
                 Ok(Some(length)) => length.min(i64::MAX as u64) as i64 + offset,
                 Ok(None) => return av_error(ESPIPE) as i64,
+                Err(SourceError::Cancelled) => {
+                    self.read_cancelled = true;
+                    return AVERROR_EXIT as i64;
+                }
                 Err(error) => {
                     self.last_error = Some(error.to_string());
                     return av_error(EIO) as i64;
@@ -3527,6 +4819,7 @@ impl CustomAvio {
             return av_error(EINVAL) as i64;
         }
         self.offset = target as u64;
+        self.last_error = None;
         self.offset.min(i64::MAX as u64) as i64
     }
 }
@@ -3564,6 +4857,7 @@ unsafe extern "C" fn custom_avio_seek(opaque: *mut c_void, offset: i64, whence: 
 }
 
 fn open_format_context(uri: &str) -> Result<FormatContext> {
+    install_ffmpeg_log_capture();
     let input = CString::new(uri).map_err(|_| FfmpegError::InteriorNul)?;
     let mut format_context = ptr::null_mut();
     check(
@@ -3581,6 +4875,7 @@ fn open_format_context(uri: &str) -> Result<FormatContext> {
 }
 
 fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatContext> {
+    install_ffmpeg_log_capture();
     let uri = CString::new(source.uri()).map_err(|_| FfmpegError::InteriorNul)?;
     let avio = CustomAvio::new(source)?;
     let format_context = unsafe { sys::avformat_alloc_context() };
@@ -3609,10 +4904,8 @@ fn open_source_format_context(source: Box<dyn MediaSource>) -> Result<FormatCont
             if !opened_context.is_null() {
                 unsafe { sys::avformat_close_input(&mut opened_context) };
             }
-            match avio.last_error.as_deref() {
-                Some(source_error) => Err(FfmpegError::Source(format!(
-                    "{error}; custom AVIO: {source_error}"
-                ))),
+            match avio.terminal_source_note(&error) {
+                Some(source_note) => Err(FfmpegError::Source(format!("{error}; {source_note}"))),
                 None => Err(error),
             }
         }
@@ -3670,6 +4963,17 @@ fn inspect_format_context(
             continue;
         };
 
+        // Embedded cover art (ID3 APIC, METADATA_BLOCK_PICTURE, ...) is exposed
+        // as a video stream with the attached-picture disposition. It is not
+        // playable content: decoding it as the main video track dead-ends the
+        // video path on a single still frame, and selecting it as the seek
+        // stream breaks seeking on demuxers without a real video index.
+        if kind == TrackKind::Video
+            && unsafe { (*stream).disposition } & sys::AV_DISPOSITION_ATTACHED_PIC as i32 != 0
+        {
+            continue;
+        }
+
         let codec = unsafe { codec_name((*codecpar).codec_id) };
         let mut track = TrackInfo::embedded(unsafe { (*stream).index as i64 }, kind);
         track.title = metadata_value(unsafe { (*stream).metadata }, "title");
@@ -3687,6 +4991,7 @@ fn inspect_format_context(
             track.pixel_format = probe.pixel_format.clone();
             track.profile = probe.profile.clone();
             track.level = probe.level;
+            track.dolby_vision_profile = unsafe { codec_parameters_dolby_vision_profile(codecpar) };
             video.push(probe);
         }
         if kind == TrackKind::Audio {
@@ -3713,6 +5018,11 @@ fn inspect_format_context(
             uri: uri.to_string(),
             duration,
             tracks,
+            chapters: inspect_chapters(raw, duration),
+            container: crate::core::ContainerInfo {
+                format: unsafe { input_format_name(raw) },
+                bit_rate: container_bit_rate,
+            },
             video,
             audio,
             subtitles,
@@ -3722,6 +5032,84 @@ fn inspect_format_context(
     )
 }
 
+/// Read once from the already-open demuxer, without another probe or IO.
+fn inspect_chapters(
+    raw: *const sys::AVFormatContext,
+    duration: Option<Duration>,
+) -> Vec<ChapterInfo> {
+    let origin = format_timeline_origin_micros(raw);
+    let mut chapters = Vec::new();
+    let count = unsafe { (*raw).nb_chapters as usize };
+    let entries = unsafe { (*raw).chapters };
+    if entries.is_null() {
+        return chapters;
+    }
+    for index in 0..count {
+        let entry = unsafe { *entries.add(index) };
+        if entry.is_null() {
+            continue;
+        }
+        let entry = unsafe { &*entry };
+        if entry.time_base.num <= 0 || entry.time_base.den <= 0 || entry.start == i64::MIN {
+            continue;
+        }
+        let time = |value| {
+            let micros = unsafe {
+                sys::av_rescale_q(
+                    value,
+                    entry.time_base,
+                    sys::AVRational {
+                        num: 1,
+                        den: 1_000_000,
+                    },
+                )
+            };
+            Duration::from_micros(micros.saturating_sub(origin).max(0) as u64)
+        };
+        let start = time(entry.start);
+        if duration.is_some_and(|duration| start >= duration) {
+            continue;
+        }
+        let end = (entry.end != i64::MIN && entry.end > entry.start)
+            .then(|| time(entry.end))
+            .map(|end| duration.map_or(end, |duration| end.min(duration)))
+            .filter(|end| *end > start);
+        chapters.push(ChapterInfo {
+            title: metadata_value(entry.metadata, "title")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            start,
+            end,
+        });
+    }
+    chapters.sort_by_key(|chapter| chapter.start);
+    chapters.dedup_by_key(|chapter| chapter.start);
+    chapters
+}
+
+/// The demuxer's short name for the container (`matroska,webm`).
+unsafe fn input_format_name(raw: *const sys::AVFormatContext) -> Option<String> {
+    let format = unsafe { (*raw).iformat };
+    if format.is_null() {
+        return None;
+    }
+    let name = unsafe { (*format).name };
+    if name.is_null() {
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// A single video track without a stated bit rate (Matroska states none)
+/// takes the container's, less what the audio tracks state (every one must
+/// state it) and what subtitle tracks state. A subtitle track stating none
+/// does not stop the estimate: text and bitmap subtitles are a few kbit/s
+/// beside the picture, and Matroska never states theirs.
 fn infer_single_video_bit_rate(tracks: &mut [TrackInfo], container_bit_rate: Option<u64>) {
     let Some(container_bit_rate) = container_bit_rate else {
         return;
@@ -3741,10 +5129,8 @@ fn infer_single_video_bit_rate(tracks: &mut [TrackInfo], container_bit_rate: Opt
         .enumerate()
         .filter(|(index, track)| {
             *index != video_index
-                && matches!(
-                    track.kind,
-                    TrackKind::Video | TrackKind::Audio | TrackKind::Subtitle
-                )
+                && (matches!(track.kind, TrackKind::Video | TrackKind::Audio)
+                    || track.kind == TrackKind::Subtitle && track.bit_rate.is_some())
         })
         .map(|(_, track)| track.bit_rate)
         .collect::<Option<Vec<_>>>();
@@ -4112,8 +5498,25 @@ unsafe fn import_av_subtitle(
                 }
             }
             sys::AVSubtitleType_SUBTITLE_BITMAP => {
-                if let Some(plane) = unsafe { subtitle_bitmap_rect_to_rgba_plane(rect) }? {
-                    frame.push_bitmap_plane(plane.with_canvas(canvas.0, canvas.1), forced);
+                // One malformed bitmap rect must not abort the whole track: a
+                // single damaged PGS/DVB packet would otherwise end subtitle
+                // decoding for the stream. Text and ASS rects above already
+                // degrade per rect, so skip the unusable one and keep going.
+                match unsafe { subtitle_bitmap_rect_to_rgba_plane(rect) } {
+                    Ok(Some(plane)) => {
+                        frame.push_bitmap_plane(plane.with_canvas(canvas.0, canvas.1), forced);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        crate::trace::diagnostic(
+                            serde_json::json!({
+                                "event": "subtitle_bitmap_rect_skipped",
+                                "trackId": track_id,
+                                "error": error.to_string(),
+                            })
+                            .to_string(),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -4314,6 +5717,401 @@ unsafe fn frame_hdr_metadata(frame: *const sys::AVFrame) -> Option<HdrMetadata> 
         return None;
     }
     Some(HdrMetadata::new(mastering_display, content_light))
+}
+
+/// Reads the container's Dolby Vision configuration record from codec
+/// parameters side data (`AV_PKT_DATA_DOVI_CONF` in ffmpeg 8), returning the
+/// Dolby Vision profile number.
+unsafe fn codec_parameters_dolby_vision_profile(
+    parameters: *const sys::AVCodecParameters,
+) -> Option<u8> {
+    if parameters.is_null() {
+        return None;
+    }
+    let side_data = unsafe {
+        sys::av_packet_side_data_get(
+            (*parameters).coded_side_data,
+            (*parameters).nb_coded_side_data,
+            sys::AVPacketSideDataType_AV_PKT_DATA_DOVI_CONF,
+        )
+    };
+    if side_data.is_null() {
+        return None;
+    }
+    let data = unsafe { (*side_data).data };
+    if data.is_null() {
+        return None;
+    }
+    let size = unsafe { (*side_data).size };
+    if usize::try_from(size).ok()? < mem::size_of::<sys::AVDOVIDecoderConfigurationRecord>() {
+        return None;
+    }
+    let record = data as *const sys::AVDOVIDecoderConfigurationRecord;
+    Some(unsafe { (*record).dv_profile })
+}
+
+/// Why a decoded frame cannot feed the Dolby Vision mapping path.
+///
+/// Reportable through [`Frame::dovi_unavailable_reason`] so a stream whose
+/// RPUs are missing or rejected stays diagnosable instead of silently falling
+/// back to the base layer — Profile 5 in particular has no HDR10-compatible
+/// base layer, and an unmapped Profile 8 frame with a rejected RPU displays
+/// with wrong colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoviRejectReason {
+    /// The frame carries no RPU side data at all. Normal for profiles whose
+    /// base layer is HDR10-compatible (e.g. Profile 8); always wrong for
+    /// Profile 5.
+    MissingSideData,
+    /// Side data exists but failed structural validation (size, alignment,
+    /// sub-structure offsets).
+    MalformedSideData,
+    /// Base-layer bit depth outside FFmpeg's 8..=16 range.
+    UnsupportedBitDepth,
+    /// `coef_log2_denom` beyond FFmpeg's fixed-point range (above 32).
+    UnsupportedCoefDenom,
+    /// Reshaping curves invalid or absent (pivots, orders, unknown methods).
+    InvalidCurves,
+    /// Color matrices/offsets invalid or the RGB→LMS matrix is singular.
+    InvalidColorMetadata,
+}
+
+impl DoviRejectReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MissingSideData => "rpu side data missing",
+            Self::MalformedSideData => "rpu side data malformed",
+            Self::UnsupportedBitDepth => "base layer bit depth outside 8..=16",
+            Self::UnsupportedCoefDenom => "coef_log2_denom above 32",
+            Self::InvalidCurves => "invalid reshaping curves",
+            Self::InvalidColorMetadata => "invalid color metadata",
+        }
+    }
+}
+
+/// Enhancement-layer information an RPU carries that this renderer does not
+/// compose. Profile 7 keeps its enhancement layer in a second HEVC layer that
+/// this renderer never decodes, so the NLQ residual these fields describe has
+/// nothing to be added to. libplacebo draws the same line: it exposes
+/// `nlq_active` and documents that "consumers that have not bound an
+/// enhancement layer must not look at these fields", while still applying the
+/// base-layer reshaping, color matrices, and trims.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DoviElStatus {
+    /// `disable_residual_flag == 0`: the RPU expects its residual to be
+    /// composed with an enhancement layer (Profile 7 FEL/MEL).
+    pub residual_requested: bool,
+    /// The RPU carries a non-trivial NLQ definition for that residual.
+    pub nlq_nontrivial: bool,
+}
+
+impl DoviElStatus {
+    /// Whether the RPU asked for anything this renderer cannot compose.
+    pub fn is_active(self) -> bool {
+        self.residual_requested || self.nlq_nontrivial
+    }
+}
+
+/// Reads the decoder's parsed Dolby Vision RPU side data and converts it into
+/// shader-ready floats, mirroring libplacebo's `pl_map_dovi_metadata`: pivots
+/// are normalized by the base-layer bit depth and curve coefficients by
+/// `2^-coef_log2_denom`. The second value reports any enhancement-layer
+/// residual the RPU asked for but this renderer cannot compose; it never
+/// rejects an otherwise valid RPU.
+unsafe fn frame_dovi_metadata_result(
+    frame: *const sys::AVFrame,
+) -> std::result::Result<(DoviSourceMetadata, DoviElStatus), DoviRejectReason> {
+    if frame.is_null() {
+        return Err(DoviRejectReason::MissingSideData);
+    }
+    let side_data = unsafe {
+        sys::av_frame_get_side_data(frame, sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA)
+    };
+    if side_data.is_null() {
+        return Err(DoviRejectReason::MissingSideData);
+    }
+    let data = unsafe { (*side_data).data };
+    if data.is_null() {
+        return Err(DoviRejectReason::MalformedSideData);
+    }
+    let size = usize::try_from(unsafe { (*side_data).size })
+        .ok()
+        .ok_or(DoviRejectReason::MalformedSideData)?;
+    if size < mem::size_of::<sys::AVDOVIMetadata>() {
+        return Err(DoviRejectReason::MalformedSideData);
+    }
+    if (data as usize) % mem::align_of::<sys::AVDOVIMetadata>() != 0 {
+        return Err(DoviRejectReason::MalformedSideData);
+    }
+    // The sub-structures live behind byte offsets inside this side data buffer
+    // (`av_dovi_get_header` and friends are C inline helpers bindgen does not
+    // emit), so resolve them by the same pointer arithmetic here with bounds checks.
+    let metadata = unsafe { *data.cast::<sys::AVDOVIMetadata>() };
+    let data_address = data as usize;
+    let aligned = |offset: usize, alignment: usize| {
+        data_address
+            .checked_add(offset)
+            .is_some_and(|address| address % alignment == 0)
+    };
+    let in_bounds = |offset: usize, structure: usize| {
+        offset.checked_add(structure).is_some_and(|end| end <= size)
+    };
+    if !in_bounds(
+        metadata.header_offset,
+        mem::size_of::<sys::AVDOVIRpuDataHeader>(),
+    ) || !in_bounds(
+        metadata.mapping_offset,
+        mem::size_of::<sys::AVDOVIDataMapping>(),
+    ) || !in_bounds(
+        metadata.color_offset,
+        mem::size_of::<sys::AVDOVIColorMetadata>(),
+    ) || !aligned(
+        metadata.header_offset,
+        mem::align_of::<sys::AVDOVIRpuDataHeader>(),
+    ) || !aligned(
+        metadata.mapping_offset,
+        mem::align_of::<sys::AVDOVIDataMapping>(),
+    ) || !aligned(
+        metadata.color_offset,
+        mem::align_of::<sys::AVDOVIColorMetadata>(),
+    ) {
+        return Err(DoviRejectReason::MalformedSideData);
+    }
+    let header = unsafe {
+        &*data
+            .add(metadata.header_offset)
+            .cast::<sys::AVDOVIRpuDataHeader>()
+    };
+    let mapping = unsafe {
+        &*data
+            .add(metadata.mapping_offset)
+            .cast::<sys::AVDOVIDataMapping>()
+    };
+    let color = unsafe {
+        &*data
+            .add(metadata.color_offset)
+            .cast::<sys::AVDOVIColorMetadata>()
+    };
+
+    let bl_bit_depth = usize::from(header.bl_bit_depth);
+    let coef_denom = u32::from(header.coef_log2_denom);
+    // Validate bit depth and coefficient denominator before using them in
+    // shifts below; malformed side data must be rejected, never panic.
+    // FFmpeg uses coef_log2_denom up to 32 for float RPU coefficients.
+    if !(8..=16).contains(&bl_bit_depth) {
+        return Err(DoviRejectReason::UnsupportedBitDepth);
+    }
+    if coef_denom > 32 {
+        return Err(DoviRejectReason::UnsupportedCoefDenom);
+    }
+    // This renderer has no enhancement-layer input, so the NLQ residual below
+    // is never composed. That does not make the RPU unusable: the base-layer
+    // reshaping curves, color matrices, and L1 trims still apply, and dropping
+    // the whole RPU would throw them away for every Profile 7 FEL frame.
+    // libplacebo keeps the same separation (it exposes `nlq_active` but only
+    // composes it when an enhancement layer is bound).
+    //
+    // FFmpeg marks an absent NLQ with the AV_DOVI_NLQ_NONE sentinel (-1);
+    // method 0 with all-neutral parameters is likewise an identity mapping.
+    let nlq_nontrivial = match mapping.nlq_method_idc as i32 {
+        -1 => false,
+        0 => mapping.nlq.iter().any(|params| {
+            params.nlq_offset != 0
+                || params.linear_deadzone_slope != 0
+                || params.linear_deadzone_threshold != 0
+                || (params.vdr_in_max != 0
+                    && params.vdr_in_max != (1_u64 << u32::from(header.coef_log2_denom)))
+        }),
+        _ => true,
+    };
+    let el = DoviElStatus {
+        residual_requested: header.disable_residual_flag == 0,
+        nlq_nontrivial,
+    };
+
+    let pivot_scale = 1.0_f32 / (((1_usize << bl_bit_depth) - 1) as f32);
+    let coefficient_scale = 2.0_f32.powi(-(coef_denom as i32));
+
+    let mut reshaping = [DoviComponentCurve::default(); 3];
+    let mut has_curve = false;
+    for (component, curve) in reshaping.iter_mut().enumerate() {
+        let source = &mapping.curves[component];
+        let num_pivots = usize::from(source.num_pivots);
+        if num_pivots == 0 {
+            continue;
+        }
+        has_curve = true;
+        if !(2..=DOVI_MAX_PIECES + 1).contains(&num_pivots) {
+            return Err(DoviRejectReason::InvalidCurves);
+        }
+        let max_pivot = ((1_usize << bl_bit_depth) - 1) as u16;
+        let mut previous = None;
+        for &pivot in source.pivots[..num_pivots].iter() {
+            if pivot > max_pivot || previous.is_some_and(|previous| pivot <= previous) {
+                return Err(DoviRejectReason::InvalidCurves);
+            }
+            previous = Some(pivot);
+        }
+        curve.num_pivots = num_pivots as u8;
+        for (slot, &pivot) in curve.pivots[..num_pivots]
+            .iter_mut()
+            .zip(source.pivots[..num_pivots].iter())
+        {
+            *slot = pivot_scale * f32::from(pivot);
+        }
+        for segment in 0..num_pivots - 1 {
+            match source.mapping_idc[segment] {
+                sys::AVDOVIMappingMethod_AV_DOVI_MAPPING_MMR => {
+                    let order = usize::from(source.mmr_order[segment]);
+                    if order == 0 || order > DOVI_MAX_MMR_ORDER {
+                        return Err(DoviRejectReason::InvalidCurves);
+                    }
+                    curve.mmr_orders[segment] = order as u8;
+                    curve.mmr_constants[segment] =
+                        coefficient_scale * source.mmr_constant[segment] as f32;
+                    let destination = &mut curve.mmr_coeffs[segment][..order];
+                    for (order_index, coefficients) in destination.iter_mut().enumerate() {
+                        for (index, coefficient) in coefficients.iter_mut().enumerate() {
+                            *coefficient = coefficient_scale
+                                * source.mmr_coef[segment][order_index][index] as f32;
+                        }
+                    }
+                }
+                sys::AVDOVIMappingMethod_AV_DOVI_MAPPING_POLYNOMIAL => {
+                    let poly_order = usize::from(source.poly_order[segment]);
+                    if !(1..=2).contains(&poly_order) {
+                        return Err(DoviRejectReason::InvalidCurves);
+                    }
+                    let coefficients = &source.poly_coef[segment];
+                    for (order_index, slot) in curve.poly_coeffs[segment].iter_mut().enumerate() {
+                        *slot = if order_index <= poly_order {
+                            coefficient_scale * coefficients[order_index] as f32
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+                _ => return Err(DoviRejectReason::InvalidCurves),
+            }
+        }
+    }
+    if !has_curve {
+        return Err(DoviRejectReason::InvalidCurves);
+    }
+
+    let rational_matrix = |values: &[sys::AVRational; 9]| -> Option<[[f32; 3]; 3]> {
+        let mut matrix = [[0.0_f32; 3]; 3];
+        for row in 0..3 {
+            for col in 0..3 {
+                let value = &values[row * 3 + col];
+                if value.den == 0 {
+                    return None;
+                }
+                let value = value.num as f32 / value.den as f32;
+                if !value.is_finite() {
+                    return None;
+                }
+                matrix[row][col] = value;
+            }
+        }
+        Some(matrix)
+    };
+
+    let mut nonlinear_offset = [0.0_f32; 3];
+    for (index, slot) in nonlinear_offset.iter_mut().enumerate() {
+        let value = &color.ycc_to_rgb_offset[index];
+        if value.den == 0 {
+            return Err(DoviRejectReason::InvalidColorMetadata);
+        }
+        *slot = value.num as f32 / value.den as f32;
+        if !slot.is_finite() {
+            return Err(DoviRejectReason::InvalidColorMetadata);
+        }
+    }
+
+    if color.source_min_pq > 4095
+        || color.source_max_pq > 4095
+        || (color.source_max_pq != 0 && color.source_min_pq > color.source_max_pq)
+    {
+        return Err(DoviRejectReason::InvalidColorMetadata);
+    }
+
+    let nonlinear_matrix =
+        rational_matrix(&color.ycc_to_rgb_matrix).ok_or(DoviRejectReason::InvalidColorMetadata)?;
+    let rgb_to_lms =
+        rational_matrix(&color.rgb_to_lms_matrix).ok_or(DoviRejectReason::InvalidColorMetadata)?;
+    let determinant = rgb_to_lms[0][0]
+        * (rgb_to_lms[1][1] * rgb_to_lms[2][2] - rgb_to_lms[1][2] * rgb_to_lms[2][1])
+        - rgb_to_lms[0][1]
+            * (rgb_to_lms[1][0] * rgb_to_lms[2][2] - rgb_to_lms[1][2] * rgb_to_lms[2][0])
+        + rgb_to_lms[0][2]
+            * (rgb_to_lms[1][0] * rgb_to_lms[2][1] - rgb_to_lms[1][1] * rgb_to_lms[2][0]);
+    if !determinant.is_finite() || determinant == 0.0 {
+        return Err(DoviRejectReason::InvalidColorMetadata);
+    }
+
+    // Level 1 per-frame brightness metadata lives in the DM extension blocks
+    // that the RPU decoder appends right after the color structure. `av_dovi_find_level`
+    // is exported by FFmpeg but performs an unchecked pointer walk, so validate
+    // the block region here like the sub-structures above. L1 is optional
+    // signal quality metadata: an invalid or absent block never rejects the RPU.
+    let l1 = unsafe { frame_dovi_level1(data, &metadata, size) };
+
+    Ok((
+        DoviSourceMetadata {
+            reshaping,
+            nonlinear_matrix: RgbMatrix::new(nonlinear_matrix),
+            nonlinear_offset,
+            rgb_to_lms: RgbMatrix::new(rgb_to_lms),
+            source_min_pq: color.source_min_pq,
+            source_max_pq: color.source_max_pq,
+            l1,
+        },
+        el,
+    ))
+}
+
+/// Reads the dynamic DM level 1 block (per-frame min/max/avg luminance in
+/// 12-bit PQ codes) from the validated ext-block region, matching
+/// `av_dovi_get_ext`'s pointer arithmetic.
+unsafe fn frame_dovi_level1(
+    data: *const u8,
+    metadata: &sys::AVDOVIMetadata,
+    size: usize,
+) -> Option<DoviFramePq> {
+    let count = usize::try_from(metadata.num_ext_blocks).ok()?;
+    if count == 0 {
+        return None;
+    }
+    let block_size = metadata.ext_block_size;
+    if block_size < mem::size_of::<sys::AVDOVIDmData>() {
+        return None;
+    }
+    let total = block_size.checked_mul(count)?;
+    let end = metadata.ext_block_offset.checked_add(total)?;
+    if end > size {
+        return None;
+    }
+    if (metadata.ext_block_offset as usize) % mem::align_of::<sys::AVDOVIDmData>() != 0 {
+        return None;
+    }
+    let ext = unsafe { data.add(metadata.ext_block_offset) };
+    for index in 0..count {
+        let block = unsafe { &*ext.add(block_size * index).cast::<sys::AVDOVIDmData>() };
+        if block.level != 1 {
+            continue;
+        }
+        let l1 = unsafe { block.__bindgen_anon_1.l1 };
+        if l1.max_pq == 0 || (l1.min_pq != 0 && l1.min_pq > l1.max_pq) {
+            return None;
+        }
+        return Some(DoviFramePq {
+            min_pq: l1.min_pq,
+            max_pq: l1.max_pq,
+            avg_pq: l1.avg_pq,
+        });
+    }
+    None
 }
 
 unsafe fn mastering_display_metadata(
@@ -4531,6 +6329,7 @@ unsafe extern "C" fn select_hw_format(
                 break;
             }
             if format == target {
+                unsafe { (*state).route.chose_hardware() };
                 #[cfg(target_os = "windows")]
                 if target == sys::AVPixelFormat_AV_PIX_FMT_D3D11 {
                     unsafe { ensure_d3d11va_frames_for_context(context, state.cast_mut()) };
@@ -4549,6 +6348,25 @@ unsafe extern "C" fn select_hw_format(
                 return format;
             }
             index += 1;
+        }
+        // Never report a software frame as NVDEC/VA-API. Return an error to
+        // the playback layer, which owns the explicit, observable fallback.
+        if matches!(
+            target,
+            sys::AVPixelFormat_AV_PIX_FMT_CUDA | sys::AVPixelFormat_AV_PIX_FMT_VAAPI
+        ) {
+            return sys::AVPixelFormat_AV_PIX_FMT_NONE;
+        }
+        // VideoToolbox and D3D11VA continue in software. Record it: the
+        // decoder was opened as hardware and must not keep reporting so.
+        // (MediaCodec's own decoders stay MediaCodec whatever they output.)
+        if matches!(
+            target,
+            sys::AVPixelFormat_AV_PIX_FMT_VIDEOTOOLBOX | sys::AVPixelFormat_AV_PIX_FMT_D3D11
+        ) {
+            let chosen = unsafe { sys::avcodec_default_get_format(context, formats) };
+            unsafe { (*state).route.chose_software(chosen) };
+            return chosen;
         }
     }
     unsafe { sys::avcodec_default_get_format(context, formats) }
@@ -4575,21 +6393,234 @@ mod tests {
         );
     }
 
+    struct ControlledSource {
+        source: crate::source::LocalFileSource,
+        failure: Arc<AtomicU8>,
+    }
+
+    impl MediaSource for ControlledSource {
+        fn uri(&self) -> &str {
+            self.source.uri()
+        }
+
+        fn len(&mut self) -> crate::source::Result<Option<u64>> {
+            if self.failure.load(Ordering::SeqCst) == 3 {
+                Err(SourceError::Cancelled)
+            } else {
+                self.source.len()
+            }
+        }
+
+        fn read_range(&mut self, range: ByteRange) -> crate::source::Result<Vec<u8>> {
+            match self.failure.load(Ordering::SeqCst) {
+                1 => Err(SourceError::Cancelled),
+                2 => Err(SourceError::Io("controlled read failure".into())),
+                _ => self.source.read_range(range),
+            }
+        }
+    }
+
+    fn controlled_demuxer() -> (Demuxer, Arc<AtomicU8>) {
+        let failure = Arc::new(AtomicU8::new(0));
+        let source = ControlledSource {
+            source: crate::source::LocalFileSource::open(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("testdata/playback/playback-fixture.mkv"),
+            )
+            .unwrap(),
+            failure: failure.clone(),
+        };
+        (Demuxer::open_source(Box::new(source)).unwrap(), failure)
+    }
+
     #[test]
-    fn videotoolbox_uses_ffmpeg_av1_decoder() {
-        let (codec, operation) = videotoolbox_decoder(sys::AVCodecID_AV_CODEC_ID_AV1);
+    fn cancelled_source_read_is_distinct_and_seek_clears_the_avio_latch() {
+        let (mut demuxer, failure) = controlled_demuxer();
+        failure.store(1, Ordering::SeqCst);
+        loop {
+            match demuxer.read_packet() {
+                Ok(Some(_)) => continue,
+                Err(FfmpegError::SourceCancelled) => break,
+                Err(error) => panic!("expected a cancelled read, got {error}"),
+                Ok(None) => panic!("cancelled read was reported as EOF"),
+            }
+        }
+        let avio = demuxer.context.avio.as_ref().unwrap();
+        assert!(avio.read_cancelled);
+        assert!(avio.last_read_failure.is_none());
+        assert_eq!(unsafe { (*avio.context).error }, AVERROR_EXIT);
+
+        failure.store(0, Ordering::SeqCst);
+        demuxer.seek(Duration::from_secs(1)).unwrap();
+        let avio = demuxer.context.avio.as_ref().unwrap();
+        assert!(!avio.read_cancelled);
+        assert_eq!(unsafe { (*avio.context).error }, 0);
+        let mut packets = 0;
+        while demuxer.read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(packets > 0);
+    }
+
+    #[test]
+    fn source_io_failure_remains_terminal_with_its_reason() {
+        let (mut demuxer, failure) = controlled_demuxer();
+        failure.store(2, Ordering::SeqCst);
+        loop {
+            match demuxer.read_packet() {
+                Ok(Some(_)) => continue,
+                Err(FfmpegError::Source(message)) => {
+                    assert!(message.contains("controlled read failure"), "{message}");
+                    break;
+                }
+                Err(error) => panic!("expected a terminal source failure, got {error}"),
+                Ok(None) => panic!("I/O failure was reported as EOF"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_source_length_query_preserves_cancellation_identity() {
+        let (mut demuxer, failure) = controlled_demuxer();
+        failure.store(3, Ordering::SeqCst);
+        let avio = demuxer.context.avio.as_mut().unwrap();
+        for whence in [sys::AVSEEK_SIZE as c_int, SEEK_END] {
+            avio.clear_terminal_error();
+            assert_eq!(avio.seek(0, whence), AVERROR_EXIT as i64);
+            assert!(avio.read_cancelled);
+            assert!(avio.last_error.is_none());
+            assert!(avio.last_read_failure.is_none());
+        }
+    }
+
+    #[test]
+    fn software_av1_preserves_hardware_decoder_selection() {
+        let (codec, operation) = ffmpeg_hardware_decoder(sys::AVCodecID_AV_CODEC_ID_AV1);
         assert_eq!(operation, "avcodec_find_decoder_by_name(av1)");
         assert!(!codec.is_null());
+        let (software, _) = software_decoder(sys::AVCodecID_AV_CODEC_ID_AV1);
+        assert!(!software.is_null());
+        assert_ne!(codec, software);
     }
 
     #[test]
     fn software_uses_available_ffmpeg_av1_decoder() {
         let (codec, operation) = software_decoder(sys::AVCodecID_AV_CODEC_ID_AV1);
-        #[cfg(target_os = "windows")]
-        assert_eq!(operation, "avcodec_find_decoder");
-        #[cfg(not(target_os = "windows"))]
         assert_eq!(operation, "avcodec_find_decoder_by_name(libdav1d)");
         assert!(!codec.is_null());
+    }
+
+    #[test]
+    fn software_av1_decodes_eight_and_ten_bit_frames() {
+        for (fixture, format, bytes_per_sample) in [
+            ("av1-8bit.ivf", PlanarPixelFormat::Nv12, 1),
+            ("av1-10bit.ivf", PlanarPixelFormat::P010, 2),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/software")
+                .join(fixture);
+            let mut demuxer = Demuxer::open_path(path).unwrap();
+            let mut decoder = demuxer.open_decoder(0).unwrap();
+            assert_eq!(decoder.backend(), DecoderBackend::Software);
+            let mut count = 0;
+            let mut check_frame = |frame: Frame| {
+                assert!(!frame.has_hw_frames_context());
+                let planar = frame.to_planar_frame().expect("CPU AV1 frame upload");
+                assert_eq!(planar.format, format);
+                assert_eq!((planar.width, planar.height), (64, 48));
+                assert_eq!(planar.luma.len(), 64 * 48 * bytes_per_sample);
+                assert_eq!(planar.chroma.len(), 32 * 24 * 2 * bytes_per_sample);
+                assert!(planar.luma.iter().any(|value| *value != planar.luma[0]));
+                count += 1;
+            };
+            while let Some(packet) = demuxer.read_packet().unwrap() {
+                decoder.send_packet(&packet).unwrap();
+                while let DecoderOutputFrame::Frame(frame) = decoder.receive_frame().unwrap() {
+                    check_frame(frame);
+                }
+            }
+            decoder.send_eof().unwrap();
+            while let DecoderOutputFrame::Frame(frame) = decoder.receive_frame().unwrap() {
+                check_frame(frame);
+            }
+            assert!(decoder.is_end_of_stream());
+            assert_eq!(count, 2, "{fixture}");
+        }
+    }
+
+    #[test]
+    fn mp3_attached_picture_is_not_a_video_track() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/software/mp3-attached-pic.mp3");
+        let probe = probe_path(path).unwrap();
+        assert!(
+            probe
+                .tracks
+                .iter()
+                .all(|track| track.kind != TrackKind::Video),
+            "embedded cover art must not appear as a video track: {:?}",
+            probe.tracks,
+        );
+        assert!(
+            probe.video.is_empty(),
+            "no video probe entries for cover art"
+        );
+        assert_eq!(
+            probe
+                .tracks
+                .iter()
+                .filter(|track| track.kind == TrackKind::Audio)
+                .count(),
+            1,
+            "the audio track stays discoverable"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decoder_reports_the_route_ffmpeg_negotiated() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback/playback-fixture.mkv");
+        let mut demuxer = Demuxer::open_path(&fixture).unwrap();
+        demuxer
+            .set_stream_selection(StreamSelection::only([0]))
+            .unwrap();
+        let mut decoder = Decoder::open_with_config(
+            demuxer.codec_parameters(0).unwrap(),
+            DecoderConfig::videotoolbox(),
+        )
+        .unwrap();
+        assert_eq!(decoder.backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.active_backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.take_route_change(), None);
+
+        let mut frame = None;
+        while frame.is_none() {
+            let packet = demuxer.read_packet().unwrap().expect("a video packet");
+            if packet.stream_index() != 0 {
+                continue;
+            }
+            decoder.send_packet(&packet).unwrap();
+            if let DecoderOutputFrame::Frame(decoded) = decoder.receive_frame().unwrap() {
+                frame = Some(decoded);
+            }
+        }
+        // MPEG-4 Part 2 at 160x90: FFmpeg offers videotoolbox_vld, its
+        // hwaccel fails to initialise, and FFmpeg decodes in software.
+        assert!(!frame.unwrap().is_videotoolbox());
+        assert_eq!(decoder.backend(), DecoderBackend::VideoToolbox);
+        assert_eq!(decoder.active_backend(), DecoderBackend::Software);
+        let change = decoder.take_route_change().expect("a route change");
+        assert_eq!(change.configured, DecoderBackend::VideoToolbox);
+        assert_eq!(change.active, DecoderBackend::Software);
+        assert_eq!(change.pixel_format.as_deref(), Some("yuv420p"));
+        assert!(
+            change
+                .reason
+                .unwrap()
+                .contains("could not initialise the videotoolbox hwaccel")
+        );
+        assert_eq!(decoder.take_route_change(), None);
     }
 
     #[test]
@@ -4606,10 +6637,56 @@ mod tests {
             .find(|track| track.kind == TrackKind::Video)
             .unwrap();
 
+        assert_eq!(probe.container.format.as_deref(), Some("matroska,webm"));
         assert_eq!(video.codec.as_deref(), Some("mpeg4"));
         assert_eq!((video.width, video.height), (160, 90));
         assert_eq!(video.bit_rate, None);
         assert_eq!(video.frame_rate, FrameRate::new(30, 1));
+    }
+
+    #[test]
+    fn chapters_use_container_time_bases_and_the_playback_origin() {
+        let mut first: sys::AVChapter = unsafe { mem::zeroed() };
+        first.time_base = sys::AVRational { num: 1, den: 1000 };
+        first.start = 15_000;
+        first.end = 35_000;
+        unsafe {
+            sys::av_dict_set(&mut first.metadata, c"title".as_ptr(), c"OP".as_ptr(), 0);
+        }
+        let mut last: sys::AVChapter = unsafe { mem::zeroed() };
+        last.time_base = sys::AVRational { num: 1, den: 1 };
+        last.start = 95;
+        last.end = 120;
+        let mut invalid: sys::AVChapter = unsafe { mem::zeroed() };
+        invalid.time_base = sys::AVRational { num: 1, den: 0 };
+        let mut entries = [
+            &mut last as *mut _,
+            &mut invalid as *mut _,
+            &mut first as *mut _,
+        ];
+        let mut context: sys::AVFormatContext = unsafe { mem::zeroed() };
+        context.start_time = 5_000_000;
+        context.chapters = entries.as_mut_ptr();
+        context.nb_chapters = entries.len() as u32;
+        let chapters = inspect_chapters(&context, Some(Duration::from_secs(100)));
+        unsafe {
+            sys::av_dict_free(&mut first.metadata);
+        }
+        assert_eq!(
+            chapters,
+            vec![
+                ChapterInfo {
+                    title: "OP".into(),
+                    start: Duration::from_secs(10),
+                    end: Some(Duration::from_secs(30))
+                },
+                ChapterInfo {
+                    title: String::new(),
+                    start: Duration::from_secs(90),
+                    end: Some(Duration::from_secs(100))
+                },
+            ]
+        );
     }
 
     #[test]
@@ -4629,10 +6706,12 @@ mod tests {
         infer_single_video_bit_rate(&mut tracks, Some(1_256_000));
         assert_eq!(tracks[0].bit_rate, Some(1_000_000));
 
+        // A subtitle track stating no bit rate (Matroska's ASS) does not
+        // stop the estimate.
         subtitle.bit_rate = None;
         let mut tracks = vec![video.clone(), audio.clone(), subtitle];
         infer_single_video_bit_rate(&mut tracks, Some(1_256_000));
-        assert_eq!(tracks[0].bit_rate, None);
+        assert_eq!(tracks[0].bit_rate, Some(1_128_000));
 
         audio.bit_rate = None;
         let mut tracks = vec![video.clone(), audio];
@@ -5072,6 +7151,62 @@ mod tests {
     }
 
     #[test]
+    fn playback_fixture_has_no_dolby_vision_profile() {
+        let path = std::env::var_os("ERIKA_PLAYBACK_FIXTURE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback/playback-fixture.mkv")
+            });
+        let demuxer = Demuxer::open_path(&path).unwrap();
+        let video = demuxer
+            .probe()
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Video)
+            .unwrap();
+
+        assert_eq!(video.dolby_vision_profile, None);
+        let parameters = demuxer.owned_codec_parameters(video.id as i32).unwrap();
+        assert_eq!(parameters.dolby_vision_profile(), None);
+    }
+
+    #[test]
+    fn dv_sample_reports_dolby_vision_profile() {
+        let Some(path) = std::env::var_os("ERIKA_DV_SAMPLE") else {
+            return;
+        };
+        let demuxer = Demuxer::open_path(&path).unwrap();
+        let video = demuxer
+            .probe()
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Video)
+            .expect("DV sample must contain a video stream");
+
+        assert_eq!(video.dolby_vision_profile, Some(5));
+        let parameters = demuxer.owned_codec_parameters(video.id as i32).unwrap();
+        assert_eq!(parameters.dolby_vision_profile(), Some(5));
+    }
+
+    #[test]
+    fn dv_profile_8_sample_reports_profile() {
+        let Some(path) = std::env::var_os("ERIKA_DV_PROFILE_8_SAMPLE") else {
+            return;
+        };
+        let demuxer = Demuxer::open_path(&path).unwrap();
+        let video = demuxer
+            .probe()
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Video)
+            .expect("DV Profile 8 sample must contain a video stream");
+
+        assert_eq!(video.dolby_vision_profile, Some(8));
+        let parameters = demuxer.owned_codec_parameters(video.id as i32).unwrap();
+        assert_eq!(parameters.dolby_vision_profile(), Some(8));
+    }
+
+    #[test]
     fn real_ass_container_preserves_header_fonts_and_matroska_chunk_when_env_is_set() {
         let Ok(path) = std::env::var("ERIKA_ASS_SAMPLE") else {
             return;
@@ -5148,6 +7283,44 @@ mod tests {
         let error = unsafe { subtitle_bitmap_rect_to_rgba_plane(&rect) }.unwrap_err();
 
         assert!(matches!(error, FfmpegError::InvalidSubtitleBitmap { .. }));
+    }
+
+    #[test]
+    fn import_av_subtitle_skips_a_malformed_bitmap_rect_instead_of_failing() {
+        let mut malformed = sys::AVSubtitleRect {
+            w: 4,
+            h: 2,
+            linesize: [3, 0, 0, 0],
+            nb_colors: 1,
+            type_: sys::AVSubtitleType_SUBTITLE_BITMAP,
+            ..sys::AVSubtitleRect::default()
+        };
+        let pixels = [0u8; 8];
+        let palette = [0xffffffffu32];
+        malformed.data[0] = pixels.as_ptr().cast_mut();
+        malformed.data[1] = palette.as_ptr().cast::<u8>().cast_mut();
+
+        let caption = CString::new("caption").unwrap();
+        let mut text_rect = sys::AVSubtitleRect {
+            type_: sys::AVSubtitleType_SUBTITLE_TEXT,
+            text: caption.as_ptr().cast_mut(),
+            ..sys::AVSubtitleRect::default()
+        };
+        let mut rects: [*mut sys::AVSubtitleRect; 2] = [&mut malformed, &mut text_rect];
+        let subtitle = sys::AVSubtitle {
+            num_rects: 2,
+            rects: rects.as_mut_ptr(),
+            ..sys::AVSubtitle::default()
+        };
+
+        let packet = Packet::alloc().unwrap();
+        let frame = unsafe {
+            import_av_subtitle(7, &packet, &subtitle, (64, 48), None)
+                .expect("one malformed bitmap rect must not abort the whole subtitle frame")
+        };
+        assert!(frame.bitmap.planes.is_empty());
+        assert_eq!(frame.text.len(), 1);
+        assert_eq!(frame.text[0].text, "caption");
     }
 
     #[test]
@@ -5309,6 +7482,469 @@ mod tests {
     }
 
     #[test]
+    fn frame_reads_dovi_side_data() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe {
+            let mut size = 0_usize;
+            let metadata = sys::av_dovi_metadata_alloc(&mut size);
+            assert!(!metadata.is_null());
+            assert!(size >= mem::size_of::<sys::AVDOVIMetadata>());
+            let header = (metadata as *mut u8)
+                .add((*metadata).header_offset)
+                .cast::<sys::AVDOVIRpuDataHeader>();
+            let mapping = (metadata as *mut u8)
+                .add((*metadata).mapping_offset)
+                .cast::<sys::AVDOVIDataMapping>();
+            let color = (metadata as *mut u8)
+                .add((*metadata).color_offset)
+                .cast::<sys::AVDOVIColorMetadata>();
+
+            (*header).bl_bit_depth = 10;
+            (*header).el_bit_depth = 10;
+            (*header).coef_log2_denom = 13;
+            (*header).disable_residual_flag = 1;
+
+            let curve = &mut (*mapping).curves[0];
+            curve.num_pivots = 3;
+            curve.pivots[0] = 0;
+            curve.pivots[1] = 256;
+            curve.pivots[2] = 1023;
+            curve.mapping_idc[0] = sys::AVDOVIMappingMethod_AV_DOVI_MAPPING_POLYNOMIAL;
+            curve.poly_order[0] = 1;
+            curve.poly_coef[0][0] = 0;
+            curve.poly_coef[0][1] = 1 << 13;
+            curve.poly_coef[0][2] = 0;
+            curve.mapping_idc[1] = sys::AVDOVIMappingMethod_AV_DOVI_MAPPING_MMR;
+            curve.mmr_order[1] = 1;
+            curve.mmr_constant[1] = 1024;
+            curve.mmr_coef[1][0][0] = 4096;
+            curve.mmr_coef[1][0][6] = -8192;
+
+            (*color).ycc_to_rgb_matrix = [
+                rational(9575, 8192),
+                rational(0, 8192),
+                rational(14742, 8192),
+                rational(9575, 8192),
+                rational(1754, 8192),
+                rational(4383, 8192),
+                rational(9575, 8192),
+                rational(17372, 8192),
+                rational(0, 8192),
+            ];
+            (*color).ycc_to_rgb_offset = [rational(1, 4), rational(2, 1), rational(2, 1)];
+            (*color).rgb_to_lms_matrix = [
+                rational(5845, 16384),
+                rational(9702, 16384),
+                rational(837, 16384),
+                rational(2568, 16384),
+                rational(12256, 16384),
+                rational(1561, 16384),
+                rational(0, 16384),
+                rational(679, 16384),
+                rational(15705, 16384),
+            ];
+            (*color).source_min_pq = 62;
+            (*color).source_max_pq = 3079;
+
+            let side_data = sys::av_frame_new_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+                size,
+            );
+            assert!(!side_data.is_null());
+            ptr::copy_nonoverlapping(metadata.cast::<u8>(), (*side_data).data, size);
+            sys::av_free(metadata.cast());
+        }
+
+        let dovi = frame.dovi_metadata().unwrap();
+        let luma = &dovi.reshaping[0];
+        assert_eq!(luma.num_pivots, 3);
+        assert_close(luma.pivots[1], 256.0 / 1023.0);
+        assert_close(luma.pivots[2], 1.0);
+        assert_close(luma.poly_coeffs[0][1], 1.0);
+        assert_eq!(luma.mmr_orders[1], 1);
+        assert_close(luma.mmr_constants[1], 0.125);
+        assert_close(luma.mmr_coeffs[1][0][0], 0.5);
+        assert_close(luma.mmr_coeffs[1][0][6], -1.0);
+        // Chroma and luma curves without pivots stay empty.
+        assert_eq!(dovi.reshaping[1].num_pivots, 0);
+        assert_close(dovi.nonlinear_matrix.rows()[0][0], 9575.0 / 8192.0);
+        assert_close(dovi.nonlinear_offset[0], 0.25);
+        assert_close(dovi.rgb_to_lms.rows()[2][2], 15705.0 / 16384.0);
+        assert_eq!(dovi.source_min_pq, 62);
+        assert_eq!(dovi.source_max_pq, 3079);
+
+        unsafe {
+            let side_data = sys::av_frame_get_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+            );
+            assert!(!side_data.is_null());
+            let metadata = *(*side_data).data.cast::<sys::AVDOVIMetadata>();
+            let header = &mut *((*side_data)
+                .data
+                .add(metadata.header_offset)
+                .cast::<sys::AVDOVIRpuDataHeader>());
+            let mapping = &mut *((*side_data)
+                .data
+                .add(metadata.mapping_offset)
+                .cast::<sys::AVDOVIDataMapping>());
+            mapping.curves[0].mmr_order[1] = 0;
+            assert_eq!(frame.dovi_metadata(), None);
+            header.disable_residual_flag = 0;
+            assert_eq!(frame.dovi_metadata(), None);
+        }
+    }
+
+    #[test]
+    fn frame_rejects_truncated_or_invalid_dovi_side_data() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe {
+            let side_data = sys::av_frame_new_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+                4,
+            );
+            assert!(!side_data.is_null());
+        }
+        assert_eq!(frame.dovi_metadata(), None);
+    }
+
+    /// Attaches a known-good RPU: 10-bit base layer, `coef_log2_denom = 32`
+    /// with the identity polynomial scaled to match, no residual, identity
+    /// matrices, valid PQ range.
+    unsafe fn attach_valid_dovi_rpu(frame: &Frame) {
+        unsafe {
+            let mut size = 0_usize;
+            let metadata = sys::av_dovi_metadata_alloc(&mut size);
+            assert!(!metadata.is_null());
+            let header = (metadata as *mut u8)
+                .add((*metadata).header_offset)
+                .cast::<sys::AVDOVIRpuDataHeader>();
+            let mapping = (metadata as *mut u8)
+                .add((*metadata).mapping_offset)
+                .cast::<sys::AVDOVIDataMapping>();
+            let color = (metadata as *mut u8)
+                .add((*metadata).color_offset)
+                .cast::<sys::AVDOVIColorMetadata>();
+
+            (*header).bl_bit_depth = 10;
+            (*header).el_bit_depth = 10;
+            (*header).coef_log2_denom = 32;
+            (*header).disable_residual_flag = 1;
+
+            let curve = &mut (*mapping).curves[0];
+            curve.num_pivots = 2;
+            curve.pivots[0] = 0;
+            curve.pivots[1] = 1023;
+            curve.mapping_idc[0] = sys::AVDOVIMappingMethod_AV_DOVI_MAPPING_POLYNOMIAL;
+            curve.poly_order[0] = 1;
+            curve.poly_coef[0][0] = 0;
+            curve.poly_coef[0][1] = 1_i64 << 32;
+            curve.poly_coef[0][2] = 0;
+
+            (*color).ycc_to_rgb_matrix = [
+                rational(1, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(1, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(1, 1),
+            ];
+            (*color).ycc_to_rgb_offset = [rational(0, 1), rational(0, 1), rational(0, 1)];
+            (*color).rgb_to_lms_matrix = [
+                rational(1, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(1, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(0, 1),
+                rational(1, 1),
+            ];
+            (*color).source_min_pq = 0;
+            (*color).source_max_pq = 3079;
+
+            let side_data = sys::av_frame_new_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+                size,
+            );
+            assert!(!side_data.is_null());
+            ptr::copy_nonoverlapping(metadata.cast::<u8>(), (*side_data).data, size);
+            sys::av_free(metadata.cast());
+        }
+    }
+
+    unsafe fn mutate_dovi_rpu(
+        frame: &Frame,
+        mutate: impl FnOnce(
+            &mut sys::AVDOVIRpuDataHeader,
+            &mut sys::AVDOVIDataMapping,
+            &mut sys::AVDOVIColorMetadata,
+        ),
+    ) {
+        unsafe {
+            let side_data = sys::av_frame_get_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+            );
+            assert!(!side_data.is_null());
+            let metadata = *(*side_data).data.cast::<sys::AVDOVIMetadata>();
+            let header = &mut *((*side_data)
+                .data
+                .add(metadata.header_offset)
+                .cast::<sys::AVDOVIRpuDataHeader>());
+            let mapping = &mut *((*side_data)
+                .data
+                .add(metadata.mapping_offset)
+                .cast::<sys::AVDOVIDataMapping>());
+            let color = &mut *((*side_data)
+                .data
+                .add(metadata.color_offset)
+                .cast::<sys::AVDOVIColorMetadata>());
+            mutate(header, mapping, color);
+        }
+    }
+
+    /// Writes a single dynamic DM level 1 ext block into the side data.
+    /// `av_dovi_metadata_alloc` reserves the full ext block array inside the
+    /// same allocation, so the first block lands at `ext_block_offset`.
+    unsafe fn with_dovi_l1(frame: &Frame, min_pq: u16, max_pq: u16, avg_pq: u16) {
+        unsafe {
+            let side_data = sys::av_frame_get_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+            );
+            assert!(!side_data.is_null());
+            let metadata = &mut *(*side_data).data.cast::<sys::AVDOVIMetadata>();
+            let block = &mut *((*side_data)
+                .data
+                .add(metadata.ext_block_offset)
+                .cast::<sys::AVDOVIDmData>());
+            block.level = 1;
+            block.__bindgen_anon_1.l1 = sys::AVDOVIDmLevel1 {
+                min_pq,
+                max_pq,
+                avg_pq,
+            };
+            metadata.num_ext_blocks = 1;
+        }
+    }
+
+    #[test]
+    fn dovi_l1_brightness_metadata_is_parsed() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe { attach_valid_dovi_rpu(&frame) };
+        assert_eq!(frame.dovi_metadata().unwrap().l1, None);
+
+        unsafe { with_dovi_l1(&frame, 62, 2200, 1500) };
+        let l1 = frame
+            .dovi_metadata()
+            .unwrap()
+            .l1
+            .expect("level 1 block should be parsed");
+        assert_eq!(
+            l1,
+            DoviFramePq {
+                min_pq: 62,
+                max_pq: 2200,
+                avg_pq: 1500
+            }
+        );
+
+        // Inverted min/max and an all-zero block are treated as absent.
+        unsafe { with_dovi_l1(&frame, 2200, 100, 1500) };
+        assert_eq!(frame.dovi_metadata().unwrap().l1, None);
+        unsafe { with_dovi_l1(&frame, 0, 0, 0) };
+        assert_eq!(frame.dovi_metadata().unwrap().l1, None);
+    }
+
+    #[test]
+    fn dovi_malformed_ext_region_skips_l1_but_keeps_rpu() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe {
+            attach_valid_dovi_rpu(&frame);
+            let side_data = sys::av_frame_get_side_data(
+                frame.ptr,
+                sys::AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA,
+            );
+            assert!(!side_data.is_null());
+            let metadata = &mut *(*side_data).data.cast::<sys::AVDOVIMetadata>();
+            metadata.ext_block_offset = usize::MAX;
+            metadata.ext_block_size = mem::size_of::<sys::AVDOVIDmData>();
+            metadata.num_ext_blocks = 5;
+        }
+        let dovi = frame
+            .dovi_metadata()
+            .expect("RPU must remain usable when the ext region is malformed");
+        assert_eq!(dovi.l1, None);
+    }
+
+    #[test]
+    fn frame_reads_dovi_side_data_with_32bit_coef_denom() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe { attach_valid_dovi_rpu(&frame) };
+
+        let dovi = frame
+            .dovi_metadata()
+            .expect("32-bit coef denominator should be accepted");
+        let luma = &dovi.reshaping[0];
+        assert_eq!(luma.num_pivots, 2);
+        assert_close(luma.poly_coeffs[0][1], 1.0);
+
+        // Test with 31-bit denominator
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, mapping, _| {
+                header.coef_log2_denom = 31;
+                mapping.curves[0].poly_coef[0][1] = 1_i64 << 31;
+            });
+        }
+        let dovi31 = frame
+            .dovi_metadata()
+            .expect("31-bit coef denominator should be accepted");
+        assert_close(dovi31.reshaping[0].poly_coeffs[0][1], 1.0);
+
+        // Test with invalid 33-bit denominator (should be rejected)
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, _, _| header.coef_log2_denom = 33);
+        }
+        assert_eq!(frame.dovi_metadata(), None);
+    }
+
+    #[test]
+    fn dovi_unavailable_reason_classifies_rejections() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        assert_eq!(
+            frame.dovi_unavailable_reason(),
+            Some(DoviRejectReason::MissingSideData)
+        );
+
+        unsafe { attach_valid_dovi_rpu(&frame) };
+        assert_eq!(frame.dovi_unavailable_reason(), None);
+
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, _, _| header.coef_log2_denom = 33);
+        }
+        assert_eq!(
+            frame.dovi_unavailable_reason(),
+            Some(DoviRejectReason::UnsupportedCoefDenom)
+        );
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, _, _| header.coef_log2_denom = 32);
+        }
+
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, _, _| header.disable_residual_flag = 0);
+        }
+        // A residual request is reported through `dovi_el_status`, not rejected:
+        // the base-layer mapping still applies (see
+        // `fel_residual_keeps_the_base_layer_mapping`).
+        assert_eq!(frame.dovi_unavailable_reason(), None);
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, _, _| header.disable_residual_flag = 1);
+        }
+
+        unsafe {
+            mutate_dovi_rpu(&frame, |_, mapping, _| mapping.curves[0].pivots[1] = 0);
+        }
+        assert_eq!(
+            frame.dovi_unavailable_reason(),
+            Some(DoviRejectReason::InvalidCurves)
+        );
+        unsafe {
+            mutate_dovi_rpu(&frame, |_, mapping, _| mapping.curves[0].pivots[1] = 1023);
+        }
+
+        unsafe {
+            mutate_dovi_rpu(&frame, |_, _, color| {
+                color.rgb_to_lms_matrix = [
+                    rational(1, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                ];
+            });
+        }
+        assert_eq!(
+            frame.dovi_unavailable_reason(),
+            Some(DoviRejectReason::InvalidColorMetadata)
+        );
+
+        // Restoring the matrix makes the RPU usable again, and the reason
+        // tracks the metadata rather than sticky stream state.
+        unsafe {
+            mutate_dovi_rpu(&frame, |_, _, color| {
+                color.rgb_to_lms_matrix = [
+                    rational(1, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(1, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(0, 1),
+                    rational(1, 1),
+                ];
+            });
+        }
+        assert_eq!(frame.dovi_unavailable_reason(), None);
+        assert!(frame.dovi_metadata().is_some());
+    }
+
+    #[test]
+    fn fel_residual_keeps_the_base_layer_mapping() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe { attach_valid_dovi_rpu(&frame) };
+
+        // Profile 7 FEL: the RPU asks for residual composition, which this
+        // renderer cannot do (no enhancement-layer input). The RPU itself is
+        // still valid, so the base-layer reshaping must survive; only the
+        // un-composable part is reported.
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, _, _| header.disable_residual_flag = 0);
+        }
+        assert_eq!(frame.dovi_unavailable_reason(), None);
+        let metadata = frame.dovi_metadata().expect("FEL RPU stays usable");
+        assert_eq!(metadata.reshaping[0].num_pivots, 2);
+        assert_close(metadata.reshaping[0].pivots[1], 1.0);
+        let status = frame.dovi_el_status().expect("FEL status is reported");
+        assert!(status.residual_requested);
+        assert!(!status.nlq_nontrivial);
+        assert!(status.is_active());
+
+        // A non-trivial NLQ definition is likewise reported, never rejected.
+        unsafe {
+            mutate_dovi_rpu(&frame, |_, mapping, _| mapping.nlq_method_idc = 1);
+        }
+        assert_eq!(frame.dovi_unavailable_reason(), None);
+        assert!(frame.dovi_metadata().is_some());
+        let status = frame.dovi_el_status().expect("NLQ status is reported");
+        assert!(status.nlq_nontrivial);
+        assert!(status.is_active());
+
+        // Profile 8 style RPUs (no residual, no NLQ) report an inactive status
+        // so callers do not diagnose them.
+        unsafe {
+            mutate_dovi_rpu(&frame, |header, mapping, _| {
+                header.disable_residual_flag = 1;
+                mapping.nlq_method_idc = -1;
+            });
+        }
+        assert_eq!(frame.dovi_el_status(), Some(DoviElStatus::default()));
+        assert!(!frame.dovi_el_status().unwrap().is_active());
+    }
+
+    #[test]
     fn frame_rate_normalizes_positive_rationals() {
         assert_eq!(
             frame_rate_from_av(rational(60_000, 2_002)),
@@ -5323,6 +7959,68 @@ mod tests {
         assert!(
             (actual - expected).abs() < 0.0001,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn av_log_bridge_copies_warnings_and_errors_into_the_log_ring() {
+        use crate::trace::{FfmpegLogCapture, LogLevel, LogQuery, export_logs, ffmpeg_log_capture};
+
+        install_ffmpeg_log_capture();
+        if ffmpeg_log_capture() != FfmpegLogCapture::Active {
+            // Disabled via ERIKA_FFMPEG_LOG_CAPTURE=0 or a shared system FFmpeg.
+            return;
+        }
+        let marker = "erika-av-log-bridge-5d1e";
+        let warning = CString::new(format!("{marker} warning %d\n")).unwrap();
+        let error = CString::new(format!("{marker} error %s\n")).unwrap();
+        let info = CString::new(format!("{marker} info\n")).unwrap();
+        let detail = CString::new("detail").unwrap();
+        unsafe {
+            sys::av_log(
+                ptr::null_mut(),
+                sys::AV_LOG_WARNING as c_int,
+                warning.as_ptr(),
+                42 as c_int,
+            );
+            sys::av_log(
+                ptr::null_mut(),
+                sys::AV_LOG_ERROR as c_int,
+                error.as_ptr(),
+                detail.as_ptr(),
+            );
+            sys::av_log(ptr::null_mut(), sys::AV_LOG_INFO as c_int, info.as_ptr());
+        }
+        let exported = export_logs(&LogQuery {
+            limit: 0,
+            min_level: None,
+            since_seq: 0,
+        });
+        let entries: Vec<&serde_json::Value> = exported["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(marker))
+            })
+            .collect();
+        assert_eq!(exported["ffmpegCapture"], "active");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["source"], "ffmpeg");
+        assert_eq!(entries[0]["level"], LogLevel::Warn.as_str());
+        assert_eq!(entries[0]["message"], format!("{marker} warning 42"));
+        assert_eq!(entries[1]["level"], LogLevel::Error.as_str());
+        assert_eq!(entries[1]["message"], format!("{marker} error detail"));
+        assert_eq!(
+            ffmpeg_log_level(sys::AV_LOG_FATAL as c_int),
+            LogLevel::Error
+        );
+        assert_eq!(ffmpeg_log_level(sys::AV_LOG_INFO as c_int), LogLevel::Info);
+        assert_eq!(
+            ffmpeg_log_level(sys::AV_LOG_TRACE as c_int),
+            LogLevel::Trace
         );
     }
 }

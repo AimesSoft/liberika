@@ -1,9 +1,15 @@
-# Building Erika
+# Building liberika
 
 > Translations: [中文](building.zh.md) · [日本語](building.ja.md)
 
-Erika is a Rust workspace that links a set of **statically built native
-dependencies** (FFmpeg, dav1d as the non-Windows AV1 fallback, and optionally
+For browsers, use `cargo run -p xtask -- web build` from current source and
+follow the [Web build and deployment guide](web.md). That entry point builds
+the Rust danmaku engine, libass and FFmpeg demuxer into a complete JS/WASM
+package; audio/video decoding uses WebCodecs. The steps below cover native
+platform dependencies and builds.
+
+liberika is a Rust workspace that links a set of **statically built native
+dependencies** (FFmpeg, dav1d for AV1 software decode on every target, and optionally
 the libass subtitle stack). Those native libraries are not vendored — you build them once with the `xtask` orchestrator,
 which stages them under `third_party/dist/`, and the Rust crates link against
 that staging directory.
@@ -16,6 +22,19 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
                                   cargo build -p erika
 ```
 
+## Linux dual architecture and dependency modes
+
+Linux release targets are `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`,
+each on a matching native host. Both offer `bundled` / `system` archives built on
+Ubuntu 22.04 / glibc 2.35. The common entry point is
+`ERIKA_LINUX_DEPENDENCIES=bundled bash scripts/build_linux_release.sh`; change
+the mode to `system` for external FFmpeg/font libraries. Bundled reuses
+`xtask deps build --all`; system uses a pinned FFmpeg 8 shared SDK only for
+building/testing, not distribution. Users may install compatible FFmpeg 8
+shared libraries themselves. Both embed patched libass and SoundTouch, while
+retaining system desktop/driver dependencies; neither is fully static.
+See [Linux integration](linux.md) for prerequisites, verification and archive use.
+
 ## Prerequisites
 
 ### Rust
@@ -24,16 +43,16 @@ xtask deps build  ──▶  third_party/dist/<target>/<profile>/{ffmpeg,dav1d,z
 - For cross-targets, add the Rust std target, e.g.
   `rustup target add aarch64-apple-ios` or
   `rustup target add x86_64-pc-windows-msvc`.
-- tvOS targets are tier 2 as of Rust 1.84, but Erika still builds them with
-  nightly and Cargo's `-Z build-std` (a `panic_abort` std). Install nightly
-  with `rust-src` instead of `rustup target add`.
+- tvOS source builds use nightly with `rust-src` and Cargo's `-Z build-std`
+  (`panic_abort` std), matching the release workflow.
 
 ### Build tools — macOS / Unix host
 
 `tar`, `make`, `clang`, `cmake`, `pkg-config`, and `python3` (with `venv`) must
-be on `PATH`. Building the full subtitle stack (`--all`) additionally needs
-`meson` and `ninja` (and `nasm` for FFmpeg's x86 assembly on Intel hosts). On
-macOS, install the Xcode Command Line Tools plus the above via Homebrew.
+be on `PATH`. The baseline dav1d build needs Meson and Ninja; `xtask` can
+bootstrap them in a Python virtual environment when absent. An x86_64 Apple
+target also needs `nasm` for dav1d and FFmpeg assembly, including without
+`--all`. On macOS, install the Xcode Command Line Tools and needed tools via Homebrew.
 
 `erika_ffmpeg_sys` runs **bindgen**, which needs `libclang`. If it is not found
 automatically, set `LIBCLANG_PATH`.
@@ -44,9 +63,9 @@ automatically, set `LIBCLANG_PATH`.
   component.
 - A **POSIX shell** (Git for Windows or MSYS2) — FFmpeg's `configure` needs it.
 - **GNU make** (MSYS2 `make` or MinGW `mingw32-make`).
-- `nasm` for FFmpeg assembly.
-- For `--all`: **Python** (with `venv`); `xtask` provisions a `pkg-config` shim
-  automatically.
+- `nasm` for x86_64 FFmpeg and dav1d assembly.
+- **Python** (with `venv`) for every Windows dependency build; `xtask` can
+  provision Meson/Ninja and a `pkg-config` shim automatically.
 
 Run the commands from a shell where the MSVC environment is active (e.g. a
 *"x64 Native Tools Command Prompt"*), so `xtask` can locate the toolchain.
@@ -70,7 +89,7 @@ Run the commands from a shell where the MSVC environment is active (e.g. a
   `OHOS_NDK_HOME` or `OHOS_SDK_NATIVE`, plus the
   `aarch64-unknown-linux-ohos` Rust standard-library target.
 
-Erika's Android minimum is API **26**. Override it with
+liberika's Android minimum is API **26**. Override it with
 `ANDROID_API_LEVEL` only when targeting a newer API.
 
 ## Native dependencies via `xtask`
@@ -82,12 +101,26 @@ Erika's Android minimum is API **26**. Override it with
 cargo run -p xtask -- deps plan
 cargo run -p xtask -- deps status
 
-# Build the baseline set (zlib + FFmpeg; dav1d on Android and Apple targets) — LGPL profile
+# Build the baseline set (zlib + FFmpeg + dav1d on every target) — LGPL profile
 cargo run -p xtask -- deps build --profile lgpl
 
 # Build everything, including the libass subtitle stack
 cargo run -p xtask -- deps build --all --profile lgpl
 ```
+
+The examples above use the default `host` target. On Windows x64 and ARM64,
+`host` resolves to the matching MSVC target and stages dependencies under
+`dist/<triple>/lgpl`, matching a plain `cargo build`. An explicit target still
+selects another architecture; for example, on x64:
+
+```powershell
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc
+$env:ERIKA_NATIVE_TARGET = "x86_64-pc-windows-msvc"
+cargo build -p erika_capi --target x86_64-pc-windows-msvc
+```
+
+Use `aarch64-pc-windows-msvc` for Windows ARM64. Default Cargo builds and
+workspace tests enable libass, so they need `--all`, not just the baseline.
 
 Subcommands: `plan` (print the plan), `fetch` (download sources only),
 `status` (what is present/built), `build` (fetch + compile).
@@ -97,8 +130,9 @@ Subcommands: `plan` (print the plan), `fetch` (download sources only),
 | Flag | Values | Default | Meaning |
 |------|--------|---------|---------|
 | `--profile` | `lgpl`, `gpl-full` | `lgpl` | FFmpeg license profile (see below). |
+| `--ffmpeg` | `full`, `common`, `slim`, `slim,<group>…` | `full` | Which formats FFmpeg carries (see [Build what you need](#build-what-you-need)). |
 | `--target` | see targets table | `host` | Cross-compile target. |
-| `--all` | — | off | Also build libass + FreeType + HarfBuzz + FriBidi (subtitle rendering). The baseline is zlib + FFmpeg, plus dav1d for Android and Apple targets. |
+| `--all` | — | off | Also build libass + FreeType + HarfBuzz + FriBidi (subtitle rendering). The baseline is zlib + FFmpeg + dav1d on every target. |
 | `--force` | — | off | Rebuild even if up-to-date markers exist. |
 | `--jobs N` | integer | auto | Parallelism for the native builds. |
 
@@ -106,6 +140,8 @@ Subcommands: `plan` (print the plan), `fetch` (download sources only),
 
 | `--target` | Triple | Notes |
 |------------|--------|-------|
+| `x86_64-unknown-linux-gnu` (`linux-x64`) | Linux x86_64 | Matching native GNU/Linux host; PIC + VA-API/NVDEC/Vulkan. |
+| `aarch64-unknown-linux-gnu` (`linux-arm64`) | Linux ARM64 | Matching native GNU/Linux host; no musl/cross build. |
 | `host` | current machine | Default. |
 | `aarch64-apple-darwin` | Apple Silicon macOS | |
 | `x86_64-apple-darwin` | Intel macOS | |
@@ -131,7 +167,7 @@ Android builds use `android-26`, `c++_shared`, PIC static dependencies, and the
 NDK LLVM toolchain selected for the requested ABI.
 
 HarmonyOS builds take the DevEco Studio `openharmony/native` directory from
-`OHOS_NDK_HOME` or `OHOS_SDK_NATIVE` and build FFmpeg, zlib, and Erika with the
+`OHOS_NDK_HOME` or `OHOS_SDK_NATIVE` and build FFmpeg, zlib, and liberika with the
 `aarch64-unknown-linux-ohos-clang` toolchain inside it. The Flutter plugin's
 Hvigor/CMake build runs this chain automatically and packages `liberika_capi.so`
 and `liberika_flutter.so` into the HAP.
@@ -144,7 +180,7 @@ Windows with `ERIKA_WINDOWS_ARCH=x64|arm64`, and Android with
 `ERIKA_FORCE_SOURCE_BUILD=1` to bypass prebuilt downloads.
 
 The Apple plugins default to the checksummed prebuilt archive, except on macOS
-inside an Erika checkout: when the pod script finds
+inside a liberika checkout: when the pod script finds
 `crates/erika_capi/Cargo.toml` above the package (or `ERIKA_REPO_ROOT` points
 at one), it builds `erika_capi` from source so local changes are picked up
 without a new prebuilt release. `ERIKA_FORCE_PREBUILT=1` always downloads the
@@ -186,6 +222,18 @@ The `xtask --target`, `ERIKA_NATIVE_TARGET`, and Cargo `--target` values must
 match, otherwise Cargo can attempt to link native dependencies for a different
 architecture.
 
+Windows native libraries link the DLL C runtime (`/MD`) by default, as Rust
+does. A host that links the C runtime statically
+(`-C target-feature=+crt-static`) needs native libraries that do too, or the
+link misses symbols such as `__imp_strtol`: add `--crt static`. The build goes
+to its own `<profile>-crt-static` directory, which `erika_ffmpeg_sys` and
+`erika` use when Rust links the C runtime statically.
+
+```powershell
+# Only for Rust builds with -C target-feature=+crt-static; omit for the default DLL CRT.
+cargo run -p xtask -- deps build --all --profile lgpl --target x86_64-pc-windows-msvc --crt static
+```
+
 ### Android x86_64 build (Windows PowerShell)
 
 ```powershell
@@ -218,6 +266,65 @@ Cargo produces both `liberika_capi.so` and `liberika_capi.a` under
 `target/x86_64-linux-android/release`. The Flutter Android Gradle task packages
 the cdylib directly together with the matching NDK `libc++_shared.so`.
 
+## Build what you need
+
+A default build carries everything. The switches below are independent, and with
+all of them off the build is at its smallest.
+
+### Cargo features
+
+| Feature | Default | When off |
+|---|---|---|
+| `embedded-fallback-font` | on | No Droid Sans Fallback, about 6 MB less. Nothing is left when the system's fonts cannot be read; see the [platform matrix](platform_matrix.md#fallback-font) |
+| `artcnn-r8f64` | on | No R8F64, the largest super resolution network, about 1.8 MB less |
+| `libass` | on | No ASS rendering, and no HarfBuzz, so composed emoji are drawn one by one |
+| `wgpu` | on in `erika_capi` | No wgpu renderer. Android, OpenHarmony and Linux need it |
+
+### FFmpeg
+
+`xtask deps build --ffmpeg` picks the formats FFmpeg carries, and
+`ERIKA_FFMPEG_SET` makes Cargo link that build:
+
+```bash
+cargo run -p xtask -- deps build --all --ffmpeg common
+ERIKA_FFMPEG_SET=common cargo build -p erika_capi --release \
+  --no-default-features --features libass,wgpu,artcnn-r8f64
+```
+
+| Value | Decoders | Demuxers | Contents |
+|---|---|---|---|
+| `full` (default) | 503 | 354 | All of FFmpeg's decoders and demuxers |
+| `common` | 204 | 77 | `slim` plus every group below |
+| `slim` | 44 | 27 | Mainstream video, audio, containers and subtitles |
+
+`slim` can take groups after it, in the order of this table, such as
+`slim,images,streaming`:
+
+| Group | Contents |
+|---|---|
+| `legacy-video` | RealVideo, H.263, VP3/VP5/VP6, Indeo, Cinepak and more; RM, Bink, SWF |
+| `pro-video` | ProRes, DNxHD, FFV1, UtVideo; MXF, NUT, DV |
+| `images` | PNG, GIF, WebP, BMP, TIFF |
+| `legacy-audio` | MP1/MP2, RealAudio, AMR, ADPCM and more; CAF, AIFF, Musepack |
+| `lossless-audio` | ALAC, APE, WavPack, TAK, TTA, DSD, all PCM |
+| `subtitles` | SAMI, MicroDVD, VobSub, LRC and other text and external subtitles |
+| `streaming` | HLS, concat |
+
+### Size
+
+`liberika_capi.dylib` on macOS arm64, stripped:
+
+| Build | Size | After `xz -9e` |
+|---|---|---|
+| Default | 36.84 MB | 13.76 MB |
+| `common`, no font | 23.16 MB | 8.88 MB |
+| `slim`, no font | 21.52 MB | 8.23 MB |
+| Also without R8F64 | 19.72 MB | 6.62 MB |
+| Also without wgpu | 16.39 MB | 5.63 MB |
+
+Web: `web build --without-fallback-font` takes the wasm from 7.66 MB to 1.59 MB,
+and `Player.create({ fallbackFont })` passes the font in instead.
+
 ## License profiles
 
 The native build is split into profiles so the license boundary is explicit:
@@ -225,14 +332,15 @@ The native build is split into profiles so the license boundary is explicit:
 - **`lgpl`** (default) — FFmpeg configured `--disable-gpl --enable-version3`,
   static, no network, file protocol only, a curated demuxer/decoder/parser set,
   zlib enabled, plus VideoToolbox (Apple), D3D11VA/DXVA2 (Windows), or
-  JNI/MediaCodec plus source-built dav1d AV1 software fallback (Android and
-  Apple targets).
+  JNI/MediaCodec (Android). Every target also includes source-built dav1d
+  for AV1 software decode.
 - **`gpl-full`** — the same set with `--enable-gpl`. Use only if you accept GPL
   terms for the resulting binary.
 
 The Rust workspace itself is MPL-2.0 (see [`LICENSE`](../LICENSE)). Keep the
 profile consistent across `xtask` and your `cargo build`. `cargo run -p xtask --
-check license` validates the policy.
+check license` checks the default feature, configured FFmpeg flags and dav1d
+notices; it does not inspect built artifacts or detect mixed profiles.
 
 ## The `dist` layout
 
@@ -258,14 +366,17 @@ For the `host` target the `<target>` path segment is omitted
 1. `ERIKA_FFMPEG_DIR`, if set (explicit override).
 2. else `third_party/dist/$ERIKA_NATIVE_TARGET/$ERIKA_NATIVE_PROFILE/ffmpeg`,
    if `ERIKA_NATIVE_TARGET` is set.
-3. else `third_party/dist/<profile>/ffmpeg` under the workspace root (with an
-   `ios/` segment when building for iOS).
+3. else use an inferred target directory for Windows, Android, iOS (`ios`),
+   and tvOS. For other targets, a matching Cargo target directory is used if
+   present; otherwise `third_party/dist/<profile>/ffmpeg` is used. Set
+   `ERIKA_NATIVE_TARGET` to select the intended staged target explicitly.
 
 Relevant environment variables: `ERIKA_NATIVE_PROFILE`, `ERIKA_NATIVE_TARGET`,
 `ERIKA_FFMPEG_DIR`, `ERIKA_DAV1D_DIR`, `ERIKA_ZLIB_DIR`, `LIBCLANG_PATH`, and
-`ERIKA_ALLOW_LEGACY_FFMPEG` (escape hatch). Erika requires FFmpeg **8.x**
-(`libavutil >= 60`); the Windows and Android native core enforces this. Set
-`ERIKA_ALLOW_LEGACY_FFMPEG=1` only for local compatibility experiments.
+`ERIKA_ALLOW_LEGACY_FFMPEG` (escape hatch). liberika requires FFmpeg **8.x**
+(`libavutil >= 60`). Set `ERIKA_ALLOW_LEGACY_FFMPEG=1` only for local
+compatibility experiments; it skips the bundled dependency version check, not
+the pkg-config FFmpeg 8 requirements on the Linux system-library path.
 
 ## Compile and test
 
@@ -292,7 +403,7 @@ pipeline, preserving subtitles, danmaku, and screenshots. This is hardware
 decode with a CPU upload, not a zero-copy Surface path; metrics must report it
 accordingly. If AV1 MediaCodec cannot open or fails while decoding, the software
 path explicitly selects FFmpeg's `libdav1d` decoder. `xtask` builds dav1d 1.5.1
-from source for every Android ABI and the Apple targets, with both 8-bit and
+from source for every target, including Windows and OpenHarmony, with both 8-bit and
 high-bit-depth support; the 32-bit Android x86 slice disables assembly to
 preserve PIC safety.
 
@@ -329,20 +440,32 @@ HDR-device run above passes.
 
 ## Verify the playback path
 
+macOS (shell):
+
 ```sh
-# macOS
-export SAMPLE="/path/to/video.mp4"
+SAMPLE="/path/to/video.mp4"
 cargo run -p macos_native_demo -- "$SAMPLE"
 cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
-
-# Windows
-cargo run -p windows_native_demo -- "%SAMPLE%"
-cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl "%SAMPLE%"
 ```
 
-The demos print per-frame pipeline stats (decoded/rendered frames, zero-copy vs
-CPU fallback, HDR10 activity, audio underflow) — a quick way to confirm hardware
-decode and zero-copy interop are engaged.
+Windows (PowerShell):
+
+```powershell
+$sample = "C:\path\to\video.mp4"
+cargo run -p windows_native_demo -- $sample
+cargo run -p windows_native_demo -- --smoke-seconds 3 --metrics-log out.jsonl $sample
+cargo run --release -p windows_native_demo -- --upscaler anime4k_ul $sample
+cargo run --release -p windows_native_demo -- --upscaler custom --upscaler-model FSRCNNX_x2_8-0-4-1.glsl $sample
+```
+
+In the Windows demo, Space toggles playback, Left/Right seek, `U` / `Shift+U`
+cycles the upscaler modes and `I` prints the upscaler status; the window title
+shows the active mode, backend and GPU time.
+
+The Windows smoke test prints a summary of decode, zero-copy, HDR10, audio and
+other metrics on exit; `--metrics-log` writes metrics approximately every 250 ms.
+The macOS demo reports playback and errors by default; `--seek-sequence` also
+prints decode, render and failure counts.
 
 ## Troubleshooting
 
@@ -364,11 +487,12 @@ decode and zero-copy interop are engaged.
   `Rgba16Float` (`4`), unavailable dataspace API (`5`), or failed
   `SCRGB_LINEAR` verification (`6`). Codes `7` and `8` identify surface
   configuration failure and an Apple-EDR request on an unsupported backend.
-- **Legacy FFmpeg rejected** — the native core requires the 8.x bundle
-  (`libavutil >= 60`) and fails at build time otherwise; the check is skipped
-  only when `ERIKA_ALLOW_LEGACY_FFMPEG=1` is set for local experiments.
-- **License check fails** — your profile mixes GPL and LGPL artifacts; rebuild
-  deps with a single `--profile`.
+- **Legacy FFmpeg rejected** — install or build FFmpeg 8.x. For local
+  compatibility experiments only, `ERIKA_ALLOW_LEGACY_FFMPEG=1` skips the
+  bundled dependency check, but not Linux system-library pkg-config requirements.
+- **License check fails** — inspect the reported default feature, FFmpeg configure
+  flags or dav1d notice. The check does not inspect built artifacts; separately
+  ensure the selected dependency profile matches the Cargo build.
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development workflow and
 [architecture.md](architecture.md) for how the pieces fit together.

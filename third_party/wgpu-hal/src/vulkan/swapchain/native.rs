@@ -506,6 +506,7 @@ impl Swapchain for NativeSwapchain {
                     depth: 1,
                 },
                 identity,
+                initial_usage: wgt::TextureUses::UNINITIALIZED,
             },
             metadata: Box::new(NativeSurfaceTextureMetadata {
                 acquire_semaphores: acquire_semaphore_arc,

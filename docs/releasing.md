@@ -1,236 +1,102 @@
-# Releasing Erika
+# Releasing liberika
 
-> Translations: [中文](releasing.zh.md) · [日本語](releasing.ja.md)
+[中文](releasing.zh.md) · [日本語](releasing.ja.md) · [Documentation](README.md)
 
-This describes how prebuilt `erika_capi` binaries are published so that other
-projects can link Erika without building it from source.
+A normal release starts with one core `vX.Y.Z` tag. GitHub Actions publishes the native libraries, then updates and publishes the Flutter, OHPM, and Swift SDKs.
 
-## What ships
+## Release steps
 
-Per-platform archives, each containing the C ABI library, the header, and
-license files:
-
-| Platform | Archive | Library artifacts |
-|----------|---------|-------------------|
-| macOS arm64 | `erika-capi-macos-arm64.zip` | `liberika_capi.dylib`, `liberika_capi.a` |
-| macOS x64 | `erika-capi-macos-x64.zip` | `liberika_capi.dylib`, `liberika_capi.a` |
-| macOS universal | `erika-capi-macos-universal.zip` | `liberika_capi.dylib`, `liberika_capi.a` (arm64 + x86_64) |
-| Windows x64 | `erika-capi-windows-x64.zip` | `erika_capi.dll`, `erika_capi.dll.lib` (import), `erika_capi.lib` (static) |
-| Windows ARM64 | `erika-capi-windows-arm64.zip` | `erika_capi.dll`, `erika_capi.dll.lib` (import), `erika_capi.lib` (static) |
-| iOS | `erika-capi-ios.zip` | `erika_capi.xcframework` (device + simulator) |
-| tvOS | `erika-capi-tvos.zip` | `erika_capi.xcframework` (device + arm64/x86_64 simulator) |
-| Android | `erika-capi-android.zip` | `liberika_capi.so`, `liberika_capi.a`, and `libc++_shared.so` for `arm64-v8a`, `armeabi-v7a`, `x86_64`, and `x86` |
-| Flutter Android | `erika-flutter-android-<abi>.zip` | `liberika_capi.so` and `libc++_shared.so` for one requested ABI |
-| OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | `liberika_capi.so`, `liberika_flutter.so` |
-
-The OpenHarmony archive is built against the OpenHarmony 5.1.0 native SDK with
-compatible SDK version 18. It contains the C API runtime and Flutter N-API
-bridge. The Flutter plugin downloads the package-pinned release by default,
-verifies its SHA-256, links the prebuilt runtime, and packages it beside the
-locally linked N-API bridge. Download and verification failures are explicit;
-source builds are enabled only with `ERIKA_FORCE_SOURCE_BUILD=1`.
-
-The Android archive stores each ABI at `lib/android/<abi>/`. Flutter/Gradle
-consumers instead download one `erika-flutter-android-<abi>.zip` per requested
-ABI and package `liberika_capi.so` together with the matching NDK
-`libc++_shared.so`. They do not download other architectures or the static
-library. The combined C API archive retains `liberika_capi.a` for native
-embedders that prefer static linkage.
-
-Every archive also includes `include/erika.h`, `LICENSE` (Erika, MPL-2.0),
-`THIRD_PARTY_NOTICES.md`, applicable dependency and embedded asset license texts
-under `licenses/`, and a `MANIFEST.txt` recording the tag/commit.
-Every GitHub Release also includes `SHA256SUMS` with the digest of each archive.
-
-The native dependencies (FFmpeg, libass, FreeType, HarfBuzz, FriBidi, zlib,
-dav1d, and SoundTouch) are **statically linked** via the `lgpl`
-profile, so each library is self-contained except for OS frameworks
-(VideoToolbox/Metal/CoreAudio on Apple; Direct3D 11 / WASAPI on Windows;
-MediaCodec/AAudio/ANativeWindow on Android), which are always present on
-the target OS. The Android shared library additionally depends on the bundled
-NDK `libc++_shared.so` for the same ABI.
-
-Linux is **not yet published**. Android is cross-built with NDK r29 at API 26;
-the four ABI archives are reproducible through the same `xtask` dependency
-pipeline as Apple and Windows.
-
-## Publishing the Flutter package
-
-`erika_flutter` is published separately on [pub.dev](https://pub.dev/packages/erika_flutter).
-Version `0.1.7` is the first standalone package release and supports macOS,
-iOS, tvOS, Windows, Android, and HarmonyOS/OpenHarmony. The package archive
-contains the plugin sources, package `LICENSE`, README files, examples, and the
-version-pinned native artifact manifest; platform builds fetch the matching
-GitHub Release archives and verify their SHA-256 values.
-
-From a clean worktree, validate and publish the package from its directory:
+1. Merge the changes into `main`, update the [CHANGELOG](../CHANGELOG.md), SDK READMEs, and affected integration guides. C ABI changes also require matching headers, platform bindings, and native binaries.
+2. Run the affected tests and platform builds. Basic native and Flutter package checks:
 
 ```sh
+cargo fmt --all -- --check
+cargo test --locked -p erika -p erika_capi
+cargo clippy --locked -p erika --all-targets --all-features --no-deps
 cd packages/erika_flutter
 dart pub publish --dry-run
-dart pub publish
 ```
 
-The isolated package and platform consumer checks run from
-[`.github/workflows/flutter-package.yml`](../.github/workflows/flutter-package.yml)
-before a package release is merged. Linux and Web are not package targets yet.
-
-Publishing pub.dev, OHPM, and ErikaSwift is orchestrated by
-[`.github/workflows/release-ecosystem.yml`](../.github/workflows/release-ecosystem.yml).
-Because native archives include build metadata, the workflow updates the package
-versions and all pinned SHA-256 values after the GitHub Release and its
-`SHA256SUMS` asset exist. A normal release now starts with one core tag:
+3. Set `[workspace.package].version` in `Cargo.toml` to the release version and run `cargo update -w`; commit `Cargo.lock` with it. The Release workflow rejects tags that differ from the Cargo version. Tag that commit on `main`; the tag's own `Release` run builds every platform and publishes, so there is no separate rehearsal run. The version below is an example for the next release; replace it with the intended version:
 
 ```sh
-VERSION=0.1.8
+VERSION=0.3.8
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
 
-After the native Release succeeds, the workflow automatically:
+4. Check `Release`, `Release ecosystem packages`, and each SDK publish result in Actions. Write the features and fixes in the GitHub Release. OHPM review follows a successful upload.
 
-1. Updates the Flutter and OHPM manifests and `native_artifacts.properties`.
-2. Creates the matching `erika_flutter-vX.Y.Z` tag on the metadata commit;
-   that tag triggers the pub.dev OIDC publish after its version and checksums
-   are verified.
-3. Builds and publishes `erika` to OHPM.
-4. Builds and uploads the Swift XCFramework, then dispatches ErikaSwift to
-   update, test, tag, and release the matching SDK.
+## Automated pipeline
 
-The `erika_flutter-vX.Y.Z` tag is an internal package-release tag created by
-the workflow; maintainers only create and push the core `vX.Y.Z` tag.
-Cross-repository package-tag and Swift publishing require the one-time
-`ERIKA_SWIFT_RELEASE_TOKEN` secret in `AimesSoft/Erika`.
+[release.yml](../.github/workflows/release.yml) builds platforms in parallel. iOS, tvOS, and Android build independent architecture slices and then assemble their archives; macOS arm64/x64 outputs form the universal bundle. The workflow creates a GitHub Release with 17 native/Flutter archives, two Web archives, and `SHA256SUMS`.
 
-### Pub.dev publisher identity
+[release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) then:
 
-`unverified uploader` means the package was uploaded by a pub.dev account that
-is not associated with a verified pub.dev publisher. It does not indicate a
-package validation, license, or build failure. To show a verified publisher,
-create or join a pub.dev publisher for a domain you control and complete the
-domain verification, then transfer ownership of the package to that publisher.
+- Updates Flutter/OHPM versions and `native_artifacts.properties` with the uploaded checksums, committing the metadata to `main`.
+- Creates the internal `erika_flutter-vX.Y.Z` tag to trigger [Flutter OIDC publishing](../.github/workflows/pub-publish.yml).
+- Builds the ArkTS HAR and uploads it to OHPM.
+- Assembles the Swift XCFramework, appends it to the core Release and `SHA256SUMS`, and dispatches liberika-swift to update, test, and publish its matching version.
+- Publishes the npm packages `@aimessoft/liberika-web` and `@aimessoft/liberika-web-nofont` from the two tarballs `Release` packed while building the Web archives; their version comes from the Cargo workspace.
 
-## How to cut a release
+Flutter, OHPM, and Swift publishing can run in parallel. Maintainers create only the core tag. Cross-repository tags and Swift publishing use the repository secret `ERIKA_SWIFT_RELEASE_TOKEN`.
 
-The release is fully automated by
-[`.github/workflows/release.yml`](../.github/workflows/release.yml).
+A tag triggers the builds and the GitHub Release publish step. The manual `workflow_dispatch` run is only for investigating a failed build; it is not a release step.
 
-1. Make sure `main` is green and the docs/version are up to date. Review the
-   root [`CHANGELOG.md`](../CHANGELOG.md), especially its breaking-change
-   section, and bump `version` in the root `Cargo.toml` if appropriate.
-2. Tag and push:
-   ```sh
-   VERSION=0.1.8
-   git tag "v${VERSION}"
-   git push origin "v${VERSION}"
-   ```
-3. The workflow cross-builds macOS arm64 and x64 on `macos-26`, then combines
-   those outputs into the universal bundle. iOS and tvOS XCFrameworks also use
-   `macos-26`. Windows x64 runs on `windows-latest` and Windows ARM64 runs
-   natively on `windows-11-arm`. It also builds the Android and OpenHarmony
-   bundles and attaches all archives to a new GitHub Release for that tag.
+### First-time npm setup
 
-To dry-run the builds without publishing, trigger the workflow manually
-("Run workflow" / `workflow_dispatch`) — the build jobs run, but the publish job
-is skipped because it is gated on a tag ref.
+npm publishing uses trusted publishing, stores no token, and runs only while the repository variable `NPM_PUBLISH` is `true`. A trusted publisher is configured on a package's settings page, so the first version of each package is published by hand:
 
-## Pre-release validation
+1. Create the `aimessoft` organization on npmjs.com, with 2FA on the account.
+2. Download the `liberika-web-npm` artifact of a `Release` run and run `npm publish <tarball> --access public --registry https://registry.npmjs.org/` for each of its two tarballs. Locally, `python3 scripts/web_npm_package.py` after `web build`, then `npm pack`, gives the same tarballs.
+3. Under Settings → Trusted Publisher of both packages, choose GitHub Actions and enter `AimesSoft/liberika` and the workflow file name `release-ecosystem.yml`.
+4. Add `NPM_PUBLISH=true` under the repository's Settings → Variables. Every later release uploads by itself and skips a version that already exists.
 
-Before pushing a `v*` tag, use a clean worktree and record:
+## Release artifacts
 
-```sh
-cargo fmt --all -- --check
-cargo test -p erika -p erika_capi
-cargo test --workspace
-cargo clippy -p erika -p erika_capi --all-targets -- -D warnings
-```
+A complete release contains 20 ZIPs plus `SHA256SUMS`:
 
-Also compile affected examples, compare the public `erika.h` header with the C
-ABI reference and Flutter FFI glue, inspect every archive manifest/license, and
-verify the pinned prebuilt tag in NipaPlay before publishing release notes.
+| Platform | Archive naming | Count |
+|---|---|---|
+| macOS arm64 / x64 / universal | `erika-capi-macos-{arm64,x64,universal}.zip` | 3 |
+| Windows x64 / ARM64 | `erika-capi-windows-{x64,arm64}.zip` | 2 |
+| iOS / tvOS | `erika-capi-{ios,tvos}.zip` | 2 |
+| Android | `erika-capi-android.zip` | 1 |
+| Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
+| OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
+| Web / WASM | `liberika-web-X.Y.Z.zip`, `liberika-web-nofont-X.Y.Z.zip` | 2 |
+| Linux x64 / ARM64 | `erika-capi-linux-{x64,arm64}-{bundled,system}.zip` | 4 |
+| Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
-## Packaging
+C ABI bundles include the library, `include/erika.h`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, dependency license texts, and a `MANIFEST.txt` with the tag/commit. iOS/tvOS contain device + simulator XCFramework slices. The combined Android bundle contains static/shared libraries and matching `libc++_shared.so` for four ABIs. Flutter Android bundles contain one ABI's shared runtime each.
 
-[`packaging/bundle.sh`](../packaging/bundle.sh) stages and zips a bundle from a
-set of built artifacts (lib files or an `.xcframework`), adding the header,
-`LICENSE`, `THIRD_PARTY_NOTICES.md`, and `MANIFEST.txt`. It runs the same locally
-and in CI:
+OpenHarmony uses the 5.1.0 Native SDK with compatible SDK 18. The four Linux combinations reuse the [Linux workflow](../.github/workflows/linux.yml), all built on Ubuntu 22.04 / glibc 2.35; publishing waits for clean-runtime acceptance. Bundled embeds FFmpeg/subtitle libraries; system excludes the FFmpeg SDK and accepts user-installed ABI-compatible FFmpeg 8 shared libraries, whose licensing depends on their configuration. Neither is fully static. Dependency reports accompany each archive. Flutter Linux uses `ERIKA_LIBRARY_DIR`, not automatic downloads. See the [Linux guide](linux.md).
+
+## OHPM upload timeout
+
+The publish command in [ohpm-package.yml](../.github/workflows/ohpm-package.yml) uses `--fetch_timeout 360000`, the CLI's six-minute request limit. The publish job allows 60 minutes for the whole task. The uploaded version becomes public after OHPM approval.
+
+## Consuming prebuilt runtimes
+
+Flutter downloads its package-pinned native tag and verifies SHA-256 by default. Application setup belongs in the [Flutter README](../packages/erika_flutter/README.md). These variables support local development and custom builds:
+
+| Variable | Purpose |
+|---|---|
+| `ERIKA_PREBUILT_TAG` | Override the native version; also supply matching checksums. |
+| `ERIKA_PREBUILT_SHA256` | Archive checksum for a custom tag. |
+| `ERIKA_PREBUILT_SHA256_<ABI>` | Set `ARM64_V8A`, `ARMEABI_V7A`, `X86_64`, and `X86` separately for multi-ABI Android. |
+| `ERIKA_FORCE_SOURCE_BUILD=1` | Build the local liberika source. |
+| `ERIKA_MACOS_ARCHS` | `universal`, `arm64`, `x86_64`, `arm64,x86_64` |
+
+C/C++ consumers link `lib/` and include `include/erika.h` after extracting a bundle. The macOS dylib uses `@rpath/liberika_capi.dylib`. Use the [native integration guide](integration.md).
+
+## Local packaging and licenses
+
+[packaging/bundle.sh](../packaging/bundle.sh) is shared by local builds and CI:
 
 ```sh
 bash packaging/bundle.sh erika-capi-macos-universal \
   dist/erika-capi-macos-universal.zip out/liberika_capi.dylib out/liberika_capi.a
 ```
 
-## Consuming prebuilt bundles from the Flutter plugin
-
-The `erika_flutter` plugin can download a prebuilt bundle from a release instead
-of building Erika from source, which avoids compiling FFmpeg in the host app's
-build. Verified prebuilt bundles are the default. Download, extraction, or
-checksum failures stop with an actionable error instead of silently requiring a
-Rust and native dependency toolchain.
-
-The following environment variables customize that behavior:
-
-| Variable | Effect |
-|----------|--------|
-| `ERIKA_PREBUILT_TAG=v0.1.7` | Override the package-pinned release tag. Also requires `ERIKA_PREBUILT_SHA256`. |
-| `ERIKA_PREBUILT_SHA256=...` | Expected digest when overriding the release tag. |
-| `ERIKA_PREBUILT_SHA256_<ABI>=...` | Per-ABI digest for custom multi-ABI Android builds; suffixes are `ARM64_V8A`, `ARMEABI_V7A`, `X86_64`, and `X86`. |
-| `ERIKA_FORCE_SOURCE_BUILD=1` | Bypass the prebuilt path and build the local source, useful when debugging Erika changes through the Flutter plugin. |
-| `ERIKA_MACOS_ARCHS=universal|arm64|x86_64|arm64,x86_64` | Select the macOS source and prebuilt artifact architecture. |
-
-- **Windows** (`build_erika_runtime.cmake`): downloads the x64 or ARM64 archive
-  selected by the CMake target and drops `erika_capi.dll` where the plugin
-  bundles it.
-- **iOS** (podspec): downloads `erika-capi-ios.zip`, picks the device or
-  simulator slice from the XCFramework, and links it. The prebuilt static lib
-  must be built `--no-default-features --features libass` to match the plugin's
-  link flags (the release workflow does this); verify against a release built
-  that way before relying on it.
-- **tvOS** (podspec): downloads `erika-capi-tvos.zip` and selects the device or
-  universal simulator slice from its XCFramework.
-- **OpenHarmony** (plugin CMake): downloads
-  `erika-capi-openharmony-arm64.zip`, links its `liberika_capi.so`, and stages
-  that runtime beside `liberika_flutter.so` for HAR/HAP packaging.
-- **macOS** (podspec `script_phase`): downloads the arm64, x64, or universal
-  archive selected by `ERIKA_MACOS_ARCHS` and bundles its dylib into the app's
-  `Contents/Frameworks` (`install_name @rpath`, codesigned). With
-  `ERIKA_FORCE_SOURCE_BUILD=1`, the same phase builds the selected architecture from source.
-  `ERIKA_MACOS_CAPI_DYLIB` can point at an explicit dylib instead.
-- **Android** (`erika-native.gradle`): downloads only the ABI-specific
-  `erika-flutter-android-<abi>.zip` assets requested by the Flutter build and
-  stages `liberika_capi.so` plus `libc++_shared.so`. Native C/C++ embedders may
-  instead use the combined `erika-capi-android.zip`, link its static archive,
-  and provide the matching C++ runtime themselves.
-
-The package pins its native tag and SHA-256 values. If you override the tag,
-provide the matching digest so the C ABI in the package header and the prebuilt
-library cannot drift silently. A single-ABI Android build may use the generic
-digest variable; a multi-ABI Android build requires each selected ABI's
-specific variable.
-
-## Consuming a bundle
-
-Unzip, then point your build at `include/` for the header and `lib/` for the
-library. See [integration.md](integration.md) for the embedding model and
-[capi_reference.md](capi_reference.md) for the API. On macOS the dylib's install
-name is `@rpath/liberika_capi.dylib`, so add an `@rpath` entry (or copy it
-beside your binary).
-
-## Licensing
-
-Erika is MPL-2.0. The bundled native libraries keep their own licenses
-(`THIRD_PARTY_NOTICES.md`). Because Erika is open source with a reproducible
-build, the LGPL components (FFmpeg, FriBidi, SoundTouch) satisfy the LGPL relinking
-requirement: the `MANIFEST.txt` records the exact source commit, and anyone can
-rebuild against a modified FFmpeg via `xtask deps build --all` + `cargo build`
-(see [building.md](building.md)). Keep `LICENSE` and `THIRD_PARTY_NOTICES.md` in
-every published archive.
-
-## First-run notes
-
-The native-dependency builds (especially Windows MSVC + MSYS2 + nasm, and the
-multi-arch Apple builds) are the parts most likely to need a tweak on the first
-real CI run. If a job fails, the failure is almost always in the
-`xtask deps build` step; consult [building.md](building.md) for the per-platform
-tool requirements and adjust the "Install native build tools" step accordingly.
+liberika uses MPL-2.0; third-party dependencies retain their own licenses. Preserve license texts, third-party notices, and build provenance in published bundles. The [build guide](building.md#license-profiles) maintains the `lgpl` / `gpl-full` dependency configuration.

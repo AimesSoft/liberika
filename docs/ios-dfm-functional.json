@@ -1,0 +1,85 @@
+[
+  {
+    "case": "paused seek 20",
+    "frame": {
+      "media": 20.0,
+      "generation": 5,
+      "glyphs": 252
+    }
+  },
+  {
+    "case": "paused seek 8",
+    "frame": {
+      "media": 8.0,
+      "generation": 6,
+      "glyphs": 252
+    }
+  },
+  {
+    "case": "paused seek 8.1",
+    "frame": {
+      "media": 8.1,
+      "generation": 7,
+      "glyphs": 252
+    }
+  },
+  {
+    "case": "paused seek 8",
+    "frame": {
+      "media": 8.0,
+      "generation": 8,
+      "glyphs": 252
+    }
+  },
+  {
+    "case": "pause stable",
+    "passed": true
+  },
+  {
+    "case": "offset preserves playback clock",
+    "frame": {
+      "media": 8.0,
+      "generation": 9,
+      "glyphs": 216
+    }
+  },
+  {
+    "case": "hidden seek then show",
+    "frame": {
+      "media": 15.0,
+      "generation": 12,
+      "glyphs": 252
+    }
+  },
+  {
+    "case": "empty segment then return",
+    "frame": {
+      "media": 5.0,
+      "generation": 14,
+      "glyphs": 234
+    }
+  },
+  {
+    "case": "consecutive seeks last wins",
+    "frame": {
+      "media": 7.05,
+      "generation": 18,
+      "glyphs": 270
+    }
+  },
+  {
+    "case": "rate 0.5",
+    "wall_seconds": 1.5074715000810102,
+    "media_advance": 0.7590000000000003
+  },
+  {
+    "case": "rate 1",
+    "wall_seconds": 1.509201042004861,
+    "media_advance": 1.491999999999999
+  },
+  {
+    "case": "rate 2",
+    "wall_seconds": 1.5086904999334365,
+    "media_advance": 3.004999999999999
+  }
+]

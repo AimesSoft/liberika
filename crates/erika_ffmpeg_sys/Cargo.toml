@@ -16,3 +16,4 @@ libc.workspace = true
 
 [build-dependencies]
 bindgen.workspace = true
+pkg-config.workspace = true

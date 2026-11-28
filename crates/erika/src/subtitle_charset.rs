@@ -25,7 +25,7 @@ const MAX_GARBLED_RATIO: f64 = 0.05;
 pub struct CharsetInspection {
     /// Name of the encoding that drove the decision, for diagnostics.
     pub detected: &'static str,
-    /// UTF-8 bytes when the input required transcoding; `None` means the
+    /// UTF-8 bytes when the input required transcoding or BOM cleanup; `None` means the
     /// original bytes should be handed to FFmpeg unchanged.
     pub utf8: Option<Vec<u8>>,
 }
@@ -34,11 +34,11 @@ pub struct CharsetInspection {
 /// necessary.
 ///
 /// Returns `None` when the input already is valid UTF-8 (with or without a
-/// BOM — FFmpeg's text demuxers strip a UTF-8 BOM themselves, so the BOM is
-/// deliberately preserved to avoid a copy) or when detection is not confident
+/// single BOM — FFmpeg strips it itself, so it is preserved to avoid a
+/// copy) or when detection is not confident
 /// enough, in which case the caller should pass the original bytes through.
 /// UTF-16 with a BOM and detected legacy encodings return `Some` with the
-/// UTF-8 transcoding.
+/// UTF-8 transcoding. Repeated leading UTF-8 BOMs are collapsed to one.
 pub fn detect_and_transcode(bytes: &[u8]) -> Option<Vec<u8>> {
     inspect(bytes).utf8
 }
@@ -47,9 +47,15 @@ pub fn detect_and_transcode(bytes: &[u8]) -> Option<Vec<u8>> {
 /// name so callers can log the decision.
 pub fn inspect(bytes: &[u8]) -> CharsetInspection {
     if bytes.starts_with(&UTF8_BOM) {
+        // Some subtitle converters prepend a BOM to text that already has
+        // one. FFmpeg strips only one; preserve a single BOM for probing.
+        let mut start = 0;
+        while bytes[start..].starts_with(&UTF8_BOM) {
+            start += UTF8_BOM.len();
+        }
         return CharsetInspection {
             detected: "UTF-8 (BOM)",
-            utf8: None,
+            utf8: (start > UTF8_BOM.len()).then(|| bytes[start - UTF8_BOM.len()..].to_vec()),
         };
     }
     if bytes.starts_with(&UTF16_LE_BOM) || bytes.starts_with(&UTF16_BE_BOM) {
@@ -195,6 +201,18 @@ mod tests {
         bytes.extend_from_slice(GBK_SRT.as_bytes());
         assert!(detect_and_transcode(&bytes).is_none());
         assert_eq!(inspect(&bytes).detected, "UTF-8 (BOM)");
+    }
+
+    #[test]
+    fn collapses_repeated_leading_utf8_boms_without_changing_subtitle_text() {
+        let text = "[Script Info]\nTitle: keep an interior \u{feff} character\n";
+        for count in [2, 3] {
+            let mut bytes = UTF8_BOM.repeat(count);
+            bytes.extend_from_slice(text.as_bytes());
+            let mut expected = UTF8_BOM.to_vec();
+            expected.extend_from_slice(text.as_bytes());
+            assert_eq!(detect_and_transcode(&bytes), Some(expected));
+        }
     }
 
     #[test]

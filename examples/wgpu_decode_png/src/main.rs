@@ -1,4 +1,4 @@
-//! Decodes a video frame with Erika (software path) and renders it through the
+//! Decodes a video frame with liberika (software path) and renders it through the
 //! wgpu backend's `upload_player_frame` -> `render_current_offscreen` path, writing
 //! the result to a PNG. End-to-end proof that wgpu renders real decoded frames.
 //!
@@ -102,14 +102,34 @@ fn render_frame(renderer: &mut WgpuRenderer, frame: Frame, out: &str) {
         media_time: pts.unwrap_or_default(),
         late_by: None,
         generation: 1,
+        scene_avg_nits: std::env::var("ERIKA_TEST_SCENE_AVG_NITS")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok()),
     };
     renderer
         .upload_player_frame(&player_frame)
         .expect("upload decoded frame");
-    let readback = renderer
+    // The perceptual gamut LUT is generated on a background thread and only
+    // bound once ready, so the first render uses the fast path. Repeat the
+    // render (ERIKA_TEST_RENDER_PASSES, default 1) to exercise the LUT path
+    // the player reaches after the first frames.
+    let passes = std::env::var("ERIKA_TEST_RENDER_PASSES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    let mut readback = renderer
         .render_current_offscreen(None)
         .expect("render current frame")
         .expect("a frame was uploaded");
+    for _ in 1..passes {
+        // TODO: replace fixed-delay waiting with explicit LUT-ready synchronization.
+        std::thread::sleep(Duration::from_millis(200));
+        readback = renderer
+            .render_current_offscreen(None)
+            .expect("render current frame")
+            .expect("a frame was uploaded");
+    }
     write_png(out, readback.width, readback.height, &readback.rgba);
     println!("wrote {out} ({}x{})", readback.width, readback.height);
 }

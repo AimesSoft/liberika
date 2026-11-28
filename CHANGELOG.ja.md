@@ -1,0 +1,426 @@
+# 更新履歴
+
+[中文](CHANGELOG.zh.md) · [English](CHANGELOG.md)
+
+## Unreleased
+
+### ブラウザー
+
+- Web ランタイムを npm の `@aimessoft/liberika-web`、およびフォールバックフォントを含まない `@aimessoft/liberika-web-nofont` として公開。Vite は設定なしでバンドルできます。
+- ページは別オリジン（npm CDN など）からランタイムを読み込めます。`worker.js` を自分で配信するホスト向けに `Player.create` へ `workerURL` を追加。
+- ビルド出力の `package.json` のバージョンを Cargo workspace に合わせました（従来は 0.1.8 のまま）。
+
+## 0.3.8 - 2026-11-20
+
+### Windows
+
+- D3D11 スクリーンショット：現在のフレームを SDR で読み戻し、字幕と任意の弾幕を含めます。
+  HDR はトーンマッピングし、ストレートアルファの RGBA を出力します。表示中の出力設定は変えず、
+  GPU 読み戻しにはタイムアウトを設け、超解像は適用しません（#215）。
+- Flutter の Windows と macOS で、置き換えられた HTTP オープンをキャンセルします（#259）。
+- 統計の取得や未対応メソッドの呼び出しで再描画しなくなりました（#265）。
+- libass の SSE2 と SSSE3 のコードパスを有効にしました（#237）。
+- dav1d の MSVC ヘッダー機能検出の修正をバックポートしました（#263）。
+
+### macOS と iOS
+
+- macOS の通常の SDR 映像は、Dolby Vision 処理を含まない専用の Metal パスで描画します（#268）。
+- Metal の字幕アトラス比較とエンコーダーのバインドを減らしました（#228）。
+- macOS で Flutter が `alphaVideo` を指定しない場合、映像を不透明として扱います（#242）。
+- Flutter は Apple プラットフォームでネイティブの再生エラーとオープンエラーを報告します（#239）。
+
+### HTTP ソース
+
+- レスポンスの同一性を検証し、短いレスポンスが続いても外部ファイルを最後まで読み込みます（#246）。
+- 停止した読み込みを再開し、検証済みのバッファデータを渡します（#253）。
+- 再生再開時に上限付きの `Retry-After` に従います（#257）。
+
+### 字幕と弾幕
+
+- フレームのエクスポートだけを使うホストでは、使われない再生用字幕レイヤーを生成しません。
+  surface を接続すると、一時停止中でも現在の字幕を復元します（#197）。
+- libass ビットマップの取り込みで行末パディングを読みません（#223、#270）。
+- ASS イベントは一度に転送したログから再生します（#226）。
+- 弾幕の最初のレイアウトを余分な Present やちらつきなしに表示し、フレームのアップロードで
+  弾幕編集が進めた世代を戻しません（#266、#269）。
+- 弾幕のタイミングがポンプの遅延で揺れなくなりました（#217）。
+- 弾幕アトラスの各プレーンを個別に初期化します（#218）。
+
+### 再生とレンダリング
+
+- seek による読み取りキャンセルを I/O 障害と区別し、次の demux コマンドを待ちます。
+  seek 前に AVIO に残ったエラーも解除します（#205）。
+- 満杯の demux キューは、パケットまたは制御イベントで起床します（#241）。
+- Metal と D3D11 でソフトウェアデコードの映像プレーンを直接アップロードします（#230）。
+  ソフトウェア変換バッファを再利用し、P010 のパッキングを高速化しました（#222）。
+  D3D11 のソフトウェア P010 アップロードの CPU 使用量を減らしました（#267）。
+- D3D11 は字幕アトラスとそのアップロード領域を再利用し、変化のないシーンの表示を省きます（#236、#264）。
+
+### 統合
+
+- 外部 Rust workspace に必要な明示的な `wgpu-hal` パッチを文書化し、Linux CI で独立した
+  利用側をコンパイルします。Windows の依存ビルドでは `host` を Cargo が期待する
+  MSVC ターゲットのディレクトリに解決します（#213）。
+
+## 0.3.7 - 2026-11-13
+
+### Linux リリースパッケージ
+
+- x86_64、ARM64 × `bundled`、`system` の 4 種類のアーカイブを追加しました。
+  すべて Ubuntu 22.04 / glibc 2.35 でビルドし、C ABI の共有・静的ライブラリ、
+  ヘッダー、ライセンス、依存関係レポートを含みます。
+- `bundled` は FFmpeg と字幕スタックを内蔵し、`system` は利用者が導入したものを含む
+  ABI 互換の FFmpeg 8 共有ライブラリを使用します。どちらも完全静的ではなく、
+  システムの音声、Fontconfig、GPU ドライバのインターフェースを使用します。
+- 4 組のネイティブビルド、ELF/ABI チェック、クリーンな Ubuntu 22.04 での C ABI
+  再生テストを公開の条件にしました。Flutter Linux は自動ダウンロードではなく、
+  `ERIKA_LIBRARY_DIR` で展開済みライブラリを指定します。
+
+### 弾幕
+
+- Bilibili mode 7 の高度なコメントに対応しました。
+- D3D11 と wgpu のコメント全体の不透明度を修正しました。文字、縁取り、影を合成してから
+  コメント全体に不透明度を適用します。
+
+### ネイティブテクスチャ出力
+
+- `PresenterRuntime::export_frame_dmabuf(w, h, scale)` を追加しました。
+  `export_frame_texture` と同じ合成結果を、リニアな RGBA8 dma-buf 1 枚として渡します
+  （fourcc は `ABGR8888`、modifier は 0、ドライバが報告する行ピッチとオフセット付き）。
+  dma-buf を import できるホスト（GTK の `GdkDmabufTexture`、EGL、Wayland コンポジタ）は
+  自前の Vulkan デバイスを持つ必要がありません。`ExternalTextureInfo`、
+  `ExternalTextureKind`、C API はいずれも変更ありません。
+
+## 0.3.6 - 2026-11-07
+
+### リリースパッケージ
+
+- 静的ライブラリにデバッグ情報を含めなくなり、リリースパッケージが大幅に小さくなりました。macOS
+  arm64 は約 122 MB から約 47 MB になります。クラッシュ時に関数名は見えますが、ファイルと行番号は
+  見えません。
+
+### カラー絵文字
+
+- 弾幕の絵文字は四角にならず、弾幕の色にも染まらず、絵文字自身の色で描かれます。
+  フォントの `sbix`、`CBDT` ビットマップと `COLR` ベクターを読めます。
+- 国旗、肌の色、家族、キーキャップなどの組み合わせ絵文字は HarfBuzz が 1 つのグリフに
+  合成します。フォントに合成グリフがなければ 1 つずつ描きます。`libass` なしのビルドには
+  HarfBuzz がないので、同じく 1 つずつ描きます。
+- 絵文字は行の中央に揃い、文字と同じ縁取りと影が付きます。
+- 字幕の絵文字は単色のままです。libass はアルファビットマップしか出力しません。
+- `DanmakuRenderPlan` に `color_atlas` と `color_glyphs` を追加しました。弾幕を自前で
+  描く組み込み側はこの層も描かないと絵文字が見えません。Web はブラウザのフォントが
+  描くので、`Player` の変更は不要です。
+
+### フォールバックフォント
+
+- 字幕と弾幕は足りない文字にまずシステムフォントを使い、読めないときに内蔵の Droid Sans
+  Fallback を使います。Android は言語ごとのフェイスを `fonts.xml` から読み、フォントは
+  メモリマップのまま扱います。iOS 18 以降と tvOS の中国語は内蔵フォントに頼ります。PingFang
+  のアウトラインは Apple の `hvgl` テーブルにあり、FreeType では読めません。
+- `system_font::fallback()` は端末のフェイスを返します。フォントはコピーせず、使用中の
+  フェイスだけをマップします。
+- `font::embedded_fallback_font()` と `erika_embedded_fallback_font()` は内蔵フォントを返します。
+  ホストが自分のページに渡せば、フォントは 1 つで済みます。
+- Web: 新しい `liberika-web-nofont` パッケージはフォントを含まず、
+  `Player.create({ fallbackFont })` で受け取ります。
+
+### 必要な分だけビルド
+
+- リリースパッケージは変わりません。以下のスイッチでソースから小さなビルドを作れ、すべて切ると
+  最小になります（[ビルド](docs/building.ja.md#必要な分だけビルド) を参照）。
+- `embedded-fallback-font` は既定で有効で、約 6 MB です。無効にするとシステムフォントを読めない
+  ときの代わりがありません。
+- `artcnn-r8f64` は既定で有効で、最大の超解像ネットワーク R8F64 を含みます。約 1.8 MB です。
+- `xtask deps build --ffmpeg` で FFmpeg のどの部分を含めるか選びます。既定は `full`、
+  最小は `slim`、中間は `common` または `slim` とグループです。`ERIKA_FFMPEG_SET` で
+  Cargo がそのビルドをリンクします。
+
+## 0.3.5 - 2026-11-07
+
+- 0.3.4 の Windows ネイティブ動画ウィンドウが Flutter の再生 UI を覆う問題を修正しました。HDR 出力を維持し、透明な Flutter ホストの背後に動画を配置します。Flutter アプリはプラグインを更新して再ビルドしてください。ネイティブ DLL の置き換えだけでは修正されません。
+- Windows の cooperative matrix 超解像バックエンドがシステムの Vulkan ランタイムを使うようになり、アプリ同梱の古いローダーとの競合を回避します。ローダーと GPU の診断を追加し、利用できない場合は既存のスカラー処理にフォールバックします。
+- 外部字幕の先頭に重複した UTF-8 BOM がある場合は 1 つに正規化し、ASS などのテキスト字幕を認識できない問題を修正しました。字幕追加の失敗は呼び出し元に返し、プレーヤー全体のエラーイベントを送らず、開いている動画を利用できる状態に保ちます。
+
+## 0.3.4 - 2026-11-06
+
+### 超解像（#193、#194）
+
+- 超解像を、バックエンドに依存しない 1 つのネットワーク記述（`renderer/sr/`）を中心に作り直しました。ArtCNN、Anime4K、実行時に読み込むネットワークはすべてこの記述に変換され、線形層は隣の層へ厳密に畳み込まれます（ArtCNN の積和は 26-33% 減。画像端 1 ピクセルには専用の重みを使い、出力は元のネットワークと一致します）。すべての GPU バックエンドを CPU 参照実装と照合しています。
+- 新しいモード：ArtCNN C4F16 DN、C4F32 DS/DN、R8F64（デスクトップのみ）、Anime4K v3.2 Upscale CNN x2 S/M/L/VL/UL と Upscale+Denoise S/M/L/VL/UL、AMD FSR 1.0（EASU + RCAS を 1 つの kernel に融合）、`PlatformVideo`（Windows では D3D11 video processor 経由の NVIDIA RTX Video Super Resolution / Intel VSR、Apple では VideoToolbox の低遅延超解像）、`MetalFxSpatial`、そして `Custom`：`erika_presenter_load_upscaler_model` で Erika `.esr` ファイルまたは mpv の FSRCNNX/Anime4K shader を実行時に読み込みます（FSRCNNX の重みは LGPL のため同梱しません）。
+- Windows（D3D11）：層ごとに kernel を生成し、重みは定数バッファ、入力は `groupshared` に置き、epilogue と depth-to-space の出力層を融合しました。Anime4K の最終層は前の層の実行中に累積し、FSR1 は `GatherRed` で取得します。shader はバックグラウンドスレッドでコンパイルしてディスクにキャッシュするため、モード切り替えで描画が止まりません。RTX 5060 Ti、1080p 入力：ArtCNN C4F16 2.44 ms（従来 12.4 ms）、C4F32 7.3 ms（従来 39.4 ms）、Anime4K S/M/L/VL/UL 0.35/0.78/0.83/2.07/4.11 ms、FSR1 で 4K へ 0.31 ms。
+- Windows の Tensor Core バックエンド：Vulkan `VK_KHR_cooperative_matrix` の実行器と opt-in の D3D12 SM 6.10 linalg preview が、共有テクスチャと fence で D3D11 と連携します。ネットワークとフレームサイズごとに実フレームでスカラー、cooperative matrix、linalg を計測して最速を選び、幅の広いモデル（C4F32、R8F64）では行列バックエンドが選ばれます。
+- Apple（Metal）：M5/A19 では Metal 4 tensor ops、M1-M4/A14+ では `simdgroup_matrix` を使い、参照実装と一致する範囲で fp16 累積を使います。Anime4K の最終層は層ごとの部分和として計算します。M5 Pro、1080p 入力：C4F16 2.65 ms、C4F32 6.35 ms、Anime4K UL 7.3 ms、FSR1 で 4K へ 0.77 ms。
+- wgpu（Linux、Android、OpenHarmony、Windows の wgpu fallback）：すべてのネットワークモードと `Fsr1` が動くようになりました（以前は従来の ArtCNN のみ）。生成した WGSL kernel を使い、adapter が対応すれば fp16、16x16 cooperative matrix を公開する Vulkan adapter では行列ユニットを使い、最初の数フレームで少数の kernel 候補を計測して adapter ごとの選択を調整します。RTX 5060 Ti の Vulkan では 1080p 入力の C4F16 が 2.77 ms（従来 12.6 ms）、C4F32 が 11.4 ms（従来 73 ms）です。Android と OpenHarmony の実機ではまだ計測していません。
+- D3D11 と Metal の超解像輝度出力は通常の 2x `R16_FLOAT` テクスチャになりました。GPU 時間は `lastGpuMicros` に報告され、診断の `upscaler` オブジェクトに `engine`、`reason`、`lastGpuMs` が加わりました。
+- 新しいバックエンド状態がモードの実行方法を示します：`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx`、`TensorOps`。モードを実行できないバックエンドはネイティブのサンプリングを保ち、`Inactive` を報告します。
+
+### Flutter プラグイン：presenter ごとの owner スレッド（#93）
+
+- Windows：各 presenter が生成、コマンド、surface の変更、描画、キャプチャ、破棄を担うネイティブのワーカースレッドを持ちます。フレーム要求はまとめられ、プラットフォームスレッドはメソッドの結果、イベント、SMTC の更新、ウィンドウ/合成の操作だけを届けます。
+- Linux と OpenHarmony も同じ owner を使い、描画とネイティブコマンドがプラットフォームスレッドで動かなくなりました。OpenHarmony の N-API 関数に `...Async` 版が加わり、従来の C ヘルパー `ErikaOhosPlayerFromId` は null を返すようになりました。
+- macOS、iOS、tvOS：生成、すべてのネイティブコマンド、描画、ポーリング、キャプチャ、破棄が presenter 専用のスレッドで実行され、display link はそれを起こすだけです。時間のかかる `open`、`seek`、`dispose` が UI スレッドを止めたり、フレームを遅らせたりしなくなりました。
+- `ERIKA_FLUTTER_FRAME_TRACE=1` で、各 tick とコマンドを実行したスレッドを記録します。
+
+### 修正
+
+- Windows Flutter プラグイン：ウィンドウ overlay を再びホストウィンドウの上に置くため、映像が隠れなくなりました。event channel が messenger より後に破棄されても、アプリ終了時にクラッシュしなくなりました。
+
+## 0.3.3 - 2026-11-01
+
+- 音量を保持するミュートを追加しました：`PresenterRuntime::set_muted`、C `erika_presenter_set_muted`、JSON `setMuted` と `volume`（`{volume, muted}`）、Flutter `ErikaPlayer.setMuted` と `getVolume`。ミュート中に設定した音量はミュート解除時に適用され、`volume()` は常にホストが選んだ音量を返します。
+- 診断がコンテナを報告するようになりました。`media.container` に `format`（デマルチプレクサーの短い名前。`matroska,webm`、`mov,mp4,m4a,3gp,3g2,mj2` など）と `bitRate`（コンテナが示す、または FFmpeg が推定した全体ビットレート）が入ります。JSON メソッド `container`（`{format, bitRate, mediaOpen}`）でスナップショット全体を取らずに読めます。Rust では `Player::container()`（`ContainerInfo`）です。
+- 映像トラックがコンテナの示す Dolby Vision プロファイル（`dvcC`/`dvvC`）を報告します：`TrackInfo::dolby_vision_profile`、JSON `tracks` メソッドと診断 `media.video` の `dolbyVisionProfile`。
+- 映像トラック自身のビットレートが示されていない場合、字幕トラックを含むファイルでも全体ビットレートから再び推定します。ビットレートを示さない字幕トラックは不明なストリームとして数えません。
+- macOS で代替タイマー（`ERIKA_FLUTTER_TARGET_FPS`、または CVDisplayLink が起動できない場合）を使うと最初の画面の EDR ヘッドルームのままになる問題を修正しました。サーフェスが接続されている間は、どの駆動方式でも画面の変化を監視します（#140）。
+- ブラウザ版は wasm-bindgen 0.2.130 と js-sys 0.3.107 を使います。wgpu 30 にも依存するアプリが Linux で依存関係を解決できます。Web パッケージのビルドには `wasm-bindgen-cli` 0.2.130 が必要です（#188）。
+
+## 0.3.2 - 2026-10-31
+
+- Flutter の Windows プラグインがメディアを開く際に `ErikaOpenOptions` の範囲外へ書き込む問題を修正しました。0.3.1 で `start_position_micros` に割り当てた 2 番目の reserved 枠を引き続きゼロクリアしていました。MSVC はこれでビルドを停止し（C4789 がエラー扱い）、そのチェックがなければスタックを上書きしていました。iOS・tvOS・macOS の Swift ミラー構造体は `startPositionMicros` を明記しました（レイアウトは元々ヘッダーと同じです）。各ミラーのサイズと書き込む reserved 枠をヘッダーと照合するパッケージテストを追加しました。
+
+## 0.3.1 - 2026-10-31
+
+- 指定位置からの open を追加しました：`MediaRequest::with_start_position`、C `ErikaOpenOptions.start_position_micros`（最初の reserved 枠を使用。ゼロ初期化した構造体は従来どおり先頭から開きます）、`erika_presenter_set_open_start_position`、JSON `open` の `startPositionMicros` と `setOpenStartPosition`、Flutter `ErikaPlayer.open(startPosition:)`。
+- 自然終了を明示する `PlayerEvent::Ended` / C `ErikaEventKind_Ended`（14）を `Stopped` の後に送ります。明示的な stop では送りません。Flutter は `ErikaEventKind.ended`。
+- 埋め込み・外部トラック共通の字幕ディレイを追加しました：`set_subtitle_delay`、C `erika_presenter_set_subtitle_delay`、JSON `setSubtitleDelay` / `subtitleDelay`、Flutter `setSubtitleDelay`。
+- 現在表示中の字幕テキストを返す JSON `subtitleText` と Flutter `subtitleText` を追加しました。
+- オフスクリーンのホスト合成向けに Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` と C `erika_presenter_capture_frame_rgba_with_danmaku` を追加しました。要求したキャプチャサイズで有効な弾幕を含めます。既存のスクリーンショット API は引き続き弾幕を含みません（#175）。
+- 不変で所有権を持つネイティブフレーム handle を返す `export_frame_texture` を追加しました。ウィンドウ、Flutter、CPU ピクセル readback、出力テクスチャのコピーなしでホスト合成できます。wgpu renderer は Linux Vulkan OPAQUE_FD 割り当てと Apple Metal テクスチャを、字幕と有効な弾幕を含めて export します。C の作成/export/情報取得/解放の入口、Vulkan C importer、UI フレームワークに依存しない wgpu バージョン間の独立ホスト例を追加しました。export ループは音声も進め、ホストの content scale で画面表示と同じバックグラウンド弾幕 planner を使い、非対応のサイズは再生処理の前に拒否します（#175）。
+
+## 0.3.0 - 2026-10-25
+
+### 既定動作の変更
+
+- ネイティブ字幕のスーパーサンプリングを既定で有効化しました。ネイティブと Web の両バックエンドで字幕と弾幕のスーパーサンプリングが既定でオンになり、従来のサイズ制限、ネイティブ字幕の CPU フォールバック、明示的な無効化設定は維持されます。
+- ソフトウェア動画デコーダーは再生とエクスポートの両方でフレーム・スライスマルチスレッドを使用します（スレッド数は FFmpeg が選択）。`ERIKA_VIDEO_DECODE_THREADS=1` でシングルスレッドに戻せます。ソフトウェアデコードを強制した 4K H.264 の 3 倍速再生では、1 スレッド時の 7 fps・15 秒間で 481 フレームの遅延ドロップに対し、72 fps・遅延ドロップなしとなり、シークから最初の画像までの中央値は 2.8 秒から 0.43 秒になりました。測定用に `ERIKA_HWDEC=software` で全プラットフォームの既定デコードをソフトウェアにできます。
+
+### 機能と修正
+
+- プロジェクトとリポジトリを liberika、liberika-swift に改名しました。`erika` Rust crate、`erika_*` C ABI、既存 SDK パッケージ名の互換性は維持されます。
+- 完全な Web ランタイム、デモページ、ライセンスを含む `liberika-web-0.3.0.zip` を Release に追加し、`SHA256SUMS` にダイジェストを記録しました。
+- 既存 C 構造体を変更せずホストが取得できるコンテナのチャプターを presenter JSON（`chapters`）に追加しました（#172）。
+- 一時停止中の内蔵字幕の配信、シーク位置をまたぐ長い字幕、一時停止中の字幕トラック切り替え後の有効字幕を修正しました（#171）。
+- iOS/tvOS のオプションのエクスポート・診断シンボルの静的リンクを修正しました。選択したネイティブアーカイブに存在するシンボルのみを強制リンクし、固定された旧ランタイムも引き続きリンクできます（#170）。
+- 再生開始失敗をログから診断できるよう、`erika_play` トレースに失敗理由を追加しました。
+- 最後の 4 MiB 内で通常の未配信 HTTP 末尾範囲は EOF として扱い、範囲検証とエンティティ変更のエラーは引き続きエラーとします（#169）。
+- 内蔵フォールバックフォントが対応しない文字（絵文字など）を弾幕が含む場合のメモリ急増を修正しました。システムフォントのフォールバックは face の読み込み前にゼロコピー検索で文字の収録を確認し、既存のフォールバック順を維持したまま LRU で常駐 face 数を制限します。未収録文字 1 文字のために全システムフォント（報告された macOS の例では約 1.65 GB）をメモリにコピーしなくなりました。
+- 重複する Web フォールバックフォントを削除しました。libass は Rust WASM に既に埋め込まれた完全なフォントを使用し、別のフォントリクエストと約 6.07 MiB（gzip で 2.74 MiB）のパッケージデータを削減します。Web の増分ビルドでは旧単独フォントファイルも削除します。
+- ブラウザバックエンドと `cargo run -p xtask -- web build` を追加し、ネイティブ Rust 弾幕エンジン、パッチ適用済み libass/テキストライブラリ、FFmpeg デマルチプレクサを WASM としてまとめました。WebCodecs が音声・動画をデコードし、Web Audio がクロックを駆動し、WebGL2 が動画・字幕・弾幕を合成します。
+- ブラウザで MKV 内蔵 ASS/SSA と添付フォント、外部 ASS/SSA/SRT/WebVTT、字幕・弾幕それぞれのスーパーサンプリング、リアルタイムスタイル更新、弾幕ファイルの追加、ローカルコメント、トラック選択、チャプター、PNG キャプチャに対応しました。ローカルファイルは分割読み取り、リモートソースは上限付き HTTP Range キャッシュを使用します。
+- Web バックエンドを Erika のブラウザアプリに統合し、Chrome で H.264/AAC/ASS MKV、VP9/Opus WebM、2,000 件のコメント、再生操作、スクリーンショット、UI 遷移、プレーヤーのクリーンアップを検証しました。Web は Release アーカイブまたはソースから利用できます。[ブラウザガイド](docs/web.md) を参照してください。
+- Range を無視してファイル全体を `200` で返す配信元に対する HTTP(S) 読み取りと持続的プリフェッチを修正しました。Content-Length のない HLS プレイリストとセグメントも対象です。再送されたプレフィックスはキャッシュ前に破棄し、上限付き読み取りは要求長で停止し、EOF から総サイズを取得できます。リトライは変更されたエンティティ検証子を拒否して別バージョンの混在を防ぎます。検証失敗は同期フォールバックと後続読み取りも阻止し、弱い ETag では部分応答の再開を許可しません。
+- 新しい `erika_log_read_json` で読み取るプロセス全体の診断ログリングを追加しました。レベル・タイムスタンプ付き運用診断、従来 stderr に直接出力された障害、FFmpeg の警告とエラーを保持します。FFmpeg の `av_log` ブリッジはブロックせず、重複をまとめ、大量出力を制限します。エクスポート時は URL クエリとユーザー情報、認証情報、ホームディレクトリを秘匿します。既存 stderr、logcat、hilog 出力は変わりません。`ERIKA_FFMPEG_LOG_CAPTURE=0` で FFmpeg キャプチャを無効化でき、Linux でシステム共有 FFmpeg にリンクする場合は `ERIKA_FFMPEG_LOG_CAPTURE=1` のときのみ取得します。
+- `erika_presenter_get_diagnostics_json` を追加しました。デコーダーとハードウェア経路、presenter カウンタ、出力/HDR、リソース、アップスケーラー、音声、バッファ深度、タイミングを 1 回で JSON スナップショットとして取得します。タイミングには遅延でスケジューラが落としたフレーム、ドロップ予算消費後に表示した遅延フレーム、表示周期とジッター、音声クロックのドリフト・補正・スナップのカウンタを追加しました。既存構造体は変更しません。
+- `erika_presenter_invoke_json` を発見可能なパススルーにしました。単一のディスパッチ表を使い、`listMethods` が引数と結果を含む表を返し、`invokeJson` が呼び出しをネストします。`listMethods`/`getLogs` は NULL ハンドルを受け入れ、未知のメソッドは `"code": "unknown_method"` を返します。`getDiagnosticsSnapshot`、`getLogs`、`setDebugHudEnabled`、`setOutputHeadroom`、`trackSelection`、`getDanmakuConfig`、`setSubtitleFont`、`setSubtitleStyle` を追加し、Android JSON ブリッジは未実装メソッドをこの表へフォールバックします。
+- デコーダーを開いた後に FFmpeg が VideoToolbox または D3D11VA を放棄した場合の報告を修正しました。ハードウェアアクセラレーションの初期化失敗やストリームでの非提供時に FFmpeg は再ネゴシエーションしてソフトウェアデコードしますが、従来 liberika はフォールバックなしのハードウェアバックエンドと報告していました。現在はフォーマット交渉を記録し、再生セッションがソフトウェアのピクセル形式と理由を添えたデコーダー変更（`hwaccel_<backend>_to_software`、復帰時は `…_restored`）を発行し、フォールバックを数え、実際のデコードバックエンドをフレームに付けます。
+- `erika_export_frame` と `erika_frame_export_result_free` を追加しました。独立したデマルチプレクサとマルチスレッドソフトウェアデコーダーを使うヘッドレス単一フレームエクスポートで、メディア時刻の画像を RGBA または PNG で返し、任意の境界内に縮小できます。
+- フレームエクスポートセッション `erika_frame_export_session_open`、`erika_frame_export_session_frame`、`erika_frame_export_session_close` を追加しました。メディアを一度開き、連続して画像を取得します。前回と次回の間にキーフレームがない場合はデマルチプレクサのシークインデックスに基づき前回停止位置からデコードを続け、それ以外はシークします。4096×1744 H.264 ファイルから 100 ms 間隔の画像 60 枚を個別 `erika_export_frame` で取得すると 23.9 秒（60 回の open と seek）、セッションでは 1.0 秒（1 回の seek、335 フレームのデコード）でした。JSON メソッド表にグローバルな `exportFrame` と `exportFrames` を追加し、各項目に `blocking` と `writesFiles` を明記します。
+- フレームエクスポートでは HDR ソース（PQ、HLG、Dolby Vision）を、SDR ディスプレイ向け動画レンダラーと同じ演算で SDR にトーンマッピングします（203 nit 目標の ITU-R BT.2390 EETF、BT.2020 から BT.709 への色域マッピング、gamma 2.2）。結果の `reserved_flags` に `ERIKA_FRAME_EXPORT_TONE_MAPPED` を設定します。SDR ディスプレイのプレーヤースクリーンショットとの差は、4K HDR10 フレームで平均 0.1–0.3 / 255（従来 7–9）です。
+- メディア未オープン時にホストが字幕をクリアするため `erika_presenter_select_subtitle_track`（および `Player::select_subtitle_track`）で字幕なしを選ぶと `ErikaStatus 3` が返る問題を修正しました。現在は成功し、状態は変わりません。
+
+## 0.2.1 - 2026-10-02
+
+### 再生と HTTP(S)
+
+- ネイティブハードウェアデコーダーがソースを処理できない場合のソフトウェアフォールバックを復元しました。WMV/WMA と同梱 dav1d による 8/10-bit AV1 を含みます。Windows D3D11 はソフトウェアデコードフレームのアップロードを一貫して処理します。
+- HTTP I/O は接続、TLS、応答ヘッダー、本文読み取り中にキャンセル可能です。ソースとデマルチプレクサの終了時に I/O をキャンセルして所有ワーカーの終了を待ちます。stop は再生再開を維持しつつ HTTP バッファを解放し、close はセッションを破棄します。
+- 持続ストリームのすべての stripe 境界で先読みウィンドウを強制します。
+
+### Flutter と OpenHarmony
+
+- Flutter と独立した OpenHarmony の open オプションに `httpBackBufferBytes` を追加しました。既存の全 SDK ブリッジが巻き戻し予算をネイティブエンジンに渡し、ゼロまたは省略時は既定の 16 MiB を使用します。
+- iOS は表示の呈示目標時刻で弾幕と字幕をサンプリングし、合流型タイムスタンプメールボックスとオプションの `erika_presenter_render_tick_with_timing` を使用します。旧ライブラリは従来の render-tick 動作を維持します。
+
+### 実験的 Linux サポート
+
+- X11/Wayland でのネイティブ・Flutter Linux 再生、PulseAudio 出力、NVDEC/VA-API ハードウェアデコードとソフトウェアフォールバックを追加しました。
+- ネイティブ Wayland 動画サブサーフェス、実験的な VA-API Vulkan 直接フレームインポート、オプトインの WSL D3D12 GPU プレーンコピーを追加しました。実機 Linux HDR と Intel/AMD 直接フレームインポートは未検証です。Linux はソースからビルドする必要があり、ビルド済み Release アーカイブには含まれません。
+- P010 補間を修正し、信号の全精度を保持します。
+
+## 0.2.0 - 2026-09-23
+
+### 再生
+
+- HTTP(S) プリフェッチは単一の持続ストリームと終端指定のない GET（`bytes=anchor-`）を使い、4 MiB ごとのリクエストとサーバーシークを避けつつ、重複する末尾をダウンロードしません。先読みウィンドウが満杯になるとワーカーはソケットの読み取りを停止し、シークでは epoch カウンタで旧ストリームを破棄します。短い応答や本文エラーはエンティティ検証子を再送して到達オフセットから再開し、繰り返し失敗した場合は上限付き同期リクエストにフォールバックします。キャッシュ追記はバイトの連続性を維持し、既知の EOF では最後の部分読み取りがバッファ充填を待たずに返ります。
+- open オプションの `http_back_buffer_bytes` でホストが巻き戻し予算を調整できます（最初の予約スロットを使用し ABI とレイアウトは不変、ゼロは既定の 16 MiB）。高ビットレート媒体はビットレートから必要量を設定してください。71 Mbps で 10 秒戻すには約 89 MB 必要で、固定の既定値では不足します。
+- 同期 HTTP(S) 範囲リクエストを 4 MiB に制限し、大きなウィンドウに非現実的な持続帯域を要求しないようにしました（単一の 32 MiB リクエストが ureq の本文期限 15 秒内に完了するには約 18 Mbps が必要でした）。バックグラウンド処理の失敗は読み取りを終了せず同期取得に移行し、バイトを継続的に返す配信元には固定 3 回より多く再開を許可します。
+- デマルチプレクサのエラーに単なる `Input/output error (-5)` ではなく、メディアソース固有の HTTP ステータスやタイムアウトを表示します。
+
+### レンダラー
+
+#### Dolby Vision と HDR トーンマッピング
+
+- Dolby Vision RPU を libplacebo 方式の区分多項式/MMR で再形成し、RPU 非線形行列、PQ 線形化、LMS→RGB 合成を適用します。Profile 5/8 VUI タグは BT.2020/PQ に強制します。
+- ハードウェアフレームに RPU side data を付けられないモバイルバックエンド（MediaCodec / 汎用 AvCodec）では Profile 5 をソフトウェアデコードにフォールバックします。VideoToolbox と D3D11VA はハードウェアデコードを維持します。
+- Profile 7 FEL/MEL RPU を無条件に拒否しなくなりました。`disable_residual_flag` が拡張レイヤーを要求していても、ベースレイヤーの再形成曲線、色行列、L1 調整を適用します。以前は RPU 全体の破棄によりこれらが失われ、通常の HDR10 になっていました。合成できない残差は新しい `Frame::dovi_el_status()` とストリームごとに制限付きで 1 回の `dovi_el_not_composed` 診断で報告し、libplacebo の `nlq_active` と「拡張レイヤーをバインドしていない利用者はこれらのフィールドを参照してはならない」という区別に合わせます。
+- フレームごとの Dolby Vision L1 輝度（`min_pq`/`max_pq`/`avg_pq`）がトーンマップのソースピークとシーン平均のピボットを決定します。静的マスタリングディスプレイ（L0）のピークは出力モードの交渉とトーンマップ/知覚色域 LUT の有効化を引き続き決定します。
+- トーンマップを libplacebo 方式の IPT 領域カラーマップに変更し、**BT.2390 EETF を既定**としました。spline、BT.2446 method A、SMPTE ST 2094-10、Mobius、Reinhard、clip も利用できます。黒点補正は `target black = target peak / contrast_ratio`（SDR の自動値は 1000:1）を使います。
+- トーンマッピングした HDR ソースを小さい色域に圧縮する場合、CPU 生成の 48×32×256 IPT 3D LUT（libplacebo の格子とインデックス対応）で知覚色域マッピングします。バックグラウンド生成により最初の広色域フレームで描画スレッドが停止しません。彩度ロールオフは現在、libplacebo の完全な色相別境界探索ではなく簡略化したデッドゾーンブレンドです。
+- シーン適応 HDR10：DoVi L1 のないソフトウェアデコード PQ フレームは CPU で測定したシーン平均輝度（`luma_stats`）でトーンマップのピボットを決定し、mpv の `--hdr-compute-peak` に対応します。
+- Metal EDR の交渉は `NSScreen.mainScreen` ではなく実際の表示画面を読み、Auto HDR はその画面の能力で判断します。呼び出し元は `CAMetalLayer.delegate` を設定する必要があります（例を更新済み）。
+- Metal はフレームに解決されたテクスチャが（source、target、target-peak）キーと実際に一致した場合のみ知覚色域 LUT を有効とします。以前は新 LUT の生成中に headroom や原色を変更すると、1×1×1 プレースホルダーをバインドしたまま `gamut_lut_enabled` が有効となり、生成完了まで黒フレームが表示されました。D3D11 も LUT 生成中は同様に uniform を無効化します。
+- ST 2094-10 トーンマッピングは libplacebo 内部の再スケールと同様に PQ 領域で knee を選択し、`ToneMapConfig::curve_param` で knee 適応を調整できます（既定 0.70、libplacebo の `param_def`）。従来このパラメータは無効で、knee は線形 nits で選ばれていました。
+- トーンマップ、黒点補正、知覚色域 LUT の有効化はフレームごとの Dolby Vision L1 ピークではなく静的マスタリングディスプレイの L0 ピークに基づくため、暗いシーンで 1 フレームだけ無効化されて戻ることがなくなりました。
+- Metal EDR / extended-linear 出力は線形 drawable への合成前に字幕と弾幕の色を線形化します。以前は gamma エンコードのまま書き込み、中間調や色付き文字が明るすぎました。
+- HDR10 シーン輝度測定はフレームの色範囲に従い、限定（TV）範囲の輝度プレーンをフル範囲として測定せず、シェーダーの `expand_ycbcr_range` のように有効コード範囲へ展開します。また `yuv420p10le`（10-bit コードが `[9:0]`）と P010（`[15:6]` に左詰め）を区別します。両者を P010 と扱うとソフトウェア Main10 HDR10 はほぼ黒として測定されていました。
+- 知覚色域 LUT の I 軸は `[0, peak]` ではなく PQ コードで対象の `[black, peak]`（libplacebo の `gamut.min_luma`/`max_luma`）をカバーします。生成と 3 バックエンドのサンプラーが一致し、キャッシュキーに対象黒点を含むため `contrast_ratio` 変更で LUT を再生成します。SDR 対象の色域マッピングは I 軸の最大約 3.5% 移動し、HDR/EDR は変化しません（black = 0）。
+- 退化した ST 2094-10 アンカー集合（重複または非有限点）はゼロ係数ではなく恒等曲線（Clip）にフォールバックします。ゼロ係数ではシェーダーが黒フレームを描画していました。
+
+## 0.1.8 - 2026-09-07
+
+### 互換性
+
+- presenter 設定 ABI に packed-alpha 動画とネイティブ合成オプションを追加しました。ネイティブ組み込み側は対応する `erika.h` とランタイムで再ビルドし、旧リリースの設定構造体を 0.1.8 バイナリと混在させないでください。Flutter パッケージは対応するネイティブ成果物を固定します。
+
+### C API
+
+- `ErikaOpenOptions` と `erika_open_with_options` / `erika_presenter_open_with_options` を追加し、`_with_headers` の組を置き換えます。オプション構造体はヘッダー配列とリクエスト単位の調整をまとめ、まず HTTP(S) 先読みウィンドウを上書きする `http_read_ahead_bytes` を提供します（0 の場合は設定済み `ERIKA_HTTP_READAHEAD_BYTES`、なければ既定 2 MiB。明示値は環境変数より優先）。予約フィールドはゼロ必須で検証され、将来のフィールドが動作を無言で変えないようにします。
+
+### Flutter と OpenHarmony
+
+- Android、Apple、Windows、OpenHarmony の Flutter `ErikaPlayer.open` に `httpReadAheadBytes` を追加し、独立 OpenHarmony SDK にも対応する open オプションを公開しました。
+
+### 弾幕
+
+- スライドするプランナーウィンドウ間で採用・拒否の両方の配置決定を安定させ、破棄したコメントの途中再出現や表示中コメントのレーン変更を防ぎます。
+- ホスト提供の弾幕 ID と内部レイアウト識別子を分離し、任意の JSON ID を浮動小数点丸めなしの正確な `u64` として解析します。
+
+### 再生
+
+- ホスト提供 Metal layer は有限の drawable タイムアウト（最大 1 秒で nil）を明示的に保持し、スキップした呈示をカウントして制限付き診断を出します。
+- render tick がブロックされた後、音声キューを深くせず音声マスタークロックのドリフトを回復します。Presenter フィードバックは取得時刻、再生意図、generation、output epoch を保持し、古いフィードバックと無音のみのコールバックはクロック補正に使いません。新しい出力はまず進行の基準を確立します。
+- 動画デコードのフォアグラウンド再開時にキュー済み音声を再生し直さず、音声中断の回復中はホストが準備できるまで iOS のフォアグラウンド再開を延期します。
+- 上限付きの旧速度音声ブリッジで再生速度の変更を滑らかにし、既定以外の速度でも音声マスター同期を維持します。
+- 最初の音声ストリームをデコードできない場合、コンテナ順に残りを試し、すべて開けなければ全デコーダーの失敗を報告します。
+- Windows と macOS で premultiplied GPU 出力による packed-alpha 動画表示を追加し、ネイティブ背景を考慮した overlay 合成にも対応しました。
+- 再生速度上限を 16x に引き上げました。
+
+### Windows 描画
+
+- 安全でない D3D11 フレーム再利用による DWM クラッシュと縞模様を修正し、ネイティブ不透明再生の HDR 対応パスを維持し、fill サイズを修正しました。
+- 明示的な SDR Flutter テクスチャパスと同期された GPU テクスチャ受け渡しを追加しました。プレーヤー終了時は DLL をアンロードする前に弾幕ワーカーの終了を待ちます。
+
+### SDK 配布
+
+- Swift SDK バイナリアーカイブを追加し、ネイティブ、Flutter、OpenHarmony、Swift のパッケージリリースをネイティブバージョンタグに統一しました。
+
+## 0.1.7 - 2026-08-16
+
+### Flutter パッケージ配布
+
+- `erika_flutter` の初回 pub.dev リリースに向け、パッケージ内ライセンス、更新履歴、メタデータ、例、独立パッケージテストを準備しました。
+- Android、Apple、Windows、OpenHarmony では検証済み・バージョン固定のネイティブ Release バンドルを既定とし、ソースビルドは `ERIKA_FORCE_SOURCE_BUILD=1` で明示的に選択します。
+- ABI 別 Flutter Android ランタイムアーカイブを追加し、アプリビルドが要求したアーキテクチャだけをダウンロードし、ネイティブ組み込み用の静的ライブラリを除外します。
+- 公開するすべてのネイティブアーカイブを網羅する Release 単位の `SHA256SUMS` を追加しました。
+- Android、iOS、macOS、tvOS、Windows、OpenHarmony の分離された GitHub Actions 利用側を追加し、パッケージビルドが monorepo に依存しないようにしました。
+
+### OpenHarmony パッケージ配布
+
+- 独立したネイティブ ArkTS パッケージ `erika` を OpenHarmony arm64（API 18+）向けに OHPM へ公開しました。`XComponent` サーフェスのライフサイクル、`renderTick()` スケジューリング、再生操作、イベント、スクリーンショットを含みます。
+
+## 0.1.6 - 2026-08-14
+
+### 描画と再生
+
+- 劣化したアニメ素材向けの ArtCNN C4F16 DS ノイズ除去/シャープ化輝度アップスケーラーを Rust、C、Flutter、Metal、wgpu の各インターフェースに追加しました。
+- Android と macOS の presenter 描画をアプリの UI/メインスレッドから移し、Android AHardwareBuffer 変換の帯域を削減し、デバイスをまたぐ D3D11 フレーム再利用を防ぎました。
+- Apple プラットフォームにソースに応じた SDR/EDR 出力選択を追加し、Android、Windows、OpenHarmony 組み込みでリソース状態を公開しました。
+
+### 組み込みと動作
+
+- 弾幕のスクロール上書きを既定で無効にし、高密度再生でも既に安定したコメントを保持します。
+- Windows システムメディアコントロールのビルドを復元し、OpenHarmony Flutter プラグインの ArkTS 宣言を明示しました。
+
+## 0.1.5 - 2026-08-03
+
+### システムメディア操作とバックグラウンド音声
+
+- iOS、tvOS、macOS、Android、Windows、OpenHarmony に Now Playing メタデータ、再生状態、タイムライン、再生/一時停止/シーク、前/次への移動操作を追加しました。
+- iOS と Android にオプトインのバックグラウンド音声再生を追加し、その間は動画デコードを停止します。再生ワーカーのバリアに上限を設け、ライフサイクルコールバックがアプリスレッドを無期限にブロックしないようにしました。
+- `ErikaMediaMetadata` のないメディアを開く際に古いメタデータを消去し、一時停止/再生の順序を決定的にし、複数 Flutter エンジン間の Android メディアコールバックを分離しました。
+- Android のアートワークをキャッシュし、ネイティブ再生状態が変わらない場合はメディア通知を再構築しません。
+
+### プラットフォーム対応とリリース成果物
+
+- Apple TV 実機と arm64/x86_64 シミュレータ用の tvOS Flutter プラグインとネイティブターゲットを追加しました。Metal 表示、Apple 音声、VideoToolbox、字幕、弾幕、スクリーンショット、HTTP ソースを含みます。
+- tvOS 実機と universal シミュレータの `erika_capi.xcframework` を含む `erika-capi-tvos.zip` を自動 GitHub Release ワークフローに追加しました。
+- OpenHarmony のビルド済みライブラリをオプトインで利用可能にしました。プラグインの CMake ビルドはタグ付き `liberika_capi.so` をダウンロードして `liberika_flutter.so` の隣に配置し、失敗時はソースビルドにフォールバックします。
+- macOS、iOS、tvOS の CI/Release ビルドを macOS 26 runner に統一し、macOS x64 を arm64 と並行してクロスビルドした後 universal アーカイブを組み立てます。
+- ネイティブ依存関係ビルドの tvOS プラットフォーム検出を修正し、有効な長さゼロの HTTP リソースを途中切断と誤判定せず受け入れます。
+
+### 字幕メモリフォント
+
+- Rust、C API、Dart、すべてのネイティブ Flutter 組み込みにインメモリ字幕フォントレジストリを追加しました。ホストはフォント face の確認、順序付きフォールバック集合の選択、データ置換、レジストリ消去を、フォントファイルをディスクに書かずに実行できます。
+- 同梱 libass ビルドで順序付きフォールバックを維持し、face 間で TTC/OTC データを共有します。同一パスのフォントを置き換えた際はレンダラーキャッシュを無効化し、有効な字幕トラックが直ちに新データを使います。
+- レジストリと選択フォントの generation を分離し、レンダラー再作成後に libass codec private data を再送し、OpenHarmony と tvOS の C API でメモリフォントの全機能を検証します。
+
+### 再生回復
+
+- 音声・動画入力が枯渇した場合の明示的なバッファリング遷移を追加しました。停滞中は再生クロックを停止し、回復後のメディア時刻に再固定して、先行したクロックによる長時間のフレームドロップや黒画面を防ぎます。
+
+## 0.1.4 - 2026-07-30
+
+### 互換性の注意
+
+- **`outline_width` は倍率ではなく段階指定になりました。** `0` はオフ、`1` は細、`2` は標準、`3` は太で、`3` より大きい値は太に制限されます。標準と太は旧連続倍率の `1.0` と `2.0` が生成した幅をそれぞれ正確に再現します。従来 `outline_width: 1.0` を送ったホストは同じ線幅にするため `2.0` を送る必要があります。移行しないと輪郭が細くなり、既定フォントサイズではラスタライズ半径が 2 px から 1 px に半減します。
+- **弾幕フォントサイズは em あたりのピクセル数として解釈されます。** `ab_glyph` の `PxScale` はアセントからディセントまでの高さで、以前のコードは em サイズをそのまま渡していたため、フォントの高さ/em 比率に応じて要求より小さく表示されていました。現在は要求サイズに一致するため、既存ユーザーは更新後に弾幕が大きく見えます。STHeiti と Hiragino Sans GB の比率は 1.0、PingFang SC（macOS 既定）は 1.4 で、同じ設定でも最大 40% 大きくなり、収容できるトラックが減ります。旧表示を望むホストは設定フォントサイズを下げてください。
+- スクロール時間はビューポートの論理幅に応じて伸縮し（640 pt で ×0.9、1920 pt 以上で最大 ×1.3）、広いウィンドウでも弾幕が横切る視覚的な時間を近づけます。そのため大きなウィンドウでは同じ設定でも以前より遅く流れます。
+- 弾幕のスクリーンショットに弾幕は含まれなくなり、`capture_*` は動画と字幕のみを合成します。デバッグ HUD もキャプチャから除外します。
+
+### プラットフォーム対応とリリース成果物
+
+- OpenHarmony プレーヤーバックエンドと Flutter プラグインを追加しました。AVCodec H.264/HEVC ハードウェアデコード、OHNativeBuffer/Vulkan ゼロコピー表示、WGPU 合成、字幕、弾幕、音声、診断、RGBA スクリーンショットを含みます。Release の `erika-capi-openharmony-arm64.zip` には C API ランタイムと Flutter ネイティブブリッジが入ります。
+- ネイティブ Windows ARM64 の依存関係と `erika_capi` ビルド、および新しい `erika-capi-windows-arm64.zip` を追加しました。Windows x64 と ARM64 の CI は対応する GitHub ホストアーキテクチャで実行します。
+- macOS arm64、x86_64、universal を選択できるビルドと対応するアーキテクチャ別 Release アーカイブを追加しました。
+- NDK の `darwin-x86_64` ツールディレクトリに同梱された universal `glslc` を選択し、Apple Silicon での Android ソースビルドを修正しました。
+- 配布する x86_64 ビルドで FFmpeg の最適化 x86 アセンブリを再有効化しました。これらのターゲットのソースビルドには NASM が必要です。
+
+### 再生、描画、ウィンドウ統合
+
+- 共有再生クロックを直接公開し、フレームスナップショットが時刻、状態、generation をアトミックに取得します。弾幕、字幕、描画は別の前進専用表示クロックを使わず同じ時間基準を使用します。
+- 一時停止中のシークはメディアクロックを固定したまま要求されたプレビューフレームをデコード・表示します。シークプリロール、EOF、シーク直後の一時停止、再開時の競合によるクロック巻き戻り、ワーカーの空回り、長時間の黒フレームを防ぎます。
+- 音声と動画のデマルチプレクス需要を分離し、上限付きデコード済み音声キューを維持しつつ、音声のバックプレッシャーが動画パケット走査を止めないようにしました。字幕の切り替え・追加は音動画のデマルチプレクス選択をリセットしません。
+- macOS 表示を `CVDisplayLink` 中心に再構成し、遅いフレームをまとめ、画面変更後に display link の対象を更新します。リサイズとウィンドウ移動時の冗長な overlay 接続と GPU リソース処理も削減しました。
+- デスクトップ overlay API に複数 `FlutterView` とセカンダリウィンドウの対象指定を追加しました。macOS と Windows の overlay は surface、表示状態、generation、aspect-fit を保ち、ホストウィンドウ間を移動するプレーヤーに追従します。
+- Windows D3D11 overlay の寿命、非ブロッキング表示、再開時シークを改善しました。字幕は動画ビューポート内、弾幕はウィンドウ全体のビューポートに合成します。
+
+### 弾幕と字幕
+
+- 弾幕の衝突範囲をラスタライズした輪郭に合わせ、影/輪郭/文字の順序を修正し、トラック選択を安定させ、高密度の重なりをオーバーフロートラックに限定しました。
+- 非同期の再レイアウト完了まで以前の弾幕プランを動かし続けます。描画のみの設定はレイアウトを再利用し、表示状態の変更は即時に適用され、弾幕無効化後に古いプランが再出現しません。
+- 増分グリフアトラスアップロードと再利用可能な Metal インスタンスバッファを追加し、フレームごとの DFM 割り当てと候補走査の負荷を削減しました。
+- 外部テキスト字幕に文字コード検出・変換を追加しました。GBK、Big5、Shift_JIS、UTF-16 を含み、UTF-8 はそのまま通し、低信頼度またはバイナリ入力には保護付きフォールバックを使います。
+- libass は iOS/Android だけでなく全プラットフォームで liberika 同梱 Droid Sans Fallback を登録し、システムフォントプロバイダーのないターゲットは解決できない `Arial` の代わりにそのファミリーを既定にします。
+- 字幕フォールバックと選択的スタイル上書きを追加しました。カスタムフォントファミリー・ファイル、RGBA 色、メトリクス、文字属性、境界、配置、余白、ぼかしに対応します。新しい入口は `erika_presenter_set_subtitle_font`、`erika_presenter_set_subtitle_style`、`ErikaPlayer.setSubtitleStyle` です。
+
+### ネットワークとメディア診断
+
+- `erika_open_with_headers` と `erika_presenter_open_with_headers` を追加しました。Android、iOS、macOS、Windows の `ErikaPlayer.open` は `httpHeaders` を受け取り、プローブ、範囲読み取り、リトライ、プリフェッチに適用します。元の open 関数は互換性を維持し、空のヘッダーリストを使います。
+- liberika が管理する転送ヘッダーや無効な HTTP フィールド名・値を呼び出し元が指定した場合は拒否します。外部字幕と弾幕 sidecar は引き続きヘッダーなしで取得し、メディアリクエストのヘッダーを継承しません。
+- 無視された `Range`、不正な応答オフセット、一時的なリクエスト/本文エラー、部分応答、重複プリフェッチ、誤 EOF に対して HTTP 範囲入力を強化しました。リトライは取得操作全体で上限を設けます。
+- Rust、C、Dart にトラックのビットレートと有理数フレームレートのメタデータを追加し、デコーダー、レンダラー、GPU、音声、出力/HDR、弾幕の診断用オプトイン・ネイティブデバッグ HUD を追加しました。
+
+### 音声、色、コーデックの更新
+
+- サラウンドからステレオへのダウンミックス行列を正規化し、クリッピングを防ぎます。
+- 全音声バックエンドにコールバックごとの滑らかな音量ランプを追加し、WASAPI に観測可能な回復状態と上限付きバックオフを備えたデバイス喪失回復を追加しました。
+- Metal、WGPU、D3D11 に BT.2100 HLG デコードを追加し、HDR10 出力時の D3D11 overlay の PQ エンコードを修正しました。
+- FFmpeg を 8.1.2 に更新し、Darwin AV1 ハードウェアデコード/インポートを改善し、シーク読み込み中は最後のフレームを保持して黒い点滅を防ぎます。
+
+## 0.1.3 - 2026-07-17
+
+### Android 再生とパッケージング
+
+- MediaCodec、AHardwareBuffer/wgpu、AAudio、Flutter PlatformView、SAF/content ソース、字幕、弾幕、スクリーンショット、SDR/HDR、診断、回復の完全なパスを追加しました。
+- `ERIKA_PREBUILT=1` はタグ付き Android Release アーカイブから要求された Flutter ABI 用の `liberika_capi.so` と `libc++_shared.so` を配置し、明示的なソースビルドフォールバックを提供します。
+
+### 互換性を破る C API サーフェスサイズの意味
+
+`erika_presenter_attach_metal_layer`、`erika_presenter_attach_wgpu_surface`、`erika_presenter_attach_wgpu_surface_with_output_capabilities`、`erika_presenter_attach_windows_hwnd`、`erika_presenter_resize_surface` に渡す `width` と `height` は、物理ピクセル単位の正確な drawable サイズを意味します。
+
+以前はネイティブレンダラーがこれらの値に `scale` を掛けていました。現在 `scale` は独立して弾幕などの論理 UI コンテンツに影響し、サーフェスのサイズを変更しません。論理サイズを渡している直接 C API ホストは、呼び出す前に物理ピクセルへ変換してください。リポジトリ内の macOS、iOS、Windows、Android の Flutter 組み込みと例は更新済みです。
+
+### 再生コマンドのディスパッチ
+
+`play` は非同期でキューに入り、再生ワーカーを無期限に待ちません。ホストは遷移の確定結果として `StateChanged` と `Error` イベントを監視する必要があります。

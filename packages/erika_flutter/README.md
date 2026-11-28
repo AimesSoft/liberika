@@ -1,27 +1,71 @@
 # erika_flutter
 
-Flutter plugin for the Erika media playback engine.
+[中文](README.zh.md) | English | [日本語](README.ja.md)
+
+Flutter plugin for the liberika media playback engine.
+
+The latest [pub.dev release](https://pub.dev/packages/erika_flutter) is **0.3.7**
+(verified 2026-11-16). Use the matching native runtime and rebuild the application.
+
+Since 0.3.5, Windows native video stays below the transparent Flutter host so
+controls and menus remain visible; replacing the DLL alone does not update the
+plugin's window ordering. A failed `addExternalSubtitle` still fails that call,
+but no longer raises a global playback error or stops the opened video.
+Version 0.3.6 adds color emoji danmaku and improves font fallback; subtitle emoji
+remain monochrome. Version 0.3.7 adds Bilibili mode 7 positioning, linear motion,
+duration and alpha fades, plus the Linux archives described below. Rotation,
+multiline mode 7 and modes 8 / 9 remain unsupported.
 
 The plugin keeps Dart out of the hot path:
 
 - Dart exposes low-frequency player commands and event streams.
-- The native plugins expose two surface strategies: `ErikaWindowOverlayVideoView`
-  for the recommended window-hosted overlay path (Metal on macOS/iOS/tvOS, a D3D11
-  swapchain on Windows), and `ErikaVideoView` for platform-view embedding. On
-  Android both widgets route through the same native-view selector: SDR uses a
-  real `TextureView`, while requested extended-linear output uses a
-  `SurfaceView` with Hybrid Composition.
-- The macOS plugin loads the Erika dynamic library.
-- The iOS plugin links the Erika static library.
-- The tvOS plugin links the Erika static library and hosts its Metal layer in an
+- The native plugins offer window overlays, platform views, and Flutter textures
+  through `ErikaWindowOverlayVideoView`, `ErikaVideoView`, and
+  `ErikaTextureVideoView`. Platform behavior is described below.
+- The macOS plugin loads the liberika dynamic library.
+- The iOS plugin links the liberika static library.
+- The tvOS plugin links the liberika static library and hosts its Metal layer in an
   Apple TV platform view.
-- The Windows plugin builds and links the Erika C ABI DLL.
-- The Android plugin builds `liberika_capi.so` per ABI and drives its native
-  surface from `Choreographer`.
+- The Windows plugin links the liberika C ABI DLL; by default it downloads a verified prebuilt runtime.
+- The Android plugin uses a verified prebuilt `liberika_capi.so` per ABI by default and drives its native surface from `Choreographer`. Both platforms can build the runtime from source when configured.
 - The HarmonyOS plugin registers a Flutter external texture, attaches its
-  `OHNativeWindow` to Erika, and uses OHAudio for low-latency PCM output.
-- Erika owns playback, rendering, audio, timing, and overlays through
+  `OHNativeWindow` to liberika, and uses OHAudio for low-latency PCM output.
+- liberika owns playback, rendering, audio, timing, and overlays through
   `ErikaPresenterHandle`.
+
+## Start position, playback completion and subtitles
+
+With the 0.3.1 or later plugin and matching native runtime, `open(startPosition:)` asks
+the engine to seek before presenting the first frame. It returns `false` when
+an older native runtime cannot accept the position; the media still opens at
+the beginning, so the host can seek afterward. A missing or non-positive start
+position opens at the beginning and returns `true`.
+
+```dart
+final player = ErikaPlayer();
+final subscription = player.events.listen((event) {
+  if (event.kind == ErikaEventKind.ended) {
+    // Natural end of media; advance the playlist here.
+  }
+});
+const start = Duration(minutes: 1, seconds: 30);
+final accepted = await player.open(mediaUrl, startPosition: start);
+if (!accepted) await player.seek(start); // Compatibility with older runtimes.
+await player.play();
+
+final supported = await player.setSubtitleDelay(const Duration(milliseconds: 500));
+final currentText = await player.subtitleText();
+// Cancel subscription and dispose the player when the host is finished.
+```
+
+`ended` follows the `stopped` state after natural completion; an explicit stop
+does not emit it. Positive subtitle delay shows text later and negative delay
+shows it earlier, clamped to ±10 minutes for embedded and external subtitles.
+`setSubtitleDelay` returns `false` when the native runtime cannot apply it.
+`subtitleText()` returns currently displayed text with the delay applied; ASS
+override tags are removed. Bitmap subtitles have no text, and `null` means the
+native runtime cannot report text. Cancel the event subscription and dispose
+the player when no longer needed.
 
 ## Video Surfaces
 
@@ -39,11 +83,9 @@ for content that needs Flutter opacity, clipping or color filters. Its default
 `srcOver` uses BGRA8 GPU snapshots; `overlay` uses native Windows Composition.
 Other Windows blend modes are rejected explicitly.
 
-Windows texture output requires a runtime built from the matching source
-revision (`ERIKA_FORCE_SOURCE_BUILD=1`); the pinned v0.1.7 prebuilt does not
-provide this new API. Native video/player creation remains compatible with
-that prebuilt. Publish matching binaries and update the artifact manifest
-before distributing the new texture capability in a release.
+Windows texture output requires the matching v0.1.8 or newer native runtime.
+The package pins its native version and checksums in `native_artifacts.properties`.
+Older runtimes lack the optional texture API but can still create native players.
 
 Use `ErikaVideoView` when a standard Flutter platform view is required for a
 small embedder, compatibility path, or diagnostics.
@@ -51,9 +93,33 @@ small embedder, compatibility path, or diagnostics.
 On Android the SDR video surface is a native `TextureView`. An
 `ErikaOutputMode.extendedLinear` player instead creates a `SurfaceView` through
 `PlatformViewLink`/Hybrid Composition, because scRGB must bypass Flutter's
-texture-layer composition. The plugin forwards the borrowed `Surface` to Erika
+texture-layer composition. The plugin forwards the borrowed `Surface` to liberika
 and handles creation, resize, destruction, audio focus, HDR eligibility, and
 vsync ticks.
+
+## Linux Setup
+
+Download the matching Linux archive from the
+[0.3.7 Release](https://github.com/AimesSoft/liberika/releases/tag/v0.3.7): choose
+x64 or ARM64, then `bundled` (embedded FFmpeg/font libraries) or `system`
+(ABI-compatible FFmpeg 8 shared libraries and system font libraries). All four
+use an Ubuntu 22.04 / glibc 2.35 baseline. Bundled still needs system audio and
+graphics libraries and drivers; system needs the actual shared libraries, not
+just the `ffmpeg` executable. See [Linux setup](https://github.com/AimesSoft/liberika/blob/main/docs/linux.md)
+for dependencies or a source build.
+
+Set `ERIKA_LIBRARY_DIR` to the extracted `lib/` directory before running
+`flutter build linux`. Linux archives are not downloaded automatically.
+The plugin bundles that library and uses a GTK Flutter texture. Use `ErikaTextureVideoView` (also selected by `ErikaVideoView`
+on Linux). GPU composition includes subtitles and danmaku; pixels are read back
+as RGBA for Flutter. Linux screenshots return tightly packed RGBA bytes.
+
+NVIDIA uses CUDA/NVDEC; Intel and AMD use VA-API. Set
+`ERIKA_REQUIRE_HARDWARE_DECODE=1` to fail explicitly if hardware decoding is
+unavailable. WSLg also needs `GALLIUM_DRIVER=d3d12 WGPU_BACKEND=gl` for hardware
+rendering. The texture path provides SDR output. On Wayland, `ErikaWindowOverlayVideoView`
+places a native video layer below transparent Flutter UI and avoids per-frame
+readback. This overlay path requires a Wayland session and does not run on X11.
 
 ## macOS Setup
 
@@ -70,19 +136,22 @@ timeline through Now Playing, and handles system play, pause, stop, and seek
 commands through Remote Command Center.
 
 Overrides: `ERIKA_CAPI_DYLIB` forces the runtime dylib path; `ERIKA_MACOS_CAPI_DYLIB`
-points the build phase at an explicit dylib to bundle instead of building.
+points the build phase at an explicit dylib to bundle instead of building or
+downloading, such as a local `cargo build -p erika_capi --release` used before
+a release. It is not checksum-verified; the build fails when it lacks an
+architecture being built.
 
 ## Native binaries
 
-The plugin downloads the matching `v0.1.7` native runtime by default on macOS,
+The plugin downloads its version-pinned native runtime by default on macOS,
 Windows, iOS, tvOS, Android, and OpenHarmony. Every archive is pinned by SHA-256;
 a missing or invalid archive fails with an explicit error instead of silently
 requiring a Rust, FFmpeg, or NDK toolchain. See the
-[release guide](https://github.com/AimesSoft/Erika/blob/main/docs/releasing.md).
+[release guide](https://github.com/AimesSoft/liberika/blob/main/docs/releasing.md).
 Android downloads one approximately 20–22 MB runtime archive per requested ABI;
 it does not fetch the four-ABI C API bundle or its static libraries.
 
-When debugging local Erika changes from an Erika checkout, set
+When debugging local liberika changes from a liberika checkout, set
 `ERIKA_FORCE_SOURCE_BUILD=1`. A custom `ERIKA_PREBUILT_TAG` must be accompanied
 by the matching `ERIKA_PREBUILT_SHA256`. A custom multi-ABI Android build uses
 the per-ABI variables `ERIKA_PREBUILT_SHA256_ARM64_V8A`,
@@ -94,7 +163,7 @@ Windows with `ERIKA_WINDOWS_ARCH=x64|arm64`, and Android with
 `ERIKA_ANDROID_ABIS=arm64-v8a,armeabi-v7a,x86_64,x86`. For direct native builds,
 `xtask --target`, `ERIKA_NATIVE_TARGET`, and `cargo build --target` must name the
 same target. See the
-[build guide](https://github.com/AimesSoft/Erika/blob/main/docs/building.md).
+[build guide](https://github.com/AimesSoft/liberika/blob/main/docs/building.md).
 
 ## iOS Setup
 
@@ -128,7 +197,7 @@ await player.play();
 ## System Media Navigation
 
 Playlist apps can enable the system previous and next buttons for the active
-item. Erika emits a `systemMediaNavigationRequested` event instead of choosing
+item. liberika emits a `systemMediaNavigationRequested` event instead of choosing
 the next media item itself, so Dart remains the source of truth for the
 playlist. Update the capabilities whenever the active item changes.
 
@@ -208,8 +277,7 @@ system-media integration.
 ## tvOS Setup
 
 The tvOS CocoaPod script phase downloads the verified C ABI static library for
-Apple TV devices and simulators. An explicit source build uses Rust's tier-3
-tvOS targets and requires nightly with its source component:
+Apple TV devices and simulators. An explicit source build requires nightly with its source component:
 
 - `rustup toolchain install nightly --component rust-src`
 
@@ -219,7 +287,7 @@ with `-Z build-std=std,panic_abort`.
 
 ## Windows Setup
 
-The Windows plugin (`ErikaFlutterPluginCApi`) downloads the verified Erika C ABI
+The Windows plugin (`ErikaFlutterPluginCApi`) downloads the verified liberika C ABI
 runtime (`erika_capi.dll`) during the CMake build,
 automatically following the CMake generator's x64 or ARM64 architecture and
 staging the DLL next to the app. A consuming project can explicitly select the
@@ -235,12 +303,26 @@ Windows SDK. An explicit source build additionally requires:
   (via the repo `xtask deps build` flow)
 
 Set `ERIKA_REPO_ROOT` together with `ERIKA_FORCE_SOURCE_BUILD=1` when developing
-against an Erika checkout.
+against a liberika checkout.
 
 The Windows plugin publishes title, artist, album, artwork, playback state, and
 timeline through System Media Transport Controls (SMTC), and handles system
 play, pause, and seek commands. A Windows SDK with C++/WinRT is required; the
 plugin links the required WinRT system libraries automatically.
+
+Each presenter runs on its own native worker thread on Windows (create, commands, surface
+attach/resize/detach, render ticks, capture and destroy), and frame requests coalesce. Method results,
+`EventSink` events, SMTC updates, texture registration and HWND/DirectComposition operations stay on the
+platform thread. Set `ERIKA_FLUTTER_FRAME_TRACE=1` to log `presenter_worker` once per presenter and slow
+ticks (`frame_tick ... work_ms=`) measured on the worker.
+
+Linux uses the same owner model (a 16 ms monotonic clock; GTK, view and texture registration stay on
+the platform thread). OpenHarmony has one owner thread per presenter, and every N-API function also
+has an `...Async` variant that resolves a promise on the ArkTS thread; `ErikaOhosPlayerFromId` now
+returns null. Android uses a dedicated `HandlerThread` per presenter. On macOS, iOS and tvOS each
+presenter owns a dedicated thread (`ErikaPresenterOwner.swift`) for create, commands, rendering, event
+polling, capture and destroy; `CVDisplayLink`/`CADisplayLink` only wake it, and a slow `open`, `seek` or
+`dispose` no longer blocks the UI thread or delays rendering.
 
 ## Android Setup
 
@@ -251,7 +333,7 @@ x86_64 are selected; override
 this with `-PerikaAndroidAbis=arm64-v8a,x86_64` or `ERIKA_ANDROID_ABIS`.
 
 Android `content://` media and subtitle URIs are opened through
-`ContentResolver`, detached, and passed to Erika as owned `fd://` sources with
+`ContentResolver`, detached, and passed to liberika as owned `fd://` sources with
 their provider offset and length.
 
 Android uses MediaSession and a media notification for lock-screen, Bluetooth,
@@ -267,7 +349,7 @@ Android's minimum remains API 26. Extended-linear output additionally needs the
 native-window dataspace API (API 28+); API 26/27 continue in SDR and report the
 specific fallback. On API 34+, the plugin observes
 `Display.registerHdrSdrRatioChangedListener` and publishes real ratio changes
-to Erika, allowing wgpu to update subsequent frame targets and output status
+to liberika, allowing wgpu to update subsequent frame targets and output status
 without reattaching the surface. On API 35 it also applies per-`SurfaceView`
 desired HDR headroom without changing the host window globally.
 
@@ -322,7 +404,7 @@ than silently dropping them.
 Headers apply to the media source only — external subtitle tracks and danmaku
 sidecar files are still fetched without them.
 
-## HTTP read-ahead
+## HTTP read-ahead and rewind budget
 
 Use `httpReadAheadBytes` to tune the HTTP(S) read-ahead window for one open:
 
@@ -338,6 +420,22 @@ environment variable when set, otherwise the native 2 MiB default. Local files
 ignore this option. A native library from 0.1.7 or earlier does not export the
 options entry point, so requesting read-ahead with one throws a descriptive
 error instead of silently dropping the setting.
+
+Use `httpBackBufferBytes` to size the HTTP(S) rewind budget: how much
+already-played data stays cached so a rewind inside it is served without a
+network request.
+
+```dart
+await player.open(
+  'https://example.com/video.mp4',
+  httpBackBufferBytes: 89 * 1024 * 1024,
+);
+```
+
+A positive value overrides the native 16 MiB default; null or zero keeps it.
+Size it from the bitrate for high-bitrate media: a -10 s skip at 71 Mbps covers
+~89 MB, which the fixed default cannot hold, so every rewind past it re-anchors
+the stream instead of being served locally. Local files ignore this option.
 
 ## Output Mode
 
@@ -363,7 +461,7 @@ final player = ErikaPlayer(
 ```
 
 `edrHeadroom` is a content-headroom ceiling. If it is omitted for an
-extended-linear player, Erika uses a 4x content ceiling while the
+extended-linear player, liberika uses a 4x content ceiling while the
 `SurfaceView` receives desired headroom `0` (system auto). An explicit value is
 also applied as the per-`SurfaceView` desired headroom on API 35. The current
 display HDR/SDR ratio, when available, further bounds the effective wgpu target.
@@ -416,8 +514,8 @@ changes; duplicate listener notifications are ignored.
 
 `player.screenshot()` returns raw SDR RGBA8 for the current composited frame
 (video + subtitle + danmaku), even when the display is Apple EDR or Android
-extended-linear. Metal and Android/wgpu implement capture; the current Windows
-D3D11 Flutter path does not return screenshot bytes.
+extended-linear. Metal, Android/wgpu, and Windows D3D11 (since 0.3.8, encoded
+as SDR PNG with video and subtitles) implement capture.
 
 Non-HDR emulator/device coverage verifies the explicit SDR fallback and its
 reason. Active extended-linear output is not yet claimed as device-validated;
@@ -427,15 +525,48 @@ multiple players, and SDR screenshot checks.
 
 ## Upscaler
 
-Select ArtCNN at creation time, or switch it later at runtime:
+Select a mode at creation time, or switch it later at runtime:
 
 ```dart
 final player = ErikaPlayer(upscaler: ErikaUpscalerMode.artCnnC4F16Ds);
-await player.setUpscaler(ErikaUpscalerMode.artCnnC4F16Ds);
+await player.setUpscaler(ErikaUpscalerMode.anime4kM);
 ```
 
-Use `ErikaUpscalerMode.off` to disable it. Call
-`player.getUpscalerStatus()` to inspect the requested mode, active backend,
-fallback count, upscaled frame count, and recent GPU timings. Apple uses Metal;
-Android uses wgpu/Vulkan compute for both planar and MediaCodec Surface frames.
-GLES 3.0 keeps normal playback and reports an explicit `inactive` fallback.
+`ErikaUpscalerMode` covers ArtCNN (`artCnnC4F16`, `artCnnC4F32`, `artCnnC4F16Ds`,
+`artCnnC4F16Dn`, `artCnnC4F32Ds`, `artCnnC4F32Dn`, `artCnnR8F64`), Anime4K
+(`anime4kS` ... `anime4kUl`, `anime4kDenoiseS` ... `anime4kDenoiseUl`), `fsr1`
+(AMD FSR 1.0 on luma, any content), `platformVideo` (the platform's video super
+resolution), `metalFxSpatial` (Apple only) and `custom`. Use
+`ErikaUpscalerMode.off` to disable it. Network modes upscale the luma plane 2x;
+`fsr1` and `metalFxSpatial` scale luma to the presented size and `platformVideo`
+scales the whole frame.
+
+Call `player.getUpscalerStatus()` to inspect the requested mode, active backend
+(`off`, `inactive`, `building`, `scalar`, `simdgroupMatrix`, `cooperativeMatrix`,
+`linalgMatrix`, `videoProcessor`, `videoToolbox`, `metalFx`, `tensorOps`), fallback
+count, upscaled frame count, and recent GPU timings (`lastGpuDuration` is now
+reported on Windows too). `building` means kernels are compiling in the background
+and playback uses native sampling meanwhile; `inactive` means the mode cannot run on
+this platform (the reason is in the diagnostics `upscaler` object).
+
+Load your own network with `await player.loadUpscalerModel(bytes, name: 'my-model')`
+(an Erika `.esr` file or an FSRCNNX / Anime4K CNN mpv hook shader; FSRCNNX is not
+bundled for licensing reasons), then `setUpscaler(ErikaUpscalerMode.custom)`;
+`clearUpscalerModel()` unloads it. On Linux only the JSON file-path method
+(`loadUpscalerModelFile`) is available.
+
+Platform notes:
+
+- Windows (D3D11): every network mode including `custom`, `fsr1`, and `platformVideo`
+  through NVIDIA RTX Video Super Resolution (an RTX GPU, enabled in the NVIDIA App /
+  Control Panel, SDR video only) or Intel VSR. `metalFxSpatial` is `inactive`.
+- Apple (Metal): every network mode including `custom`, `fsr1`, `metalFxSpatial`, and
+  `platformVideo` through VideoToolbox (2x only, 8-bit 4:2:0 sources between 96x96 and
+  960x960, macOS/iOS/tvOS 26+; otherwise `inactive`).
+- Linux, Android and OpenHarmony (wgpu/Vulkan): every network mode including
+  `custom`, and `fsr1`; `platformVideo` and `metalFxSpatial` are `inactive`. GLES
+  3.0 keeps normal playback and reports an explicit `inactive` fallback.
+- Web: no upscaler.
+
+See [docs/integration.md](https://github.com/AimesSoft/liberika/blob/main/docs/integration.md#upscaler) for the full matrix and
+measured timings.

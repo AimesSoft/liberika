@@ -8,14 +8,13 @@ name: Release
 #
 # Bundles (per platform): liberika_capi.{dylib,a} / erika_capi.dll + libs /
 # iOS/tvOS erika_capi.xcframework bundles / Android ABI archives /
-# OpenHarmony shared libraries,
-# plus erika.h, LICENSE (MPL-2.0), and THIRD_PARTY_NOTICES.md. Native deps
-# (FFmpeg/libass/...) are statically linked via the `lgpl` profile.
+# OpenHarmony shared libraries and Linux x64/arm64 bundled + system variants,
+# plus erika.h, LICENSE (MPL-2.0), and THIRD_PARTY_NOTICES.md. Bundled native
+# deps use the `lgpl` profile; Linux system mode uses externally supplied FFmpeg.
 #
 # Windows uses MSYS2 + MSVC + LLVM/libclang. Android uses NDK LLVM at API 26;
 # xtask supports both Linux-hosted CI and Windows-hosted Git Bash builds.
-#
-# NOTE: desktop Linux is intentionally not published yet.
+# Linux variants both build/test on Ubuntu 22.04 (glibc 2.35).
 
 on:
   push:
@@ -25,6 +24,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   PROFILE: lgpl
   ANDROID_API_LEVEL: "26"
@@ -33,8 +36,31 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
+  version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Match the tag to the Cargo workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "erika") | .version')"
+          [[ "$crate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_REF_TYPE" == tag && "v${crate_version}" != "$GITHUB_REF_NAME" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo version ${crate_version}." >&2
+            exit 1
+          fi
+          echo "version=$crate_version" >> "$GITHUB_OUTPUT"
+
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     env:
@@ -71,6 +97,7 @@ jobs:
           mkdir -p "out/${{ matrix.arch }}"
           cp "target/${{ matrix.target }}/release/liberika_capi.dylib" "out/${{ matrix.arch }}/"
           cp "target/${{ matrix.target }}/release/liberika_capi.a" "out/${{ matrix.arch }}/"
+          strip -S "out/${{ matrix.arch }}/liberika_capi.a"
           install_name_tool -id @rpath/liberika_capi.dylib "out/${{ matrix.arch }}/liberika_capi.dylib"
       - name: Package
         run: |
@@ -115,10 +142,24 @@ jobs:
           name: erika-capi-macos-universal
           path: dist/*.zip
 
-  ios:
-    name: iOS (XCFramework)
+  ios-slices:
+    name: iOS ${{ matrix.target }}
+    needs: version
     runs-on: macos-26
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            sdk: iphoneos
+            clang_target: arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}
+          - target: aarch64-apple-ios-sim
+            sdk: iphonesimulator
+            clang_target: arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}-simulator
+          - target: x86_64-apple-ios
+            sdk: iphonesimulator
+            clang_target: x86_64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}-simulator
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "13.0"
       LANG: C
@@ -127,46 +168,59 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+          targets: ${{ matrix.target }}
       - name: Install native build tools
         run: brew install nasm meson ninja pkg-config
       - name: Cache native dependencies
         uses: actions/cache@v4
         with:
           path: third_party
-          key: native-v2-ios-release-all-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
-      - name: Build native deps + erika_capi (device + simulators)
-        # iOS links against the static lib only (XCFramework). Build just the
-        # staticlib via `cargo rustc --crate-type staticlib` so the cdylib link
-        # (which iOS does not use and which fails to resolve here) is skipped.
+          key: native-v2-ios-${{ matrix.target }}-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+          restore-keys: |
+            ${{ matrix.target == 'aarch64-apple-ios' && format('native-v2-ios-device-aarch64-min{0}-{1}', env.IPHONEOS_DEPLOYMENT_TARGET, hashFiles('xtask/src/main.rs', 'third_party/patches/**')) || '' }}
+      - name: Build native dependencies and static C API
+        # Apple mobile bundles use the static library; skip the cdylib link.
         run: |
           set -euo pipefail
-          for ENTRY in \
-            "aarch64-apple-ios|iphoneos|arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}" \
-            "aarch64-apple-ios-sim|iphonesimulator|arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}-simulator" \
-            "x86_64-apple-ios|iphonesimulator|x86_64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}-simulator"
-          do
-            IFS='|' read -r T SDK CLANG_TARGET <<< "$ENTRY"
-            SDKROOT="$(xcrun --sdk "$SDK" --show-sdk-path)"
-            BINDGEN_KEY="${T//-/_}"
-            export SDKROOT
-            export "BINDGEN_EXTRA_CLANG_ARGS_${BINDGEN_KEY}=--target=${CLANG_TARGET} -isysroot ${SDKROOT}"
-            cargo run -p xtask -- deps build --all --profile "$PROFILE" --target "$T"
-            ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
-            cargo rustc -p erika_capi --lib --release --target "$T" \
-                --no-default-features --features libass --crate-type staticlib
-          done
+          T="${{ matrix.target }}"
+          SDKROOT="$(xcrun --sdk "${{ matrix.sdk }}" --show-sdk-path)"
+          BINDGEN_KEY="${T//-/_}"
+          export SDKROOT
+          export "BINDGEN_EXTRA_CLANG_ARGS_${BINDGEN_KEY}=--target=${{ matrix.clang_target }} -isysroot ${SDKROOT}"
+          cargo run --locked -p xtask -- deps build --all --profile "$PROFILE" --target "$T"
+          ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
+            cargo rustc --locked \
+              -p erika_capi --lib --release --target "$T" \
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
+          strip -S "target/$T/release/liberika_capi.a"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-ios-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/liberika_capi.a
+          if-no-files-found: error
+
+  ios:
+    name: iOS (XCFramework)
+    needs: ios-slices
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-ios-*
+          path: slices
       - name: Assemble XCFramework
         run: |
           mkdir -p out hdr
           cp crates/erika_capi/include/erika.h hdr/erika.h
           # Fat static lib for the simulator slice (arm64 + x86_64).
           lipo -create \
-            target/aarch64-apple-ios-sim/release/liberika_capi.a \
-            target/x86_64-apple-ios/release/liberika_capi.a \
+            slices/native-ios-aarch64-apple-ios-sim/liberika_capi.a \
+            slices/native-ios-x86_64-apple-ios/liberika_capi.a \
             -output out/liberika_capi-sim.a
           xcodebuild -create-xcframework \
-            -library target/aarch64-apple-ios/release/liberika_capi.a -headers hdr \
+            -library slices/native-ios-aarch64-apple-ios/liberika_capi.a -headers hdr \
             -library out/liberika_capi-sim.a -headers hdr \
             -output out/erika_capi.xcframework
       - name: Package
@@ -178,10 +232,24 @@ jobs:
           name: erika-capi-ios
           path: dist/*.zip
 
-  tvos:
-    name: tvOS (XCFramework)
+  tvos-slices:
+    name: tvOS ${{ matrix.target }}
+    needs: version
     runs-on: macos-26
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-tvos
+            sdk: appletvos
+            clang_target: arm64-apple-tvos${TVOS_DEPLOYMENT_TARGET}
+          - target: aarch64-apple-tvos-sim
+            sdk: appletvsimulator
+            clang_target: arm64-apple-tvos${TVOS_DEPLOYMENT_TARGET}-simulator
+          - target: x86_64-apple-tvos
+            sdk: appletvsimulator
+            clang_target: x86_64-apple-tvos${TVOS_DEPLOYMENT_TARGET}-simulator
     env:
       TVOS_DEPLOYMENT_TARGET: "13.0"
       LANG: C
@@ -197,37 +265,51 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party
-          key: native-v2-tvos-release-all-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
-      - name: Build native deps + erika_capi (device + simulators)
+          key: native-v2-tvos-${{ matrix.target }}-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+          restore-keys: |
+            ${{ matrix.target == 'aarch64-apple-tvos-sim' && format('native-v2-tvos-simulator-aarch64-min{0}-{1}', env.TVOS_DEPLOYMENT_TARGET, hashFiles('xtask/src/main.rs', 'third_party/patches/**')) || '' }}
+      - name: Build native dependencies and static C API
+        # Apple mobile bundles use the static library; skip the cdylib link.
         run: |
           set -euo pipefail
-          for ENTRY in \
-            "aarch64-apple-tvos|appletvos|arm64-apple-tvos${TVOS_DEPLOYMENT_TARGET}" \
-            "aarch64-apple-tvos-sim|appletvsimulator|arm64-apple-tvos${TVOS_DEPLOYMENT_TARGET}-simulator" \
-            "x86_64-apple-tvos|appletvsimulator|x86_64-apple-tvos${TVOS_DEPLOYMENT_TARGET}-simulator"
-          do
-            IFS='|' read -r T SDK CLANG_TARGET <<< "$ENTRY"
-            SDKROOT="$(xcrun --sdk "$SDK" --show-sdk-path)"
-            BINDGEN_KEY="${T//-/_}"
-            export SDKROOT
-            export "BINDGEN_EXTRA_CLANG_ARGS_${BINDGEN_KEY}=--target=${CLANG_TARGET} -isysroot ${SDKROOT}"
-            cargo run --locked -p xtask -- deps build --all \
-              --profile "$PROFILE" --target "$T"
-            ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
-              cargo +nightly rustc -Z build-std=std,panic_abort --locked \
-                -p erika_capi --lib --release --target "$T" \
-                --no-default-features --features libass --crate-type staticlib
-          done
+          T="${{ matrix.target }}"
+          SDKROOT="$(xcrun --sdk "${{ matrix.sdk }}" --show-sdk-path)"
+          BINDGEN_KEY="${T//-/_}"
+          export SDKROOT
+          export "BINDGEN_EXTRA_CLANG_ARGS_${BINDGEN_KEY}=--target=${{ matrix.clang_target }} -isysroot ${SDKROOT}"
+          cargo run --locked -p xtask -- deps build --all --profile "$PROFILE" --target "$T"
+          ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
+            cargo +nightly rustc -Z build-std=std,panic_abort --locked \
+              -p erika_capi --lib --release --target "$T" \
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
+          strip -S "target/$T/release/liberika_capi.a"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-tvos-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/liberika_capi.a
+          if-no-files-found: error
+
+  tvos:
+    name: tvOS (XCFramework)
+    needs: tvos-slices
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-tvos-*
+          path: slices
       - name: Assemble XCFramework
         run: |
           mkdir -p out hdr
           cp crates/erika_capi/include/erika.h hdr/erika.h
           lipo -create \
-            target/aarch64-apple-tvos-sim/release/liberika_capi.a \
-            target/x86_64-apple-tvos/release/liberika_capi.a \
+            slices/native-tvos-aarch64-apple-tvos-sim/liberika_capi.a \
+            slices/native-tvos-x86_64-apple-tvos/liberika_capi.a \
             -output out/liberika_capi-sim.a
           xcodebuild -create-xcframework \
-            -library target/aarch64-apple-tvos/release/liberika_capi.a -headers hdr \
+            -library slices/native-tvos-aarch64-apple-tvos/liberika_capi.a -headers hdr \
             -library out/liberika_capi-sim.a -headers hdr \
             -output out/erika_capi.xcframework
       - name: Package
@@ -241,6 +323,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.arch }}
+    needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -292,17 +375,51 @@ jobs:
       - name: Install build tools (nasm, meson, ninja, LLVM/libclang)
         shell: pwsh
         run: |
-          choco install -y --no-progress zip
+          # The Chocolatey community feed answers 503/504 for minutes at a time,
+          # and choco can exit 0 without installing anything when it does.
+          function Install-ChocoPackage([string[]] $Arguments, [scriptblock] $Installed) {
+            foreach ($attempt in 1..4) {
+              choco @Arguments -y --no-progress | Out-Host
+              if ($LASTEXITCODE -eq 0 -and (& $Installed)) { return $true }
+              if ($attempt -lt 4) { Start-Sleep -Seconds (20 * $attempt) }
+            }
+            return $false
+          }
+          function Test-Command([string] $Name) { [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+          # A restored dependency cache may not need the tool; the step that
+          # does need it names it when it is missing.
+          function Expect([bool] $Ok, [string] $What) {
+            if (-not $Ok) { Write-Host "::warning::Could not install $What from Chocolatey after retries." }
+          }
+          $nasmDir = "C:\Program Files\NASM"
+          Expect (Install-ChocoPackage @("install", "zip") { Test-Command "zip" }) "zip"
           if ("${{ matrix.arch }}" -eq "x64") {
-            choco install -y --no-progress nasm
-          } elseif (-not (Get-Command make -ErrorAction SilentlyContinue)) {
-            choco install -y --no-progress make
+            Expect (Install-ChocoPackage @("install", "nasm") { Test-Path (Join-Path $nasmDir "nasm.exe") }) "nasm"
+          } elseif (-not (Test-Command "make")) {
+            Expect (Install-ChocoPackage @("install", "make") { Test-Command "make" }) "make"
           }
           pip install --quiet meson ninja
+          $llvmVersion = "22.1.8"
           $llvmBin = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path (Join-Path $llvmBin "libclang.dll"))) {
-            choco install llvm -y --no-progress
+          $libclang = Join-Path $llvmBin "libclang.dll"
+          # VS 2026's STL requires Clang 22 or newer when bindgen parses C++.
+          $minimum = if ("${{ matrix.arch }}" -eq "x64") { [version]"22.0" } else { [version]"0.0" }
+          function Test-Libclang {
+            (Test-Path $libclang) -and [version](Get-Item $libclang).VersionInfo.ProductVersion -ge $minimum
           }
+          if (-not (Test-Libclang)) {
+            $choco = if ("${{ matrix.arch }}" -eq "x64") { @("upgrade", "llvm", "--version=$llvmVersion") } else { @("install", "llvm") }
+            if (-not (Install-ChocoPackage $choco { Test-Libclang })) {
+              # Same installer, straight from the LLVM release.
+              $asset = if ("${{ matrix.arch }}" -eq "x64") { "win64" } else { "woa64" }
+              $installer = Join-Path $env:RUNNER_TEMP "LLVM-$llvmVersion-$asset.exe"
+              curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 10 --output $installer `
+                "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/LLVM-$llvmVersion-$asset.exe"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+            }
+          }
+          if (-not (Test-Libclang)) { Write-Error "LLVM/libclang $minimum or newer is not installed."; exit 1 }
           "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
@@ -336,16 +453,37 @@ jobs:
           name: erika-capi-windows-${{ matrix.arch }}
           path: dist/*.zip
 
-  android:
-    name: Android (4 ABIs)
+  android-slices:
+    name: Android ${{ matrix.abi }}
+    needs: version
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: aarch64-linux-android
+            abi: arm64-v8a
+            clang_target: aarch64-linux-android
+            cxx_runtime_target: aarch64-linux-android
+          - rust_target: armv7-linux-androideabi
+            abi: armeabi-v7a
+            clang_target: armv7a-linux-androideabi
+            cxx_runtime_target: arm-linux-androideabi
+          - rust_target: x86_64-linux-android
+            abi: x86_64
+            clang_target: x86_64-linux-android
+            cxx_runtime_target: x86_64-linux-android
+          - rust_target: i686-linux-android
+            abi: x86
+            clang_target: i686-linux-android
+            cxx_runtime_target: i686-linux-android
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
-      - uses: android-actions/setup-android@v3
+          targets: ${{ matrix.rust_target }}
+      - uses: android-actions/setup-android@v4
       - name: Install Android NDK and native build tools
         run: |
           sdkmanager "ndk;$ANDROID_NDK_VERSION"
@@ -353,15 +491,16 @@ jobs:
           sudo apt-get install -y build-essential cmake make meson nasm ninja-build pkg-config libclang-dev python3-venv
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
-      - name: Cache Android native dependencies
+      - name: Cache native dependencies
         uses: actions/cache@v4
         with:
           path: third_party
-          key: native-v2-android-release-all-ndk${{ env.ANDROID_NDK_VERSION }}-api${{ env.ANDROID_API_LEVEL }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
-      - name: Build native deps + erika_capi (all ABIs)
+          key: native-v2-android-${{ matrix.rust_target }}-ndk${{ env.ANDROID_NDK_VERSION }}-api${{ env.ANDROID_API_LEVEL }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Build native dependencies and C API
         shell: bash
         run: |
           set -euo pipefail
+          T="${{ matrix.rust_target }}"
           PREBUILT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
           TOOLCHAIN="$PREBUILT/bin"
           LIBCLANG_FILE="$(find "$PREBUILT" -type f -name 'libclang.so*' -print -quit)"
@@ -369,31 +508,51 @@ jobs:
           LIBCLANG_PATH="$(dirname "$LIBCLANG_FILE")"
           test -d "$LIBCLANG_PATH"
           export LIBCLANG_PATH
+          CC="$TOOLCHAIN/${{ matrix.clang_target }}${ANDROID_API_LEVEL}-clang"
+          CXX="$TOOLCHAIN/${{ matrix.clang_target }}${ANDROID_API_LEVEL}-clang++"
+          AR="$TOOLCHAIN/llvm-ar"
+          CARGO_KEY="$(echo "$T" | tr '[:lower:]-' '[:upper:]_')"
+          CC_KEY="${T//-/_}"
+          export "CARGO_TARGET_${CARGO_KEY}_LINKER=$CC"
+          export "CC_${CC_KEY}=$CC" "CXX_${CC_KEY}=$CXX" "AR_${CC_KEY}=$AR"
+          export "BINDGEN_EXTRA_CLANG_ARGS_${CC_KEY}=--target=${{ matrix.clang_target }}${ANDROID_API_LEVEL} --sysroot=$PREBUILT/sysroot"
+          export "CFLAGS_${CC_KEY}=-fPIC" "CXXFLAGS_${CC_KEY}=-fPIC"
+          cargo run --locked -p xtask -- deps build --all --profile "$PROFILE" --target "$T"
+          ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
+            cargo build --locked -p erika_capi --release --target "$T" \
+              --no-default-features --features libass,wgpu,embedded-fallback-font,artcnn-r8f64
+          mkdir -p "out/android/${{ matrix.abi }}"
+          cp "target/$T/release/liberika_capi.a" "out/android/${{ matrix.abi }}/liberika_capi.a"
+          "$PREBUILT/bin/llvm-strip" --strip-debug "out/android/${{ matrix.abi }}/liberika_capi.a"
+          cp "target/$T/release/liberika_capi.so" "out/android/${{ matrix.abi }}/liberika_capi.so"
+          cp "$PREBUILT/sysroot/usr/lib/${{ matrix.cxx_runtime_target }}/libc++_shared.so" \
+            "out/android/${{ matrix.abi }}/libc++_shared.so"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-android-${{ matrix.abi }}
+          path: out/android/${{ matrix.abi }}
+          if-no-files-found: error
+
+  android:
+    name: Android (4 ABIs)
+    needs: android-slices
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-android-*
+          path: slices
+      - name: Stage ABI libraries
+        run: |
+          set -euo pipefail
           mkdir -p out/android
-          for ENTRY in \
-            "aarch64-linux-android|arm64-v8a|aarch64-linux-android|aarch64-linux-android" \
-            "armv7-linux-androideabi|armeabi-v7a|armv7a-linux-androideabi|arm-linux-androideabi" \
-            "x86_64-linux-android|x86_64|x86_64-linux-android|x86_64-linux-android" \
-            "i686-linux-android|x86|i686-linux-android|i686-linux-android"; do
-            IFS='|' read -r T ABI CLANG_T CXX_RUNTIME_T <<< "$ENTRY"
-            CC="$TOOLCHAIN/${CLANG_T}${ANDROID_API_LEVEL}-clang"
-            CXX="$TOOLCHAIN/${CLANG_T}${ANDROID_API_LEVEL}-clang++"
-            AR="$TOOLCHAIN/llvm-ar"
-            CARGO_KEY="$(echo "$T" | tr '[:lower:]-' '[:upper:]_')"
-            CC_KEY="${T//-/_}"
-            export "CARGO_TARGET_${CARGO_KEY}_LINKER=$CC"
-            export "CC_${CC_KEY}=$CC" "CXX_${CC_KEY}=$CXX" "AR_${CC_KEY}=$AR"
-            export "BINDGEN_EXTRA_CLANG_ARGS_${CC_KEY}=--target=${CLANG_T}${ANDROID_API_LEVEL} --sysroot=$PREBUILT/sysroot"
-            export "CFLAGS_${CC_KEY}=-fPIC" "CXXFLAGS_${CC_KEY}=-fPIC"
-            cargo run -p xtask -- deps build --all --profile "$PROFILE" --target "$T"
-            ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="$T" \
-              cargo build -p erika_capi --release --target "$T" \
-                --no-default-features --features libass,wgpu
-            mkdir -p "out/android/$ABI"
-            cp "target/$T/release/liberika_capi.a" "out/android/$ABI/liberika_capi.a"
-            cp "target/$T/release/liberika_capi.so" "out/android/$ABI/liberika_capi.so"
-            cp "$PREBUILT/sysroot/usr/lib/$CXX_RUNTIME_T/libc++_shared.so" \
-              "out/android/$ABI/libc++_shared.so"
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            for LIB in liberika_capi.a liberika_capi.so libc++_shared.so; do
+              test -s "slices/native-android-$ABI/$LIB"
+            done
+            cp -R "slices/native-android-$ABI" "out/android/$ABI"
           done
       - name: Package
         shell: bash
@@ -414,6 +573,7 @@ jobs:
           path: dist/*.zip
 
   openharmony:
+    needs: version
     name: OpenHarmony arm64
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -436,7 +596,7 @@ jobs:
       - name: Install native build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake make ninja-build pkg-config zip
+          sudo apt-get install -y build-essential cmake make meson ninja-build pkg-config python3-venv zip
       - name: Configure OpenHarmony toolchain
         env:
           NATIVE_ROOT: ${{ steps.ohos_sdk.outputs.ohos_sdk_native }}
@@ -472,7 +632,7 @@ jobs:
           key: native-v1-ohos-${{ env.ERIKA_NATIVE_TARGET }}-api${{ env.OHOS_COMPATIBLE_SDK_VERSION }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
       - name: Build OpenHarmony native dependencies
         run: >-
-          cargo run --locked -p xtask -- deps build
+          cargo run --locked -p xtask -- deps build --all
           --profile "$ERIKA_NATIVE_PROFILE"
           --target "$ERIKA_NATIVE_TARGET"
       - name: Save native dependencies
@@ -489,7 +649,7 @@ jobs:
         run: >-
           cargo build --locked -p erika_capi --release
           --target "$ERIKA_NATIVE_TARGET"
-          --no-default-features --features wgpu
+          --no-default-features --features libass,wgpu,embedded-fallback-font,artcnn-r8f64
       - name: Build OpenHarmony Flutter native bridge
         run: |
           set -euo pipefail
@@ -517,7 +677,12 @@ jobs:
           for symbol in \
             erika_presenter_invoke_json \
             erika_presenter_render_tick_json \
-            erika_presenter_poll_event_json
+            erika_presenter_poll_event_json \
+            erika_export_frame \
+            erika_frame_export_result_free \
+            erika_frame_export_session_open \
+            erika_frame_export_session_frame \
+            erika_frame_export_session_close
           do
             grep -Fxq "$symbol" <<< "$symbols"
           done
@@ -529,9 +694,86 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  web:
+    name: Web / WASM package
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: "4.0.23"
+          actions-cache-folder: emsdk-cache
+      - name: Install Web build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config zip
+          python3 -m venv /tmp/erika-web-tools
+          /tmp/erika-web-tools/bin/pip install meson
+          echo /tmp/erika-web-tools/bin >> "$GITHUB_PATH"
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - name: Build complete browser package
+        run: cargo run --locked -p xtask -- web build
+      - name: Core regression
+        run: node --test packages/erika_web/tests/*.test.mjs
+      - name: Package Web runtime and demo
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f target/web/index.html
+          test -f target/web/erika_core_bg.wasm
+          test -f target/web/media.wasm
+          mkdir -p dist
+          cd target/web
+          zip -r "$GITHUB_WORKSPACE/dist/liberika-web-${VERSION}.zip" .
+      - name: Pack the npm package
+        run: |
+          set -euo pipefail
+          python3 scripts/web_npm_package.py
+          mkdir -p dist-npm
+          (cd target/npm/web && npm pack --pack-destination "$GITHUB_WORKSPACE/dist-npm")
+      - name: Build browser package without the fallback font
+        run: cargo run --locked -p xtask -- web build --skip-native --without-fallback-font
+      - name: Package it
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f target/web/erika_core_bg.wasm
+          cd target/web
+          zip -r "$GITHUB_WORKSPACE/dist/liberika-web-nofont-${VERSION}.zip" .
+          cd "$GITHUB_WORKSPACE"
+          python3 scripts/web_npm_package.py --without-fallback-font
+          (cd target/npm/web-nofont && npm pack --pack-destination "$GITHUB_WORKSPACE/dist-npm")
+          test "$(find dist-npm -name '*.tgz' | wc -l)" -eq 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liberika-web
+          path: dist/liberika-web-*.zip
+          if-no-files-found: error
+      # Published by the ecosystem workflow, not attached to the Release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liberika-web-npm
+          path: dist-npm/*.tgz
+          if-no-files-found: error
+
+  linux:
+    name: Linux dual architecture and dependency modes
+    needs: version
+    uses: ./.github/workflows/linux.yml
+
   release:
     name: Publish Release
-    needs: [macos, macos-universal, ios, tvos, windows, android, openharmony]
+    needs: [macos, macos-universal, ios, tvos, windows, android, openharmony, web, linux]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -539,7 +781,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: erika-capi-*
           path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: liberika-web
+          path: artifacts/liberika-web
       - name: Create release checksums
         shell: bash
         run: |
@@ -559,15 +806,31 @@ jobs:
             SHA256SUMS
           generate_release_notes: true
           body: |
-            Prebuilt `erika_capi` C ABI bundles (static `lgpl` profile),
-            for macOS arm64, macOS x64, macOS universal, Windows x64,
-            Windows ARM64, iOS, tvOS, and Android arm64-v8a, armeabi-v7a,
-            x86_64, and x86, plus OpenHarmony arm64.
+            Prebuilt `erika_capi` C ABI bundles for macOS arm64, macOS x64,
+            macOS universal, Windows x64, Windows ARM64, iOS, tvOS, Android
+            arm64-v8a, armeabi-v7a, x86_64 and x86, OpenHarmony arm64,
+            and Linux x64/arm64.
 
-            Each archive contains the library, `include/erika.h`, `LICENSE`
+            Linux offers `bundled` and `system` archives for each architecture,
+            both built on Ubuntu 22.04 (glibc 2.35). Bundled embeds FFmpeg and
+            the subtitle stack using the static `lgpl` profile; system needs
+            FFmpeg 8 shared libraries (which you can install yourself) and system
+            font libraries. Patched libass and SoundTouch remain embedded.
+            External FFmpeg licensing depends on its build configuration.
+            Neither Linux variant bundles libc or GPU drivers. Other native
+            platforms continue to use the static `lgpl` dependency profile.
+            See each Linux archive's README, manifest and dependency report.
+
+            Native archives contain the library, `include/erika.h`, `LICENSE`
             (MPL-2.0), and `THIRD_PARTY_NOTICES.md`. `SHA256SUMS` in this
-            release records the digest of every archive. See
-            [docs/capi_reference.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/docs/capi_reference.md)
-            and [docs/integration.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/docs/integration.md)
-            to integrate. Review [CHANGELOG.md](https://github.com/AimesSoft/Erika/blob/${{ github.ref_name }}/CHANGELOG.md)
+            release records the digest of every archive, including the separate
+            `liberika-web-X.Y.Z.zip` browser runtime and demo. Serve the complete
+            Web archive over HTTPS or localhost, preserving its relative paths.
+            `liberika-web-nofont-X.Y.Z.zip` is the same runtime without the
+            fallback font, for a page whose host passes one in.
+            See [docs/web.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/web.md)
+            for browser requirements and integration. See
+            [docs/capi_reference.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/capi_reference.md)
+            and [docs/integration.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/docs/integration.md)
+            to integrate. Review [CHANGELOG.md](https://github.com/AimesSoft/liberika/blob/${{ github.ref_name }}/CHANGELOG.md)
             before upgrading, especially the compatibility notes.

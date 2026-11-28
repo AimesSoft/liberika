@@ -1,10 +1,18 @@
+#[cfg(test)]
+mod danmaku;
+use crate::renderer::danmaku_batch::{DanmakuBatch, DanmakuBatchGlyph, DanmakuBatchInstance};
+
+#[cfg(target_os = "macos")]
+use std::cell::OnceCell;
 use std::ffi::c_void;
 use std::mem;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use crate::core::{PlayerError, Result};
-use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
+use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat, SoftwareNv12Upload};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::ffmpeg::{SoftwareP010Upload, SoftwareYuv420pUpload};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_core_foundation::CFRetained;
@@ -32,11 +40,12 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLClearColor, MTLCreateSystemDefaultDevice, MTLLoadAction,
     MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTextureDescriptor, MTLTextureUsage,
+    MTLStoreAction, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLDevice, MTLDrawable, MTLRenderPassDescriptor, MTLResource, MTLTexture,
+    MTLCommandQueue, MTLDevice, MTLDrawable, MTLGPUFamily, MTLRenderPassDescriptor, MTLResource,
+    MTLTexture,
 };
 use objc2_metal::{
     MTLLibrary, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPipelineDescriptor,
@@ -48,7 +57,14 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use objc2_quartz_core::{kCAContentsFormatRGBA8Uint, kCAContentsFormatRGBA16Float};
 
 use crate::core::{ColorPrimaries, RendererResourceStats, SurfaceMetrics, TransferFunction};
-use crate::danmaku::{DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuRenderPlan};
+use crate::danmaku::{
+    DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuColorGlyph, DanmakuGlyphAtlas, DanmakuRenderPlan,
+};
+use crate::overlay::OverlayViewport;
+use crate::renderer::gamut::{
+    GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
+};
+use crate::renderer::metal::post_process::MetalPostProcess;
 use crate::renderer::metal::upscaler::LumaUpscaler;
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
@@ -57,8 +73,13 @@ use crate::renderer::metal::{
     VideoFrameTextureSource, VideoRenderFrame, fourcc_string, metal_drawable_pixel_format,
     metal_target_color,
 };
-use crate::renderer::pipeline::{ColorRange, LumaUpscalerMode, ToneMapOperator};
-use crate::renderer::pipeline::{SourceColorState, TargetColorState};
+use crate::renderer::output::negotiate_output_mode;
+use crate::renderer::pipeline::{ColorRange, DoviUniforms, LumaUpscalerMode};
+use crate::renderer::pipeline::{SourceColorState, TargetColorState, VideoRenderPipeline};
+use crate::renderer::pipeline::{UpscalerCapabilities, UpscalerDescriptor};
+use crate::renderer::post_process::{
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
+};
 use crate::renderer::presentation::PresentationLayout as VideoPresentationLayout;
 use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
 use crate::trace;
@@ -85,12 +106,18 @@ impl ImportedVideoFrameTextures {
 
     pub fn allocated_bytes(&self) -> u64 {
         self.planes.iter().fold(0, |total, plane| {
-            total.saturating_add(plane.metal_texture.allocatedSize() as u64)
+            // A linear texture aliases its backing; count that storage once.
+            let bytes = plane.backing_buffer.as_ref().map_or_else(
+                || plane.metal_texture.allocatedSize(),
+                |buffer| buffer.allocatedSize(),
+            );
+            total.saturating_add(bytes as u64)
         })
     }
 }
 
 struct ImportedVideoPlaneTexture {
+    backing_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     #[allow(dead_code)]
     cv_texture: Option<CFRetained<CVMetalTexture>>,
     #[allow(dead_code)]
@@ -114,8 +141,54 @@ pub struct ImportedVideoFrameResult {
     pub textures: ImportedVideoFrameTextures,
 }
 
+/// Identity of a perceptual gamut LUT: it is only valid for one
+/// (source, target, target-black, target-peak) combination. The black/peak
+/// pair sets the LUT's I range. A cached LUT whose key does not match the
+/// current frame must never be bound — the shader would sample a LUT built for
+/// a different display/gamut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GamutLutKey {
+    source: u32,
+    target: u32,
+    target_black_pq: u32,
+    target_peak_pq: u32,
+}
+
+impl GamutLutKey {
+    /// The key for a frame's color pipeline. It deliberately reads only the
+    /// static target/primaries state: per-frame content brightness (Dolby
+    /// Vision L1, measured scene average) must not force LUT regeneration.
+    fn for_pipeline(pipeline: &VideoRenderPipeline) -> Self {
+        let packed = pipeline.gamut_primaries_code();
+        let target_black_nits = pipeline.tone_map_extra()[2];
+        Self {
+            source: packed >> 8,
+            target: packed & 0xff,
+            target_black_pq: quantize_luma_pq(target_black_nits),
+            target_peak_pq: quantize_luma_pq(pipeline.target.peak_nits),
+        }
+    }
+}
+
+/// Quantize a luminance (nits) to its PQ code for the LUT cache key. The key
+/// only has to change when the LUT's I axis changes, so 16-bit PQ resolution
+/// is ample (and resolves the sub-1-nit target blacks of SDR targets, which a
+/// linear nits quantization would collapse together).
+fn quantize_luma_pq(nits: f32) -> u32 {
+    (pq_code_for_lut(nits) * 65535.0) as u32
+}
+
+/// Cache of the generated perceptual gamut LUT for [`GamutLutKey`].
+struct GamutLutCache {
+    key: GamutLutKey,
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+}
+
 pub struct MetalRendererImpl {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
+    /// Widest and tallest 2D texture `device` accepts; see
+    /// [`max_texture_dimension_2d`].
+    max_texture_dimension: usize,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     requested_output_mode: MetalOutputMode,
     output_mode: MetalOutputMode,
@@ -126,20 +199,42 @@ pub struct MetalRendererImpl {
     flutter_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     texture_cache: Option<CFRetained<CVMetalTextureCache>>,
     video_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    #[cfg(target_os = "macos")]
+    sdr_pipeline_without_dovi:
+        OnceCell<Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>>,
     overlay_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     danmaku_batch_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     video_sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
     overlay_alpha_atlas_cache: Option<OverlayAlphaAtlasCache>,
     danmaku_alpha_atlas_cache: Option<DanmakuAlphaAtlasCache>,
+    danmaku_color_atlas_cache: Option<(u64, Retained<ProtocolObject<dyn MTLTexture>>)>,
     danmaku_vertex_buffers: Vec<DanmakuVertexBufferSlot>,
     danmaku_vertex_buffer_cursor: usize,
     danmaku_vertex_buffer_acquisitions: u64,
     upscaler: LumaUpscaler,
+    post_process: MetalPostProcess,
     last_submitted_command_buffer: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     pending_gpu_timing: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     stats: MetalRendererStats,
     layer_color_space_label: &'static str,
+    /// Perceptual gamut LUT (3D RGBA16Float) cached per (source, target,
+    /// peak) key; `None` when the fast path is in use.
+    gamut_lut: Option<GamutLutCache>,
+    /// Background generation for a cache miss; the fast `gamut_compress`
+    /// path renders until the LUT lands.
+    gamut_lut_job: Option<GamutLutJob>,
+    dummy_gamut_lut: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     logged_first_video_frame: bool,
+    /// EDR headroom of the display the layer is presented on, published by
+    /// the host through `RendererBackend::set_output_headroom`.
+    ///
+    /// Read here instead of querying AppKit: `select_output_mode_for_source`
+    /// runs on the render thread (CVDisplayLink or the host's render queue),
+    /// where touching `NSView`/`NSWindow`/`NSApplication` violates AppKit's
+    /// main-thread requirement. `None` means no host has reported a value
+    /// yet, which negotiates as SDR — the same fallback this used when AppKit
+    /// could not answer.
+    reported_display_headroom: Option<f32>,
 }
 
 fn hdr_debug_enabled() -> bool {
@@ -154,6 +249,63 @@ fn hdr_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn pq_code_for_lut(nits: f32) -> f32 {
+    let m1 = 0.1593017578125_f32;
+    let m2 = 78.84375_f32;
+    let c1 = 0.8359375_f32;
+    let c2 = 18.8515625_f32;
+    let c3 = 18.6875_f32;
+    let p = (nits / 10000.0).clamp(0.0, 1.0).powf(m1);
+    ((c1 + c2 * p) / (1.0 + c3 * p).max(0.000_001)).powf(m2)
+}
+
+/// Metal has no query for the 2D texture size limit; the feature set tables
+/// give 16384 for every Mac family and for Apple3 onwards, and 8192 for the
+/// Apple1 and Apple2 GPUs before them. A descriptor above it aborts the process
+/// in `-[MTLTextureDescriptorInternal validateWithDevice:]`.
+fn max_texture_dimension_2d(device: &ProtocolObject<dyn MTLDevice>) -> usize {
+    if device.supportsFamily(MTLGPUFamily::Mac2) || device.supportsFamily(MTLGPUFamily::Apple3) {
+        16_384
+    } else {
+        8_192
+    }
+}
+
+fn code_to_primaries(code: u32) -> ColorPrimaries {
+    match code {
+        1 => ColorPrimaries::Bt2020,
+        2 => ColorPrimaries::DisplayP3,
+        _ => ColorPrimaries::Bt709,
+    }
+}
+
+fn capabilities_for_device(device: &ProtocolObject<dyn MTLDevice>) -> UpscalerCapabilities {
+    let mut modes = UpscalerCapabilities::bundled_portable_modes();
+    if crate::renderer::metal::upscaler::metalfx::unavailable_reason(device).is_none() {
+        modes.push(UpscalerDescriptor::for_mode(
+            LumaUpscalerMode::MetalFxSpatial,
+        ));
+    }
+    if crate::renderer::metal::upscaler::video_toolbox::device_supported() {
+        modes.push(UpscalerDescriptor::for_mode_named(
+            LumaUpscalerMode::PlatformVideo,
+            "VideoToolbox",
+        ));
+    }
+    UpscalerCapabilities {
+        modes,
+        supports_custom_network: true,
+        supports_post_process: true,
+    }
+}
+
+pub fn probe_default_upscalers() -> UpscalerCapabilities {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return UpscalerCapabilities::default();
+    };
+    capabilities_for_device(&device)
+}
+
 impl MetalRendererImpl {
     pub fn new(config: MetalRendererConfig) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
@@ -164,6 +316,7 @@ impl MetalRendererImpl {
             .ok_or_else(|| PlayerError::Renderer("newCommandQueue returned nil".to_string()))?;
         let initial_output_mode = config.output_mode.resolve_for_source(false);
         Ok(Self {
+            max_texture_dimension: max_texture_dimension_2d(&device),
             device,
             queue,
             requested_output_mode: config.output_mode,
@@ -175,11 +328,14 @@ impl MetalRendererImpl {
             flutter_texture: None,
             texture_cache: None,
             video_pipeline: None,
+            #[cfg(target_os = "macos")]
+            sdr_pipeline_without_dovi: OnceCell::new(),
             overlay_pipeline: None,
             danmaku_batch_pipeline: None,
             video_sampler: None,
             overlay_alpha_atlas_cache: None,
             danmaku_alpha_atlas_cache: None,
+            danmaku_color_atlas_cache: None,
             danmaku_vertex_buffers: Vec::new(),
             danmaku_vertex_buffer_cursor: 0,
             danmaku_vertex_buffer_acquisitions: 0,
@@ -188,11 +344,16 @@ impl MetalRendererImpl {
                 upscaler.set_mode(config.luma_upscaler);
                 upscaler
             },
+            post_process: MetalPostProcess::default(),
             last_submitted_command_buffer: None,
             pending_gpu_timing: None,
             stats: MetalRendererStats::default(),
             layer_color_space_label: "unconfigured",
+            gamut_lut: None,
+            gamut_lut_job: None,
+            dummy_gamut_lut: None,
             logged_first_video_frame: false,
+            reported_display_headroom: None,
         })
     }
 
@@ -314,10 +475,17 @@ impl MetalRendererImpl {
             .saturating_mul(u64::from(self.stats.drawable_height))
             .saturating_mul(drawable_bytes_per_pixel)
             .saturating_mul(u64::from(drawable_count));
-        let overlay_atlas_bytes = self
-            .overlay_alpha_atlas_cache
-            .as_ref()
-            .map_or(0, |cache| cache.texture.allocatedSize() as u64);
+        let overlay_atlas_bytes = self.overlay_alpha_atlas_cache.as_ref().map_or(0, |cache| {
+            cache.pages.iter().fold(0u64, |total, page| {
+                total.saturating_add(page.texture.allocatedSize() as u64)
+            })
+        });
+        let overlay_key_bytes = self.overlay_alpha_atlas_cache.as_ref().map_or(0, |cache| {
+            cache
+                .signature
+                .as_ref()
+                .map_or(0, OverlayAlphaAtlasKey::retained_bytes) as u64
+        });
         let danmaku_atlas_bytes = self.danmaku_alpha_atlas_cache.as_ref().map_or(0, |cache| {
             (cache.fill_texture.allocatedSize() as u64)
                 .saturating_add(cache.outline_texture.allocatedSize() as u64)
@@ -332,9 +500,13 @@ impl MetalRendererImpl {
                             .map_or(0, |buffer| buffer.allocatedSize() as u64),
                     )
                 });
-        let upscaler_bytes = self.upscaler.allocated_bytes();
+        let upscaler_bytes = self
+            .upscaler
+            .allocated_bytes()
+            .saturating_add(self.post_process.allocated_bytes());
         let renderer_tracked_bytes = drawable_estimated_bytes
             .saturating_add(overlay_atlas_bytes)
+            .saturating_add(overlay_key_bytes)
             .saturating_add(danmaku_atlas_bytes)
             .saturating_add(danmaku_vertex_buffer_bytes)
             .saturating_add(upscaler_bytes);
@@ -367,6 +539,39 @@ impl MetalRendererImpl {
         self.output_mode
     }
 
+    pub fn is_hdr10_pq(&self) -> bool {
+        self.output_mode.is_edr()
+            && matches!(
+                self.layer_color_space_label,
+                "itur-2100-pq" | "display-p3-pq"
+            )
+    }
+
+    /// EDR headroom of the display the player window is presented on, as
+    /// published by the host through `RendererBackend::set_output_headroom`.
+    ///
+    /// The host resolves this on the main thread (it owns the `NSView` and
+    /// knows which screen the window is on) and pushes it here; querying
+    /// AppKit from this renderer would run on the render thread and violate
+    /// AppKit's main-thread requirement. No report yet negotiates as SDR.
+    fn display_edr_headroom(&self) -> f32 {
+        self.reported_display_headroom.unwrap_or(1.0)
+    }
+
+    /// Records a host-reported display headroom. `known == false` clears the
+    /// cache so negotiation falls back to SDR until a real value arrives.
+    pub fn set_output_headroom(&mut self, headroom: f32, known: bool) {
+        let resolved = if known && headroom.is_finite() && headroom > 0.0 {
+            Some(headroom)
+        } else {
+            None
+        };
+        if resolved != self.reported_display_headroom {
+            self.reported_display_headroom = resolved;
+            self.stats.headroom_updates = self.stats.headroom_updates.saturating_add(1);
+        }
+    }
+
     fn select_output_mode_for_source(&mut self, source: SourceColorState) {
         let source_is_hdr = source.is_hdr();
         if source_is_hdr {
@@ -378,7 +583,18 @@ impl MetalRendererImpl {
         let selected = if self.flutter_texture_attached {
             MetalOutputMode::Sdr
         } else {
-            self.requested_output_mode.resolve_for_source(source_is_hdr)
+            #[cfg(target_os = "macos")]
+            {
+                negotiate_output_mode(
+                    self.requested_output_mode,
+                    source_is_hdr,
+                    self.display_edr_headroom(),
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.requested_output_mode.resolve_for_source(source_is_hdr)
+            }
         };
         if selected != self.output_mode {
             self.set_output_mode(selected);
@@ -586,6 +802,159 @@ impl MetalRendererImpl {
         Ok(())
     }
 
+    /// Return a cached (or freshly generated) perceptual gamut LUT texture
+    /// for the frame's color pipeline, or `None` when the fast path is used
+    /// or the background generation is still pending. `Some` is returned only
+    /// when the texture matches the frame's key; callers must mask
+    /// `gamut_lut_enabled` off on `None` so the shader keeps the fast path
+    /// instead of sampling the 1x1x1 placeholder.
+    fn gamut_lut_texture(
+        &mut self,
+        frame: &VideoRenderFrame<'_>,
+    ) -> Result<Option<Retained<ProtocolObject<dyn MTLTexture>>>> {
+        if !frame.pipeline.gamut_lut_active() {
+            return Ok(None);
+        }
+        let key = GamutLutKey::for_pipeline(&frame.pipeline);
+        if let Some(cached) = &self.gamut_lut {
+            if cached.key == key {
+                return Ok(Some(cached.texture.clone()));
+            }
+        }
+        let params = GamutLutParams {
+            source: code_to_primaries(key.source),
+            target: code_to_primaries(key.target),
+            // Same target black the shader derives from tone_map_extra.z.
+            min_luma: pq_code_for_lut(frame.pipeline.tone_map_extra()[2]),
+            max_luma: pq_code_for_lut(frame.pipeline.target.peak_nits),
+        };
+        let job_params = self
+            .gamut_lut_job
+            .as_ref()
+            .map(GamutLutJob::params)
+            .filter(|job_params| *job_params == params);
+        if job_params.is_none() {
+            // First request (or the key changed): spawn generation and keep
+            // the fast path for this frame.
+            self.gamut_lut_job = Some(GamutLutJob::spawn(params));
+            return Ok(None);
+        }
+        let Some(lut) = self.gamut_lut_job.as_ref().and_then(GamutLutJob::poll) else {
+            return Ok(None);
+        };
+        self.gamut_lut_job = None;
+        let texture = self.upload_gamut_lut(&lut)?;
+        self.gamut_lut = Some(GamutLutCache {
+            key,
+            texture: texture.clone(),
+        });
+        Ok(Some(texture))
+    }
+
+    /// Pack (I, P+0.5, T+0.5) into a fresh 3D RGBA16Float texture.
+    fn upload_gamut_lut(
+        &mut self,
+        lut: &GamutLut,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        // Metal lacks a 3D convenience constructor in this binding; build the
+        // descriptor from the 2D factory and switch the type/depth.
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA16Float,
+                LUT_SIZE_I,
+                LUT_SIZE_C,
+                false,
+            )
+        };
+        descriptor.setTextureType(MTLTextureType::Type3D);
+        unsafe {
+            descriptor.setDepth(LUT_SIZE_H);
+        }
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or_else(|| {
+                PlayerError::Renderer(
+                    "newTextureWithDescriptor (gamut LUT) returned nil".to_string(),
+                )
+            })?;
+        let rgba16 = pack_rgba16f(&lut.texels, 1.0);
+        let region = MTLRegion {
+            origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc2_metal::MTLSize {
+                width: LUT_SIZE_I,
+                height: LUT_SIZE_C,
+                depth: LUT_SIZE_H,
+            },
+        };
+        let bytes_per_row = LUT_SIZE_I * 4 * 2; // RGBA16F = 8 bytes/texel
+        unsafe {
+            texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                region,
+                0,
+                0,
+                NonNull::new(rgba16.as_ptr().cast::<c_void>().cast_mut())
+                    .expect("gamut lut pointer is non-null"),
+                bytes_per_row,
+                LUT_SIZE_C * bytes_per_row, // one z-slice = width * bytes_per_row
+            );
+        }
+        Ok(texture)
+    }
+
+    fn dummy_gamut_lut_texture(&mut self) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        if let Some(dummy) = &self.dummy_gamut_lut {
+            return Ok(dummy.clone());
+        }
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA16Float,
+                1,
+                1,
+                false,
+            )
+        };
+        descriptor.setTextureType(MTLTextureType::Type3D);
+        unsafe {
+            descriptor.setDepth(1);
+        }
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or_else(|| {
+                PlayerError::Renderer(
+                    "newTextureWithDescriptor (dummy gamut LUT) returned nil".to_string(),
+                )
+            })?;
+        // 1 texel: (I=0, P=0, T=0) stored with P+0.5, T+0.5 -> [0.0, 0.5, 0.5, 1.0]
+        let dummy_data: [u16; 4] = [0x0000, 0x3800, 0x3800, 0x3c00];
+        let region = MTLRegion {
+            origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc2_metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        };
+        unsafe {
+            texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                region,
+                0,
+                0,
+                NonNull::new(dummy_data.as_ptr().cast::<c_void>().cast_mut())
+                    .expect("dummy lut pointer is non-null"),
+                8,
+                8,
+            );
+        }
+        self.dummy_gamut_lut = Some(texture.clone());
+        Ok(texture)
+    }
+
     pub fn render_video_frame(&mut self, frame: VideoRenderFrame<'_>) -> Result<()> {
         self.render_video_frame_inner(frame, None, None)
     }
@@ -769,7 +1138,7 @@ impl MetalRendererImpl {
             self.stats.drawable_width,
             self.stats.drawable_height,
         );
-        // The neural doubler only pays off when the video is actually shown
+        // Super resolution only pays off when the video is actually shown
         // larger than its source resolution.
         let upscale_requested = self.upscaler.mode().is_enabled()
             && layout.is_source_upscaled()
@@ -777,8 +1146,18 @@ impl MetalRendererImpl {
                 luma.pixelFormat(),
                 MTLPixelFormat::R8Unorm | MTLPixelFormat::R16Unorm
             );
+        if self.upscaler.mode().is_enabled() && !upscale_requested {
+            self.upscaler.note_skipped(if layout.is_source_upscaled() {
+                "unsupported luma plane format"
+            } else {
+                "the video is not presented above its source size"
+            });
+        }
 
         unsafe {
+            #[cfg(target_os = "macos")]
+            let pipeline = self.video_pipeline_for_playback(&frame, textures)?;
+            #[cfg(not(target_os = "macos"))]
             let pipeline = self.video_pipeline_state()?;
             let sampler = self.video_sampler_state()?;
             let Some(command_buffer) = self.queue.commandBuffer() else {
@@ -787,32 +1166,60 @@ impl MetalRendererImpl {
                 ));
             };
 
-            let mut upscaled_luma = None;
+            let mut upscaled = None;
             if upscale_requested {
                 let encode_start = Instant::now();
-                match self.upscaler.encode_with_token(
-                    &self.device,
-                    &command_buffer,
+                // The luma plane as presented, in luma texels: spatial and
+                // platform scalers scale straight to it (packed alpha frames
+                // keep both halves, so scale the whole plane).
+                let scale_x = f64::from(layout.target_rect[2]) / f64::from(logical_width.max(1));
+                let scale_y =
+                    f64::from(layout.target_rect[3]) / (frame.frame.info.height.max(1) as f64);
+                let presented = (
+                    ((luma.width() as f64) * scale_x).round().max(1.0) as usize,
+                    ((luma.height() as f64) * scale_y).round().max(1.0) as usize,
+                );
+                let request = crate::renderer::metal::upscaler::UpscaleRequest {
                     luma,
-                    luma.pixelFormat(),
-                    frame.frame_token,
-                ) {
-                    Ok(texture) => {
+                    chroma: Some(chroma),
+                    output_format: luma.pixelFormat(),
+                    range: if matches!(frame.pipeline.source.range, ColorRange::Full) {
+                        crate::renderer::metal::upscaler::LumaRange::Full
+                    } else {
+                        crate::renderer::metal::upscaler::LumaRange::Limited
+                    },
+                    presented,
+                    frame_token: frame.frame_token,
+                };
+                match self
+                    .upscaler
+                    .encode_frame(&self.device, &command_buffer, &request)
+                {
+                    Ok(frame) => {
                         self.stats.last_upscaler_encode_duration = encode_start.elapsed();
-                        upscaled_luma = texture;
+                        upscaled = frame;
                     }
                     Err(error) => {
-                        eprintln!("Erika luma upscaler disabled after encode failure: {error}");
+                        crate::trace::diagnostic_at(
+                            crate::trace::LogLevel::Warn,
+                            format!("Erika luma upscaler disabled after encode failure: {error}"),
+                        );
                         self.upscaler.set_mode(LumaUpscalerMode::Off);
                     }
                 }
             }
-            if upscaled_luma.is_some() {
+            if upscaled.is_some() {
                 self.stats.upscaled_frames += 1;
                 frame.pipeline = frame.pipeline.with_luma_upscaler(self.upscaler.mode());
                 upscaled_luma_used = true;
             }
-            let luma: &ProtocolObject<dyn MTLTexture> = upscaled_luma.as_deref().unwrap_or(luma);
+            let luma: &ProtocolObject<dyn MTLTexture> =
+                upscaled.as_ref().map_or(luma, |upscaled| &*upscaled.luma);
+            // Platform video scalers return the whole frame at the new size.
+            let chroma: &ProtocolObject<dyn MTLTexture> = upscaled
+                .as_ref()
+                .and_then(|upscaled| upscaled.chroma.as_deref())
+                .unwrap_or(chroma);
 
             let (drawable, texture) = if let Some(layer) = &self.layer {
                 let Some(drawable): Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> =
@@ -832,6 +1239,84 @@ impl MetalRendererImpl {
                 ));
             };
 
+            // Resolve the LUT before building the uniforms: while a new key's
+            // background generation is pending, the shader keeps the fast
+            // gamut_compress path (the dummy texture holds texture 2).
+            // Readiness comes from the returned texture, not from the cache:
+            // a stale cache entry for another key must not enable the LUT.
+            let cached_gamut_lut = self.gamut_lut_texture(&frame)?;
+            let gamut_lut_ready = cached_gamut_lut.is_some();
+            let gamut_lut = match cached_gamut_lut {
+                Some(lut) => lut,
+                None => self.dummy_gamut_lut_texture()?,
+            };
+            let post_stage = self.post_process.stage();
+            let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+                (
+                    texture.width().max(1).min(self.max_texture_dimension),
+                    texture.height().max(1).min(self.max_texture_dimension),
+                )
+            } else {
+                (
+                    (layout.target_rect[2].round().max(1.0) as usize)
+                        .min(self.max_texture_dimension),
+                    (layout.target_rect[3].round().max(1.0) as usize)
+                        .min(self.max_texture_dimension),
+                )
+            };
+            let post_pass = if self.post_process.is_enabled() {
+                self.post_process
+                    .prepare(&self.device, post_w, post_h, texture.pixelFormat())
+            } else {
+                None
+            };
+            let post_main_active = post_pass.is_some() && post_stage == PostProcessStage::Main;
+            let video_rect = if post_main_active {
+                [0.0, 0.0, post_w as f32, post_h as f32]
+            } else {
+                layout.target_rect
+            };
+            let video_viewport = if post_main_active {
+                [post_w as f32, post_h as f32, 0.0, 0.0]
+            } else {
+                layout.video_viewport()
+            };
+            let uniforms = VideoUniforms {
+                is_p010: matches!(frame.frame.info.format, ImportedVideoFormat::P010) as u32,
+                full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
+                source_transfer: transfer_code(frame.pipeline.source.transfer),
+                target_transfer: transfer_code(frame.pipeline.target.transfer),
+                tone_map: frame.pipeline.tone_map_uniform_code(),
+                edr_output: self.output_mode.is_edr() as u32,
+                _reserved0: self.video_alpha_mode as u32,
+                _reserved1: 0,
+                rect: video_rect,
+                viewport: video_viewport,
+                nits: [
+                    frame.pipeline.source.nominal_peak_nits,
+                    frame.pipeline.target.peak_nits,
+                    frame.pipeline.source.reference_white_nits,
+                    frame.pipeline.target.reference_white_nits,
+                ],
+                luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
+                gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
+                ipt_matrix_rows: frame.pipeline.ipt_matrix_rows(),
+                tone_map_extra: frame.pipeline.tone_map_extra(),
+                tone_map_coeffs: frame.pipeline.tone_map_coeffs(),
+                gamut_lut_enabled: if gamut_lut_ready {
+                    frame.pipeline.gamut_lut_active() as u32
+                } else {
+                    0
+                },
+                gamut_primaries: frame.pipeline.gamut_primaries_code(),
+                gamut_reserved0: 0,
+                gamut_reserved1: 0,
+                dovi: DoviUniforms::of_for_representation(
+                    &frame.pipeline.source,
+                    matches!(frame.frame.info.format, ImportedVideoFormat::P010),
+                ),
+            };
+
             let descriptor = MTLRenderPassDescriptor::new();
             let attachments = descriptor.colorAttachments();
             let attachment = attachments.objectAtIndexedSubscript(0);
@@ -849,73 +1334,180 @@ impl MetalRendererImpl {
                 },
             });
 
-            let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
-            else {
-                return Err(PlayerError::Renderer(
-                    "renderCommandEncoderWithDescriptor returned nil".to_string(),
-                ));
-            };
-            let uniforms = VideoUniforms {
-                is_p010: matches!(frame.frame.info.format, ImportedVideoFormat::P010) as u32,
-                full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
-                source_transfer: transfer_code(frame.pipeline.source.transfer),
-                target_transfer: transfer_code(frame.pipeline.target.transfer),
-                tone_map: tone_map_code(frame.pipeline.tone_map.operator),
-                edr_output: self.output_mode.is_edr() as u32,
-                _reserved0: self.video_alpha_mode as u32,
-                _reserved1: 0,
-                rect: layout.target_rect,
-                viewport: layout.video_viewport(),
-                nits: [
-                    frame.pipeline.source.nominal_peak_nits,
-                    frame.pipeline.target.peak_nits,
-                    frame.pipeline.source.reference_white_nits,
-                    frame.pipeline.target.reference_white_nits,
-                ],
-                luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
-                gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
-            };
-            encoder.setRenderPipelineState(&pipeline);
-            encoder.setFragmentTexture_atIndex(Some(luma), 0);
-            encoder.setFragmentTexture_atIndex(Some(chroma), 1);
-            encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
-            encoder.setVertexBytes_length_atIndex(
-                NonNull::new(
-                    (&uniforms as *const VideoUniforms)
-                        .cast::<c_void>()
-                        .cast_mut(),
-                )
-                .expect("uniform pointer is non-null"),
-                mem::size_of::<VideoUniforms>(),
-                0,
-            );
-            encoder.setFragmentBytes_length_atIndex(
-                NonNull::new(
-                    (&uniforms as *const VideoUniforms)
-                        .cast::<c_void>()
-                        .cast_mut(),
-                )
-                .expect("uniform pointer is non-null"),
-                mem::size_of::<VideoUniforms>(),
-                0,
-            );
-            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+            if let Some((post_src, post_pipeline, post_sampler)) = post_pass {
+                // Pass 1: render the decoded/upscaled video picture into the
+                // offscreen RGB source texture sized to the presented rect.
+                let offscreen = MTLRenderPassDescriptor::new();
+                let off_att = offscreen.colorAttachments().objectAtIndexedSubscript(0);
+                off_att.setTexture(Some(&*post_src));
+                off_att.setLoadAction(MTLLoadAction::Clear);
+                off_att.setStoreAction(MTLStoreAction::Store);
+                off_att.setClearColor(MTLClearColor {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: if self.video_alpha_mode.has_alpha() {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                });
+                let Some(video_enc) = command_buffer.renderCommandEncoderWithDescriptor(&offscreen)
+                else {
+                    return Err(PlayerError::Renderer(
+                        "renderCommandEncoderWithDescriptor(post_src) returned nil".to_string(),
+                    ));
+                };
+                video_enc.setRenderPipelineState(&pipeline);
+                video_enc.setFragmentTexture_atIndex(Some(luma), 0);
+                video_enc.setFragmentTexture_atIndex(Some(chroma), 1);
+                video_enc.setFragmentTexture_atIndex(Some(&gamut_lut), 2);
+                video_enc.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                video_enc.setVertexBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                video_enc.setFragmentBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                video_enc.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                );
+                let target_color = frame.pipeline.target;
+                let mut overlay = overlay;
+                if post_stage == PostProcessStage::Output {
+                    if let Some(overlay) = overlay.take() {
+                        self.draw_overlay_planes(&video_enc, overlay, layout, target_color)?;
+                    }
+                    if let Some(danmaku) = danmaku.as_ref() {
+                        self.draw_danmaku_plan(
+                            &video_enc,
+                            &command_buffer,
+                            danmaku.plan,
+                            layout,
+                            target_color,
+                        )?;
+                    }
+                }
+                video_enc.endEncoding();
 
-            let target_color = frame.pipeline.target;
-            if let Some(overlay) = overlay {
-                self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
-            }
-            if let Some(danmaku) = danmaku.as_ref() {
-                self.draw_danmaku_plan(
+                // Pass 2: run the post-process shader onto the drawable. For
+                // `Main` shaders, composite crisp subtitles and danmaku after.
+                let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
+                else {
+                    return Err(PlayerError::Renderer(
+                        "renderCommandEncoderWithDescriptor returned nil".to_string(),
+                    ));
+                };
+                let post_rect = if post_stage == PostProcessStage::Output {
+                    [
+                        0.0,
+                        0.0,
+                        self.stats.drawable_width.max(1) as f32,
+                        self.stats.drawable_height.max(1) as f32,
+                    ]
+                } else {
+                    layout.target_rect
+                };
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w as u32, post_h as u32),
+                    post_rect,
+                    (self.stats.drawable_width, self.stats.drawable_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                MetalPostProcess::encode(
                     &encoder,
-                    &command_buffer,
-                    danmaku.plan,
-                    layout,
-                    target_color,
-                )?;
-            }
+                    &post_pipeline,
+                    &post_src,
+                    &post_sampler,
+                    &post_uniforms,
+                );
 
-            encoder.endEncoding();
+                if post_stage == PostProcessStage::Main {
+                    if let Some(overlay) = overlay.take() {
+                        self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                    }
+                    if let Some(danmaku) = danmaku.as_ref() {
+                        self.draw_danmaku_plan(
+                            &encoder,
+                            &command_buffer,
+                            danmaku.plan,
+                            layout,
+                            target_color,
+                        )?;
+                    }
+                }
+                encoder.endEncoding();
+            } else {
+                let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
+                else {
+                    return Err(PlayerError::Renderer(
+                        "renderCommandEncoderWithDescriptor returned nil".to_string(),
+                    ));
+                };
+                encoder.setRenderPipelineState(&pipeline);
+                encoder.setFragmentTexture_atIndex(Some(luma), 0);
+                encoder.setFragmentTexture_atIndex(Some(chroma), 1);
+                encoder.setFragmentTexture_atIndex(Some(&gamut_lut), 2);
+                encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                encoder.setVertexBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                encoder.setFragmentBytes_length_atIndex(
+                    NonNull::new(
+                        (&uniforms as *const VideoUniforms)
+                            .cast::<c_void>()
+                            .cast_mut(),
+                    )
+                    .expect("uniform pointer is non-null"),
+                    mem::size_of::<VideoUniforms>(),
+                    0,
+                );
+                encoder.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                );
+
+                let target_color = frame.pipeline.target;
+                if let Some(overlay) = overlay {
+                    self.draw_overlay_planes(&encoder, overlay, layout, target_color)?;
+                }
+                if let Some(danmaku) = danmaku.as_ref() {
+                    self.draw_danmaku_plan(
+                        &encoder,
+                        &command_buffer,
+                        danmaku.plan,
+                        layout,
+                        target_color,
+                    )?;
+                }
+
+                encoder.endEncoding();
+            }
             if let Some(drawable) = &drawable {
                 let drawable_ref: &ProtocolObject<dyn MTLDrawable> =
                     ProtocolObject::from_ref(&**drawable);
@@ -1052,12 +1644,20 @@ impl MetalRendererImpl {
                 ));
             };
 
+            // Resolve the LUT before building the uniforms (same gating as
+            // the live path above).
+            let cached_gamut_lut = self.gamut_lut_texture(&frame)?;
+            let gamut_lut_ready = cached_gamut_lut.is_some();
+            let gamut_lut = match cached_gamut_lut {
+                Some(lut) => lut,
+                None => self.dummy_gamut_lut_texture()?,
+            };
             let uniforms = VideoUniforms {
                 is_p010: matches!(frame.frame.info.format, ImportedVideoFormat::P010) as u32,
                 full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
                 source_transfer: transfer_code(frame.pipeline.source.transfer),
                 target_transfer: transfer_code(frame.pipeline.target.transfer),
-                tone_map: tone_map_code(frame.pipeline.tone_map.operator),
+                tone_map: frame.pipeline.tone_map_uniform_code(),
                 edr_output: self.output_mode.is_edr() as u32,
                 _reserved0: 0,
                 _reserved1: 0,
@@ -1071,10 +1671,26 @@ impl MetalRendererImpl {
                 ],
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
+                ipt_matrix_rows: frame.pipeline.ipt_matrix_rows(),
+                tone_map_extra: frame.pipeline.tone_map_extra(),
+                tone_map_coeffs: frame.pipeline.tone_map_coeffs(),
+                gamut_lut_enabled: if gamut_lut_ready {
+                    frame.pipeline.gamut_lut_active() as u32
+                } else {
+                    0
+                },
+                gamut_primaries: frame.pipeline.gamut_primaries_code(),
+                gamut_reserved0: 0,
+                gamut_reserved1: 0,
+                dovi: DoviUniforms::of_for_representation(
+                    &frame.pipeline.source,
+                    matches!(frame.frame.info.format, ImportedVideoFormat::P010),
+                ),
             };
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
             encoder.setFragmentTexture_atIndex(Some(chroma), 1);
+            encoder.setFragmentTexture_atIndex(Some(&gamut_lut), 2);
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
             encoder.setVertexBytes_length_atIndex(
                 NonNull::new(
@@ -1170,6 +1786,34 @@ impl MetalRendererImpl {
         self.upscaler.set_mode(mode);
     }
 
+    pub fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        self.upscaler.set_custom_model(model);
+    }
+
+    /// Why the upscaler is inactive (or runs on a downgraded kernel family),
+    /// plus the engine actually executing it, for diagnostics.
+    pub fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        (
+            self.upscaler.status_reason().map(str::to_string),
+            self.upscaler.engine_label(),
+        )
+    }
+
+    pub fn supported_upscalers(&self) -> UpscalerCapabilities {
+        capabilities_for_device(&self.device)
+    }
+
+    pub fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.post_process.set_shader(shader);
+    }
+
+    pub fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.post_process.status_info()
+    }
+
     /// Records the GPU time of the previous frame's command buffer once it
     /// has completed. The value therefore lags by one frame, which is fine
     /// for performance metrics.
@@ -1201,6 +1845,12 @@ impl MetalRendererImpl {
         let sampler = self.video_sampler_state()?;
         let viewport_width = overlay.frame.viewport.width;
         let viewport_height = overlay.frame.viewport.height;
+        let layout = layout.with_source_size(viewport_width, viewport_height);
+        let edr = self.output_mode.is_edr();
+        unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+        }
         for plane in &overlay.frame.subtitle_planes {
             let texture = self.create_overlay_texture(
                 plane.width as usize,
@@ -1208,11 +1858,9 @@ impl MetalRendererImpl {
                 &plane.rgba,
             )?;
             let (x, y, width, height) = plane.scaled_rect(viewport_width, viewport_height);
-            let uniforms = OverlayUniforms::from_plane(x, y, width, height, layout, target);
+            let uniforms = OverlayUniforms::from_plane(x, y, width, height, layout, target, edr);
             unsafe {
-                encoder.setRenderPipelineState(&pipeline);
                 encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
-                encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
                 encoder.setVertexBytes_length_atIndex(
                     overlay_uniform_pointer(&uniforms),
                     mem::size_of::<OverlayUniforms>(),
@@ -1231,28 +1879,32 @@ impl MetalRendererImpl {
             }
         }
         if !overlay.frame.subtitle_alpha_planes.is_empty() {
-            let atlas = self.prepare_overlay_alpha_atlas(
+            let Some(atlas) = self.prepare_overlay_alpha_atlas(
                 &overlay.frame.subtitle_alpha_planes,
+                overlay.frame.viewport,
                 overlay.frame.subtitle_changed,
-            )?;
-            let texture = atlas.texture.clone();
-            let placements = atlas.placements.clone();
-            let atlas_width = atlas.width;
-            let atlas_height = atlas.height;
-            for placement in &placements {
+            )?
+            else {
+                return Ok(());
+            };
+            let mut bound_page = None;
+            for placement in &atlas.placements {
                 let bitmap = &overlay.frame.subtitle_alpha_planes[placement.bitmap_index];
+                let page = &atlas.pages[placement.page];
                 let uniforms = OverlayUniforms::from_alpha_atlas_bitmap(
                     bitmap,
                     placement,
-                    atlas_width,
-                    atlas_height,
+                    page.width,
+                    page.height,
                     layout,
                     target,
+                    edr,
                 );
                 unsafe {
-                    encoder.setRenderPipelineState(&pipeline);
-                    encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
-                    encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                    if bound_page != Some(placement.page) {
+                        encoder.setFragmentTexture_atIndex(Some(&*page.texture), 0);
+                        bound_page = Some(placement.page);
+                    }
                     encoder.setVertexBytes_length_atIndex(
                         overlay_uniform_pointer(&uniforms),
                         mem::size_of::<OverlayUniforms>(),
@@ -1315,7 +1967,68 @@ impl MetalRendererImpl {
             layout,
             target,
         )?;
+        self.draw_danmaku_pictures(encoder, plan, layout, target)
+    }
+
+    /// Emoji go over the text of their comment, in their own colors.
+    fn draw_danmaku_pictures(
+        &mut self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        plan: &DanmakuRenderPlan,
+        layout: VideoPresentationLayout,
+        target: TargetColorState,
+    ) -> Result<()> {
+        let Some(atlas) = plan.color_atlas.as_ref() else {
+            return Ok(());
+        };
+        if plan.color_glyphs.is_empty() {
+            return Ok(());
+        }
+        let texture = self.prepare_danmaku_color_atlas(atlas)?;
+        let pipeline = self.overlay_pipeline_state()?;
+        let sampler = self.video_sampler_state()?;
+        let edr = self.output_mode.is_edr();
+        unsafe {
+            encoder.setRenderPipelineState(&pipeline);
+            encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
+            encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+        }
+        for glyph in &plan.color_glyphs {
+            let uniforms = OverlayUniforms::from_danmaku_picture(glyph, layout, target, edr);
+            unsafe {
+                encoder.setVertexBytes_length_atIndex(
+                    overlay_uniform_pointer(&uniforms),
+                    mem::size_of::<OverlayUniforms>(),
+                    0,
+                );
+                encoder.setFragmentBytes_length_atIndex(
+                    overlay_uniform_pointer(&uniforms),
+                    mem::size_of::<OverlayUniforms>(),
+                    0,
+                );
+                encoder.drawPrimitives_vertexStart_vertexCount(
+                    MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                );
+            }
+        }
         Ok(())
+    }
+
+    fn prepare_danmaku_color_atlas(
+        &mut self,
+        atlas: &DanmakuColorAtlas,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        if let Some((version, texture)) = &self.danmaku_color_atlas_cache
+            && *version == atlas.version
+        {
+            return Ok(texture.clone());
+        }
+        let texture =
+            self.create_overlay_texture(atlas.width as usize, atlas.height as usize, &atlas.rgba)?;
+        self.danmaku_color_atlas_cache = Some((atlas.version, texture.clone()));
+        Ok(texture)
     }
 
     fn prepare_danmaku_alpha_atlas(
@@ -1417,7 +2130,7 @@ impl MetalRendererImpl {
             viewport: layout.overlay_viewport(),
             target_transfer: transfer_code(target.transfer),
             _reserved0: 0,
-            ui_nits: [ui_reference_white_nits(target), 0.0, 0.0, 0.0],
+            ui_nits: ui_output_nits(target, self.output_mode.is_edr()),
         };
         unsafe {
             encoder.setRenderPipelineState(pipeline);
@@ -1443,28 +2156,26 @@ impl MetalRendererImpl {
                 1,
             );
         }
-        let shadow_count = plan
-            .items
-            .iter()
-            .filter(|item| item.shadow_rgba[3] > 0.0)
-            .count();
-        let outline_count = plan
-            .items
-            .iter()
-            .filter(|item| item.outline_rgba[3] > 0.0)
-            .count();
-        let effect_count = shadow_count
-            .checked_add(outline_count)
-            .ok_or_else(|| PlayerError::Renderer("danmaku instance count overflow".to_string()))?;
-        let fill_count = plan.items.len();
-        let total_instances = effect_count
-            .checked_add(fill_count)
-            .ok_or_else(|| PlayerError::Renderer("danmaku instance count overflow".to_string()))?;
-        let total_bytes = instance_bytes_len(total_instances)?;
+        let batch = DanmakuBatch::new(&plan.items);
+        let total_instances = batch.instances.len();
+        if total_instances == 0 {
+            return Ok(());
+        }
+        let glyph_offset = total_instances * mem::size_of::<DanmakuBatchInstance>();
+        let total_bytes = glyph_offset + batch.glyphs.len() * mem::size_of::<DanmakuBatchGlyph>();
         self.stats.last_danmaku_vertex_bytes = total_bytes;
         self.stats.last_danmaku_vertex_count = total_instances;
         let buffer = self.acquire_danmaku_vertex_buffer(total_bytes, command_buffer)?;
-        write_danmaku_instances_direct(&buffer, plan, total_instances)?;
+        unsafe {
+            let dst = buffer.contents().as_ptr().cast::<u8>();
+            std::ptr::copy_nonoverlapping(batch.instances.as_ptr().cast::<u8>(), dst, glyph_offset);
+            std::ptr::copy_nonoverlapping(
+                batch.glyphs.as_ptr().cast::<u8>(),
+                dst.add(glyph_offset),
+                total_bytes - glyph_offset,
+            );
+            encoder.setFragmentBuffer_offset_atIndex(Some(&buffer), glyph_offset, 2);
+        }
         self.stats.last_danmaku_vertex_build_duration = build_started.elapsed();
         self.stats.last_danmaku_vertex_copy_duration = Duration::ZERO;
 
@@ -1555,36 +2266,59 @@ impl MetalRendererImpl {
         Ok(buffer)
     }
 
+    /// Returns `None` when no bitmap has a visible pixel.
     fn prepare_overlay_alpha_atlas(
         &mut self,
         bitmaps: &[SubtitleAlphaBitmap],
+        viewport: OverlayViewport,
         changed: bool,
-    ) -> Result<&OverlayAlphaAtlasCache> {
+    ) -> Result<Option<&OverlayAlphaAtlasCache>> {
+        let previous_changed = self
+            .overlay_alpha_atlas_cache
+            .as_ref()
+            .is_some_and(|cache| cache.previous_call_changed && cache.viewport == viewport);
         if !changed {
-            if let Some(cache) = &self.overlay_alpha_atlas_cache {
-                if cache.can_reuse_for(bitmaps) {
+            if let Some(cache) = &mut self.overlay_alpha_atlas_cache {
+                cache.previous_call_changed = false;
+                if cache.can_reuse_for(bitmaps, viewport) {
                     self.stats.overlay_alpha_atlas_reuses += 1;
-                    return Ok(self
-                        .overlay_alpha_atlas_cache
-                        .as_ref()
-                        .expect("overlay atlas cache exists"));
+                    return Ok(self.overlay_alpha_atlas_cache.as_ref());
                 }
             }
         }
 
-        let Some(plan) = OverlayAlphaAtlasPlan::pack(bitmaps)? else {
-            self.overlay_alpha_atlas_cache = None;
-            return Err(PlayerError::Renderer(
-                "cannot prepare empty overlay alpha atlas".to_string(),
-            ));
+        self.overlay_alpha_atlas_cache = None;
+        let Some(plan) =
+            OverlayAlphaAtlasPlan::pack(bitmaps, viewport, self.max_texture_dimension)?
+        else {
+            return Ok(None);
         };
-        let texture = self.create_overlay_alpha_atlas_texture(&plan)?;
-        self.overlay_alpha_atlas_cache = Some(OverlayAlphaAtlasCache::new(texture, plan, bitmaps));
+        let pages = plan
+            .pages
+            .iter()
+            .map(|page| {
+                Ok(OverlayAlphaAtlasTexture {
+                    texture: self.create_overlay_alpha_texture(
+                        page.width,
+                        page.height,
+                        page.width,
+                        &page.pixels,
+                    )?,
+                    width: page.width,
+                    height: page.height,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.overlay_alpha_atlas_cache = Some(OverlayAlphaAtlasCache::new(
+            pages,
+            plan.placements,
+            bitmaps,
+            viewport,
+            changed,
+            previous_changed,
+        ));
         self.stats.overlay_alpha_atlas_uploads += 1;
-        Ok(self
-            .overlay_alpha_atlas_cache
-            .as_ref()
-            .expect("overlay atlas cache exists"))
+        Ok(self.overlay_alpha_atlas_cache.as_ref())
     }
 
     fn create_overlay_texture(
@@ -1627,13 +2361,6 @@ impl MetalRendererImpl {
             );
         }
         Ok(texture)
-    }
-
-    fn create_overlay_alpha_atlas_texture(
-        &self,
-        atlas: &OverlayAlphaAtlasPlan,
-    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
-        self.create_overlay_alpha_texture(atlas.width, atlas.height, atlas.stride, &atlas.pixels)
     }
 
     fn create_overlay_alpha_texture(
@@ -1741,6 +2468,7 @@ impl MetalRendererImpl {
                 metal_pixel_format: plane.name,
             });
             imported_textures.push(ImportedVideoPlaneTexture {
+                backing_buffer: None,
                 cv_texture: Some(texture),
                 metal_texture,
             });
@@ -1779,23 +2507,13 @@ impl MetalRendererImpl {
         let height = frame.height as usize;
         let chroma_width = width.div_ceil(2);
         let chroma_height = height.div_ceil(2);
-        let (
-            format,
-            luma_format,
-            chroma_format,
-            luma_stride,
-            chroma_stride,
-            luma_name,
-            chroma_name,
-        ) = match frame.format {
+        let (format, luma_format, chroma_format, luma_stride, chroma_stride) = match frame.format {
             PlanarPixelFormat::Nv12 => (
                 ImportedVideoFormat::Nv12,
                 MTLPixelFormat::R8Unorm,
                 MTLPixelFormat::RG8Unorm,
                 width,
                 chroma_width * 2,
-                "R8Unorm",
-                "RG8Unorm",
             ),
             PlanarPixelFormat::P010 => (
                 ImportedVideoFormat::P010,
@@ -1803,8 +2521,6 @@ impl MetalRendererImpl {
                 MTLPixelFormat::RG16Unorm,
                 width * 2,
                 chroma_width * 4,
-                "R16Unorm",
-                "RG16Unorm",
             ),
         };
         let luma =
@@ -1816,7 +2532,224 @@ impl MetalRendererImpl {
             chroma_stride,
             &frame.chroma,
         )?;
-        Ok(ImportedVideoFrameResult {
+        Ok(Self::planar_video_frame_result(
+            width, height, format, full_range, luma, chroma,
+        ))
+    }
+
+    pub(super) fn upload_software_nv12(
+        &self,
+        frame: &SoftwareNv12Upload<'_>,
+        full_range: bool,
+    ) -> Result<ImportedVideoFrameResult> {
+        let (width, height) = frame.dimensions();
+        let y = frame.luma();
+        let (uv, uv_stride) = frame.chroma_parts();
+        // The prepared view validated every source plane and finished UV
+        // packing before this point. Both sources live through these
+        // synchronous copies; no source pointer enters the returned frame.
+        let (luma, chroma) = unsafe {
+            (
+                self.create_video_plane_texture_from_ptr(
+                    width,
+                    height,
+                    MTLPixelFormat::R8Unorm,
+                    y.stride(),
+                    y.as_ptr(),
+                )?,
+                self.create_video_plane_texture_from_ptr(
+                    width.div_ceil(2),
+                    height.div_ceil(2),
+                    MTLPixelFormat::RG8Unorm,
+                    uv_stride,
+                    uv,
+                )?,
+            )
+        };
+        Ok(Self::planar_video_frame_result(
+            width,
+            height,
+            ImportedVideoFormat::Nv12,
+            full_range,
+            luma,
+            chroma,
+        ))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn upload_linear_yuv420p8_uv(
+        &self,
+        frame: &SoftwareYuv420pUpload<'_>,
+        full_range: bool,
+    ) -> Result<Option<ImportedVideoFrameResult>> {
+        if !self.device.hasUnifiedMemory() {
+            return Ok(None);
+        }
+        let (width, height) = frame.dimensions();
+        if width > self.max_texture_dimension || height > self.max_texture_dimension {
+            return Ok(None);
+        }
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let candidate = (|| {
+            let format = MTLPixelFormat::RG8Unorm;
+            let (pitch, len) = checked_linear_plane_layout(
+                cw.checked_mul(2)?,
+                ch,
+                self.device
+                    .minimumLinearTextureAlignmentForPixelFormat(format),
+                self.device.maxBufferLength(),
+            )?;
+            if pitch % 2 != 0 {
+                return None;
+            }
+            let buffer = self
+                .device
+                .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)?;
+            let descriptor = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    format, cw, ch, false,
+                )
+            };
+            descriptor.setTextureType(MTLTextureType::Type2D);
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
+            descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+            let texture =
+                buffer.newTextureWithDescriptor_offset_bytesPerRow(&descriptor, 0, pitch)?;
+            // Fresh newBufferWithLength:options: storage is already zeroed.
+            // CPU access is exclusive until publication; backing is never reused.
+            unsafe {
+                frame.write_chroma_into(
+                    std::slice::from_raw_parts_mut(buffer.contents().as_ptr().cast::<u8>(), len),
+                    pitch,
+                )?;
+            }
+            Some((buffer, texture))
+        })();
+        let Some((uv_buffer, chroma)) = candidate else {
+            return Ok(None);
+        };
+        let y = frame.luma();
+        // Keep the original synchronous Y upload. Once UV succeeds, a Y
+        // allocation failure propagates without repeating the upload path.
+        let luma = unsafe {
+            self.create_video_plane_texture_from_ptr(
+                width,
+                height,
+                MTLPixelFormat::R8Unorm,
+                y.stride(),
+                y.as_ptr(),
+            )?
+        };
+        let mut result = Self::planar_video_frame_result(
+            width,
+            height,
+            ImportedVideoFormat::Nv12,
+            full_range,
+            luma,
+            chroma,
+        );
+        result.textures.planes[1].backing_buffer = Some(uv_buffer);
+        Ok(Some(result))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn upload_linear_p010(
+        &self,
+        frame: &SoftwareP010Upload<'_>,
+        full_range: bool,
+    ) -> Option<ImportedVideoFrameResult> {
+        if !self.device.hasUnifiedMemory() {
+            return None;
+        }
+        let (width, height) = frame.dimensions();
+        if width > self.max_texture_dimension || height > self.max_texture_dimension {
+            return None;
+        }
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let y_format = MTLPixelFormat::R16Unorm;
+        let uv_format = MTLPixelFormat::RG16Unorm;
+        let max_length = self.device.maxBufferLength();
+        let (y_pitch, y_len) = checked_linear_plane_layout(
+            width.checked_mul(2)?,
+            height,
+            self.device
+                .minimumLinearTextureAlignmentForPixelFormat(y_format),
+            max_length,
+        )?;
+        let (uv_pitch, uv_len) = checked_linear_plane_layout(
+            cw.checked_mul(4)?,
+            ch,
+            self.device
+                .minimumLinearTextureAlignmentForPixelFormat(uv_format),
+            max_length,
+        )?;
+        if y_pitch % 2 != 0 || uv_pitch % 4 != 0 {
+            return None;
+        }
+        // Fresh independent backing every frame. No buffer is recycled or
+        // overwritten after publication, including while commands are in flight.
+        let y_buffer = self
+            .device
+            .newBufferWithLength_options(y_len, MTLResourceOptions::StorageModeShared)?;
+        let uv_buffer = self
+            .device
+            .newBufferWithLength_options(uv_len, MTLResourceOptions::StorageModeShared)?;
+        let make_texture =
+            |buffer: &ProtocolObject<dyn MTLBuffer>, width, height, format, pitch| {
+                let descriptor = unsafe {
+                    MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                        format, width, height, false,
+                    )
+                };
+                descriptor.setTextureType(MTLTextureType::Type2D);
+                descriptor.setUsage(MTLTextureUsage::ShaderRead);
+                descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+                buffer.newTextureWithDescriptor_offset_bytesPerRow(&descriptor, 0, pitch)
+            };
+        let y_texture = make_texture(&y_buffer, width, height, y_format, y_pitch)?;
+        let uv_texture = make_texture(&uv_buffer, cw, ch, uv_format, uv_pitch)?;
+        // contents is uninitialized storage: initialize via raw pointers BEFORE
+        // making any Rust reference. These short-lived mutable slices are gone
+        // before the textures/backing enter an ImportedVideoFrame.
+        unsafe {
+            let y_ptr = y_buffer.contents().as_ptr().cast::<u8>();
+            let uv_ptr = uv_buffer.contents().as_ptr().cast::<u8>();
+            std::ptr::write_bytes(y_ptr, 0, y_len);
+            std::ptr::write_bytes(uv_ptr, 0, uv_len);
+            frame.write_into(
+                std::slice::from_raw_parts_mut(y_ptr, y_len),
+                y_pitch,
+                std::slice::from_raw_parts_mut(uv_ptr, uv_len),
+                uv_pitch,
+            )?;
+        }
+        let mut result = Self::planar_video_frame_result(
+            width,
+            height,
+            ImportedVideoFormat::P010,
+            full_range,
+            y_texture,
+            uv_texture,
+        );
+        result.textures.planes[0].backing_buffer = Some(y_buffer);
+        result.textures.planes[1].backing_buffer = Some(uv_buffer);
+        Some(result)
+    }
+
+    fn planar_video_frame_result(
+        width: usize,
+        height: usize,
+        format: ImportedVideoFormat,
+        full_range: bool,
+        luma: Retained<ProtocolObject<dyn MTLTexture>>,
+        chroma: Retained<ProtocolObject<dyn MTLTexture>>,
+    ) -> ImportedVideoFrameResult {
+        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+        let (luma_name, chroma_name) = match format {
+            ImportedVideoFormat::Nv12 => ("R8Unorm", "RG8Unorm"),
+            ImportedVideoFormat::P010 => ("R16Unorm", "RG16Unorm"),
+        };
+        ImportedVideoFrameResult {
             info: ImportedVideoFrameInfo {
                 width,
                 height,
@@ -1852,16 +2785,18 @@ impl MetalRendererImpl {
                 source_pixel_buffer: None,
                 planes: vec![
                     ImportedVideoPlaneTexture {
+                        backing_buffer: None,
                         cv_texture: None,
                         metal_texture: luma,
                     },
                     ImportedVideoPlaneTexture {
+                        backing_buffer: None,
                         cv_texture: None,
                         metal_texture: chroma,
                     },
                 ],
             },
-        })
+        }
     }
 
     fn create_video_plane_texture(
@@ -1881,6 +2816,24 @@ impl MetalRendererImpl {
                 pixels.len()
             )));
         }
+        // SAFETY: a checked, fully initialized packed slice spans every row.
+        unsafe {
+            self.create_video_plane_texture_from_ptr(width, height, format, stride, pixels.as_ptr())
+        }
+    }
+
+    /// # Safety
+    /// The source must remain valid through replaceRegion, with initialized
+    /// visible pixels in every row separated by stride. Padding is not read
+    /// through a Rust reference. The texture consumes this data synchronously.
+    unsafe fn create_video_plane_texture_from_ptr(
+        &self,
+        width: usize,
+        height: usize,
+        format: MTLPixelFormat,
+        stride: usize,
+        pixels: *const u8,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
         let descriptor = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                 format, width, height, false,
@@ -1906,7 +2859,7 @@ impl MetalRendererImpl {
             texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 region,
                 0,
-                NonNull::new(pixels.as_ptr().cast::<c_void>().cast_mut())
+                NonNull::new(pixels.cast::<c_void>().cast_mut())
                     .expect("software video plane pointer is non-null"),
                 stride,
             );
@@ -1940,52 +2893,86 @@ impl MetalRendererImpl {
         Ok(self.texture_cache.as_deref().expect("texture cache exists"))
     }
 
+    #[cfg(target_os = "macos")]
+    fn video_pipeline_for_playback(
+        &mut self,
+        frame: &VideoRenderFrame<'_>,
+        textures: &ImportedVideoFrameTextures,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        // of_for_representation sets flags.x exactly when source DOVI data is present.
+        if frame.pipeline.source.dovi.is_none()
+            && !frame.pipeline.source.is_hdr()
+            && self.output_mode == MetalOutputMode::Sdr
+            && self.drawable_pixel_format == MetalDrawablePixelFormat::Bgra8Unorm
+            && !self.video_alpha_mode.has_alpha()
+            && self.layer.is_some()
+            && textures.source_pixel_buffer.is_some()
+            && frame.frame.info.format == ImportedVideoFormat::Nv12
+            && let Some(pipeline) = self.sdr_pipeline_without_dovi.get_or_init(|| {
+                let source = format!("#define ERIKA_NO_DOLBY_VISION\n{VIDEO_SHADER_SOURCE}");
+                self.build_video_pipeline(&source).ok()
+            })
+        {
+            // This specialization always targets BGRA8 and can coexist with
+            // the general pipeline when frame metadata changes mid-stream.
+            return Ok(pipeline.clone());
+        }
+        self.video_pipeline_state()
+    }
+
     fn video_pipeline_state(
         &mut self,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
         if self.video_pipeline.is_none() {
-            let library = self
-                .device
-                .newLibraryWithSource_options_error(&NSString::from_str(VIDEO_SHADER_SOURCE), None)
-                .map_err(|error| {
-                    PlayerError::Renderer(format!(
-                        "Metal video shader compile failed: {}",
-                        error.localizedDescription()
-                    ))
-                })?;
-            let vertex = library
-                .newFunctionWithName(&NSString::from_str("erika_video_vertex"))
-                .ok_or_else(|| {
-                    PlayerError::Renderer("Metal shader missing erika_video_vertex".to_string())
-                })?;
-            let fragment = library
-                .newFunctionWithName(&NSString::from_str("erika_video_fragment"))
-                .ok_or_else(|| {
-                    PlayerError::Renderer("Metal shader missing erika_video_fragment".to_string())
-                })?;
-            let descriptor = MTLRenderPipelineDescriptor::new();
-            descriptor.setLabel(Some(&NSString::from_str("Erika Video Pipeline")));
-            descriptor.setVertexFunction(Some(&*vertex));
-            descriptor.setFragmentFunction(Some(&*fragment));
-            let attachments = descriptor.colorAttachments();
-            let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
-            attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
-            let pipeline = self
-                .device
-                .newRenderPipelineStateWithDescriptor_error(&descriptor)
-                .map_err(|error| {
-                    PlayerError::Renderer(format!(
-                        "Metal video pipeline create failed: {}",
-                        error.localizedDescription()
-                    ))
-                })?;
-            self.video_pipeline = Some(pipeline);
+            self.video_pipeline = Some(self.build_video_pipeline(VIDEO_SHADER_SOURCE)?);
         }
         Ok(self
             .video_pipeline
             .as_ref()
             .expect("video pipeline exists")
             .clone())
+    }
+
+    fn build_video_pipeline(
+        &self,
+        source: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        let library = self
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+            .map_err(|error| {
+                PlayerError::Renderer(format!(
+                    "Metal video shader compile failed: {}",
+                    error.localizedDescription()
+                ))
+            })?;
+        let vertex = library
+            .newFunctionWithName(&NSString::from_str("erika_video_vertex"))
+            .ok_or_else(|| {
+                PlayerError::Renderer("Metal shader missing erika_video_vertex".to_string())
+            })?;
+        let fragment = library
+            .newFunctionWithName(&NSString::from_str("erika_video_fragment"))
+            .ok_or_else(|| {
+                PlayerError::Renderer("Metal shader missing erika_video_fragment".to_string())
+            })?;
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setLabel(Some(&NSString::from_str("Erika Video Pipeline")));
+        descriptor.setVertexFunction(Some(&*vertex));
+        descriptor.setFragmentFunction(Some(&*fragment));
+        let attachments = descriptor.colorAttachments();
+        let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
+        attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
+        let pipeline = self
+            .device
+            .newRenderPipelineStateWithDescriptor_error(&descriptor)
+            .map_err(|error| {
+                PlayerError::Renderer(format!(
+                    "Metal video pipeline create failed: {}",
+                    error.localizedDescription()
+                ))
+            })?;
+        Ok(pipeline)
     }
 
     fn video_sampler_state(&mut self) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>> {
@@ -2160,6 +3147,35 @@ struct VideoUniforms {
     nits: [f32; 4],
     luma_coefficients: [f32; 4],
     gamut_matrix_rows: [[f32; 4]; 3],
+    ipt_matrix_rows: [[f32; 4]; 9],
+    tone_map_extra: [f32; 4],
+    tone_map_coeffs: [f32; 4],
+    gamut_lut_enabled: u32,
+    gamut_primaries: u32,
+    gamut_reserved0: u32,
+    gamut_reserved1: u32,
+    dovi: DoviUniforms,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn checked_linear_plane_layout(
+    row_bytes: usize,
+    rows: usize,
+    alignment: usize,
+    max_length: usize,
+) -> Option<(usize, usize)> {
+    if row_bytes == 0 || rows == 0 || alignment == 0 {
+        return None;
+    }
+    let pitch = row_bytes
+        .checked_add(alignment - 1)?
+        .checked_div(alignment)?
+        .checked_mul(alignment)?;
+    let len = pitch.checked_mul(rows)?;
+    if len > isize::MAX as usize || len > max_length {
+        return None;
+    }
+    Some((pitch, len))
 }
 
 fn metal_pixel_format(format: MetalDrawablePixelFormat) -> MTLPixelFormat {
@@ -2264,12 +3280,26 @@ fn ui_reference_white_nits(target: TargetColorState) -> f32 {
     }
 }
 
-fn tone_map_code(operator: ToneMapOperator) -> u32 {
-    match operator {
-        ToneMapOperator::Clip => 0,
-        ToneMapOperator::Reinhard => 1,
-        ToneMapOperator::Mobius => 2,
+/// `ui_nits.y`: non-zero when the drawable holds linear light (Apple EDR /
+/// extended-linear output), in which case the UI color must be linearized
+/// before compositing — the video pass writes linear values into the same
+/// buffer. PQ targets encode the UI inside the shader and SDR targets
+/// composite in the output transfer, so both keep 0 here.
+fn ui_linear_reference_white_nits(target: TargetColorState, edr_output: bool) -> f32 {
+    if !edr_output || matches!(target.transfer, TransferFunction::Pq) {
+        0.0
+    } else {
+        target.reference_white_nits.max(1.0)
     }
+}
+
+fn ui_output_nits(target: TargetColorState, edr_output: bool) -> [f32; 4] {
+    [
+        ui_reference_white_nits(target),
+        ui_linear_reference_white_nits(target, edr_output),
+        0.0,
+        0.0,
+    ]
 }
 
 fn luma_coefficients(coeffs: crate::renderer::pipeline::LumaCoefficients) -> [f32; 4] {
@@ -2297,31 +3327,6 @@ struct DanmakuBatchUniforms {
     ui_nits: [f32; 4],
 }
 
-const DANMAKU_FILL_ATLAS_TEXTURE: u32 = 0;
-const DANMAKU_OUTLINE_ATLAS_TEXTURE: u32 = 1;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DanmakuBatchInstance {
-    rect: [f32; 4],
-    tex_rect: [f32; 4],
-    color: [f32; 4],
-    atlas_texture: u32,
-    _reserved0: [u32; 3],
-}
-
-impl DanmakuBatchInstance {
-    fn new(rect: [f32; 4], tex_rect: [f32; 4], color: [f32; 4], atlas_texture: u32) -> Self {
-        Self {
-            rect,
-            tex_rect,
-            color,
-            atlas_texture,
-            _reserved0: [0; 3],
-        }
-    }
-}
-
 impl OverlayUniforms {
     fn from_plane(
         x: i32,
@@ -2330,6 +3335,7 @@ impl OverlayUniforms {
         height: u32,
         layout: VideoPresentationLayout,
         target: TargetColorState,
+        edr_output: bool,
     ) -> Self {
         Self {
             rect: layout.map_source_rect(x as f32, y as f32, width as f32, height as f32),
@@ -2338,7 +3344,25 @@ impl OverlayUniforms {
             overlay_mode: 0,
             target_transfer: transfer_code(target.transfer),
             color: [1.0, 1.0, 1.0, 1.0],
-            ui_nits: [ui_reference_white_nits(target), 0.0, 0.0, 0.0],
+            ui_nits: ui_output_nits(target, edr_output),
+        }
+    }
+
+    /// Danmaku rectangles are in the overlay's own pixels already.
+    fn from_danmaku_picture(
+        glyph: &DanmakuColorGlyph,
+        layout: VideoPresentationLayout,
+        target: TargetColorState,
+        edr_output: bool,
+    ) -> Self {
+        Self {
+            rect: glyph.rect,
+            tex_rect: glyph.tex_rect,
+            viewport: layout.overlay_viewport(),
+            overlay_mode: 2,
+            target_transfer: transfer_code(target.transfer),
+            color: [1.0, 1.0, 1.0, glyph.opacity],
+            ui_nits: ui_output_nits(target, edr_output),
         }
     }
 
@@ -2349,22 +3373,23 @@ impl OverlayUniforms {
         atlas_height: usize,
         layout: VideoPresentationLayout,
         target: TargetColorState,
+        edr_output: bool,
     ) -> Self {
         let color = AssColor::from_libass_rgba(bitmap.color_rgba);
         let atlas_width = atlas_width.max(1) as f32;
         let atlas_height = atlas_height.max(1) as f32;
         Self {
             rect: layout.map_source_rect(
-                bitmap.placement.x as f32,
-                bitmap.placement.y as f32,
-                bitmap.placement.width as f32,
-                bitmap.placement.height as f32,
+                bitmap.placement.x as f32 + placement.source_x as f32,
+                bitmap.placement.y as f32 + placement.source_y as f32,
+                placement.width as f32,
+                placement.height as f32,
             ),
             tex_rect: [
                 placement.x as f32 / atlas_width,
                 placement.y as f32 / atlas_height,
-                bitmap.placement.width as f32 / atlas_width,
-                bitmap.placement.height as f32 / atlas_height,
+                placement.width as f32 / atlas_width,
+                placement.height as f32 / atlas_height,
             ],
             viewport: layout.overlay_viewport(),
             overlay_mode: 1,
@@ -2375,7 +3400,7 @@ impl OverlayUniforms {
                 color.blue as f32 / 255.0,
                 color.alpha as f32 / 255.0,
             ],
-            ui_nits: [ui_reference_white_nits(target), 0.0, 0.0, 0.0],
+            ui_nits: ui_output_nits(target, edr_output),
         }
     }
 }
@@ -2387,114 +3412,6 @@ fn overlay_uniform_pointer(uniforms: &OverlayUniforms) -> NonNull<c_void> {
             .cast_mut(),
     )
     .expect("overlay uniform pointer is non-null")
-}
-
-fn instance_bytes_len(instance_count: usize) -> Result<usize> {
-    instance_count
-        .checked_mul(mem::size_of::<DanmakuBatchInstance>())
-        .ok_or_else(|| PlayerError::Renderer("danmaku batch instance buffer overflow".to_string()))
-}
-
-fn write_danmaku_instances_direct(
-    buffer: &ProtocolObject<dyn MTLBuffer>,
-    plan: &DanmakuRenderPlan,
-    total_instances: usize,
-) -> Result<()> {
-    if total_instances == 0 {
-        return Ok(());
-    }
-    let byte_len = instance_bytes_len(total_instances)?;
-    let end = byte_len;
-    if end > buffer.length() {
-        return Err(PlayerError::Renderer(
-            "danmaku instance buffer too small".to_string(),
-        ));
-    }
-    unsafe {
-        let dst = buffer.contents().as_ptr() as *mut DanmakuBatchInstance;
-        let mut write_index = 0usize;
-        let written = for_each_ordered_danmaku_instance(&plan.items, |instance| {
-            dst.add(write_index).write(instance);
-            write_index += 1;
-        });
-        debug_assert_eq!(written, total_instances);
-        debug_assert_eq!(write_index, total_instances);
-    }
-    Ok(())
-}
-
-fn for_each_ordered_danmaku_instance(
-    items: &[crate::danmaku::DanmakuGlyphInstance],
-    mut emit: impl FnMut(DanmakuBatchInstance),
-) -> usize {
-    // Scanning for the next different `item_id` only yields whole danmaku
-    // while each item's glyphs stay contiguous: one run per distinct item. If
-    // that ever stops holding, items silently split into several groups and
-    // the shadow/outline/fill layering breaks again with no other symptom.
-    debug_assert_eq!(
-        items
-            .windows(2)
-            .filter(|pair| pair[0].item_id != pair[1].item_id)
-            .count()
-            + usize::from(!items.is_empty()),
-        items
-            .iter()
-            .map(|item| item.item_id)
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        "danmaku glyph instances must stay grouped by item_id"
-    );
-
-    let mut emitted = 0usize;
-    let mut group_start = 0usize;
-    while group_start < items.len() {
-        let item_id = items[group_start].item_id;
-        let group_end = items[group_start..]
-            .iter()
-            .position(|item| item.item_id != item_id)
-            .map_or(items.len(), |offset| group_start + offset);
-        let group = &items[group_start..group_end];
-
-        // Preserve danmaku z-order as complete visual units. Drawing every
-        // outline on the surface before every fill lets a lower item's fill
-        // erase the upper item's edge where they overlap.
-        for item in group {
-            if item.shadow_rgba[3] > 0.0 {
-                let mut rect = item.rect;
-                rect[0] += item.shadow_offset[0];
-                rect[1] += item.shadow_offset[1];
-                emit(DanmakuBatchInstance::new(
-                    rect,
-                    item.tex_rect,
-                    item.shadow_rgba,
-                    DANMAKU_OUTLINE_ATLAS_TEXTURE,
-                ));
-                emitted += 1;
-            }
-        }
-        for item in group {
-            if item.outline_rgba[3] > 0.0 {
-                emit(DanmakuBatchInstance::new(
-                    item.rect,
-                    item.tex_rect,
-                    item.outline_rgba,
-                    DANMAKU_OUTLINE_ATLAS_TEXTURE,
-                ));
-                emitted += 1;
-            }
-        }
-        for item in group {
-            emit(DanmakuBatchInstance::new(
-                item.rect,
-                item.tex_rect,
-                item.color_rgba,
-                DANMAKU_FILL_ATLAS_TEXTURE,
-            ));
-            emitted += 1;
-        }
-        group_start = group_end;
-    }
-    emitted
 }
 
 fn draw_danmaku_instance_batch(
@@ -2521,28 +3438,51 @@ fn draw_danmaku_instance_batch(
     Ok(())
 }
 
+/// One piece of a subtitle bitmap in the atlas: usually its whole visible
+/// part, or a tile of it when that part is larger than a texture may be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OverlayAlphaAtlasPlacement {
     bitmap_index: usize,
+    page: usize,
+    /// Top-left of the piece in its page.
     x: usize,
     y: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OverlayAlphaAtlasPlan {
+    /// Top-left of the piece in its bitmap.
+    source_x: usize,
+    source_y: usize,
     width: usize,
     height: usize,
-    stride: usize,
+}
+
+/// An R8 atlas image with a stride of `width`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayAlphaAtlasPage {
+    width: usize,
+    height: usize,
     pixels: Vec<u8>,
+}
+
+/// Subtitle bitmaps packed into as many pages as the texture size limit
+/// needs. Placements keep the bitmaps' draw order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayAlphaAtlasPlan {
+    pages: Vec<OverlayAlphaAtlasPage>,
     placements: Vec<OverlayAlphaAtlasPlacement>,
 }
 
-struct OverlayAlphaAtlasCache {
+#[derive(Clone)]
+struct OverlayAlphaAtlasTexture {
     texture: Retained<ProtocolObject<dyn MTLTexture>>,
     width: usize,
     height: usize,
+}
+
+struct OverlayAlphaAtlasCache {
+    pages: Vec<OverlayAlphaAtlasTexture>,
     placements: Vec<OverlayAlphaAtlasPlacement>,
-    signature: OverlayAlphaAtlasSignature,
+    viewport: OverlayViewport,
+    signature: Option<OverlayAlphaAtlasKey>,
+    previous_call_changed: bool,
 }
 
 struct DanmakuAlphaAtlasCache {
@@ -2618,21 +3558,150 @@ fn update_danmaku_alpha_texture(
 
 impl OverlayAlphaAtlasCache {
     fn new(
-        texture: Retained<ProtocolObject<dyn MTLTexture>>,
-        plan: OverlayAlphaAtlasPlan,
+        pages: Vec<OverlayAlphaAtlasTexture>,
+        placements: Vec<OverlayAlphaAtlasPlacement>,
         bitmaps: &[SubtitleAlphaBitmap],
+        viewport: OverlayViewport,
+        changed: bool,
+        previous_changed: bool,
     ) -> Self {
         Self {
-            texture,
-            width: plan.width,
-            height: plan.height,
-            placements: plan.placements,
-            signature: OverlayAlphaAtlasSignature::from_bitmaps(bitmaps),
+            pages,
+            placements,
+            viewport,
+            // Consecutive dirty calls must upload anyway. Defer the full alpha
+            // scan until a later rebuild can establish a reusable signature.
+            signature: (!(changed && previous_changed))
+                .then(|| OverlayAlphaAtlasKey::from_bitmaps(bitmaps)),
+            previous_call_changed: changed,
         }
     }
 
-    fn can_reuse_for(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
-        self.signature == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)
+    fn can_reuse_for(&self, bitmaps: &[SubtitleAlphaBitmap], viewport: OverlayViewport) -> bool {
+        self.viewport == viewport
+            && self
+                .signature
+                .as_ref()
+                .is_some_and(|signature| signature.matches(bitmaps))
+    }
+}
+
+// Static subtitles are checked each display tick. A bounded snapshot lets the
+// platform's byte comparison replace the scalar hash without trusting `changed`
+// or public Vec identity. Larger overlays retain the existing hash policy.
+const OVERLAY_ALPHA_EXACT_KEY_BUDGET: usize = 2 * 1024 * 1024;
+
+enum OverlayAlphaAtlasKey {
+    Exact(OverlayAlphaExactKey),
+    Hashed(OverlayAlphaAtlasSignature),
+}
+
+impl OverlayAlphaAtlasKey {
+    fn from_bitmaps(bitmaps: &[SubtitleAlphaBitmap]) -> Self {
+        Self::with_budget(bitmaps, OVERLAY_ALPHA_EXACT_KEY_BUDGET)
+    }
+
+    fn with_budget(bitmaps: &[SubtitleAlphaBitmap], budget: usize) -> Self {
+        OverlayAlphaExactKey::new(bitmaps, budget)
+            .map(Self::Exact)
+            .unwrap_or_else(|| Self::Hashed(OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)))
+    }
+
+    fn matches(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
+        match self {
+            Self::Exact(key) => key.matches(bitmaps),
+            Self::Hashed(key) => *key == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Exact(key) => {
+                key.layouts.len() * std::mem::size_of::<OverlayAlphaBitmapLayout>()
+                    + key.pixels.len()
+            }
+            Self::Hashed(key) => {
+                key.bitmaps.capacity() * std::mem::size_of::<OverlayAlphaBitmapSignature>()
+            }
+        }
+    }
+}
+
+struct OverlayAlphaExactKey {
+    layouts: Box<[OverlayAlphaBitmapLayout]>,
+    // Visible rows only: stride padding may be uninitialized in native images.
+    pixels: Box<[u8]>,
+}
+
+impl OverlayAlphaExactKey {
+    fn new(bitmaps: &[SubtitleAlphaBitmap], budget: usize) -> Option<Self> {
+        let layout_bytes = bitmaps
+            .len()
+            .checked_mul(std::mem::size_of::<OverlayAlphaBitmapLayout>())?;
+        let mut total = layout_bytes.checked_add(std::mem::size_of::<Self>())?;
+        for bitmap in bitmaps {
+            if !bitmap.is_valid() {
+                return None;
+            }
+            total = total.checked_add(
+                (bitmap.placement.width as usize).checked_mul(bitmap.placement.height as usize)?,
+            )?;
+            if total > budget {
+                return None;
+            }
+        }
+        if total > budget {
+            return None;
+        }
+        let layouts = bitmaps
+            .iter()
+            .map(OverlayAlphaBitmapLayout::from_bitmap)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut pixels = Vec::with_capacity(total - layout_bytes - std::mem::size_of::<Self>());
+        for bitmap in bitmaps {
+            let width = bitmap.placement.width as usize;
+            if width == 0 {
+                continue;
+            }
+            for row in 0..bitmap.placement.height as usize {
+                let start = row.checked_mul(bitmap.stride)?;
+                pixels.extend_from_slice(bitmap.alpha.get(start..start.checked_add(width)?)?);
+            }
+        }
+        Some(Self {
+            layouts,
+            pixels: pixels.into_boxed_slice(),
+        })
+    }
+
+    fn matches(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
+        if self.layouts.len() != bitmaps.len() {
+            return false;
+        }
+        let mut offset = 0;
+        for (layout, bitmap) in self.layouts.iter().zip(bitmaps) {
+            if *layout != OverlayAlphaBitmapLayout::from_bitmap(bitmap) || !bitmap.is_valid() {
+                return false;
+            }
+            let width = bitmap.placement.width as usize;
+            if width == 0 {
+                continue;
+            }
+            for row in 0..bitmap.placement.height as usize {
+                let Some(start) = row.checked_mul(bitmap.stride) else {
+                    return false;
+                };
+                let Some(end) = start.checked_add(width) else {
+                    return false;
+                };
+                if bitmap.alpha.get(start..end) != self.pixels.get(offset..offset + width) {
+                    return false;
+                }
+                offset += width;
+            }
+        }
+        offset == self.pixels.len()
     }
 }
 
@@ -2654,6 +3723,21 @@ impl OverlayAlphaAtlasSignature {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OverlayAlphaBitmapSignature {
+    layout: OverlayAlphaBitmapLayout,
+    alpha_hash: u64,
+}
+
+impl OverlayAlphaBitmapSignature {
+    fn from_bitmap(bitmap: &SubtitleAlphaBitmap) -> Self {
+        Self {
+            layout: OverlayAlphaBitmapLayout::from_bitmap(bitmap),
+            alpha_hash: hash_alpha_bitmap(bitmap),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayAlphaBitmapLayout {
     x: i32,
     y: i32,
     width: u32,
@@ -2661,10 +3745,9 @@ struct OverlayAlphaBitmapSignature {
     stride: usize,
     color_rgba: u32,
     alpha_len: usize,
-    alpha_hash: u64,
 }
 
-impl OverlayAlphaBitmapSignature {
+impl OverlayAlphaBitmapLayout {
     fn from_bitmap(bitmap: &SubtitleAlphaBitmap) -> Self {
         Self {
             x: bitmap.placement.x,
@@ -2674,7 +3757,6 @@ impl OverlayAlphaBitmapSignature {
             stride: bitmap.stride,
             color_rgba: bitmap.color_rgba,
             alpha_len: bitmap.alpha.len(),
-            alpha_hash: hash_alpha_bitmap(bitmap),
         }
     }
 }
@@ -2686,6 +3768,9 @@ fn hash_alpha_bitmap(bitmap: &SubtitleAlphaBitmap) -> u64 {
     let mut hash = FNV_OFFSET;
     let width = bitmap.placement.width as usize;
     let height = bitmap.placement.height as usize;
+    if width == 0 {
+        return hash;
+    }
     for row in 0..height {
         let row_start = row.saturating_mul(bitmap.stride);
         let row_end = row_start.saturating_add(width);
@@ -2700,36 +3785,28 @@ fn hash_alpha_bitmap(bitmap: &SubtitleAlphaBitmap) -> u64 {
     hash
 }
 
+/// Transparent texels between packed pieces, so linear filtering at the edge
+/// of one piece never reads its neighbour when the overlay is scaled.
+const OVERLAY_ALPHA_ATLAS_GUTTER: usize = 1;
+
 impl OverlayAlphaAtlasPlan {
-    fn pack(bitmaps: &[SubtitleAlphaBitmap]) -> Result<Option<Self>> {
-        let total_width = bitmaps.iter().try_fold(0usize, |sum, bitmap| {
-            let width = bitmap.placement.width as usize;
-            sum.checked_add(width).ok_or_else(|| {
-                PlayerError::Renderer("overlay alpha atlas width overflow".to_string())
-            })
-        })?;
-        let max_height = bitmaps
-            .iter()
-            .map(|bitmap| bitmap.placement.height as usize)
-            .max()
-            .unwrap_or(0);
-        if total_width == 0 || max_height == 0 {
-            return Ok(None);
-        }
-
-        let width = total_width;
-        let height = max_height;
-        let len = width.checked_mul(height).ok_or_else(|| {
-            PlayerError::Renderer("overlay alpha atlas size overflow".to_string())
-        })?;
-        let mut pixels = vec![0u8; len];
+    /// Packs `bitmaps` in rows ("shelves") into pages no wider or taller than
+    /// `max_dimension`. Only the part of a bitmap inside `viewport` is packed,
+    /// since nothing outside it is shown, and a visible part still larger
+    /// than `max_dimension` is cut into tiles.
+    ///
+    /// Laying every bitmap side by side in one row made the atlas as wide as
+    /// all of them together: two long ASS tracks with fill and outline at a
+    /// Retina viewport reached 21640 texels and Metal aborted the process.
+    fn pack(
+        bitmaps: &[SubtitleAlphaBitmap],
+        viewport: OverlayViewport,
+        max_dimension: usize,
+    ) -> Result<Option<Self>> {
+        let max_dimension = max_dimension.max(1);
         let mut placements = Vec::with_capacity(bitmaps.len());
-        let mut cursor_x = 0usize;
-
         for (bitmap_index, bitmap) in bitmaps.iter().enumerate() {
-            let bitmap_width = bitmap.placement.width as usize;
-            let bitmap_height = bitmap.placement.height as usize;
-            if bitmap_width == 0 || bitmap_height == 0 {
+            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
                 continue;
             }
             if !bitmap.is_valid() {
@@ -2742,31 +3819,97 @@ impl OverlayAlphaAtlasPlan {
                     bitmap.stride
                 )));
             }
-
-            for row in 0..bitmap_height {
-                let src_start = row * bitmap.stride;
-                let src_end = src_start + bitmap_width;
-                let dst_start = row * width + cursor_x;
-                let dst_end = dst_start + bitmap_width;
-                pixels[dst_start..dst_end].copy_from_slice(&bitmap.alpha[src_start..src_end]);
+            let Some((left, top, right, bottom)) = visible_bitmap_rect(bitmap, viewport) else {
+                continue;
+            };
+            for source_y in (top..bottom).step_by(max_dimension) {
+                for source_x in (left..right).step_by(max_dimension) {
+                    placements.push(OverlayAlphaAtlasPlacement {
+                        bitmap_index,
+                        page: 0,
+                        x: 0,
+                        y: 0,
+                        source_x,
+                        source_y,
+                        width: (right - source_x).min(max_dimension),
+                        height: (bottom - source_y).min(max_dimension),
+                    });
+                }
             }
-
-            placements.push(OverlayAlphaAtlasPlacement {
-                bitmap_index,
-                x: cursor_x,
-                y: 0,
-            });
-            cursor_x += bitmap_width;
+        }
+        if placements.is_empty() {
+            return Ok(None);
         }
 
-        Ok(Some(Self {
-            width,
-            height,
-            stride: width,
-            pixels,
-            placements,
-        }))
+        // Every piece fits an empty shelf and an empty page, so each wrap
+        // below leaves something behind and the loop always places the piece.
+        let mut page_sizes = vec![(0usize, 0usize)];
+        let mut shelf_x = 0usize;
+        let mut shelf_y = 0usize;
+        let mut shelf_height = 0usize;
+        for placement in &mut placements {
+            if shelf_x + placement.width > max_dimension {
+                shelf_y += shelf_height + OVERLAY_ALPHA_ATLAS_GUTTER;
+                shelf_x = 0;
+                shelf_height = 0;
+            }
+            if shelf_y + placement.height > max_dimension {
+                page_sizes.push((0, 0));
+                shelf_x = 0;
+                shelf_y = 0;
+                shelf_height = 0;
+            }
+            placement.page = page_sizes.len() - 1;
+            placement.x = shelf_x;
+            placement.y = shelf_y;
+            shelf_x += placement.width + OVERLAY_ALPHA_ATLAS_GUTTER;
+            shelf_height = shelf_height.max(placement.height);
+            let page = page_sizes.last_mut().expect("atlas has a page");
+            page.0 = page.0.max(placement.x + placement.width);
+            page.1 = page.1.max(placement.y + placement.height);
+        }
+
+        let mut pages = page_sizes
+            .into_iter()
+            .map(|(width, height)| OverlayAlphaAtlasPage {
+                width,
+                height,
+                pixels: vec![0u8; width * height],
+            })
+            .collect::<Vec<_>>();
+        for placement in &placements {
+            let bitmap = &bitmaps[placement.bitmap_index];
+            let page = &mut pages[placement.page];
+            for row in 0..placement.height {
+                let src_start = (placement.source_y + row) * bitmap.stride + placement.source_x;
+                let dst_start = (placement.y + row) * page.width + placement.x;
+                page.pixels[dst_start..dst_start + placement.width]
+                    .copy_from_slice(&bitmap.alpha[src_start..src_start + placement.width]);
+            }
+        }
+
+        Ok(Some(Self { pages, placements }))
     }
+}
+
+/// The part of `bitmap` inside `viewport` as `(left, top, right, bottom)` in
+/// the bitmap's own coordinates, or `None` when none of it is.
+fn visible_bitmap_rect(
+    bitmap: &SubtitleAlphaBitmap,
+    viewport: OverlayViewport,
+) -> Option<(usize, usize, usize, usize)> {
+    let x = i64::from(bitmap.placement.x);
+    let y = i64::from(bitmap.placement.y);
+    let left = (-x).max(0);
+    let top = (-y).max(0);
+    let right = (i64::from(viewport.width) - x).min(i64::from(bitmap.placement.width));
+    let bottom = (i64::from(viewport.height) - y).min(i64::from(bitmap.placement.height));
+    (left < right && top < bottom).then_some((
+        left as usize,
+        top as usize,
+        right as usize,
+        bottom as usize,
+    ))
 }
 
 const VIDEO_SHADER_SOURCE: &str = r#"
@@ -2792,6 +3935,21 @@ struct VideoUniforms {
     float4 nits;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
+    float4 ipt_matrix_rows[9];
+    float4 tone_map_extra;
+    float4 tone_map_coeffs;
+    uint gamut_lut_enabled;
+    uint gamut_primaries;
+    uint gamut_reserved0;
+    uint gamut_reserved1;
+    float4 dovi_flags;
+    float4 dovi_pivots[6];
+    float4 dovi_bounds[3];
+    float4 dovi_coefficients[24];
+    float4 dovi_mmr[144];
+    float4 dovi_nonlinear_matrix[3];
+    float4 dovi_nonlinear_offset;
+    float4 dovi_lms_matrix[3];
 };
 
 float source_peak_nits(constant VideoUniforms& uniforms) {
@@ -2881,25 +4039,16 @@ float3 source_reference_to_nits(float3 rgb, constant VideoUniforms& uniforms) {
     return max(rgb, float3(0.0)) * source_reference_white_nits(uniforms);
 }
 
-float3 tone_map_nits(float3 nits, constant VideoUniforms& uniforms) {
-    float source_peak = source_peak_nits(uniforms);
-    float target_peak = target_peak_nits(uniforms);
-    float3 x = max(nits, float3(0.0)) / target_peak;
-    float white = max(source_peak / target_peak, 1.0);
-    if (uniforms.tone_map == 1) {
-        float white2 = white * white;
-        return target_peak * clamp((x * (float3(1.0) + x / white2)) / (float3(1.0) + x), 0.0, 1.0);
-    }
-    if (uniforms.tone_map == 2) {
-        constexpr float knee = 0.75;
-        float denom = max(white - knee, 0.0001);
-        float3 t = clamp((x - float3(knee)) / denom, 0.0, 1.0);
-        float3 shoulder = knee + (1.0 - knee) * (float3(1.0) - pow(float3(1.0) - t, float3(2.0)));
-        return target_peak * mix(x, shoulder, step(float3(knee), x));
-    }
-    return target_peak * clamp(x, 0.0, 1.0);
+float pq_code(float nits) {
+    return pq_inverse_eotf(clamp(nits, 0.0, 10000.0) / 10000.0);
 }
 
+float nits_from_pq(float code) {
+    return 10000.0 * pq_eotf(clamp(code, 0.0, 1.0));
+}
+
+// Simple primaries conversion (HDR10 output path); the tone-mapped path
+// converts primaries inside the IPT roundtrip instead.
 float3 apply_gamut_map(float3 rgb, constant VideoUniforms& uniforms) {
     return float3(
         dot(uniforms.gamut_matrix_rows[0].xyz, rgb),
@@ -2908,8 +4057,286 @@ float3 apply_gamut_map(float3 rgb, constant VideoUniforms& uniforms) {
     );
 }
 
+// libplacebo pl_smoothstep with arbitrary edge order (Metal smoothstep has
+// undefined results when edge0 >= edge1, and libplacebo's knee tuning term
+// deliberately uses reversed edges).
+float sstep(float edge0, float edge1, float x) {
+    float t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// libplacebo st2094_pick_knee evaluated on absolute PQ codes. The source
+// pivot follows the scene average luminance when known and stays within
+// [10%, 80%] of the range; the destination pivot rescales it into the output
+// range and then adapts towards the 1:1 line (knee_adaptation 0.4).
+float2 st2094_pick_knee(float src_min, float src_max, float src_avg, float dst_min, float dst_max) {
+    constexpr float knee_adaptation = 0.4;
+    constexpr float min_knee = 0.1;
+    constexpr float max_knee = 0.8;
+    constexpr float def_knee = 0.4;
+    float src_knee_min = mix(src_min, src_max, min_knee);
+    float src_knee_max = mix(src_min, src_max, max_knee);
+    float dst_knee_min = mix(dst_min, dst_max, min_knee);
+    float dst_knee_max = mix(dst_min, dst_max, max_knee);
+    float fallback = mix(src_min, src_max, def_knee);
+    float src_knee = clamp(src_avg > 0.0 ? src_avg : fallback, src_knee_min, src_knee_max);
+    float target = (src_knee - src_min) / max(src_max - src_min, 0.000001);
+    float adapted = mix(dst_min, dst_max, target);
+    float tuning = 1.0 - sstep(max_knee, def_knee, target) * sstep(min_knee, def_knee, target);
+    float adaptation = mix(knee_adaptation, 1.0, tuning);
+    float dst_knee = clamp(mix(src_knee, adapted, adaptation), dst_knee_min, dst_knee_max);
+    return float2(src_knee, dst_knee);
+}
+
+// The tone-map curve evaluated on the IPT intensity axis (PQ codes),
+// mirroring libplacebo's tone-map functions. `param` is the per-operator
+// curve parameter from ToneMapConfig::curve_param (0 = operator default).
+float tone_map_curve_pq(float x_in, float param, constant VideoUniforms& uniforms) {
+    float src_peak = source_peak_nits(uniforms);
+    float dst_peak = target_peak_nits(uniforms);
+    float src_avg = uniforms.tone_map_extra.y;
+    float dst_black = uniforms.tone_map_extra.z;
+    float in_min = 0.0;
+    float in_max = max(pq_code(src_peak), 0.000001);
+    float out_min = pq_code(dst_black);
+    float out_max = max(pq_code(dst_peak), 0.000001);
+    float out_range = max(out_max - out_min, 0.000001);
+    float x = clamp(x_in, in_min, in_max);
+    if (uniforms.tone_map == 0) {
+        // Clip: values within the source range pass through untouched.
+        return x;
+    }
+    if (uniforms.tone_map == 1) {
+        // Reinhard (output-relative, libplacebo pl_tone_map_reinhard).
+        //
+        // libplacebo evaluates this curve in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators (BT.2390, spline, ST 2094-10)
+        // work on encoded values. Running it on PQ codes bends the curve's
+        // meaning: against a 1000->203 nit target mid-tones darken badly, and
+        // the Mobius knee lands far below its intended position. Rescale to
+        // linear nits here and encode back at the end.
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
+        float contrast = param > 0.0 ? param : 0.5;
+        float offset = (1.0 - contrast) / max(contrast, 0.000001);
+        float scale = (peak + offset) / peak;
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
+        float mapped = t / (t + offset) * scale;
+        return pq_code(mapped * out_range_nits + out_min_nits);
+    }
+    if (uniforms.tone_map == 2) {
+        // Mobius: Mobius transform with a 1:1 linear region below the knee,
+        // also evaluated in linear nits (see the Reinhard note above). The
+        // knee j is relative to the output range, so the linear region ends
+        // at dst_black + j * (dst_peak - dst_black).
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
+        float j = param > 0.0 ? param : 0.3;
+        float a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
+        float b = (j * j - 2.0 * j * peak + peak) / max(peak - 1.0, 0.000001);
+        float scale = (b * b + 2.0 * b * j + j * j) / (b - a);
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
+        float mapped = t > j ? scale * (t + a) / (t + b) : t;
+        return pq_code(mapped * out_range_nits + out_min_nits);
+    }
+    if (uniforms.tone_map == 3) {
+        // ITU-R BT.2390 EETF with black-point compensation (the libplacebo
+        // version also compensates target black; the earlier port skipped it).
+        float knee_offset = param > 0.0 ? param : 1.0;
+        float max_lum = clamp(out_max / in_max, 0.0, 1.0);
+        float min_lum = out_min / in_max;
+        float ks = (1.0 + knee_offset) * max_lum - knee_offset;
+        float bp = min(max(1.0 / max(min_lum, 0.000001), 0.0), 4.0);
+        float u = x / in_max;
+        if (ks < 1.0 && u > ks) {
+            float tb = (u - ks) / (1.0 - ks);
+            float tb2 = tb * tb;
+            float tb3 = tb2 * tb;
+            u = (2.0 * tb3 - 3.0 * tb2 + 1.0) * ks
+               + (tb3 - 2.0 * tb2 + tb) * (1.0 - ks)
+               + (-2.0 * tb3 + 3.0 * tb2) * max_lum;
+        }
+        if (u < 1.0) {
+            u = u + min_lum * pow(1.0 - u, bp);
+            float gain = max_lum < 1.0
+                ? 1.0 / (1.0 + min_lum / max_lum * pow(1.0 - max_lum, bp))
+                : 1.0;
+            u = gain * (u - min_lum) + min_lum;
+        }
+        return u * in_max;
+    }
+    if (uniforms.tone_map == 4) {
+        // Spline: perceptually linear single-pivot polynomial, the default
+        // tone map of libplacebo and mpv's gpu-next renderer.
+        float contrast = param > 0.0 ? param : 0.3;
+        float fallback_avg = clamp(0.4 * src_peak, 100.0, 400.0);
+        float effective_src_avg = src_avg > 0.0 ? src_avg : fallback_avg;
+        float2 knee = st2094_pick_knee(
+            in_min,
+            in_max,
+            pq_code(effective_src_avg),
+            out_min,
+            out_max
+        );
+        float src_pivot = knee.x;
+        float dst_pivot = knee.y;
+        float slope0 = (dst_pivot - out_min) / max(src_pivot - in_min, 0.000001);
+        float ratio = clamp(1.5 * (in_max / out_max - 1.0), 0.2, 1.2);
+        float slope = pow(slope0, (1.0 - contrast) * ratio);
+        float in_min0 = in_min - src_pivot;
+        float in_max0 = in_max - src_pivot;
+        float out_min0 = out_min - dst_pivot;
+        float out_max0 = out_max - dst_pivot;
+        float pa = (out_min0 - slope * in_min0) / (in_min0 * in_min0);
+        float qa = (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0 * in_max0);
+        float qb = -3.0 * (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0);
+        float xr = x - src_pivot;
+        float mapped = xr > 0.0
+            ? ((qa * xr + qb) * xr + slope) * xr
+            : (pa * xr + slope) * xr;
+        return mapped + dst_pivot;
+    }
+    if (uniforms.tone_map == 5) {
+        // ITU-R BT.2446 method A: Weber-law log compression from the source
+        // peak envelope and a standardized S-curve (mpv's recommended curve
+        // for well-mastered content).
+        float phdr = 1.0 + 32.0 * pow(src_peak / 10000.0, 1.0 / 2.4);
+        float psdr = 1.0 + 32.0 * pow(dst_peak / 10000.0, 1.0 / 2.4);
+        float t = pow(nits_from_pq(x) / max(src_peak, 0.000001), 1.0 / 2.4);
+        t = log(1.0 + (phdr - 1.0) * t) / log(phdr);
+        if (t <= 0.7399) {
+            t = 1.0770 * t;
+        } else if (t < 0.9909) {
+            t = (-1.1510 * t + 2.7811) * t - 0.6302;
+        } else {
+            t = 0.5 * t + 0.5;
+        }
+        t = (pow(psdr, t) - 1.0) / (psdr - 1.0);
+        // BT.1886 EOTF from the target black point and peak.
+        float lb = pow(max(dst_black, 0.0), 1.0 / 2.4);
+        float lw = pow(max(dst_peak, 0.0), 1.0 / 2.4);
+        return pq_code(pow((lw - lb) * t + lb, 2.4));
+    }
+    // SMPTE ST 2094-10 (DolbyVision's dynamic-metadata curve): rational
+    // Mobius interpolation in absolute nits; coefficients are solved per
+    // frame on the CPU from the same scene pivot.
+    float c1 = uniforms.tone_map_coeffs.x;
+    float c2 = uniforms.tone_map_coeffs.y;
+    float c3 = uniforms.tone_map_coeffs.z;
+    float x_nits = nits_from_pq(x);
+    float y_nits = (c1 + c2 * x_nits) / max(1.0 + c3 * x_nits, 0.000001);
+    return pq_code(clamp(y_nits, 0.0, 10000.0));
+}
+
+float3 tone_map_nits(
+    float3 input_nits,
+    texture3d<float, access::sample> gamut_lut,
+    sampler video_sampler,
+    constant VideoUniforms& uniforms
+) {
+    if (uniforms.target_transfer == 3) {
+        // HDR10 output: convert primaries by the gamut matrix and clamp to
+        // the PQ range (no tone mapping; the display does the HDR mapping).
+        return clamp(apply_gamut_map(max(input_nits, float3(0.0)) / source_reference_white_nits(uniforms), uniforms)
+            * source_reference_white_nits(uniforms), float3(0.0), float3(10000.0));
+    }
+    // libplacebo color map: RGB in source primaries (absolute nits) to
+    // HPE-LMS, PQ-encode, IPT, map the intensity axis and apply the
+    // hue-preserving chroma rule, optionally sample the 3D gamut LUT in
+    // IPT space, then decode back to RGB in the target primaries (rows 6-8).
+    // The primaries conversion and gamut mapping happen in this single IPT pass.
+    float3 rgb = max(input_nits, float3(0.0));
+    float3 lms = float3(
+        dot(uniforms.ipt_matrix_rows[0].xyz, rgb),
+        dot(uniforms.ipt_matrix_rows[1].xyz, rgb),
+        dot(uniforms.ipt_matrix_rows[2].xyz, rgb)
+    );
+    float3 lmspq = float3(pq_code(lms.r), pq_code(lms.g), pq_code(lms.b));
+    float3 ipt = float3(
+        dot(float3(0.4, 0.4, 0.2), lmspq),
+        dot(float3(4.455, -4.851, 0.396), lmspq),
+        dot(float3(0.8056, 0.3572, -1.1628), lmspq)
+    );
+    float i_orig = ipt.x;
+    ipt.x = tone_map_curve_pq(ipt.x, uniforms.tone_map_extra.x, uniforms);
+    // Libplacebo's chroma rule: clamp the saturation boost when brightening
+    // and desaturate (by the cubic hull term) when the mapping darkens.
+    float2 hull = float2(i_orig, ipt.x);
+    float2 hull_c = ((hull - float2(6.0)) * hull + float2(9.0)) * hull;
+    float ratio = min(i_orig / max(ipt.x, 0.000001), hull_c.y / max(hull_c.x, 0.000001));
+    ipt.yz = ipt.yz * ratio;
+
+    if (uniforms.gamut_lut_enabled != 0) {
+        // I axis spans the target's [black, peak] in PQ codes, matching
+        // libplacebo's gamut.min_luma/max_luma (tone_map_extra.z is the
+        // target black in nits, the same value the LUT was generated for).
+        float lut_min = pq_code(uniforms.tone_map_extra.z);
+        float lut_max = max(pq_code(target_peak_nits(uniforms)), 0.000001);
+        float lut_range = max(lut_max - lut_min, 0.000001);
+        float3 pos = float3(
+            clamp((ipt.x - lut_min) / lut_range, 0.0, 1.0),
+            clamp(2.0 * length(ipt.yz), 0.0, 1.0),
+            0.5 + 0.5 * atan2(ipt.z, ipt.y) / 3.14159265
+        );
+        // libplacebo's texel_scale: the lattice position must be remapped to
+        // the texel-center coordinate, otherwise the low end of the chroma
+        // axis (whose first texel stores zero chroma) leaks in and crushes
+        // saturation.
+        float3 idx = float3(
+            pos.x * (47.0 / 48.0) + 0.5 / 48.0,
+            pos.y * (31.0 / 32.0) + 0.5 / 32.0,
+            pos.z * (255.0 / 256.0) + 0.5 / 256.0
+        );
+        float3 sampled = gamut_lut.sample(video_sampler, idx).xyz;
+        ipt = float3(sampled.x, sampled.y - 0.5, sampled.z - 0.5);
+    }
+
+    float3 lmspq_out = float3(
+        dot(float3(1.0, 0.0975689, 0.205226), ipt),
+        dot(float3(1.0, -0.113876, 0.133217), ipt),
+        dot(float3(1.0, 0.0326151, -0.676887), ipt)
+    );
+    float3 lms_out = float3(
+        nits_from_pq(lmspq_out.r),
+        nits_from_pq(lmspq_out.g),
+        nits_from_pq(lmspq_out.b)
+    );
+    return float3(
+        dot(uniforms.ipt_matrix_rows[6].xyz, lms_out),
+        dot(uniforms.ipt_matrix_rows[7].xyz, lms_out),
+        dot(uniforms.ipt_matrix_rows[8].xyz, lms_out)
+    );
+}
+
+// Hue-preserving gamut mapping: the linear gamut matrix can push highly
+// saturated wide-gamut colors outside the target gamut (negative
+// components). Blending those towards luma shifts hue — BT.2020 primary
+// red picks up blue and turns pink. Instead blend towards the naive clip
+// by an out-of-gamut smoothstep factor: slightly-out colors stay nearly
+// intact, strongly-out primaries land on the pure target primary with
+// their hue intact, matching mpv's perceptual gamut handling. Mirrors the
+// WGSL/HLSL `gamut_compress` and the Rust reference in pipeline.rs tests.
+// Brightness overshoot (> 1) is left for the tone map.
+float3 gamut_compress(float3 rgb) {
+    float lo = min(rgb.r, min(rgb.g, rgb.b));
+    float outness = max(-lo, 0.0);
+    float k = smoothstep(0.0, 1.0, outness);
+    return mix(rgb, clamp(rgb, 0.0, 1.0), k);
+}
+
 float3 target_nits_to_reference_linear(float3 nits, constant VideoUniforms& uniforms) {
-    return max(nits, float3(0.0)) / target_reference_white_nits(uniforms);
+    // libplacebo's encode maps [target black, target peak] onto [0, 1] where
+    // 1.0 is the target reference white, so the tone-map black-point
+    // compensation lands back on true black instead of lifting it.
+    float black = uniforms.tone_map_extra.z;
+    float peak = target_peak_nits(uniforms);
+    float range = max(peak - black, 0.0001);
+    return max(nits - float3(black), float3(0.0)) / range
+        * (range / target_reference_white_nits(uniforms));
 }
 
 float3 target_reference_linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
@@ -2949,16 +4376,24 @@ float4 final_output(float3 rgb, float alpha, constant VideoUniforms& uniforms) {
     return float4(premultiplied, alpha);
 }
 
-float3 sdr_ui_color_to_target_output(float3 rgb, uint target_transfer, float reference_white_nits) {
+// SDR composites the UI in the output transfer. HDR10 (target_transfer == 3)
+// PQ-encodes it against ui_nits.x. An Apple EDR / extended-linear drawable
+// holds linear light (ui_nits.y != 0), so the sRGB-encoded UI color must be
+// linearized and scaled to the same reference white as the video pass.
+float3 sdr_ui_color_to_target_output(float3 rgb, uint target_transfer, float4 ui_nits) {
     if (target_transfer == 3) {
         constexpr float pq_absolute_peak_nits = 10000.0;
         float3 linear = pow(max(rgb, float3(0.0)), float3(2.2));
-        float3 nits = linear * max(reference_white_nits, 1.0);
+        float3 nits = linear * max(ui_nits.x, 1.0);
         return float3(
             pq_inverse_eotf(nits.r / pq_absolute_peak_nits),
             pq_inverse_eotf(nits.g / pq_absolute_peak_nits),
             pq_inverse_eotf(nits.b / pq_absolute_peak_nits)
         );
+    }
+    if (ui_nits.y > 0.0) {
+        float3 linear_rgb = pow(max(rgb, float3(0.0)), float3(2.2));
+        return linear_rgb * (max(ui_nits.x, 1.0) / max(ui_nits.y, 1.0));
     }
     return rgb;
 }
@@ -2969,6 +4404,12 @@ struct RangeExpandedYCbCr {
 };
 
 RangeExpandedYCbCr expand_ycbcr_range(float y, float2 cbcr, constant VideoUniforms& uniforms) {
+    if (uniforms.is_p010 != 0) {
+        // P010 stores 10-bit codes as code << 6 in a 16-bit UNORM texture.
+        constexpr float p010_scale = 65535.0 / 65472.0;
+        y *= p010_scale;
+        cbcr *= p010_scale;
+    }
     if (uniforms.full_range != 0) {
         return RangeExpandedYCbCr { y, cbcr - float2(0.5) };
     }
@@ -2982,6 +4423,83 @@ RangeExpandedYCbCr expand_ycbcr_range(float y, float2 cbcr, constant VideoUnifor
     y = (y - (16.0 / 255.0)) * (255.0 / 219.0);
     cbcr = (cbcr - float2(128.0 / 255.0)) * (255.0 / 224.0);
     return RangeExpandedYCbCr { y, cbcr };
+}
+
+// Dolby Vision RPU reshaping, ported from libplacebo's `pl_shader_dovi_reshape`
+// (the renderer behind mpv's Dolby Vision mapping). The base-layer signal is
+// reshaped per component through piecewise polynomial/MMR curves selected by
+// pivot comparison, where MMR coefficients mix all three raw components.
+float3 dovi_reshaped_signal(float3 sig_in, constant VideoUniforms& uniforms) {
+    float3 sig = clamp(sig_in, 0.0, 1.0);
+    float result[3] = { sig.r, sig.g, sig.b };
+    float4 flags = uniforms.dovi_flags;
+    for (uint c = 0u; c < 3u; c = c + 1u) {
+        uint segments = uint(flags[1u + c]);
+        if (segments == 0u) {
+            continue;
+        }
+        float s = result[c];
+        uint index = 0u;
+        for (uint i = 0u; i < 7u; i = i + 1u) {
+            float4 pivot_row = uniforms.dovi_pivots[2u * c + i / 4u];
+            float pivot = pivot_row[i % 4u];
+            if (s >= pivot) {
+                index = index + 1u;
+            }
+        }
+        float4 coeff = uniforms.dovi_coefficients[8u * c + index];
+        if (coeff.w < 0.5) {
+            s = (coeff.z * s + coeff.y) * s + coeff.x;
+        } else {
+            uint base = 48u * c + uint(coeff.y);
+            uint order = uint(coeff.w);
+            float4 sig_x = float4(
+                sig.x * sig.y,
+                sig.x * sig.z,
+                sig.y * sig.z,
+                sig.x * sig.y * sig.z
+            );
+            s = coeff.x;
+            s = s + dot(uniforms.dovi_mmr[base].xyz, sig);
+            s = s + dot(uniforms.dovi_mmr[base + 1u], sig_x);
+            if (order >= 2u) {
+                float3 sig2 = sig * sig;
+                float4 sig_x2 = sig_x * sig_x;
+                s = s + dot(uniforms.dovi_mmr[base + 2u].xyz, sig2);
+                s = s + dot(uniforms.dovi_mmr[base + 3u], sig_x2);
+                if (order >= 3u) {
+                    s = s + dot(uniforms.dovi_mmr[base + 4u].xyz, sig2 * sig);
+                    s = s + dot(uniforms.dovi_mmr[base + 5u], sig_x2 * sig_x);
+                }
+            }
+        }
+        float4 bounds = uniforms.dovi_bounds[c];
+        result[c] = clamp(s, bounds.x, bounds.y);
+    }
+    return float3(result[0], result[1], result[2]);
+}
+
+// Reshaped nonlinear signal to PQ-encoded IPT via the RPU's ycc_to_rgb matrix
+// and signal offsets. Applying the RPU offsets keeps integer offset codes
+// exactly on sample codes (2^bits/(2^bits-1) folded in on the CPU).
+float3 dovi_signal_to_pq_rgb(float3 sig, constant VideoUniforms& uniforms) {
+    float3 reshaped = dovi_reshaped_signal(sig, uniforms) - uniforms.dovi_nonlinear_offset.xyz;
+    return float3(
+        dot(uniforms.dovi_nonlinear_matrix[0].xyz, reshaped),
+        dot(uniforms.dovi_nonlinear_matrix[1].xyz, reshaped),
+        dot(uniforms.dovi_nonlinear_matrix[2].xyz, reshaped)
+    );
+}
+
+// Linearized BT.2020-referred HPE LMS back to linear RGB, using the composite
+// of the fixed HPE inverse with the RPU's rgb_to_lms matrix (premultiplied on
+// the CPU, matching libplacebo's dovi_lms2rgb).
+float3 dovi_lms_to_rgb(float3 linear, constant VideoUniforms& uniforms) {
+    return float3(
+        dot(uniforms.dovi_lms_matrix[0].xyz, linear),
+        dot(uniforms.dovi_lms_matrix[1].xyz, linear),
+        dot(uniforms.dovi_lms_matrix[2].xyz, linear)
+    );
 }
 
 vertex VertexOut erika_video_vertex(
@@ -3014,6 +4532,7 @@ fragment float4 erika_video_fragment(
     VertexOut in [[stage_in]],
     texture2d<float, access::sample> luma_texture [[texture(0)]],
     texture2d<float, access::sample> chroma_texture [[texture(1)]],
+    texture3d<float, access::sample> gamut_lut [[texture(2)]],
     sampler video_sampler [[sampler(0)]],
     constant VideoUniforms& uniforms [[buffer(0)]]) {
     bool packed_alpha = uniforms.video_alpha_mode == 1;
@@ -3021,24 +4540,43 @@ fragment float4 erika_video_fragment(
         ? float2(in.tex_coord.x * 0.5, in.tex_coord.y)
         : in.tex_coord;
     float2 alpha_coord = float2(0.5 + in.tex_coord.x * 0.5, in.tex_coord.y);
-    float y = luma_texture.sample(video_sampler, color_coord).r;
-    float2 cbcr = chroma_texture.sample(video_sampler, color_coord).rg;
-    RangeExpandedYCbCr expanded = expand_ycbcr_range(y, cbcr, uniforms);
-    y = expanded.y;
-    cbcr = expanded.cbcr;
-
-    float kr = uniforms.luma_coefficients.x;
-    float kg = max(uniforms.luma_coefficients.y, 0.000001);
-    float kb = uniforms.luma_coefficients.z;
+    float y_sample = luma_texture.sample(video_sampler, color_coord).r;
+    float2 cbcr_sample = chroma_texture.sample(video_sampler, color_coord).rg;
+#ifdef ERIKA_NO_DOLBY_VISION
+    const bool dovi_enabled = false;
+#else
+    bool dovi_enabled = uniforms.dovi_flags.x != 0.0;
+#endif
     float3 rgb;
-    rgb.r = y + 2.0 * (1.0 - kr) * cbcr.y;
-    rgb.b = y + 2.0 * (1.0 - kb) * cbcr.x;
-    rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
+    if (dovi_enabled) {
+        // The base layer carries the raw 12-bit DV signal (10-bit container,
+        // full range); range expansion and the YCbCr matrix are replaced by
+        // the RPU reshaping + ycc_to_rgb path.
+        float3 sig = float3(y_sample, cbcr_sample.x, cbcr_sample.y);
+        if (uniforms.is_p010 != 0) {
+            sig *= 65535.0 / 65472.0;
+        }
+        rgb = dovi_signal_to_pq_rgb(sig, uniforms);
+    } else {
+        RangeExpandedYCbCr expanded = expand_ycbcr_range(y_sample, cbcr_sample, uniforms);
+        float y = expanded.y;
+        float2 cbcr = expanded.cbcr;
+
+        float kr = uniforms.luma_coefficients.x;
+        float kg = max(uniforms.luma_coefficients.y, 0.000001);
+        float kb = uniforms.luma_coefficients.z;
+        rgb.r = y + 2.0 * (1.0 - kr) * cbcr.y;
+        rgb.b = y + 2.0 * (1.0 - kb) * cbcr.x;
+        rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
+    }
     rgb = transfer_to_source_reference_linear(rgb, uniforms);
-    rgb = apply_gamut_map(rgb, uniforms);
+    if (dovi_enabled) {
+        rgb = dovi_lms_to_rgb(rgb, uniforms);
+    }
     rgb = source_reference_to_nits(rgb, uniforms);
-    rgb = tone_map_nits(rgb, uniforms);
+    rgb = tone_map_nits(rgb, gamut_lut, video_sampler, uniforms);
     rgb = target_nits_to_reference_linear(rgb, uniforms);
+    rgb = gamut_compress(rgb);
     rgb = target_reference_linear_to_output(rgb, uniforms);
     float alpha = 1.0;
     if (packed_alpha) {
@@ -3096,14 +4634,23 @@ fragment float4 erika_overlay_fragment(
         float3 rgb = sdr_ui_color_to_target_output(
             uniforms.color.rgb,
             uniforms.target_transfer,
-            uniforms.ui_nits.x
+            uniforms.ui_nits
         );
         return float4(rgb, uniforms.color.a * sampled.r);
+    }
+    if (uniforms.overlay_mode == 2) {
+        // Premultiplied, so the filter does not darken an emoji's edges.
+        float3 rgb = sdr_ui_color_to_target_output(
+            sampled.rgb / max(sampled.a, 0.0001),
+            uniforms.target_transfer,
+            uniforms.ui_nits
+        );
+        return float4(rgb, uniforms.color.a * sampled.a);
     }
     sampled.rgb = sdr_ui_color_to_target_output(
         sampled.rgb,
         uniforms.target_transfer,
-        uniforms.ui_nits.x
+        uniforms.ui_nits
     );
     return sampled;
 }
@@ -3117,19 +4664,27 @@ struct DanmakuBatchUniforms {
 
 struct DanmakuBatchInstance {
     float4 rect;
+    uint glyph_start;
+    uint glyph_count;
+    float opacity;
+    uint reserved;
+};
+
+struct DanmakuBatchGlyph {
+    float4 rect;
     float4 tex_rect;
     float4 color;
-    uint atlas_texture;
-    uint reserved0;
-    uint reserved1;
-    uint reserved2;
+    float4 outline;
+    float4 shadow;
+    float4 shadow_offset;
 };
 
 struct DanmakuBatchOut {
     float4 position [[position]];
-    float2 tex_coord;
-    float4 color;
-    uint atlas_texture [[flat]];
+    float2 pixel_position;
+    uint glyph_start [[flat]];
+    uint glyph_count [[flat]];
+    float opacity [[flat]];
 };
 
 vertex DanmakuBatchOut erika_danmaku_batch_vertex(
@@ -3138,27 +4693,35 @@ vertex DanmakuBatchOut erika_danmaku_batch_vertex(
     constant DanmakuBatchInstance* instances [[buffer(0)]],
     constant DanmakuBatchUniforms& uniforms [[buffer(1)]]) {
     constexpr float2 corners[6] = {
-        float2(0.0, 0.0),
-        float2(1.0, 0.0),
-        float2(0.0, 1.0),
-        float2(1.0, 0.0),
-        float2(1.0, 1.0),
-        float2(0.0, 1.0),
+        float2(0.0, 0.0), float2(1.0, 0.0), float2(0.0, 1.0),
+        float2(1.0, 0.0), float2(1.0, 1.0), float2(0.0, 1.0),
     };
-    DanmakuBatchInstance glyph = instances[instance_id];
-    float2 corner = corners[vertex_id];
-    float2 position = glyph.rect.xy + corner * glyph.rect.zw;
-    float2 tex_coord = glyph.tex_rect.xy + corner * glyph.tex_rect.zw;
-    float2 ndc = float2(
-        position.x / max(uniforms.viewport.x, 1.0) * 2.0 - 1.0,
-        1.0 - position.y / max(uniforms.viewport.y, 1.0) * 2.0
-    );
+    DanmakuBatchInstance strip = instances[instance_id];
+    float2 position = strip.rect.xy + corners[vertex_id] * strip.rect.zw;
     DanmakuBatchOut out;
-    out.position = float4(ndc, 0.0, 1.0);
-    out.tex_coord = tex_coord;
-    out.color = glyph.color;
-    out.atlas_texture = glyph.atlas_texture;
+    out.position = float4(
+        position.x / max(uniforms.viewport.x, 1.0) * 2.0 - 1.0,
+        1.0 - position.y / max(uniforms.viewport.y, 1.0) * 2.0, 0.0, 1.0);
+    out.pixel_position = position;
+    out.glyph_start = strip.glyph_start;
+    out.glyph_count = strip.glyph_count;
+    out.opacity = strip.opacity;
     return out;
+}
+
+float danmaku_mask(texture2d<float, access::sample> atlas, sampler atlas_sampler,
+                   float2 position, float4 rect, float4 tex_rect) {
+    float2 local = (position - rect.xy) / max(rect.zw, float2(0.0001));
+    if (any(local < 0.0) || any(local >= 1.0)) return 0.0;
+    return atlas.sample(atlas_sampler, tex_rect.xy + local * tex_rect.zw).r;
+}
+
+float4 danmaku_layer_over(float4 below, float4 color, float mask,
+                         constant DanmakuBatchUniforms& uniforms) {
+    float alpha = color.a * mask;
+    if (alpha <= 0.0) return below;
+    float3 rgb = sdr_ui_color_to_target_output(color.rgb, uniforms.target_transfer, uniforms.ui_nits);
+    return float4(rgb * alpha, alpha) + below * (1.0 - alpha);
 }
 
 fragment float4 erika_danmaku_batch_fragment(
@@ -3166,17 +4729,32 @@ fragment float4 erika_danmaku_batch_fragment(
     texture2d<float, access::sample> fill_atlas [[texture(0)]],
     texture2d<float, access::sample> outline_atlas [[texture(1)]],
     sampler atlas_sampler [[sampler(0)]],
-    constant DanmakuBatchUniforms& uniforms [[buffer(1)]]) {
-    float mask = in.atlas_texture == 0
-        ? fill_atlas.sample(atlas_sampler, in.tex_coord).r
-        : outline_atlas.sample(atlas_sampler, in.tex_coord).r;
-    float3 rgb = sdr_ui_color_to_target_output(
-        in.color.rgb,
-        uniforms.target_transfer,
-        uniforms.ui_nits.x
-    );
-    return float4(rgb, in.color.a * mask);
+    constant DanmakuBatchUniforms& uniforms [[buffer(1)]],
+    const device DanmakuBatchGlyph* glyphs [[buffer(2)]]) {
+    float4 fill = 0.0, outline = 0.0, shadow = 0.0;
+    // Strips do not overlap within a comment. Only neighboring glyphs whose
+    // effects cross this strip are visited, in original text order. This
+    // preserves the union of adjacent glyphs and prevents repeated opacity
+    // at glyph boundaries without a temporary full-screen texture.
+    for (uint i = in.glyph_start; i < in.glyph_start + in.glyph_count; ++i) {
+        DanmakuBatchGlyph glyph = glyphs[i];
+        float f = danmaku_mask(fill_atlas, atlas_sampler, in.pixel_position, glyph.rect, glyph.tex_rect);
+        float o = danmaku_mask(outline_atlas, atlas_sampler, in.pixel_position, glyph.rect, glyph.tex_rect);
+        fill = danmaku_layer_over(fill, glyph.color, f, uniforms);
+        outline = danmaku_layer_over(outline, glyph.outline, o, uniforms);
+        if (glyph.shadow.a > 0.0) {
+            float s = danmaku_mask(outline_atlas, atlas_sampler,
+                in.pixel_position - glyph.shadow_offset.xy, glyph.rect, glyph.tex_rect);
+            shadow = danmaku_layer_over(shadow, glyph.shadow, s, uniforms);
+        }
+    }
+    float4 composed = fill + (outline + shadow * (1.0 - outline.a)) * (1.0 - fill.a);
+    if (composed.a <= 0.0) discard_fragment();
+    // The pipeline uses straight-alpha blending. RGB is unpremultiplied
+    // here; the complete comment's opacity affects alpha exactly once.
+    return float4(composed.rgb / max(composed.a, 0.000001), composed.a * in.opacity);
 }
+
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -3303,12 +4881,10 @@ fn create_plane_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DANMAKU_FILL_ATLAS_TEXTURE, DANMAKU_OUTLINE_ATLAS_TEXTURE, DanmakuBatchInstance,
-        VIDEO_SHADER_SOURCE, for_each_ordered_danmaku_instance, metal_pixel_format,
-    };
-    use crate::danmaku::DanmakuGlyphInstance;
+    use super::{VIDEO_SHADER_SOURCE, metal_pixel_format, ui_output_nits};
+    use crate::core::{ColorPrimaries, TransferFunction};
     use crate::renderer::metal::MetalDrawablePixelFormat;
+    use crate::renderer::pipeline::TargetColorState;
     use objc2_metal::MTLPixelFormat;
 
     #[test]
@@ -3349,6 +4925,153 @@ mod tests {
     }
 
     #[test]
+    fn overlay_shader_linearizes_the_ui_for_extended_linear_output() {
+        // The EDR/extended-linear drawable holds linear light, so the overlay
+        // and danmaku passes must not composite the sRGB-encoded UI color
+        // directly (ui_nits.y carries the scene-linear reference white).
+        assert!(VIDEO_SHADER_SOURCE.contains("if (ui_nits.y > 0.0)"));
+        assert!(
+            VIDEO_SHADER_SOURCE
+                .contains("float3 linear_rgb = pow(max(rgb, float3(0.0)), float3(2.2))")
+        );
+        assert!(VIDEO_SHADER_SOURCE.contains("max(ui_nits.x, 1.0) / max(ui_nits.y, 1.0)"));
+    }
+
+    #[test]
+    fn gamut_lut_shader_samples_the_target_black_to_peak_axis() {
+        // libplacebo's LUT I axis is [target black, target peak]; sampling
+        // `ipt.x / peak` again would diverge from the generated LUT. The
+        // lattice position must also be remapped to the texel-center
+        // coordinate (libplacebo's `texel_scale`), or the zero-chroma texel at
+        // the low end of the C axis crushes saturation.
+        assert!(VIDEO_SHADER_SOURCE.contains("float lut_min = pq_code(uniforms.tone_map_extra.z)"));
+        assert!(VIDEO_SHADER_SOURCE.contains("clamp((ipt.x - lut_min) / lut_range, 0.0, 1.0)"));
+        assert!(VIDEO_SHADER_SOURCE.contains("pos.y * (31.0 / 32.0) + 0.5 / 32.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("pos.x * (47.0 / 48.0) + 0.5 / 48.0"));
+    }
+
+    #[test]
+    fn ui_output_nits_flags_only_extended_linear_output() {
+        let sdr = TargetColorState::sdr(ColorPrimaries::Bt709);
+        assert_eq!(ui_output_nits(sdr, false), [100.0, 0.0, 0.0, 0.0]);
+
+        let hdr10 = TargetColorState::hdr10(ColorPrimaries::Bt2020);
+        assert_eq!(ui_output_nits(hdr10, false), [203.0, 0.0, 0.0, 0.0]);
+
+        // `metal_target_color` shapes a non-PQ EDR target with a 100-nit
+        // reference white; the UI is then linearized against it.
+        let edr = TargetColorState {
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            peak_nits: 400.0,
+            reference_white_nits: 100.0,
+            edr_headroom: 4.0,
+        };
+        assert_eq!(ui_output_nits(edr, true), [100.0, 100.0, 0.0, 0.0]);
+        assert_eq!(ui_output_nits(edr, false), [100.0, 0.0, 0.0, 0.0]);
+
+        // An explicit EDR request clamped to headroom 1.0 still renders the
+        // linear drawable, so the flag must come from the output mode rather
+        // than from the headroom.
+        let edr_unit = TargetColorState {
+            edr_headroom: 1.0,
+            peak_nits: 100.0,
+            ..edr
+        };
+        assert_eq!(ui_output_nits(edr_unit, true), [100.0, 100.0, 0.0, 0.0]);
+
+        // A PQ EDR target encodes the UI inside the shader (branch on
+        // target_transfer), so it must not also set the linear flag.
+        let edr_pq = TargetColorState {
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferFunction::Pq,
+            peak_nits: 10_000.0,
+            reference_white_nits: 203.0,
+            edr_headroom: 4.0,
+        };
+        assert_eq!(ui_output_nits(edr_pq, true), [203.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn gamut_lut_key_tracks_only_static_pipeline_state() {
+        // Regression guard for the placeholder-LUT black frames: the cache may
+        // only be reused when the key equals the current frame's key, so the
+        // key must change for anything that changes the LUT (target black and
+        // peak, source/target primaries) and must not change for per-frame
+        // content brightness.
+        use super::{GamutLutKey, quantize_luma_pq};
+        use crate::renderer::pipeline::{SourceColorState, ToneMapConfig, VideoRenderPipeline};
+
+        let source = |peak_nits: f32| {
+            SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+                .nominal_peak_nits(peak_nits)
+        };
+        let sdr_target = TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709);
+        let key = |source: SourceColorState, target: TargetColorState| {
+            GamutLutKey::for_pipeline(&VideoRenderPipeline::new(source, target))
+        };
+
+        let base = key(source(1000.0), sdr_target);
+        // Dolby Vision L1 / measured brightness move `nominal_peak_nits` every
+        // frame; the LUT must not be regenerated for them.
+        assert_eq!(
+            base,
+            key(source(4000.0), sdr_target),
+            "a per-frame source peak must not invalidate the LUT"
+        );
+        // A different target peak (EDR headroom) changes the LUT's I axis.
+        let edr_target = TargetColorState {
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Srgb,
+            peak_nits: 400.0,
+            reference_white_nits: 100.0,
+            edr_headroom: 4.0,
+        };
+        assert_ne!(
+            base,
+            key(source(1000.0), edr_target),
+            "a stale cache key must never match the current frame"
+        );
+        // So does the target black (`contrast_ratio`): 1000:1 vs 10000:1 on the
+        // same 203-nit target must not reuse the LUT.
+        let contrast_source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        let target_black = |contrast_ratio: f32| VideoRenderPipeline {
+            tone_map: ToneMapConfig {
+                contrast_ratio,
+                ..ToneMapConfig::default()
+            },
+            ..VideoRenderPipeline::new(contrast_source, sdr_target)
+        };
+        assert_ne!(
+            GamutLutKey::for_pipeline(&target_black(0.0)),
+            GamutLutKey::for_pipeline(&target_black(10_000.0)),
+            "a different target black changes the LUT's I axis"
+        );
+        // Primaries on either side change the mapping.
+        assert_ne!(
+            base,
+            key(
+                source(1000.0),
+                TargetColorState::sdr_tone_map_target(ColorPrimaries::DisplayP3)
+            )
+        );
+        assert_ne!(
+            base,
+            key(
+                SourceColorState::new(ColorPrimaries::DisplayP3, TransferFunction::Pq),
+                sdr_target
+            )
+        );
+        // The luma quantization is monotonic and stable, and keeps sub-1-nit
+        // target blacks distinguishable.
+        assert_eq!(quantize_luma_pq(203.0), quantize_luma_pq(203.0));
+        assert!(quantize_luma_pq(203.0) < quantize_luma_pq(400.0));
+        assert!(quantize_luma_pq(0.1) < quantize_luma_pq(0.203));
+        assert_eq!(quantize_luma_pq(10_000.0), 65535);
+        assert_eq!(quantize_luma_pq(-1.0), 0);
+    }
+
+    #[test]
     fn video_shader_reconstructs_packed_alpha_as_premultiplied_output() {
         assert!(VIDEO_SHADER_SOURCE.contains("uniforms.video_alpha_mode == 1"));
         assert!(VIDEO_SHADER_SOURCE.contains("in.tex_coord.x * 0.5"));
@@ -3367,7 +5090,6 @@ mod tests {
         let decode = VIDEO_SHADER_SOURCE
             .find("rgb = transfer_to_source_reference_linear")
             .unwrap();
-        let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
         let source_nits = VIDEO_SHADER_SOURCE
             .find("rgb = source_reference_to_nits")
             .unwrap();
@@ -3378,20 +5100,27 @@ mod tests {
         let output = VIDEO_SHADER_SOURCE
             .find("rgb = target_reference_linear_to_output")
             .unwrap();
-        assert!(decode < gamut);
-        assert!(gamut < source_nits);
+        assert!(decode < source_nits);
         assert!(source_nits < tone_map);
         assert!(tone_map < target_reference);
         assert!(target_reference < output);
     }
 
     #[test]
-    fn video_shader_applies_gamut_matrix_before_tone_mapping() {
+    fn video_shader_runs_the_ipt_tone_map_before_gamut_compression() {
         assert!(VIDEO_SHADER_SOURCE.contains("gamut_matrix_rows"));
         assert!(VIDEO_SHADER_SOURCE.contains("apply_gamut_map"));
-        let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
+        assert!(VIDEO_SHADER_SOURCE.contains("ipt_matrix_rows"));
+        assert!(VIDEO_SHADER_SOURCE.contains("st2094_pick_knee"));
+        assert!(VIDEO_SHADER_SOURCE.contains("tone_map_curve_pq"));
+        // The primaries conversion happens inside the tone map (IPT
+        // roundtrip), so the fragment only calls tone_map_nits then the
+        // compression pass.
         let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_nits").unwrap();
-        assert!(gamut < tone_map);
+        let compress = VIDEO_SHADER_SOURCE.find("rgb = gamut_compress").unwrap();
+        assert!(tone_map < compress);
+        // The separate matrix call site from the old flow is gone.
+        assert!(!VIDEO_SHADER_SOURCE.contains("rgb = apply_gamut_map"));
     }
 
     #[test]
@@ -3435,65 +5164,6 @@ mod tests {
     }
 
     #[test]
-    fn danmaku_batch_instances_keep_each_item_effects_below_its_fill() {
-        fn glyph(
-            item_id: u64,
-            fill_marker: f32,
-            outline_marker: f32,
-            shadow_marker: f32,
-        ) -> DanmakuGlyphInstance {
-            DanmakuGlyphInstance {
-                item_id,
-                rect: [0.0, 0.0, 10.0, 10.0],
-                tex_rect: [0.0, 0.0, 1.0, 1.0],
-                color_rgba: [fill_marker, 0.0, 0.0, 1.0],
-                outline_rgba: [outline_marker, 0.0, 0.0, 1.0],
-                shadow_rgba: [shadow_marker, 0.0, 0.0, 1.0],
-                shadow_offset: [1.0, 1.0],
-            }
-        }
-
-        let items = [
-            glyph(1, 0.13, 0.12, 0.11),
-            glyph(1, 0.23, 0.22, 0.21),
-            glyph(2, 0.33, 0.32, 0.31),
-        ];
-        let mut order = Vec::new();
-        let count = for_each_ordered_danmaku_instance(&items, |instance| {
-            order.push((instance.atlas_texture, instance.color[0]));
-        });
-
-        assert_eq!(count, 9);
-        assert_eq!(
-            order,
-            vec![
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.11),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.21),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.12),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.22),
-                (DANMAKU_FILL_ATLAS_TEXTURE, 0.13),
-                (DANMAKU_FILL_ATLAS_TEXTURE, 0.23),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.31),
-                (DANMAKU_OUTLINE_ATLAS_TEXTURE, 0.32),
-                (DANMAKU_FILL_ATLAS_TEXTURE, 0.33),
-            ]
-        );
-    }
-
-    #[test]
-    fn danmaku_batch_instance_and_shader_texture_selector_stay_aligned() {
-        assert_eq!(std::mem::size_of::<DanmakuBatchInstance>(), 64);
-        assert_eq!(
-            std::mem::offset_of!(DanmakuBatchInstance, atlas_texture),
-            48
-        );
-        assert!(VIDEO_SHADER_SOURCE.contains("uint atlas_texture;"));
-        assert!(VIDEO_SHADER_SOURCE.contains("fill_atlas [[texture(0)]]"));
-        assert!(VIDEO_SHADER_SOURCE.contains("outline_atlas [[texture(1)]]"));
-        assert!(VIDEO_SHADER_SOURCE.contains("out.atlas_texture = glyph.atlas_texture;"));
-    }
-
-    #[test]
     fn danmaku_batch_shader_compiles_with_both_atlas_textures() {
         // Needs a real Metal device; skip rather than fail where there is none.
         let Ok(mut renderer) =
@@ -3508,6 +5178,90 @@ mod tests {
     }
 
     #[test]
+    fn reported_display_headroom_drives_output_mode_negotiation() {
+        // The renderer negotiates on the render thread, where AppKit must not
+        // be touched, so it consumes whatever the host published from the main
+        // thread. A missing report negotiates as SDR, exactly like the AppKit
+        // fallback it replaced.
+        let config = crate::renderer::metal::MetalRendererConfig {
+            output_mode: crate::renderer::metal::MetalOutputMode::auto(1.0),
+            ..crate::renderer::metal::MetalRendererConfig::default()
+        };
+        // Needs a real Metal device; skip rather than fail where there is none.
+        let Ok(mut renderer) = super::MetalRendererImpl::new(config) else {
+            eprintln!("skipping: no Metal device available");
+            return;
+        };
+        let hdr = crate::renderer::pipeline::SourceColorState::new(
+            ColorPrimaries::Bt2020,
+            TransferFunction::Pq,
+        );
+
+        assert_eq!(renderer.display_edr_headroom(), 1.0);
+        renderer.select_output_mode_for_source(hdr);
+        assert!(
+            !renderer.active_output_mode().is_edr(),
+            "an unreported display must not promote to EDR"
+        );
+
+        renderer.set_output_headroom(4.0, true);
+        assert_eq!(renderer.display_edr_headroom(), 4.0);
+        renderer.select_output_mode_for_source(hdr);
+        assert_eq!(
+            renderer.active_output_mode(),
+            crate::renderer::metal::MetalOutputMode::apple_edr(4.0)
+        );
+
+        // An unreported value clears the cache and returns to SDR.
+        renderer.set_output_headroom(4.0, false);
+        assert_eq!(renderer.display_edr_headroom(), 1.0);
+        renderer.select_output_mode_for_source(hdr);
+        assert!(!renderer.active_output_mode().is_edr());
+    }
+
+    #[test]
+    fn video_shader_compiles() {
+        // The video shader is the one carrying the tone-map curves, and it is
+        // only compiled at runtime, so a syntax error there would reach users.
+        // Needs a real Metal device; skip rather than fail where there is none.
+        let Ok(mut renderer) =
+            super::MetalRendererImpl::new(crate::renderer::metal::MetalRendererConfig::default())
+        else {
+            eprintln!("skipping: no Metal device available");
+            return;
+        };
+        renderer.video_pipeline_state().expect("video pipeline");
+    }
+
+    #[test]
+    fn video_shader_evaluates_reinhard_and_mobius_in_linear_nits() {
+        // libplacebo runs these two curves in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators work on encoded values; evaluating
+        // them on PQ codes moved the Mobius knee far below its intended
+        // position and produced the mid-tone darkening the PR review measured.
+        for branch in ["uniforms.tone_map == 1", "uniforms.tone_map == 2"] {
+            let start = VIDEO_SHADER_SOURCE
+                .find(branch)
+                .unwrap_or_else(|| panic!("{branch} branch"));
+            let rest = &VIDEO_SHADER_SOURCE[start..];
+            let end = rest.find("\n    }").expect("branch end");
+            let body = &rest[..end];
+            assert!(
+                body.contains("float out_range_nits = max(dst_peak - dst_black, 0.000001);"),
+                "{branch} must scale in linear nits"
+            );
+            assert!(
+                body.contains("nits_from_pq(x)"),
+                "{branch} must decode the PQ code before the curve"
+            );
+            assert!(
+                body.contains("return pq_code("),
+                "{branch} must re-encode the result"
+            );
+        }
+    }
+
+    #[test]
     fn overlay_uniforms_decode_libass_color() {
         let bitmap = crate::subtitle::SubtitleAlphaBitmap::new(
             crate::subtitle::SubtitleBitmapPlacement::new(12, 34, 56, 78),
@@ -3517,8 +5271,13 @@ mod tests {
         );
         let placement = super::OverlayAlphaAtlasPlacement {
             bitmap_index: 0,
+            page: 0,
             x: 10,
             y: 5,
+            source_x: 0,
+            source_y: 0,
+            width: 56,
+            height: 78,
         };
         let layout = super::VideoPresentationLayout::aspect_fit(640, 360, 640, 360);
 
@@ -3529,6 +5288,7 @@ mod tests {
             100,
             layout,
             crate::renderer::pipeline::TargetColorState::default(),
+            false,
         );
 
         assert_eq!(uniforms.rect, [12.0, 34.0, 56.0, 78.0]);
@@ -3538,6 +5298,61 @@ mod tests {
         assert!((uniforms.color[1] - (64.0 / 255.0)).abs() < 0.0001);
         assert!((uniforms.color[2] - (32.0 / 255.0)).abs() < 0.0001);
         assert!((uniforms.color[3] - (128.0 / 255.0)).abs() < 0.0001);
+    }
+
+    fn alpha_bitmap(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        seed: u8,
+    ) -> crate::subtitle::SubtitleAlphaBitmap {
+        let alpha = (0..width as usize * height as usize)
+            .map(|index| seed.wrapping_add((index % 251) as u8))
+            .collect();
+        crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(x, y, width, height),
+            width as usize,
+            0xffffff00,
+            alpha,
+        )
+    }
+
+    /// Every page within `max_dimension`, every piece inside its page and
+    /// apart from the others, and every piece holding its bitmap's texels.
+    fn assert_atlas_is_sound(
+        atlas: &super::OverlayAlphaAtlasPlan,
+        bitmaps: &[crate::subtitle::SubtitleAlphaBitmap],
+        max_dimension: usize,
+    ) {
+        for page in &atlas.pages {
+            assert!(page.width <= max_dimension && page.height <= max_dimension);
+            assert_eq!(page.pixels.len(), page.width * page.height);
+        }
+        for (index, piece) in atlas.placements.iter().enumerate() {
+            let page = &atlas.pages[piece.page];
+            assert!(piece.x + piece.width <= page.width);
+            assert!(piece.y + piece.height <= page.height);
+            for other in &atlas.placements[index + 1..] {
+                assert!(
+                    other.page != piece.page
+                        || other.x >= piece.x + piece.width
+                        || piece.x >= other.x + other.width
+                        || other.y >= piece.y + piece.height
+                        || piece.y >= other.y + other.height,
+                    "{piece:?} overlaps {other:?}"
+                );
+            }
+            let bitmap = &bitmaps[piece.bitmap_index];
+            for row in 0..piece.height {
+                let src = (piece.source_y + row) * bitmap.stride + piece.source_x;
+                let dst = (piece.y + row) * page.width + piece.x;
+                assert_eq!(
+                    page.pixels[dst..dst + piece.width],
+                    bitmap.alpha[src..src + piece.width]
+                );
+            }
+        }
     }
 
     #[test]
@@ -3555,19 +5370,182 @@ mod tests {
             vec![5, 6, 7],
         );
 
-        let atlas = super::OverlayAlphaAtlasPlan::pack(&[first, second])
-            .unwrap()
-            .unwrap();
+        let atlas = super::OverlayAlphaAtlasPlan::pack(
+            &[first, second],
+            crate::overlay::OverlayViewport::new(64, 64),
+            16_384,
+        )
+        .unwrap()
+        .unwrap();
 
-        assert_eq!(atlas.width, 3);
-        assert_eq!(atlas.height, 3);
-        assert_eq!(atlas.stride, 3);
-        assert_eq!(atlas.pixels, vec![1, 2, 5, 3, 4, 6, 0, 0, 7]);
+        // One page, the bitmaps side by side with a transparent gutter.
+        assert_eq!(atlas.pages.len(), 1);
+        assert_eq!(atlas.pages[0].width, 4);
+        assert_eq!(atlas.pages[0].height, 3);
+        assert_eq!(
+            atlas.pages[0].pixels,
+            vec![1, 2, 0, 5, 3, 4, 0, 6, 0, 0, 0, 7]
+        );
         assert_eq!(atlas.placements.len(), 2);
         assert_eq!(atlas.placements[0].bitmap_index, 0);
         assert_eq!(atlas.placements[0].x, 0);
         assert_eq!(atlas.placements[1].bitmap_index, 1);
-        assert_eq!(atlas.placements[1].x, 2);
+        assert_eq!(atlas.placements[1].x, 3);
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_wraps_rows_at_the_texture_limit() {
+        // The crash at 15:35 of a two-track ASS video on a Retina window:
+        // two subtitle tracks, a Chinese and a Japanese line each, a fill and
+        // an outline bitmap per line. Side by side they needed a 21640-texel
+        // wide texture and Metal aborted on its 16384 limit.
+        let viewport = crate::overlay::OverlayViewport::new(3456, 2234);
+        let bitmaps = (0..8u8)
+            .map(|index| alpha_bitmap(375, 1800 - i32::from(index / 2) * 140, 2705, 130, index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bitmaps
+                .iter()
+                .map(|bitmap| bitmap.placement.width)
+                .sum::<u32>(),
+            21_640
+        );
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 16_384)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 16_384);
+        assert_eq!(atlas.pages.len(), 1);
+        assert_eq!(atlas.placements.len(), 8);
+        // Six fit the first shelf; the last two start a second one below it.
+        assert_eq!(atlas.pages[0].width, 6 * 2705 + 5);
+        assert_eq!(atlas.pages[0].height, 130 + 1 + 130);
+        assert_eq!((atlas.placements[6].x, atlas.placements[6].y), (0, 131));
+        // Draw order is kept.
+        assert!(
+            atlas
+                .placements
+                .iter()
+                .enumerate()
+                .all(|(index, piece)| piece.bitmap_index == index)
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_starts_a_page_when_shelves_fill_one() {
+        let viewport = crate::overlay::OverlayViewport::new(64, 64);
+        let bitmaps = (0..3u8)
+            .map(|index| alpha_bitmap(i32::from(index) * 6, 0, 5, 5, index * 50))
+            .collect::<Vec<_>>();
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 8)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 8);
+        assert_eq!(atlas.pages.len(), 3);
+        assert_eq!(
+            atlas
+                .placements
+                .iter()
+                .map(|piece| piece.page)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_packs_only_the_visible_part() {
+        let viewport = crate::overlay::OverlayViewport::new(4, 3);
+        let bitmaps = [
+            alpha_bitmap(-2, -1, 5, 5, 0),
+            alpha_bitmap(4, 0, 5, 5, 100),
+            alpha_bitmap(0, -9, 2, 2, 200),
+        ];
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 16_384)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 16_384);
+        assert_eq!(atlas.placements.len(), 1);
+        let piece = atlas.placements[0];
+        assert_eq!(piece.bitmap_index, 0);
+        assert_eq!((piece.source_x, piece.source_y), (2, 1));
+        assert_eq!((piece.width, piece.height), (3, 3));
+
+        let uniforms = super::OverlayUniforms::from_alpha_atlas_bitmap(
+            &bitmaps[0],
+            &piece,
+            atlas.pages[0].width,
+            atlas.pages[0].height,
+            super::VideoPresentationLayout::aspect_fit(4, 3, 4, 3),
+            crate::renderer::pipeline::TargetColorState::default(),
+            false,
+        );
+        assert_eq!(uniforms.rect, [0.0, 0.0, 3.0, 3.0]);
+        assert_eq!(uniforms.tex_rect, [0.0, 0.0, 1.0, 1.0]);
+
+        let hidden = [alpha_bitmap(10, 10, 2, 2, 0)];
+        assert!(
+            super::OverlayAlphaAtlasPlan::pack(&hidden, viewport, 16_384)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_tiles_a_bitmap_wider_than_the_texture_limit() {
+        let viewport = crate::overlay::OverlayViewport::new(10, 3);
+        let bitmaps = [alpha_bitmap(0, 0, 10, 3, 7)];
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&bitmaps, viewport, 4)
+            .unwrap()
+            .unwrap();
+
+        assert_atlas_is_sound(&atlas, &bitmaps, 4);
+        assert_eq!(
+            atlas
+                .placements
+                .iter()
+                .map(|piece| (piece.source_x, piece.source_y, piece.width, piece.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 4, 3), (4, 0, 4, 3), (8, 0, 2, 3)]
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_textures_stay_within_the_device_limit() {
+        use objc2_metal::MTLTexture;
+
+        // Needs a real Metal device; skip rather than fail where there is none.
+        let Ok(mut renderer) =
+            super::MetalRendererImpl::new(crate::renderer::metal::MetalRendererConfig::default())
+        else {
+            eprintln!("skipping: no Metal device available");
+            return;
+        };
+        let limit = renderer.max_texture_dimension;
+        let viewport = crate::overlay::OverlayViewport::new(3456, 2234);
+        // Wider together than the limit, and wider than a page row alone.
+        let bitmaps = (0..12u8)
+            .map(|index| alpha_bitmap(0, i32::from(index) * 150, 2705, 130, index))
+            .collect::<Vec<_>>();
+
+        let cache = renderer
+            .prepare_overlay_alpha_atlas(&bitmaps, viewport, true)
+            .expect("overlay atlas")
+            .expect("visible bitmaps");
+
+        assert_eq!(cache.placements.len(), bitmaps.len());
+        for page in &cache.pages {
+            assert!(page.texture.width() <= limit && page.texture.height() <= limit);
+            assert_eq!(
+                (page.texture.width(), page.texture.height()),
+                (page.width, page.height)
+            );
+        }
     }
 
     #[test]
@@ -3626,7 +5604,7 @@ mod tests {
 
     #[test]
     fn video_uniforms_keep_float4_fields_aligned() {
-        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 144);
+        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 3296);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, edr_output), 20);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, rect), 32);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, viewport), 48);
@@ -3639,6 +5617,23 @@ mod tests {
             std::mem::offset_of!(super::VideoUniforms, gamut_matrix_rows),
             96
         );
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, ipt_matrix_rows),
+            144
+        );
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, tone_map_extra),
+            288
+        );
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, tone_map_coeffs),
+            304
+        );
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, gamut_lut_enabled),
+            320
+        );
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, dovi), 336);
     }
 
     #[test]
@@ -3669,6 +5664,7 @@ mod tests {
             108,
             layout,
             crate::renderer::pipeline::TargetColorState::default(),
+            false,
         );
 
         assert_eq!(uniforms.viewport, [1000.0, 1000.0]);

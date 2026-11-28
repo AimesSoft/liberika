@@ -345,15 +345,18 @@ struct Inner {
 // Different calls to `eglGetPlatformDisplay` may return the same `Display`, making it a global
 // state of all our `EglContext`s. This forces us to track the number of such context to prevent
 // terminating the display if it's currently used by another `EglContext`.
-static DISPLAYS_REFERENCE_COUNT: LazyLock<Mutex<HashMap<usize, usize>>> =
+static DISPLAYS_REFERENCE_COUNT: LazyLock<Mutex<HashMap<usize, (usize, bool)>>> =
     LazyLock::new(Default::default);
 
 fn initialize_display(
     egl: &EglInstance,
     display: khronos_egl::Display,
+    externally_owned: bool,
 ) -> Result<(i32, i32), khronos_egl::Error> {
     let mut guard = DISPLAYS_REFERENCE_COUNT.lock();
-    *guard.entry(display.as_ptr() as usize).or_default() += 1;
+    let entry = guard.entry(display.as_ptr() as usize).or_default();
+    entry.0 += 1;
+    entry.1 |= externally_owned;
 
     // We don't need to check the reference count here since according to the `eglInitialize`
     // documentation, initializing an already initialized EGL display connection has no effect
@@ -371,14 +374,24 @@ fn terminate_display(
         .get_mut(key)
         .expect("Attempted to decref a display before incref was called");
 
-    if *count_ref > 1 {
-        *count_ref -= 1;
+    if count_ref.0 > 1 {
+        count_ref.0 -= 1;
 
         Ok(())
     } else {
-        guard.remove(key);
-
-        egl.terminate(display)
+        let (_, externally_owned) = guard.remove(key).unwrap();
+        // EGL initialization is not reference-counted by the driver. GTK may
+        // use this same display outside wgpu, so terminating a borrowed display
+        // would invalidate Flutter's contexts during native-surface detach.
+        // Desktop Linux surfaceless/default displays are also process-wide
+        // singletons: calling eglTerminate unloads DRI drivers such as
+        // swrast_dri.so while libLLVM remains resident, causing subsequent
+        // eglCreateContext calls in Mesa 23 to segfault.
+        if externally_owned || cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
+            Ok(())
+        } else {
+            egl.terminate(display)
+        }
     }
 }
 
@@ -394,8 +407,9 @@ impl Inner {
         egl: Arc<EglInstance>,
         display: khronos_egl::Display,
         force_gles_minor_version: wgt::Gles3MinorVersion,
+        externally_owned: bool,
     ) -> Result<Self, crate::InstanceError> {
-        let version = initialize_display(&egl, display)
+        let version = initialize_display(&egl, display, externally_owned)
             .map_err(instance_err("failed to initialize EGL display connection"))?;
         let vendor = egl
             .query_string(Some(display), khronos_egl::VENDOR)
@@ -716,28 +730,50 @@ impl crate::Instance for Instance {
 
         profiling::scope!("Init OpenGL (EGL) Backend");
         #[cfg(Emscripten)]
-        let egl_result: Result<EglInstance, khronos_egl::Error> =
-            Ok(khronos_egl::Instance::new(khronos_egl::Static));
+        let egl: Arc<EglInstance> = Arc::new(khronos_egl::Instance::new(khronos_egl::Static));
 
-        #[cfg(not(Emscripten))]
-        let egl_result = if cfg!(windows) {
-            unsafe {
-                khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
-                    "libEGL.dll",
-                )
+        #[cfg(all(not(Emscripten), target_os = "linux", not(target_env = "ohos")))]
+        let egl: Arc<EglInstance> = {
+            struct RetainedEgl(Arc<EglInstance>);
+            unsafe impl Send for RetainedEgl {}
+            unsafe impl Sync for RetainedEgl {}
+
+            static LINUX_EGL: Mutex<Option<RetainedEgl>> = Mutex::new(None);
+            let mut guard = LINUX_EGL.lock();
+            if let Some(cached) = guard.as_ref() {
+                Arc::clone(&cached.0)
+            } else {
+                let loaded = unsafe {
+                    khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required()
+                }
+                .map(Arc::new)
+                .map_err(instance_err("unable to open libEGL"))?;
+                *guard = Some(RetainedEgl(Arc::clone(&loaded)));
+                loaded
             }
-        } else if cfg!(target_vendor = "apple") {
-            unsafe {
-                khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
-                    "libEGL.dylib",
-                )
-            }
-        } else {
-            unsafe { khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required() }
         };
-        let egl = egl_result
-            .map(Arc::new)
-            .map_err(instance_err("unable to open libEGL"))?;
+
+        #[cfg(all(not(Emscripten), not(all(target_os = "linux", not(target_env = "ohos")))))]
+        let egl = {
+            let egl_result = if cfg!(windows) {
+                unsafe {
+                    khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
+                        "libEGL.dll",
+                    )
+                }
+            } else if cfg!(target_vendor = "apple") {
+                unsafe {
+                    khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
+                        "libEGL.dylib",
+                    )
+                }
+            } else {
+                unsafe { khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required() }
+            };
+            egl_result
+                .map(Arc::new)
+                .map_err(instance_err("unable to open libEGL"))?
+        };
 
         let client_extensions = egl.query_string(None, khronos_egl::EXTENSIONS);
 
@@ -876,6 +912,7 @@ impl crate::Instance for Instance {
             egl,
             display,
             desc.backend_options.gl.gles_minor_version,
+            desc.display.is_some(),
         )?;
 
         Ok(Instance {
@@ -1051,6 +1088,7 @@ impl super::Device {
 #[derive(Debug)]
 pub struct Swapchain {
     surface: khronos_egl::Surface,
+    present_mode: wgt::PresentMode,
     wl_window: Option<*mut wayland_sys::egl::wl_egl_window>,
     framebuffer: glow::Framebuffer,
     renderbuffer: glow::Renderbuffer,
@@ -1102,6 +1140,13 @@ impl Surface {
             })?;
 
         unsafe { gl.disable(glow::SCISSOR_TEST) };
+        #[cfg(target_os = "linux")]
+        self.egl.instance.swap_interval(self.egl.display,
+            if sc.present_mode == wgt::PresentMode::Immediate { 0 } else { 1 })
+            .map_err(|e| {
+                log::error!("swap_interval failed: {e}");
+                crate::SurfaceError::Lost
+            })?;
         unsafe { gl.color_mask(true, true, true, true) };
 
         unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
@@ -1376,6 +1421,7 @@ impl crate::Surface for Surface {
 
         let mut swapchain = self.swapchain.write();
         *swapchain = Some(Swapchain {
+            present_mode: config.present_mode,
             surface,
             wl_window,
             renderbuffer,

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,12 +11,14 @@ use thiserror::Error;
 
 use crate::audio::AudioClockSnapshot;
 use crate::core::{
-    MediaRequest, MediaSourceHint, TrackInfo, TrackKind, TrackSelection, VideoDecoderEvent,
-    VideoFrameImportFailure, VideoParams,
+    ChapterInfo, MediaRequest, MediaSourceHint, TrackInfo, TrackKind, TrackSelection,
+    VideoDecoderEvent, VideoFrameImportFailure, VideoParams,
 };
+use crate::diagnostics::{PlaybackTimingCounters, QueueDepths};
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
-    Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat, StreamSelection, SubtitleDecoder,
+    DoviRejectReason, FfmpegError, Frame, OwnedCodecParameters, PcmAudioFrame, PcmFormat,
+    StreamSelection, SubtitleDecoder,
 };
 use crate::source::{self, source_from_uri_with_hint, source_from_uri_with_options};
 use crate::subtitle::{
@@ -162,6 +165,11 @@ enum DemuxCommand {
     Seek {
         generation: u64,
         position: Duration,
+        io_generation: Option<u64>,
+    },
+    ReleaseBuffers {
+        stale_packets: Receiver<DemuxMessage>,
+        reply: Sender<()>,
     },
     Stop,
 }
@@ -190,13 +198,16 @@ struct AsyncDemuxer {
     commands: Sender<DemuxCommand>,
     generation: u64,
     active: bool,
+    worker: Option<thread::JoinHandle<()>>,
+    cancellation: Option<source::SourceCancellation>,
 }
 
 impl AsyncDemuxer {
     fn spawn(demuxer: Demuxer) -> Self {
+        let cancellation = demuxer.source_cancellation();
         let (packet_sender, packets) = bounded(DEMUX_PACKET_QUEUE_LIMIT);
         let (commands, command_receiver) = unbounded();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("erika-demux".to_string())
             .spawn(move || run_demux_worker(demuxer, packet_sender, command_receiver))
             .expect("spawn erika demux worker");
@@ -205,6 +216,8 @@ impl AsyncDemuxer {
             commands,
             generation: 1,
             active: false,
+            worker: Some(worker),
+            cancellation,
         }
     }
 
@@ -234,6 +247,10 @@ impl AsyncDemuxer {
     }
 
     fn seek(&mut self, position: Duration) -> Result<()> {
+        let io_generation = self
+            .cancellation
+            .as_ref()
+            .map(source::SourceCancellation::interrupt);
         self.generation = self.generation.saturating_add(1).max(1);
         self.active = false;
         self.drain_stale_packets();
@@ -241,6 +258,7 @@ impl AsyncDemuxer {
             .send(DemuxCommand::Seek {
                 generation: self.generation,
                 position,
+                io_generation,
             })
             .map_err(|_| PlaybackError::DemuxWorker("demux command channel closed".to_string()))
     }
@@ -277,11 +295,38 @@ impl AsyncDemuxer {
     fn drain_stale_packets(&mut self) {
         while self.packets.try_recv().is_ok() {}
     }
+
+    fn release_buffers(&self) -> Result<()> {
+        let (reply, released) = bounded(1);
+        self.commands
+            .send(DemuxCommand::ReleaseBuffers {
+                stale_packets: self.packets.clone(),
+                reply,
+            })
+            .map_err(|_| PlaybackError::DemuxWorker("demux command channel closed".to_string()))?;
+        released
+            .recv()
+            .map_err(|_| PlaybackError::DemuxWorker("demux worker stopped".to_string()))
+    }
 }
 
 impl Drop for AsyncDemuxer {
     fn drop(&mut self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
         let _ = self.commands.send(DemuxCommand::Stop);
+        if let Some(worker) = self.worker.take() {
+            while !worker.is_finished() {
+                if matches!(
+                    self.packets.recv_timeout(Duration::from_millis(10)),
+                    Err(RecvTimeoutError::Disconnected)
+                ) {
+                    break;
+                }
+            }
+            let _ = worker.join();
+        }
     }
 }
 
@@ -354,6 +399,17 @@ fn run_demux_worker(
                 ));
                 DemuxMessage::Eof { generation }
             }
+            Err(FfmpegError::SourceCancelled)
+                if demuxer
+                    .source_cancellation()
+                    .is_some_and(|source| source.is_cancelled()) =>
+            {
+                // The interrupt precedes enqueueing Seek/Stop. Park until the
+                // command arrives; retrying here would spin on the cancelled
+                // token, and publishing an error can poison the new generation.
+                active = false;
+                continue;
+            }
             Err(error) => {
                 eof = true;
                 trace::log(format!(
@@ -423,8 +479,11 @@ fn send_demux_message(
             Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
                 message = returned;
-                match commands.recv_timeout(Duration::from_millis(5)) {
-                    Ok(command) => {
+                // A full packet queue needs either consumer progress or a
+                // control command. Prefer a ready command without polling.
+                crossbeam_channel::select_biased! {
+                    recv(commands) -> command => {
+                        let Ok(command) = command else { return false; };
                         trace_demux_send_wait(started, packets.len(), "command_after_full");
                         if !handle_demux_command(
                             demuxer,
@@ -441,8 +500,13 @@ fn send_demux_message(
                             return true;
                         }
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return false,
+                    send(packets, message) -> result => {
+                        if result.is_err() {
+                            return false;
+                        }
+                        trace_demux_send_wait(started, packets.len(), "sent");
+                        return true;
+                    }
                 }
             }
         }
@@ -486,6 +550,16 @@ fn handle_demux_command(
                 *generation = seek_generation;
                 *eof = false;
                 if let Err(error) = demuxer.seek(position) {
+                    if matches!(error, FfmpegError::SourceCancelled)
+                        && demuxer
+                            .source_cancellation()
+                            .is_some_and(|source| source.is_cancelled())
+                    {
+                        // A newer seek or shutdown interrupted this seek's own
+                        // reads. Its queued command will supply the next target.
+                        *active = false;
+                        return true;
+                    }
                     let _ = packets.send(DemuxMessage::Error {
                         generation: *generation,
                         message: error.to_string(),
@@ -534,11 +608,26 @@ fn handle_demux_command(
         DemuxCommand::Seek {
             generation: next_generation,
             position,
+            io_generation,
         } => {
+            if let (Some(cancellation), Some(io_generation)) =
+                (demuxer.source_cancellation(), io_generation)
+            {
+                cancellation.resume(io_generation);
+            }
             *generation = next_generation;
             *eof = false;
             *active = false;
             *pending_seek = Some((*generation, position));
+            true
+        }
+        DemuxCommand::ReleaseBuffers {
+            stale_packets,
+            reply,
+        } => {
+            while stale_packets.try_recv().is_ok() {}
+            demuxer.release_source_buffer();
+            let _ = reply.send(());
             true
         }
         DemuxCommand::Stop => false,
@@ -548,6 +637,9 @@ fn handle_demux_command(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoDecodePreference {
     Software,
+    LinuxAuto,
+    Cuda,
+    Vaapi,
     VideoToolbox,
     D3d11va,
     MediaCodec,
@@ -559,6 +651,8 @@ impl VideoDecodePreference {
     fn decoder_config(self) -> DecoderConfig {
         match self {
             Self::Software => DecoderConfig::software(),
+            Self::LinuxAuto | Self::Cuda => DecoderConfig::cuda(),
+            Self::Vaapi => DecoderConfig::vaapi(),
             Self::VideoToolbox => DecoderConfig::videotoolbox(),
             Self::D3d11va => DecoderConfig::d3d11va(),
             Self::MediaCodec => DecoderConfig::mediacodec(),
@@ -571,28 +665,28 @@ impl VideoDecodePreference {
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::VideoToolbox
+        software_forced_by_env().unwrap_or(Self::VideoToolbox)
     }
 }
 
 #[cfg(target_os = "windows")]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::D3d11va
+        software_forced_by_env().unwrap_or(Self::D3d11va)
     }
 }
 
 #[cfg(target_os = "android")]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::MediaCodec
+        software_forced_by_env().unwrap_or(Self::MediaCodec)
     }
 }
 
 #[cfg(target_env = "ohos")]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
-        Self::AvCodec
+        software_forced_by_env().unwrap_or(Self::AvCodec)
     }
 }
 
@@ -601,12 +695,52 @@ impl Default for VideoDecodePreference {
     any(target_os = "ios", target_os = "tvos"),
     target_os = "windows",
     target_os = "android",
+    target_os = "linux",
     target_env = "ohos"
 )))]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
         Self::Software
     }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+impl Default for VideoDecodePreference {
+    fn default() -> Self {
+        match std::env::var("ERIKA_HWDEC")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cuda" | "nvdec" => Self::Cuda,
+            "vaapi" => Self::Vaapi,
+            "software" | "none" => Self::Software,
+            _ => Self::LinuxAuto,
+        }
+    }
+}
+
+/// `ERIKA_HWDEC=software` (or `none`) makes software decoding the default
+/// video decoder on every platform, as it already does on Linux; for
+/// measuring the software path on hardware that would otherwise decode.
+#[cfg_attr(all(target_os = "linux", not(target_env = "ohos")), allow(dead_code))]
+fn software_forced_by_env() -> Option<VideoDecodePreference> {
+    software_forced_by(std::env::var("ERIKA_HWDEC").ok().as_deref())
+}
+
+fn software_forced_by(value: Option<&str>) -> Option<VideoDecodePreference> {
+    matches!(
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("software" | "none")
+    )
+    .then_some(VideoDecodePreference::Software)
+}
+
+fn require_hardware_decode() -> bool {
+    cfg!(all(target_os = "linux", not(target_env = "ohos")))
+        && std::env::var("ERIKA_REQUIRE_HARDWARE_DECODE").is_ok_and(|value| value == "1")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,6 +782,8 @@ pub struct OpenedMediaInfo {
     pub uri: String,
     pub duration: Option<Duration>,
     pub tracks: Vec<TrackInfo>,
+    pub chapters: Vec<ChapterInfo>,
+    pub container: crate::core::ContainerInfo,
     pub video_params: Option<VideoParams>,
     pub selected_video_track: Option<i64>,
     pub selected_audio_track: Option<i64>,
@@ -678,12 +814,14 @@ enum MediaCodecFallbackTarget {
     Software,
 }
 
+#[cfg(target_os = "android")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaCodecSeekRoute {
     Surface,
     ByteBuffer,
 }
 
+#[cfg(target_os = "android")]
 impl MediaCodecSeekRoute {
     fn decoder_config(self) -> DecoderConfig {
         match self {
@@ -725,12 +863,23 @@ pub struct PlaybackSession {
     video_frames: VecDeque<DecodedVideoFrame>,
     audio_frames: VecDeque<PcmAudioFrame>,
     subtitle_frames: VecDeque<DecodedSubtitleFrame>,
+    subtitle_backfill: Option<SubtitleBackfill>,
+    /// After a seek, the cues on at its target were read back (see
+    /// [`SubtitleBackfill`]): what the stream delivers that starts at or
+    /// before it is already among them.
+    subtitle_backfilled_until: Option<Duration>,
+    /// The position of a seek whose backfill had to leave out the cues that
+    /// began before its window because the track's cue index was still being
+    /// built; they are added from the index once it is complete.
+    subtitle_backfill_catch_up: Option<Duration>,
     pending_video_packets: VecDeque<ffmpeg::Packet>,
     video_fallback_waiting_for_keyframe: bool,
     audio_seek_waiting_for_valid_packet: bool,
     audio_seek_dropped_packets: usize,
     mediacodec_surface_disabled: bool,
     video_decoder_fallbacks: u64,
+    dolby_vision_profile: Option<u8>,
+    dovi_rpu_diagnostics: DoviRpuDiagnostics,
     video_decoder_events: VecDeque<VideoDecoderEvent>,
     queue_limits: PlaybackQueueLimits,
     buffer_recovery_audio: Duration,
@@ -753,6 +902,40 @@ struct BufferingAudioVideoScan {
     bytes: usize,
     discarded_frames: usize,
     baseline_media_time: Option<Duration>,
+}
+
+fn open_preferred_video_decoder(
+    parameters: &OwnedCodecParameters,
+    preference: VideoDecodePreference,
+    config: DecoderConfig,
+    resources: &PlaybackDecoderResources,
+) -> ffmpeg::Result<Decoder> {
+    if config.backend == DecoderBackend::Software && require_hardware_decode() {
+        return Err(ffmpeg::FfmpegError::Source(
+            "hardware decoding is required; software decoder disabled".into(),
+        ));
+    }
+    if preference == VideoDecodePreference::LinuxAuto && config.backend != DecoderBackend::Software
+    {
+        let mut last_error = None;
+        for candidate in [DecoderConfig::cuda(), DecoderConfig::vaapi()] {
+            match open_video_decoder(parameters, candidate, resources) {
+                Ok(decoder) => return Ok(decoder),
+                Err(error) => {
+                    trace::diagnostic(
+                        serde_json::json!({
+                            "event": "linux_hardware_decoder", "stage": "device_unavailable",
+                            "backend": candidate.backend.as_str(), "reason": error.to_string(),
+                        })
+                        .to_string(),
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        return Err(last_error.expect("hardware candidate list is nonempty"));
+    }
+    open_video_decoder(parameters, config, resources)
 }
 
 fn open_video_decoder(
@@ -839,13 +1022,24 @@ impl PlaybackSession {
         config: PlaybackSessionConfig,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
+        Self::open_with_cold_open_cancellation(request, config, decoder_resources, None)
+    }
+
+    pub(crate) fn open_with_cold_open_cancellation(
+        request: &MediaRequest,
+        config: PlaybackSessionConfig,
+        decoder_resources: PlaybackDecoderResources,
+        cancellation: Option<crate::source::ColdOpenCancellation>,
+    ) -> Result<Self> {
         let queue_limits = PlaybackQueueLimits::for_request(request);
-        let source = source_from_uri_with_options(
+        let mut source = source_from_uri_with_options(
             &request.uri,
             request.source_hint,
             request.http_headers.clone(),
             request.http_read_ahead_bytes,
+            request.http_back_buffer_bytes,
         )?;
+        source.set_cold_open_cancellation(cancellation);
         let mut demuxer = Demuxer::open_source(source)?;
         let mut probe = demuxer.probe().clone();
         let subtitle_fonts = probe.subtitle_fonts.clone();
@@ -877,36 +1071,40 @@ impl PlaybackSession {
         let mut video_decoder = None;
         let mut video_decoder_fallbacks = 0u64;
         let mut video_decoder_events = VecDeque::new();
+        let mut dolby_vision_profile = None;
         let mut selected_streams = Vec::new();
         if let Some(stream_index) = selected_video_track {
             selected_streams.push(stream_index);
             let parameters = codec_parameters_for(&codec_parameters, stream_index)?;
             let codec = parameters.codec_name();
-            let decoder_config = config.video_decode.decoder_config();
+            let requested_config = config.video_decode.decoder_config();
+            dolby_vision_profile = parameters.dolby_vision_profile();
+            let (decoder_config, decode_fallback_reason) =
+                dolby_vision_decode_fallback(dolby_vision_profile, requested_config);
             video_decoder = Some(
-                match open_video_decoder(parameters, decoder_config, &decoder_resources) {
+                match open_preferred_video_decoder(
+                    parameters,
+                    config.video_decode,
+                    decoder_config,
+                    &decoder_resources,
+                ) {
                     Ok(decoder) => {
                         let event = VideoDecoderEvent {
                             stage: video_decoder_open_stage(decoder_config).to_string(),
-                            requested_backend: decoder_config.backend,
+                            requested_backend: requested_config.backend,
                             previous_backend: None,
                             active_backend: decoder.backend(),
                             fallback_count: 0,
                             codec: codec.clone(),
                             pixel_format: None,
                             line_sizes: None,
-                            reason: None,
+                            reason: decode_fallback_reason,
                         };
                         trace::diagnostic(event.structured_message());
                         video_decoder_events.push_back(event);
                         decoder
                     }
-                    Err(error)
-                        if should_fallback_video_decoder_open_error(
-                            decoder_config.backend,
-                            codec.as_deref(),
-                        ) =>
-                    {
+                    Err(error) if should_fallback_video_decoder_error(decoder_config.backend) => {
                         let surface_error = error.to_string();
                         if decoder_config.backend == DecoderBackend::MediaCodec
                             && decoder_config.mediacodec_surface
@@ -1153,7 +1351,10 @@ impl PlaybackSession {
                     subtitle_decoder = Some(decoder);
                 }
                 Err(error) => {
-                    eprintln!("Erika playback subtitle decoder open failed: {error}");
+                    trace::diagnostic_at(
+                        trace::LogLevel::Warn,
+                        format!("Erika playback subtitle decoder open failed: {error}"),
+                    );
                 }
             }
         }
@@ -1195,6 +1396,8 @@ impl PlaybackSession {
             uri: probe.uri,
             duration: probe.duration,
             tracks: probe.tracks,
+            chapters: probe.chapters,
+            container: probe.container,
             video_params,
             selected_video_track: selected_video_track.map(i64::from),
             selected_audio_track: selected_audio_track.map(i64::from),
@@ -1226,12 +1429,17 @@ impl PlaybackSession {
             video_frames: VecDeque::new(),
             audio_frames: VecDeque::new(),
             subtitle_frames: VecDeque::new(),
+            subtitle_backfill: None,
+            subtitle_backfilled_until: None,
+            subtitle_backfill_catch_up: None,
             pending_video_packets: VecDeque::new(),
             video_fallback_waiting_for_keyframe: false,
             audio_seek_waiting_for_valid_packet: false,
             audio_seek_dropped_packets: 0,
             mediacodec_surface_disabled,
             video_decoder_fallbacks,
+            dolby_vision_profile,
+            dovi_rpu_diagnostics: DoviRpuDiagnostics::default(),
             video_decoder_events,
             queue_limits,
             buffer_recovery_audio: buffer_recovery_audio_for_request(request),
@@ -1341,6 +1549,7 @@ impl PlaybackSession {
         }
     }
 
+    #[cfg(target_os = "android")]
     fn selected_video_codec(&self) -> Option<String> {
         let selected = self.info.selected_video_track?;
         self.info
@@ -1391,8 +1600,16 @@ impl PlaybackSession {
     fn decoder_fallback_requires_replay(&self) -> bool {
         self.demux_eof
             || self.eof
-            || self.active_video_decoder_backend() == Some(DecoderBackend::VideoToolbox)
-            || self.active_video_decoder_backend() == Some(DecoderBackend::AvCodec)
+            || matches!(
+                self.active_video_decoder_backend(),
+                Some(
+                    DecoderBackend::VideoToolbox
+                        | DecoderBackend::D3d11va
+                        | DecoderBackend::Cuda
+                        | DecoderBackend::Vaapi
+                        | DecoderBackend::AvCodec
+                )
+            )
     }
 
     fn recover_from_video_input_stall(&mut self, reason: &str) -> Result<bool> {
@@ -1594,6 +1811,7 @@ impl PlaybackSession {
         {
             return Ok(None);
         }
+        self.finish_subtitle_backfill(media_time);
         self.pump_external_subtitles(selected_track, media_time)?;
         Ok(self.pop_ready_subtitle(media_time))
     }
@@ -1689,6 +1907,10 @@ impl PlaybackSession {
     ) -> Result<Option<DecodedSubtitleFrame>> {
         let previous = self.info.selected_subtitle_track;
         self.select_subtitle_track_internal(track_id)?;
+        // The new track's cue that is on right now began before the switch,
+        // and the demuxer is already past it: read it back like a seek to
+        // here would, so it shows at once, playing or paused.
+        self.backfill_embedded_subtitle(media_time);
         Ok(clear_subtitle_frame(previous, media_time))
     }
 
@@ -1715,6 +1937,11 @@ impl PlaybackSession {
             }
         }
         self.subtitle_frames.clear();
+        // The read-back state belongs to the track that was selected when the
+        // seek happened: the new track's cues that start at or before that
+        // position are not among it and must not be dropped as already read.
+        self.subtitle_backfilled_until = None;
+        self.subtitle_backfill_catch_up = None;
         // All embedded subtitle streams are selected when the main demuxer is
         // opened (and whenever an audio selection rebuilds its selection).
         // Do not touch the asynchronous demux selection for a subtitle-only
@@ -1729,7 +1956,16 @@ impl PlaybackSession {
     }
 
     fn seek_for_stop(&mut self, position: Duration) -> Result<()> {
-        self.seek_with_decoder_flush_inner(position, true, true, false)
+        self.seek_with_decoder_flush_inner(position, true, true, false)?;
+        self.video_frames.shrink_to_fit();
+        self.audio_frames.shrink_to_fit();
+        self.subtitle_frames.shrink_to_fit();
+        self.pending_video_packets.shrink_to_fit();
+        for external in &mut self.external_subtitles {
+            external.frames.shrink_to_fit();
+            external.demuxer.release_source_buffer();
+        }
+        self.demuxer.release_buffers()
     }
 
     fn seek_with_decoder_flush(
@@ -1815,9 +2051,114 @@ impl PlaybackSession {
         for external in &mut self.external_subtitles {
             external.seek(position)?;
         }
+        self.backfill_embedded_subtitle(position);
         self.audio_resampler = None;
         self.reset_eof_drain_state();
         Ok(())
+    }
+
+    /// The cues on at [`position`] that began before the stream's seek
+    /// landed on its keyframe: the demuxer starts reading at that keyframe,
+    /// so a cue that began a moment before it would only show from the next
+    /// one. Read from the file again, the subtitle stream alone; what is on
+    /// at [`position`] goes in front of what the stream delivers. A cue that
+    /// began long before (a sign, a song's lyrics) is found through the
+    /// track's cue index, see [`SubtitleCueIndex`]; while that is still being
+    /// built only the cues of the last [`SUBTITLE_BACKFILL_WINDOW`] are read
+    /// back, and [`Self::finish_subtitle_backfill`] adds the rest once the
+    /// index is complete. Local files only: a network source is not read
+    /// twice for this, and keeps what the stream delivers.
+    fn backfill_embedded_subtitle(&mut self, position: Duration) {
+        self.subtitle_backfilled_until = None;
+        self.subtitle_backfill_catch_up = None;
+        let Some(track_id) = self.info.selected_subtitle_track else {
+            self.subtitle_backfill = None;
+            return;
+        };
+        let Some(decoder) = self.subtitle_decoder.as_ref() else {
+            self.subtitle_backfill = None;
+            return;
+        };
+        let stream_index = decoder.stream_index();
+        if !subtitle_backfill_source_is_local(&self.info.uri) {
+            return;
+        }
+        if self
+            .subtitle_backfill
+            .as_ref()
+            .is_none_or(|backfill| backfill.stream_index != stream_index)
+        {
+            self.subtitle_backfill = SubtitleBackfill::open(&self.info.uri, stream_index);
+        }
+        let Some(backfill) = self.subtitle_backfill.as_mut() else {
+            return;
+        };
+        let main = self.subtitle_decoder.as_ref().expect("checked above");
+        match backfill.active_at(position, main, track_id) {
+            Ok(read_back) => {
+                self.subtitle_backfilled_until = Some(position);
+                if read_back.earlier_cues_pending {
+                    self.subtitle_backfill_catch_up = Some(position);
+                }
+                for frame in read_back.frames {
+                    self.subtitle_frames.push_back(frame);
+                }
+                trim_subtitle_queue(&mut self.subtitle_frames, self.queue_limits.subtitle_frames);
+            }
+            Err(error) => {
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!(
+                        "Erika subtitle backfill at {:.3}s failed: {error}",
+                        position.as_secs_f64()
+                    ),
+                );
+                self.subtitle_backfill = None;
+            }
+        }
+    }
+
+    /// Adds the cues that began before the backfill window of the last seek
+    /// and are still on at `media_time`, once the track's cue index is
+    /// complete. Nothing to do (and nothing blocked on) before that.
+    fn finish_subtitle_backfill(&mut self, media_time: Duration) {
+        let Some(position) = self.subtitle_backfill_catch_up else {
+            return;
+        };
+        let (Some(track_id), Some(main), Some(backfill)) = (
+            self.info.selected_subtitle_track,
+            self.subtitle_decoder.as_ref(),
+            self.subtitle_backfill.as_mut(),
+        ) else {
+            self.subtitle_backfill_catch_up = None;
+            return;
+        };
+        match backfill.earlier_active_at(position, main, track_id) {
+            Ok(EarlierCues::Scanning) => {}
+            Ok(EarlierCues::Unavailable) => self.subtitle_backfill_catch_up = None,
+            Ok(EarlierCues::Frames(frames)) => {
+                self.subtitle_backfill_catch_up = None;
+                // They began before everything queued, so they go first; a
+                // cue that has ended by now is not worth showing.
+                for frame in frames
+                    .into_iter()
+                    .filter(|frame| frame.end.is_none_or(|end| end > media_time))
+                    .rev()
+                {
+                    self.subtitle_frames.push_front(frame);
+                }
+            }
+            Err(error) => {
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!(
+                        "Erika subtitle catch-up at {:.3}s failed: {error}",
+                        position.as_secs_f64()
+                    ),
+                );
+                self.subtitle_backfill_catch_up = None;
+            }
+        }
     }
 
     #[cfg(target_os = "android")]
@@ -2387,8 +2728,17 @@ impl PlaybackSession {
                 .as_mut()
                 .expect("subtitle decoder exists");
             if let Some(frame) = decoder.decode_packet(&packet)? {
-                self.subtitle_frames.push_back(frame);
-                trim_subtitle_queue(&mut self.subtitle_frames, self.queue_limits.subtitle_frames);
+                let read_back = self
+                    .subtitle_backfilled_until
+                    .zip(frame.start)
+                    .is_some_and(|(until, start)| start <= until);
+                if !read_back {
+                    self.subtitle_frames.push_back(frame);
+                    trim_subtitle_queue(
+                        &mut self.subtitle_frames,
+                        self.queue_limits.subtitle_frames,
+                    );
+                }
             }
         }
         Ok(())
@@ -2652,40 +3002,14 @@ impl PlaybackSession {
                 }
             }
             Err(error)
-                if self.active_video_decoder_backend() == Some(DecoderBackend::VideoToolbox)
-                    && self.active_video_codec_is_av1() =>
+                if self
+                    .active_video_decoder_backend()
+                    .is_some_and(should_fallback_video_decoder_error) =>
             {
+                let backend = self.active_video_decoder_backend().expect("active decoder");
                 let reason = error.to_string();
                 self.fallback_video_decoder_to_software(
-                    "decode_videotoolbox_to_software",
-                    reason.clone(),
-                    None,
-                )?;
-                if !packet.is_key() {
-                    self.video_fallback_waiting_for_keyframe = true;
-                    trace::diagnostic(
-                        serde_json::json!({
-                            "event": "video_decoder_recovery_waiting_for_keyframe",
-                            "backend": DecoderBackend::Software.as_str(),
-                            "stream": packet.stream_index(),
-                            "reason": reason,
-                        })
-                        .to_string(),
-                    );
-                    return Ok(true);
-                }
-                match self.route_video_packet_with_active_decoder(&packet, demand)? {
-                    Some(progress) => Ok(progress),
-                    None => {
-                        self.pending_video_packets.push_front(packet);
-                        Ok(self.video_frames.len() > before_frames)
-                    }
-                }
-            }
-            Err(error) if self.active_video_decoder_backend() == Some(DecoderBackend::AvCodec) => {
-                let reason = error.to_string();
-                self.fallback_video_decoder_to_software(
-                    "decode_avcodec_to_software",
+                    &format!("decode_{}_to_software", backend.as_str()),
                     reason.clone(),
                     None,
                 )?;
@@ -2756,7 +3080,13 @@ impl PlaybackSession {
         let status = drain_video_frames(
             self.video_decoder.as_mut().expect("video decoder exists"),
             &mut self.video_frames,
-        )?;
+            self.dolby_vision_profile,
+            &mut self.dovi_rpu_diagnostics,
+        );
+        // Report a route FFmpeg changed while decoding, also when the decode
+        // then failed: the fallback below starts from the backend in use.
+        self.observe_video_decoder_route();
+        let status = status?;
         let video_frame_limit = self.active_video_frame_queue_limit();
         if demand != PlaybackPumpDemand::BufferingAudio {
             trim_video_queue(&mut self.video_frames, video_frame_limit);
@@ -2799,6 +3129,46 @@ impl PlaybackSession {
 
     fn active_video_decoder_backend(&self) -> Option<DecoderBackend> {
         self.video_decoder.as_ref().map(Decoder::backend)
+    }
+
+    /// A hardware decoder whose hwaccel FFmpeg dropped in format negotiation
+    /// (it failed to initialise or does not take the stream) keeps decoding
+    /// in software, or a later negotiation took the hardware again. Reports
+    /// that as a decoder change, so the backend Erika reports is the one
+    /// decoding and the fallback is counted.
+    fn observe_video_decoder_route(&mut self) {
+        let Some(decoder) = self.video_decoder.as_mut() else {
+            return;
+        };
+        let Some(change) = decoder.take_route_change() else {
+            return;
+        };
+        let codec = codec_parameters_for(&self.codec_parameters, decoder.stream_index())
+            .ok()
+            .and_then(|parameters| parameters.codec_name());
+        let software = change.active == DecoderBackend::Software;
+        if software {
+            self.video_decoder_fallbacks = self.video_decoder_fallbacks.saturating_add(1);
+        }
+        let previous_backend = self.info.video_decode_backend.unwrap_or(change.configured);
+        self.info.video_decode_backend = Some(change.active);
+        let event = VideoDecoderEvent {
+            stage: if software {
+                format!("hwaccel_{}_to_software", change.configured.as_str())
+            } else {
+                format!("hwaccel_{}_restored", change.configured.as_str())
+            },
+            requested_backend: change.configured,
+            previous_backend: Some(previous_backend),
+            active_backend: change.active,
+            fallback_count: self.video_decoder_fallbacks,
+            codec,
+            pixel_format: change.pixel_format,
+            line_sizes: None,
+            reason: change.reason,
+        };
+        trace::diagnostic(event.structured_message());
+        self.video_decoder_events.push_back(event);
     }
 
     fn active_video_codec_is_av1(&self) -> bool {
@@ -2936,6 +3306,11 @@ impl PlaybackSession {
         reason: String,
         import_failure: Option<&VideoFrameImportFailure>,
     ) -> Result<()> {
+        if require_hardware_decode() {
+            return Err(PlaybackError::VideoDecoderUnavailable {
+                reason: format!("hardware decoding is required; {stage}: {reason}"),
+            });
+        }
         let stream_index = self.active_or_selected_video_stream_index()?;
         let codec = codec_parameters_for(&self.codec_parameters, stream_index)?.codec_name();
         let previous_backend = self
@@ -3024,24 +3399,11 @@ impl PlaybackSession {
         stage: &str,
         failure: &VideoFrameImportFailure,
     ) -> Result<bool> {
-        let is_mediacodec = failure.decode_backend == DecoderBackend::MediaCodec;
-        let is_avcodec = failure.decode_backend == DecoderBackend::AvCodec;
-        let is_videotoolbox_av1 = failure.decode_backend == DecoderBackend::VideoToolbox
-            && failure
-                .codec
-                .as_deref()
-                .is_some_and(|codec| codec.eq_ignore_ascii_case("av1"));
-        if !is_mediacodec && !is_avcodec && !is_videotoolbox_av1 {
+        if !should_fallback_video_decoder_error(failure.decode_backend) {
             return Ok(false);
         }
         let active_backend = self.active_video_decoder_backend();
-        let expected_backend = if is_videotoolbox_av1 {
-            DecoderBackend::VideoToolbox
-        } else if is_avcodec {
-            DecoderBackend::AvCodec
-        } else {
-            DecoderBackend::MediaCodec
-        };
+        let expected_backend = failure.decode_backend;
         if active_backend != Some(expected_backend) {
             trace::diagnostic(
                 serde_json::json!({
@@ -3056,12 +3418,8 @@ impl PlaybackSession {
             );
             return Ok(false);
         }
-        if is_videotoolbox_av1 || is_avcodec {
-            let fallback_stage = if is_avcodec {
-                format!("{stage}_avcodec_to_software")
-            } else {
-                format!("{stage}_videotoolbox_to_software")
-            };
+        if expected_backend != DecoderBackend::MediaCodec {
+            let fallback_stage = format!("{stage}_{}_to_software", expected_backend.as_str());
             self.fallback_video_decoder_to_software(
                 &fallback_stage,
                 failure.reason.clone(),
@@ -3448,6 +3806,347 @@ fn select_ready_subtitle(
 
 fn decoded_subtitle_start(frame: &DecodedSubtitleFrame) -> Duration {
     frame.start.unwrap_or(Duration::ZERO)
+}
+
+/// How far before a seek's target the backfill starts reading.
+const SUBTITLE_BACKFILL_WINDOW: Duration = Duration::from_secs(15);
+
+fn subtitle_backfill_source_is_local(uri: &str) -> bool {
+    match uri.split_once("://") {
+        None => uri.starts_with('/') || uri.chars().nth(1) == Some(':'),
+        Some((scheme, _)) => scheme.eq_ignore_ascii_case("file"),
+    }
+}
+
+/// What a backfill found at a seek's target.
+struct BackfilledCues {
+    frames: Vec<DecodedSubtitleFrame>,
+    /// The cue index was not complete, so cues that began before the window
+    /// may be missing; ask [`SubtitleBackfill::earlier_active_at`] later.
+    earlier_cues_pending: bool,
+}
+
+enum EarlierCues {
+    /// The index is still being built.
+    Scanning,
+    /// There is no index to ask (it failed, or the source has none).
+    Unavailable,
+    Frames(Vec<DecodedSubtitleFrame>),
+}
+
+/// A second reader of the media file with only the selected subtitle
+/// stream on, to read the cues that are on at a seek's target.
+struct SubtitleBackfill {
+    demuxer: Demuxer,
+    decoder: SubtitleDecoder,
+    stream_index: i32,
+    index: Option<SubtitleCueIndex>,
+}
+
+impl SubtitleBackfill {
+    fn open(uri: &str, stream_index: i32) -> Option<Self> {
+        let source = source_from_uri_with_hint(uri, crate::core::MediaSourceHint::Auto).ok()?;
+        let mut demuxer = Demuxer::open_source(source).ok()?;
+        let decoder = demuxer.open_subtitle_decoder(stream_index).ok()?;
+        demuxer
+            .set_stream_selection(StreamSelection::only([stream_index]))
+            .ok()?;
+        Some(Self {
+            demuxer,
+            decoder,
+            stream_index,
+            index: SubtitleCueIndex::start(uri, stream_index),
+        })
+    }
+
+    /// The frames whose cues are on at `position`. With a complete cue index
+    /// (or one that has been built past `position`) they all come from it.
+    /// Otherwise the stream is read from [`SUBTITLE_BACKFILL_WINDOW`] before
+    /// `position`, which finds every cue that began in the window.
+    fn active_at(
+        &mut self,
+        position: Duration,
+        main: &SubtitleDecoder,
+        track_id: i64,
+    ) -> Result<BackfilledCues> {
+        self.decoder.share_ass_track_with(main);
+        let window_start = position.saturating_sub(SUBTITLE_BACKFILL_WINDOW);
+        if let Some(index) = &self.index {
+            let packets = index.lock();
+            if packets.covers(position) {
+                self.decoder.flush();
+                let frames = decode_active(
+                    &mut self.decoder,
+                    packets.candidates(position, window_start, CueScope::All),
+                    position,
+                    track_id,
+                )?;
+                return Ok(BackfilledCues {
+                    frames,
+                    earlier_cues_pending: false,
+                });
+            }
+        }
+        self.demuxer.seek(window_start)?;
+        self.decoder.flush();
+        let mut active = Vec::new();
+        while let Some(packet) = self.demuxer.read_packet()? {
+            if packet
+                .pts()
+                .and_then(|pts| pts.as_duration())
+                .is_some_and(|pts| pts > position)
+            {
+                break;
+            }
+            if let Some(frame) = self.decoder.decode_packet(&packet)?
+                && cue_is_active_at(&frame, position)
+            {
+                active.push(frame.with_track_id(track_id));
+            }
+        }
+        Ok(BackfilledCues {
+            frames: active,
+            earlier_cues_pending: self.index.as_ref().is_some_and(|index| !index.failed()),
+        })
+    }
+
+    /// The cues that began before the window of an [`Self::active_at`] that
+    /// ran while the index was incomplete and are on at `position`.
+    fn earlier_active_at(
+        &mut self,
+        position: Duration,
+        main: &SubtitleDecoder,
+        track_id: i64,
+    ) -> Result<EarlierCues> {
+        let Some(index) = &self.index else {
+            return Ok(EarlierCues::Unavailable);
+        };
+        let packets = index.lock();
+        if packets.failed() {
+            return Ok(EarlierCues::Unavailable);
+        }
+        if !packets.complete() {
+            return Ok(EarlierCues::Scanning);
+        }
+        self.decoder.share_ass_track_with(main);
+        self.decoder.flush();
+        let window_start = position.saturating_sub(SUBTITLE_BACKFILL_WINDOW);
+        let frames = decode_active(
+            &mut self.decoder,
+            packets.candidates(position, window_start, CueScope::BeforeWindow),
+            position,
+            track_id,
+        )?;
+        Ok(EarlierCues::Frames(frames))
+    }
+}
+
+fn cue_is_active_at(frame: &DecodedSubtitleFrame, position: Duration) -> bool {
+    frame.start.is_none_or(|start| start <= position) && frame.end.is_none_or(|end| end > position)
+}
+
+fn decode_active<'a>(
+    decoder: &mut SubtitleDecoder,
+    packets: impl Iterator<Item = &'a ffmpeg::Packet>,
+    position: Duration,
+    track_id: i64,
+) -> Result<Vec<DecodedSubtitleFrame>> {
+    let mut active = Vec::new();
+    for packet in packets {
+        if let Some(frame) = decoder.decode_packet(packet)?
+            && cue_is_active_at(&frame, position)
+        {
+            active.push(frame.with_track_id(track_id));
+        }
+    }
+    Ok(active)
+}
+
+/// Which of the indexed cues a query wants.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CueScope {
+    /// Every cue on at the position.
+    All,
+    /// Only those that began before the backfill window.
+    BeforeWindow,
+}
+
+/// Every packet of one subtitle stream of a local file, read once by a
+/// background thread the first time a seek needs it. Subtitle packets are
+/// small (a few hundred bytes a cue), so a whole film's worth fits in memory,
+/// and a cue that began at any time before a seek's target is found by
+/// looking at the packets' times, however long it has been on screen.
+///
+/// The container's own index is no help: Matroska cues point at video
+/// keyframes, and nothing in the format says how long before a position a
+/// cue may have started. The scan reads the file once through the
+/// subtitle-only demuxer, so it costs sequential I/O but no decoding; it
+/// never runs on the playback thread, and the queries only take the lock for
+/// the few packets they decode. While it runs, [`SubtitleBackfill`] falls
+/// back to the window read and adds the earlier cues when the scan is done.
+/// A scan that fails or outgrows [`SUBTITLE_CUE_INDEX_BYTE_LIMIT`] leaves the
+/// window read as the only backfill. Dropping the index stops the scan.
+struct SubtitleCueIndex {
+    shared: Arc<SubtitleCueIndexShared>,
+}
+
+struct SubtitleCueIndexShared {
+    cancelled: AtomicBool,
+    state: Mutex<IndexedCues>,
+}
+
+#[derive(Default)]
+struct IndexedCues {
+    packets: Vec<ffmpeg::Packet>,
+    bytes: usize,
+    /// The latest packet start seen: the scan has read everything up to it.
+    scanned_until: Duration,
+    status: CueScanStatus,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum CueScanStatus {
+    #[default]
+    Scanning,
+    Complete,
+    Failed,
+}
+
+/// The packets kept at most, so a hostile or odd file cannot grow the index
+/// without bound. Ordinary subtitle tracks are a few hundred KiB.
+const SUBTITLE_CUE_INDEX_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+
+impl SubtitleCueIndex {
+    /// Starts the scan of a local file's stream; `None` for any other
+    /// source, which is not read a second time.
+    fn start(uri: &str, stream_index: i32) -> Option<Self> {
+        if !subtitle_backfill_source_is_local(uri) {
+            return None;
+        }
+        let shared = Arc::new(SubtitleCueIndexShared {
+            cancelled: AtomicBool::new(false),
+            state: Mutex::new(IndexedCues::default()),
+        });
+        let scan = Arc::clone(&shared);
+        let uri = uri.to_string();
+        thread::Builder::new()
+            .name("erika-subtitle-index".into())
+            .spawn(move || {
+                let status = match scan_subtitle_cues(&uri, stream_index, &scan) {
+                    Ok(true) => CueScanStatus::Complete,
+                    Ok(false) => return,
+                    Err(_) => CueScanStatus::Failed,
+                };
+                let mut state = scan.state.lock().unwrap_or_else(|e| e.into_inner());
+                if status == CueScanStatus::Failed {
+                    state.packets = Vec::new();
+                }
+                state.status = status;
+            })
+            .ok()?;
+        Some(Self { shared })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, IndexedCues> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn failed(&self) -> bool {
+        self.lock().failed()
+    }
+
+    #[cfg(test)]
+    fn wait_until_scanned(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.lock().complete() {
+            assert!(Instant::now() < deadline, "the cue scan did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for SubtitleCueIndex {
+    fn drop(&mut self) {
+        self.shared.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reads all packets of the stream into `shared`. `Ok(false)` when stopped.
+fn scan_subtitle_cues(
+    uri: &str,
+    stream_index: i32,
+    shared: &SubtitleCueIndexShared,
+) -> Result<bool> {
+    let source = source_from_uri_with_hint(uri, crate::core::MediaSourceHint::Auto)?;
+    let mut demuxer = Demuxer::open_source(source)?;
+    demuxer.set_stream_selection(StreamSelection::only([stream_index]))?;
+    while let Some(packet) = demuxer.read_packet()? {
+        if shared.cancelled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let Some(start) = packet.pts().and_then(|pts| pts.as_duration()) else {
+            continue;
+        };
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.bytes += packet.size() + std::mem::size_of::<ffmpeg::Packet>();
+        if state.bytes > SUBTITLE_CUE_INDEX_BYTE_LIMIT {
+            state.packets = Vec::new();
+            state.status = CueScanStatus::Failed;
+            return Ok(false);
+        }
+        state.scanned_until = state.scanned_until.max(start);
+        state.packets.push(packet);
+    }
+    Ok(!shared.cancelled.load(Ordering::Relaxed))
+}
+
+impl IndexedCues {
+    fn complete(&self) -> bool {
+        self.status == CueScanStatus::Complete
+    }
+
+    fn failed(&self) -> bool {
+        self.status == CueScanStatus::Failed
+    }
+
+    /// Whether every packet that starts at or before `position` is in.
+    fn covers(&self, position: Duration) -> bool {
+        match self.status {
+            CueScanStatus::Complete => true,
+            CueScanStatus::Scanning => self.scanned_until > position,
+            CueScanStatus::Failed => false,
+        }
+    }
+
+    /// The packets that may hold a cue on at `position`, in file order: those
+    /// that started before it and last past it, and, for packets that carry
+    /// no duration (a bitmap cue ends where the next packet says), those from
+    /// the backfill window, like the window read.
+    fn candidates(
+        &self,
+        position: Duration,
+        window_start: Duration,
+        scope: CueScope,
+    ) -> impl Iterator<Item = &ffmpeg::Packet> {
+        self.packets.iter().filter(move |packet| {
+            let Some(start) = packet.pts().and_then(|pts| pts.as_duration()) else {
+                return false;
+            };
+            if start > position || (scope == CueScope::BeforeWindow && start >= window_start) {
+                return false;
+            }
+            match packet
+                .duration_seconds()
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            {
+                Some(duration) => start.saturating_add(duration) > position,
+                None => scope == CueScope::All && start >= window_start,
+            }
+        })
+    }
 }
 
 struct ExternalSubtitleSession {
@@ -4150,6 +4849,9 @@ pub struct VideoPlaybackEngine {
     video_seek_preroll_started_at: Option<Instant>,
     video_seek_preroll_dropped_frames: u64,
     last_video_seek_preroll_log: Option<Instant>,
+    /// Scheduler/clock/buffering counters read by diagnostics snapshots.
+    /// Replaced by the player's shared instance when it opens media.
+    timing_counters: Arc<PlaybackTimingCounters>,
 }
 
 impl VideoPlaybackEngine {
@@ -4222,9 +4924,23 @@ impl VideoPlaybackEngine {
         config: PlaybackSessionConfig,
         decoder_resources: PlaybackDecoderResources,
     ) -> Result<Self> {
+        Self::open_with_cold_open_cancellation(request, config, decoder_resources, None)
+    }
+
+    pub(crate) fn open_with_cold_open_cancellation(
+        request: &MediaRequest,
+        config: PlaybackSessionConfig,
+        decoder_resources: PlaybackDecoderResources,
+        cancellation: Option<crate::source::ColdOpenCancellation>,
+    ) -> Result<Self> {
         let timing = playback_timing_for_request(request, config.timing);
         Ok(Self::from_session_with_timing(
-            PlaybackSession::open_with_decoder_resources(request, config, decoder_resources)?,
+            PlaybackSession::open_with_cold_open_cancellation(
+                request,
+                config,
+                decoder_resources,
+                cancellation,
+            )?,
             timing,
         ))
     }
@@ -4238,6 +4954,8 @@ impl VideoPlaybackEngine {
         timing: PlaybackTimingConfig,
     ) -> Self {
         let buffer_recovery_audio = session.buffer_recovery_audio;
+        let timing_counters = Arc::new(PlaybackTimingCounters::new());
+        timing_counters.set_config(&timing);
         Self {
             session,
             state: PlaybackRunState::Paused,
@@ -4268,7 +4986,38 @@ impl VideoPlaybackEngine {
             video_seek_preroll_started_at: None,
             video_seek_preroll_dropped_frames: 0,
             last_video_seek_preroll_log: None,
+            timing_counters,
         }
+    }
+
+    /// Routes this engine's timing counters into `counters` (the player's
+    /// shared instance), restarting them for the newly opened media.
+    pub(crate) fn attach_timing_counters(&mut self, counters: Arc<PlaybackTimingCounters>) {
+        counters.reset(&self.timing);
+        self.timing_counters = counters;
+    }
+
+    pub(crate) fn timing_counters(&self) -> &PlaybackTimingCounters {
+        &self.timing_counters
+    }
+
+    /// Publishes queue depths for diagnostics. Called once per worker loop;
+    /// it only reads lengths and stores relaxed atomics.
+    pub(crate) fn publish_queue_depths(&self) {
+        let session = &self.session;
+        self.timing_counters.publish_queues(QueueDepths {
+            demux_packets: session.demuxer.packets.len(),
+            demux_packet_capacity: DEMUX_PACKET_QUEUE_LIMIT,
+            pending_video_packets: session.pending_video_packets.len(),
+            video_frames: session.video_frames.len() + usize::from(self.pending_frame.is_some()),
+            video_frame_limit: session.queue_limits.video_frames,
+            audio_frames: session.audio_frames.len() + usize::from(self.pending_audio.is_some()),
+            audio_frame_limit: session.queue_limits.audio_frames,
+            subtitle_frames: session.subtitle_frames.len()
+                + usize::from(self.pending_subtitle.is_some()),
+            subtitle_frame_limit: session.queue_limits.subtitle_frames,
+            demux_eof: session.demux_eof,
+        });
     }
 
     pub fn info(&self) -> &OpenedMediaInfo {
@@ -4926,6 +5675,10 @@ impl VideoPlaybackEngine {
         self.timing = timing;
     }
 
+    pub(crate) fn playback_rate(&self) -> f64 {
+        self.clock.rate()
+    }
+
     pub fn set_playback_rate(&mut self, rate: f64) {
         self.set_playback_rate_at(rate, Instant::now());
     }
@@ -5045,6 +5798,7 @@ impl VideoPlaybackEngine {
             self.timing.audio_sync,
         );
         let after = self.clock.media_time_at(now);
+        self.timing_counters.record_clock_correction(&correction);
         trace_clock_correction(
             "output_audio_clock",
             before,
@@ -5161,7 +5915,11 @@ impl VideoPlaybackEngine {
     }
 
     pub fn tick_subtitle(&mut self) -> Result<Option<TimedSubtitleFrame>> {
-        if self.state != PlaybackRunState::Playing {
+        // Paused too: the cue on at a paused seek's frame is delivered with it.
+        if !matches!(
+            self.state,
+            PlaybackRunState::Playing | PlaybackRunState::Paused
+        ) {
             return Ok(None);
         }
         let media_time = self.media_time();
@@ -5203,6 +5961,19 @@ impl VideoPlaybackEngine {
     ) -> Result<Option<TimedVideoFrame>> {
         let paused_seek_preview =
             self.state == PlaybackRunState::Paused && self.paused_seek_frame_pending;
+        if paused_seek_preview && self.session.video_decode_suspended {
+            // Background audio-only playback suspends video decoding, and a
+            // suspended decoder can never produce the preview frame: pumping
+            // for it would discard every remaining video packet at the 2 ms
+            // paused rate -- a full file scan for an HTTP source. Give the
+            // preview up; a foreground resume that wants the frame seeks again.
+            self.paused_seek_frame_pending = false;
+            trace::log(format!(
+                "[erika-playback-trace] stage=paused_seek_frame_abandoned reason=video_decode_suspended target={}",
+                trace::duration_label(self.video_seek_floor),
+            ));
+            return Ok(None);
+        }
         if self.state != PlaybackRunState::Playing && !paused_seek_preview {
             return Ok(None);
         }
@@ -5264,6 +6035,7 @@ impl VideoPlaybackEngine {
                 seek_preroll_drops = seek_preroll_drops.saturating_add(1);
                 self.video_seek_preroll_dropped_frames =
                     self.video_seek_preroll_dropped_frames.saturating_add(1);
+                self.timing_counters.record_seek_preroll_drop();
                 let elapsed = tick_started.elapsed();
                 if seek_preroll_budget_exhausted(
                     seek_preroll_drops,
@@ -5323,11 +6095,13 @@ impl VideoPlaybackEngine {
                 .schedule(pts, media_time, should_present_first)
             {
                 VideoFrameDecision::Wait { .. } => return Ok(None),
-                VideoFrameDecision::Drop { .. }
+                VideoFrameDecision::Drop { late_by }
                     if consecutive_drops < self.timing.video_scheduler.max_consecutive_drops =>
                 {
                     let _ = self.pending_frame.take();
                     consecutive_drops += 1;
+                    self.timing_counters
+                        .record_late_drop(late_by, consecutive_drops);
                 }
                 decision => {
                     #[cfg(target_os = "android")]
@@ -5335,6 +6109,12 @@ impl VideoPlaybackEngine {
                         return Ok(None);
                     }
                     let frame = self.pending_frame.take().expect("pending frame exists");
+                    match decision {
+                        VideoFrameDecision::Drop { late_by } => {
+                            self.timing_counters.record_forced_late_present(late_by)
+                        }
+                        decision => self.timing_counters.record_present(decision.late_by()),
+                    }
                     self.last_presented_pts = pts;
                     if paused_seek_preview {
                         self.paused_seek_frame_pending = false;
@@ -5499,6 +6279,19 @@ impl VideoPlaybackEngine {
                 self.pending_audio.is_some(),
                 self.session.has_queued_audio_frames(),
             ) {
+                return Ok(());
+            }
+            if self.state == PlaybackRunState::Paused && self.paused_seek_frame_pending {
+                // The preview pump ran a paused seek to the end of the media.
+                // The user's session is paused, not finished: abandon the
+                // preview instead of flipping a paused session into Ended,
+                // which would publish a spurious end-of-media and turn the
+                // next play() into a rewind-from-ended full reopen.
+                self.paused_seek_frame_pending = false;
+                trace::log(format!(
+                    "[erika-playback-trace] stage=paused_seek_frame_abandoned reason=eof target={}",
+                    trace::duration_label(self.video_seek_floor),
+                ));
                 return Ok(());
             }
             self.eof = true;
@@ -5767,12 +6560,22 @@ fn trace_clock_correction(
 fn drain_video_frames(
     decoder: &mut Decoder,
     frames: &mut VecDeque<DecodedVideoFrame>,
+    dolby_vision_profile: Option<u8>,
+    dovi_rpu_diagnostics: &mut DoviRpuDiagnostics,
 ) -> Result<DecoderDrainStatus> {
-    let decode_backend = decoder.backend();
     let mut status = DecoderDrainStatus::default();
     loop {
         match decoder.receive_frame()? {
             DecoderOutputFrame::Frame(frame) => {
+                // The backend that produced this frame: FFmpeg may have
+                // dropped the hardware format during negotiation.
+                let decode_backend = decoder.active_backend();
+                diagnose_dovi_frame(
+                    dolby_vision_profile,
+                    dovi_rpu_diagnostics,
+                    &frame,
+                    decode_backend,
+                );
                 frames.push_back(DecodedVideoFrame {
                     frame,
                     decode_backend,
@@ -5786,6 +6589,99 @@ fn drain_video_frames(
             }
         }
     }
+}
+
+/// Per-stream accounting for decoded frames whose Dolby Vision RPU cannot
+/// feed the mapping path, and for frames whose RPU asks for an enhancement
+/// layer this renderer never decodes.
+#[derive(Debug, Default)]
+struct DoviRpuDiagnostics {
+    unavailable_frames: u64,
+    el_frames: u64,
+}
+
+/// Re-report interval after the first diagnostic, so a broken stream stays
+/// visible over long playback without logging at frame rate.
+const DOVI_RPU_DIAGNOSTIC_INTERVAL: u64 = 1024;
+
+impl DoviRpuDiagnostics {
+    fn record_unavailable_frame(&mut self) -> u64 {
+        self.unavailable_frames = self.unavailable_frames.saturating_add(1);
+        self.unavailable_frames
+    }
+
+    fn record_el_frame(&mut self) -> u64 {
+        self.el_frames = self.el_frames.saturating_add(1);
+        self.el_frames
+    }
+
+    fn should_report(count: u64) -> bool {
+        count == 1 || count % DOVI_RPU_DIAGNOSTIC_INTERVAL == 0
+    }
+}
+
+/// Decides whether a frame lacking usable RPU metadata warrants a diagnostic.
+/// A missing RPU is only fatal on Profile 5, whose base layer is not
+/// HDR10-compatible; other profiles either repeat RPUs across frames or fall
+/// back to a base layer that displays correctly. A *present but rejected*
+/// RPU always warrants one: the stream intended to carry Dolby Vision mapping
+/// and the frame will silently display unmapped.
+fn dovi_rpu_diagnostic_warranted(profile: Option<u8>, reason: DoviRejectReason) -> bool {
+    reason != DoviRejectReason::MissingSideData || profile == Some(5)
+}
+
+fn diagnose_dovi_frame(
+    profile: Option<u8>,
+    diagnostics: &mut DoviRpuDiagnostics,
+    frame: &Frame,
+    decode_backend: DecoderBackend,
+) {
+    // One parse: both the reject reason and the EL residual status come from
+    // the same `frame_dovi_metadata_result` result.
+    let el_status = match frame.dovi_mapping_probe() {
+        Ok(status) => status,
+        Err(reason) => {
+            if !dovi_rpu_diagnostic_warranted(profile, reason) {
+                return;
+            }
+            let count = diagnostics.record_unavailable_frame();
+            if !DoviRpuDiagnostics::should_report(count) {
+                return;
+            }
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "dovi_rpu_unavailable",
+                    "profile": profile,
+                    "decodeBackend": decode_backend.as_str(),
+                    "reason": reason.label(),
+                    "framesAffected": count,
+                })
+                .to_string(),
+            );
+            return;
+        }
+    };
+    // The RPU is usable, but it may ask for an enhancement layer this renderer
+    // never decodes (Profile 7 FEL/MEL). The base-layer mapping still applies,
+    // so report the gap instead of pretending the stream was composed.
+    if !el_status.is_active() {
+        return;
+    }
+    let count = diagnostics.record_el_frame();
+    if !DoviRpuDiagnostics::should_report(count) {
+        return;
+    }
+    trace::diagnostic(
+        serde_json::json!({
+            "event": "dovi_el_not_composed",
+            "profile": profile,
+            "decodeBackend": decode_backend.as_str(),
+            "residualRequested": el_status.residual_requested,
+            "nlqNontrivial": el_status.nlq_nontrivial,
+            "framesAffected": count,
+        })
+        .to_string(),
+    );
 }
 
 fn pop_matching_audio_frame(
@@ -5928,12 +6824,34 @@ fn sanitize_playback_rate(rate: f64) -> f64 {
     }
 }
 
-fn should_fallback_video_decoder_open_error(backend: DecoderBackend, codec: Option<&str>) -> bool {
-    matches!(
-        backend,
-        DecoderBackend::D3d11va | DecoderBackend::MediaCodec | DecoderBackend::AvCodec
-    ) || (backend == DecoderBackend::VideoToolbox
-        && codec.is_some_and(|codec| codec.eq_ignore_ascii_case("av1")))
+// A hardware preference must not make software-only codecs unplayable. This
+// policy also covers delayed hardware initialization and renderer import errors.
+fn should_fallback_video_decoder_error(backend: DecoderBackend) -> bool {
+    backend != DecoderBackend::Software && !require_hardware_decode()
+}
+
+/// VideoToolbox and D3D11VA hardware decoders retain the Dolby Vision RPU
+/// metadata side data on the hardware AVFrame, allowing GPU textures + RPU
+/// reshaping via shaders without software decode.
+///
+/// Backends without GPU shader RPU mapping (e.g. Android MediaCodec with
+/// direct surface output, or OpenHarmony AVCodec) fall back to software
+/// decoding for Profile 5 streams to preserve color mapping.
+fn dolby_vision_decode_fallback(
+    profile: Option<u8>,
+    requested: DecoderConfig,
+) -> (DecoderConfig, Option<String>) {
+    let mobile_hardware_fallback = matches!(
+        requested.backend,
+        DecoderBackend::MediaCodec | DecoderBackend::AvCodec
+    );
+    if !mobile_hardware_fallback || profile != Some(5) {
+        return (requested, None);
+    }
+    (
+        DecoderConfig::software(),
+        Some("dolby vision profile 5 on mobile/embedded backend requires software decode for RPU mapping".to_string()),
+    )
 }
 
 fn video_decoder_open_stage(config: DecoderConfig) -> &'static str {
@@ -5983,6 +6901,7 @@ fn mediacodec_fallback_target(
     }
 }
 
+#[cfg(target_os = "android")]
 fn mediacodec_seek_route(
     active_backend: Option<DecoderBackend>,
     uses_surface: bool,
@@ -6026,6 +6945,252 @@ mod tests {
 
     const FIXTURE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+    #[test]
+    fn hwdec_software_forces_the_software_decoder() {
+        for value in ["software", " Software ", "none"] {
+            assert_eq!(
+                software_forced_by(Some(value)),
+                Some(VideoDecodePreference::Software)
+            );
+        }
+        for value in [None, Some(""), Some("auto"), Some("cuda")] {
+            assert_eq!(software_forced_by(value), None);
+        }
+    }
+
+    #[test]
+    fn subtitle_backfill_reads_local_files_only() {
+        assert!(subtitle_backfill_source_is_local("/Users/a/b.mkv"));
+        assert!(subtitle_backfill_source_is_local("file:///Users/a/b.mkv"));
+        assert!(subtitle_backfill_source_is_local("C:\\media\\b.mkv"));
+        assert!(!subtitle_backfill_source_is_local("https://host/b.mkv"));
+        assert!(!subtitle_backfill_source_is_local("smb://host/b.mkv"));
+        assert!(!subtitle_backfill_source_is_local(
+            "fd://12?offset=0&length=9"
+        ));
+    }
+
+    #[test]
+    fn dropping_async_demuxer_waits_for_source_resources() {
+        struct TrackedSource {
+            source: source::LocalFileSource,
+            dropped: std::sync::mpsc::Sender<()>,
+        }
+        impl source::MediaSource for TrackedSource {
+            fn uri(&self) -> &str {
+                self.source.uri()
+            }
+            fn len(&mut self) -> source::Result<Option<u64>> {
+                self.source.len()
+            }
+            fn read_range(&mut self, range: source::ByteRange) -> source::Result<Vec<u8>> {
+                self.source.read_range(range)
+            }
+        }
+        impl Drop for TrackedSource {
+            fn drop(&mut self) {
+                thread::sleep(Duration::from_millis(50));
+                let _ = self.dropped.send(());
+            }
+        }
+
+        let (dropped, receiver) = std::sync::mpsc::channel();
+        let demuxer = Demuxer::open_source(Box::new(TrackedSource {
+            source: source::LocalFileSource::open(playback_fixture_path()).unwrap(),
+            dropped,
+        }))
+        .unwrap();
+        drop(AsyncDemuxer::spawn(demuxer));
+        assert!(
+            receiver.try_recv().is_ok(),
+            "demux drop returned with a live media source"
+        );
+    }
+
+    struct CancellableFixtureSource {
+        source: source::LocalFileSource,
+        cancellation: source::SourceCancellation,
+        interrupted: Sender<()>,
+        block_next_read: Arc<AtomicBool>,
+        read_started: Sender<()>,
+    }
+
+    impl source::MediaSource for CancellableFixtureSource {
+        fn uri(&self) -> &str {
+            self.source.uri()
+        }
+
+        fn len(&mut self) -> source::Result<Option<u64>> {
+            self.source.len()
+        }
+
+        fn read_range(&mut self, range: source::ByteRange) -> source::Result<Vec<u8>> {
+            if self.block_next_read.swap(false, Ordering::SeqCst) {
+                let _ = self.read_started.send(());
+                let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+                while !self.cancellation.is_cancelled() {
+                    if Instant::now() >= deadline {
+                        return Err(source::SourceError::Io("read was not interrupted".into()));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            if self.cancellation.is_cancelled() {
+                let _ = self.interrupted.send(());
+                return Err(source::SourceError::Cancelled);
+            }
+            self.source.read_range(range)
+        }
+
+        fn cancellation(&self) -> Option<source::SourceCancellation> {
+            Some(self.cancellation.clone())
+        }
+    }
+
+    struct FixtureSourceControl {
+        cancellation: source::SourceCancellation,
+        interrupted: Receiver<()>,
+        block_next_read: Arc<AtomicBool>,
+        read_started: Receiver<()>,
+    }
+
+    fn cancellable_fixture_demuxer() -> (Demuxer, FixtureSourceControl) {
+        let cancellation = source::SourceCancellation::default();
+        let (interrupted, interrupt_receiver) = unbounded();
+        let block_next_read = Arc::new(AtomicBool::new(false));
+        let (read_started, read_receiver) = unbounded();
+        let demuxer = Demuxer::open_source(Box::new(CancellableFixtureSource {
+            source: source::LocalFileSource::open(playback_fixture_path()).unwrap(),
+            cancellation: cancellation.clone(),
+            interrupted,
+            block_next_read: block_next_read.clone(),
+            read_started,
+        }))
+        .unwrap();
+        (
+            demuxer,
+            FixtureSourceControl {
+                cancellation,
+                interrupted: interrupt_receiver,
+                block_next_read,
+                read_started: read_receiver,
+            },
+        )
+    }
+
+    #[test]
+    fn demux_worker_does_not_publish_a_cancelled_read_as_error_or_eof() {
+        let (demuxer, control) = cancellable_fixture_demuxer();
+        let (packet_sender, packets) = unbounded();
+        let (commands, command_receiver) = unbounded();
+        control.block_next_read.store(true, Ordering::SeqCst);
+        commands
+            .send(DemuxCommand::Start { generation: 1 })
+            .unwrap();
+        let worker = thread::spawn(move || {
+            run_demux_worker(demuxer, packet_sender, command_receiver);
+        });
+        control
+            .read_started
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .unwrap();
+        control.cancellation.interrupt();
+        control
+            .interrupted
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .unwrap();
+        // End the interrupt-to-command window by disconnecting the control
+        // channel. Joining makes the assertions independent of scheduling.
+        drop(commands);
+        worker.join().unwrap();
+        for message in packets.try_iter() {
+            match message {
+                DemuxMessage::Packet { .. } => {}
+                DemuxMessage::Error { message, .. } => panic!("{message}"),
+                DemuxMessage::Eof { .. } => panic!("cancelled read became EOF"),
+            }
+        }
+    }
+
+    #[test]
+    fn demux_worker_recovers_when_a_new_seek_interrupts_an_older_resume() {
+        let (demuxer, control) = cancellable_fixture_demuxer();
+        let first = control.cancellation.interrupt();
+        let latest = control.cancellation.interrupt();
+        let (packet_sender, packets) = unbounded();
+        let (commands, command_receiver) = unbounded();
+        // The second seek has interrupted I/O but is not yet enqueued. The
+        // first resume must not reset its token or turn its read into fatal.
+        commands
+            .send(DemuxCommand::Seek {
+                generation: 2,
+                position: Duration::ZERO,
+                io_generation: Some(first),
+            })
+            .unwrap();
+        commands
+            .send(DemuxCommand::Start { generation: 2 })
+            .unwrap();
+        let worker = thread::spawn(move || {
+            run_demux_worker(demuxer, packet_sender, command_receiver);
+        });
+        control
+            .interrupted
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .unwrap();
+        commands
+            .send(DemuxCommand::Seek {
+                generation: 3,
+                position: Duration::from_secs(1),
+                io_generation: Some(latest),
+            })
+            .unwrap();
+        commands
+            .send(DemuxCommand::Start { generation: 3 })
+            .unwrap();
+        let mut latest_packets = 0;
+        loop {
+            match packets.recv_timeout(FIXTURE_WAIT_TIMEOUT).unwrap() {
+                DemuxMessage::Packet { generation, .. } => {
+                    if generation == 3 {
+                        latest_packets += 1;
+                    }
+                }
+                DemuxMessage::Eof { generation } => {
+                    assert_eq!(generation, 3);
+                    break;
+                }
+                DemuxMessage::Error { message, .. } => panic!("{message}"),
+            }
+        }
+        assert!(latest_packets > 0);
+        commands.send(DemuxCommand::Stop).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_async_demuxer_with_full_packet_queue_does_not_deadlock() {
+        let demuxer = AsyncDemuxer::spawn(Demuxer::open_path(playback_fixture_path()).unwrap());
+        for _ in 0..=DEMUX_PACKET_QUEUE_LIMIT {
+            demuxer
+                .commands
+                .send(DemuxCommand::SetSelection {
+                    generation: 1,
+                    selection: StreamSelection::only([i32::MAX]),
+                })
+                .unwrap();
+        }
+        let (done, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            drop(demuxer);
+            let _ = done.send(());
+        });
+        receiver
+            .recv_timeout(FIXTURE_WAIT_TIMEOUT)
+            .expect("demux teardown blocked on a full packet queue");
+        worker.join().unwrap();
+    }
+
     fn playback_fixture_path() -> PathBuf {
         std::env::var_os("ERIKA_PLAYBACK_FIXTURE")
             .map(PathBuf::from)
@@ -6043,6 +7208,8 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
+            start_position: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,
@@ -6150,6 +7317,27 @@ mod tests {
                 "timed out waiting for a fixture video frame"
             );
             thread::yield_now();
+        }
+    }
+
+    fn wait_for_buffering_video_to_park(engine: &mut VideoPlaybackEngine, mut now: Instant) {
+        // Advancing a synthetic clock does not advance the asynchronous demux
+        // worker. Wait for actual decode progress before checking the bound.
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        loop {
+            now += BUFFERING_VIDEO_DRAIN_INTERVAL;
+            assert!(engine.tick_at(now).unwrap().is_none());
+            assert!(engine.buffering_video_drained_frames <= BUFFERING_VIDEO_MAX_DRAINED_FRAMES);
+            if engine.pending_frame.is_some() {
+                // A buffering tick parks a frame only when the recovery bound
+                // prevents it from being discarded.
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for bounded video recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -6389,6 +7577,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "android")]
     #[test]
     fn mediacodec_seek_reopens_the_active_surface_or_bytebuffer_route() {
         assert_eq!(
@@ -6433,30 +7622,143 @@ mod tests {
     }
 
     #[test]
+    fn software_only_wmv_plays_and_seeks_with_every_decoder_preference() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/software/wmv2-wmav2.asf");
+        for preference in [
+            VideoDecodePreference::Software,
+            VideoDecodePreference::VideoToolbox,
+            VideoDecodePreference::D3d11va,
+            VideoDecodePreference::MediaCodec,
+            VideoDecodePreference::MediaCodecByteBuffer,
+            VideoDecodePreference::AvCodec,
+        ] {
+            let mut engine = VideoPlaybackEngine::open(
+                &MediaRequest::new(path.to_string_lossy()),
+                PlaybackSessionConfig {
+                    video_decode: preference,
+                    ..PlaybackSessionConfig::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{preference:?}: {error}"));
+            assert_eq!(
+                engine.info().video_decode_backend,
+                Some(DecoderBackend::Software)
+            );
+            let events = engine.take_video_decoder_events();
+            let event = events.last().expect("decoder selection event");
+            assert_eq!(event.requested_backend, preference.decoder_config().backend);
+            assert_eq!(event.active_backend, DecoderBackend::Software);
+            assert_eq!(event.codec.as_deref(), Some("wmv2"));
+            assert_eq!(
+                event.fallback_count > 0,
+                preference != VideoDecodePreference::Software
+            );
+            let started = Instant::now();
+            engine.play_at(started);
+            let video = next_fixture_video_at(&mut engine, started);
+            assert_eq!(video.decode_backend, DecoderBackend::Software);
+            let planar = video
+                .frame
+                .to_planar_frame()
+                .expect("GPU-uploadable software frame");
+            assert_eq!((planar.width, planar.height), (160, 90));
+            assert!(planar.luma.iter().any(|value| *value != planar.luma[0]));
+            let audio = next_fixture_audio_at(&mut engine, started);
+            assert!(!audio.frame.samples.is_empty());
+
+            let target = Duration::from_secs(1);
+            let seek_at = started + target;
+            engine.seek_at(target, seek_at).unwrap();
+            let video = next_fixture_video_at(&mut engine, seek_at);
+            assert!(video.pts.unwrap() >= target);
+            assert!(video.frame.to_planar_frame().is_some());
+            assert_eq!(
+                engine.info().video_decode_backend,
+                Some(DecoderBackend::Software)
+            );
+
+            engine.stop_checked_at(seek_at).unwrap();
+            engine.play_at(seek_at);
+            let replay = next_fixture_video_at(&mut engine, seek_at);
+            assert_eq!(replay.pts, Some(Duration::from_millis(46)));
+        }
+    }
+
+    /// FFmpeg opens the VideoToolbox decoder for the MPEG-4 Part 2 fixture,
+    /// then fails to initialise its hwaccel and decodes in software. The
+    /// engine must report that fallback instead of an active VideoToolbox.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn videotoolbox_dropped_by_ffmpeg_is_reported_as_software_fallback() {
+        let mut engine = VideoPlaybackEngine::open(
+            &MediaRequest::new(playback_fixture_path().to_string_lossy()),
+            PlaybackSessionConfig {
+                video_decode: VideoDecodePreference::VideoToolbox,
+                ..PlaybackSessionConfig::default()
+            },
+        )
+        .unwrap();
+        let opened = engine.take_video_decoder_events();
+        assert_eq!(opened.last().unwrap().stage, "open");
+        assert_eq!(
+            opened.last().unwrap().active_backend,
+            DecoderBackend::VideoToolbox
+        );
+
+        let started = Instant::now();
+        engine.play_at(started);
+        let video = next_fixture_video_at(&mut engine, started);
+        assert!(!video.frame.is_videotoolbox());
+        assert_eq!(video.decode_backend, DecoderBackend::Software);
+        assert_eq!(
+            engine.info().video_decode_backend,
+            Some(DecoderBackend::Software)
+        );
+        let events = engine.take_video_decoder_events();
+        let fallback = events
+            .iter()
+            .find(|event| event.stage == "hwaccel_videotoolbox_to_software")
+            .expect("software fallback event");
+        assert_eq!(fallback.requested_backend, DecoderBackend::VideoToolbox);
+        assert_eq!(
+            fallback.previous_backend,
+            Some(DecoderBackend::VideoToolbox)
+        );
+        assert_eq!(fallback.active_backend, DecoderBackend::Software);
+        assert_eq!(fallback.fallback_count, 1);
+        assert_eq!(fallback.codec.as_deref(), Some("mpeg4"));
+        assert_eq!(fallback.pixel_format.as_deref(), Some("yuv420p"));
+        assert!(
+            fallback
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("could not initialise")),
+            "{:?}",
+            fallback.reason
+        );
+        // Reported once, not per frame.
+        let _ = next_fixture_video_at(&mut engine, started + Duration::from_millis(100));
+        assert!(
+            engine
+                .take_video_decoder_events()
+                .iter()
+                .all(|event| !event.stage.starts_with("hwaccel_"))
+        );
+    }
+
+    #[test]
     fn decoder_open_fallback_is_enabled_for_platform_hardware_backends() {
-        assert!(should_fallback_video_decoder_open_error(
+        for backend in [
+            DecoderBackend::VideoToolbox,
             DecoderBackend::D3d11va,
-            None
-        ));
-        assert!(should_fallback_video_decoder_open_error(
             DecoderBackend::MediaCodec,
-            None
-        ));
-        assert!(!should_fallback_video_decoder_open_error(
-            DecoderBackend::VideoToolbox,
-            Some("h264")
-        ));
-        assert!(should_fallback_video_decoder_open_error(
-            DecoderBackend::VideoToolbox,
-            Some("av1")
-        ));
-        assert!(should_fallback_video_decoder_open_error(
-            DecoderBackend::VideoToolbox,
-            Some("AV1")
-        ));
-        assert!(!should_fallback_video_decoder_open_error(
-            DecoderBackend::Software,
-            Some("av1")
+            DecoderBackend::AvCodec,
+        ] {
+            assert!(should_fallback_video_decoder_error(backend));
+        }
+        assert!(!should_fallback_video_decoder_error(
+            DecoderBackend::Software
         ));
     }
 
@@ -6600,6 +7902,8 @@ mod tests {
             uri: "file:///tmp/test.mp4".to_string(),
             duration: Some(Duration::from_secs(12)),
             tracks: vec![video_track],
+            chapters: Vec::new(),
+            container: crate::core::ContainerInfo::default(),
             video_params: Some(VideoParams {
                 width: 3840,
                 height: 2160,
@@ -6698,6 +8002,77 @@ mod tests {
         assert!(video_pts >= target);
         assert!(audio_pts >= target);
         assert!(audio_pts - target <= Duration::from_millis(34));
+    }
+
+    #[test]
+    fn playback_fixture_paused_seek_past_the_last_frame_stays_paused() {
+        let mut engine = playback_fixture_engine();
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let _ = next_fixture_video_at(&mut engine, t0);
+
+        let paused_at = t0 + Duration::from_millis(500);
+        engine.pause_at(paused_at);
+        // The fixture is 8 s long and its frames end before the target, so
+        // every decoded frame is seek preroll and the preview pump reaches
+        // demux EOF without ever presenting a frame. Audio output stays off
+        // so the queued tail audio is discarded at EOF instead of stalling it.
+        let target = Duration::from_secs(8);
+        engine.seek_at(target, paused_at).unwrap();
+        engine.set_audio_output_active(false);
+
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert_eq!(engine.media_time_at(paused_at), target);
+
+        let mut ticks = 0;
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        while engine.has_pending_paused_seek_frame() {
+            let _ = engine.tick_at(paused_at).unwrap();
+            ticks += 1;
+            assert!(
+                Instant::now() < deadline,
+                "the preview pump must reach the abandonment path"
+            );
+            assert_eq!(
+                engine.state(),
+                PlaybackRunState::Paused,
+                "a paused session must not become Ended while only seeking"
+            );
+            assert_eq!(
+                engine.media_time_at(paused_at + Duration::from_secs(60)),
+                target
+            );
+            thread::yield_now();
+        }
+        assert!(ticks > 0);
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+    }
+
+    #[test]
+    fn playback_fixture_suspended_decode_abandons_the_paused_seek_preview() {
+        let mut engine = playback_fixture_engine();
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let _ = next_fixture_video_at(&mut engine, t0);
+
+        let paused_at = t0 + Duration::from_millis(500);
+        engine.pause_at(paused_at);
+        let target = Duration::from_millis(5_125);
+        engine.seek_at(target, paused_at).unwrap();
+        engine.set_video_decode_suspended(true).unwrap();
+
+        assert!(engine.has_pending_paused_seek_frame());
+        let tick = engine.tick_at(paused_at + Duration::from_secs(60)).unwrap();
+        assert!(tick.is_none());
+        assert!(
+            !engine.has_pending_paused_seek_frame(),
+            "a suspended decoder can never produce the preview"
+        );
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert_eq!(
+            engine.media_time_at(paused_at + Duration::from_secs(60)),
+            target
+        );
     }
 
     #[test]
@@ -6820,6 +8195,51 @@ mod tests {
         assert_eq!(after.media_time, Duration::from_secs(5));
         assert_eq!(after.source, PlaybackClockSource::Audio);
         assert_eq!(after.rate, 2.0);
+
+        // The correction that used to reach only the opt-in clock trace is
+        // now counted for diagnostics.
+        let clock = engine.timing_counters().clock_json();
+        assert_eq!(clock["observations"], 1);
+        assert_eq!(clock["snaps"], 1);
+        assert_eq!(clock["corrections"], 0);
+        assert_eq!(clock["forwardCorrections"], 1);
+        assert!(clock["lastDriftMs"].as_f64().unwrap() > 4_000.0);
+        assert!(clock["lastSnapAgoMs"].as_f64().is_some());
+    }
+
+    #[test]
+    fn playback_fixture_scheduler_counts_late_drops_and_presents() {
+        let mut engine = playback_fixture_engine();
+        let counters = Arc::new(PlaybackTimingCounters::new());
+        engine.attach_timing_counters(Arc::clone(&counters));
+        assert_eq!(counters.scheduler_json()["dropToleranceMs"], 120.0);
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let _ = next_fixture_video_at(&mut engine, t0);
+        assert_eq!(counters.presented_frames(), 1);
+        assert_eq!(counters.late_dropped_frames(), 0);
+
+        // Two seconds on, the frames queued right after the first one are far
+        // past the 120 ms drop tolerance: the scheduler discards them (at most
+        // five in a row) before presenting again.
+        let late_at = t0 + Duration::from_secs(2);
+        let _ = next_fixture_video_at(&mut engine, late_at);
+        let scheduler = counters.scheduler_json();
+        assert!(counters.late_dropped_frames() >= 1, "{scheduler}");
+        assert!(counters.presented_frames() >= 2, "{scheduler}");
+        let burst = scheduler["maxDropBurst"].as_u64().unwrap();
+        assert!((1..=5).contains(&burst), "{scheduler}");
+        assert!(scheduler["maxDroppedLateMs"].as_f64().unwrap() > 120.0);
+        assert!(scheduler["lastDropAgoMs"].as_f64().is_some());
+        assert_eq!(
+            scheduler["lateByMs"]["samples"],
+            counters.presented_frames()
+        );
+
+        engine.publish_queue_depths();
+        let queues = counters.queues_json();
+        assert_eq!(queues["demuxPackets"]["capacity"], DEMUX_PACKET_QUEUE_LIMIT);
+        assert!(queues["decodedVideoFrames"]["capacity"].as_u64().unwrap() > 0);
     }
 
     fn clock_test_ring() -> crate::audio::AudioRingBuffer {
@@ -7757,11 +9177,7 @@ mod tests {
         assert_eq!(engine.buffering_video_pts(), visible_buffering_pts);
         assert_eq!(engine.last_buffering_video_drain_at, Some(next_drain));
 
-        for index in 2..=200 {
-            let _ = engine
-                .tick_at(stalled_at + BUFFERING_VIDEO_DRAIN_INTERVAL * index)
-                .unwrap();
-        }
+        wait_for_buffering_video_to_park(&mut engine, next_drain);
         let parked = engine
             .pending_frame
             .as_ref()
@@ -7812,11 +9228,7 @@ mod tests {
         );
         assert!(!engine.session.demux_eof);
 
-        for index in 1..=200 {
-            let _ = engine
-                .tick_at(stalled_at + BUFFERING_VIDEO_DRAIN_INTERVAL * index)
-                .unwrap();
-        }
+        wait_for_buffering_video_to_park(&mut engine, stalled_at);
 
         assert!(engine.pending_frame.is_some());
         assert!(engine.buffering_video_drained_frames <= BUFFERING_VIDEO_MAX_DRAINED_FRAMES);
@@ -8044,6 +9456,8 @@ mod tests {
             source_hint: MediaSourceHint::LocalFile,
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
+            http_back_buffer_bytes: None,
+            start_position: None,
         };
         let config = PlaybackSessionConfig {
             video_decode: VideoDecodePreference::Software,
@@ -8508,5 +9922,297 @@ mod tests {
         assert_eq!(first.vsyncs + second.vsyncs, 5);
         assert_ne!(first.vsyncs, second.vsyncs);
         assert!(first.residual_error_nanos.signum() != second.residual_error_nanos.signum());
+    }
+
+    #[test]
+    fn dolby_vision_profile_5_stays_on_hardware_for_videotoolbox_and_d3d11va() {
+        let vt_config = DecoderConfig {
+            backend: DecoderBackend::VideoToolbox,
+            mediacodec_surface: false,
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), vt_config);
+        assert_eq!(config.backend, DecoderBackend::VideoToolbox);
+        assert_eq!(reason, None);
+
+        let d3d11_config = DecoderConfig {
+            backend: DecoderBackend::D3d11va,
+            mediacodec_surface: false,
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), d3d11_config);
+        assert_eq!(config.backend, DecoderBackend::D3d11va);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dolby_vision_profile_5_falls_back_to_software_decode_on_mobile_backends() {
+        let avcodec_config = DecoderConfig {
+            backend: DecoderBackend::AvCodec,
+            mediacodec_surface: false,
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), avcodec_config);
+        assert_eq!(config.backend, DecoderBackend::Software);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("profile 5"));
+
+        let mediacodec_config = DecoderConfig {
+            backend: DecoderBackend::MediaCodec,
+            mediacodec_surface: true,
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), mediacodec_config);
+        assert_eq!(config.backend, DecoderBackend::Software);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("profile 5"));
+    }
+
+    #[test]
+    fn dolby_vision_profile_8_stays_on_hardware_decode() {
+        let hardware_config = DecoderConfig {
+            backend: DecoderBackend::VideoToolbox,
+            mediacodec_surface: false,
+        };
+        let (config, reason) = dolby_vision_decode_fallback(Some(8), hardware_config);
+
+        assert_eq!(config.backend, DecoderBackend::VideoToolbox);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dolby_vision_software_decode_stays_software() {
+        let software_config = DecoderConfig::software();
+        let (config, reason) = dolby_vision_decode_fallback(Some(5), software_config);
+
+        assert_eq!(config.backend, DecoderBackend::Software);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dovi_rpu_missing_is_diagnostic_only_on_profile_5() {
+        assert!(dovi_rpu_diagnostic_warranted(
+            Some(5),
+            DoviRejectReason::MissingSideData
+        ));
+        assert!(!dovi_rpu_diagnostic_warranted(
+            Some(8),
+            DoviRejectReason::MissingSideData
+        ));
+        assert!(!dovi_rpu_diagnostic_warranted(
+            None,
+            DoviRejectReason::MissingSideData
+        ));
+        assert!(dovi_rpu_diagnostic_warranted(
+            None,
+            DoviRejectReason::UnsupportedCoefDenom
+        ));
+        assert!(dovi_rpu_diagnostic_warranted(
+            Some(8),
+            DoviRejectReason::InvalidCurves
+        ));
+    }
+
+    #[test]
+    fn dovi_rpu_diagnostics_report_first_then_spaced() {
+        assert!(DoviRpuDiagnostics::should_report(1));
+        assert!(!DoviRpuDiagnostics::should_report(2));
+        assert!(!DoviRpuDiagnostics::should_report(
+            DOVI_RPU_DIAGNOSTIC_INTERVAL - 1
+        ));
+        assert!(DoviRpuDiagnostics::should_report(
+            DOVI_RPU_DIAGNOSTIC_INTERVAL
+        ));
+        assert!(!DoviRpuDiagnostics::should_report(
+            DOVI_RPU_DIAGNOSTIC_INTERVAL + 1
+        ));
+
+        let mut diagnostics = DoviRpuDiagnostics::default();
+        assert_eq!(diagnostics.record_unavailable_frame(), 1);
+        assert_eq!(diagnostics.record_unavailable_frame(), 2);
+        // The enhancement-layer counter is independent, so a stream that both
+        // loses RPUs and carries FEL residual reports each at its own cadence.
+        assert_eq!(diagnostics.record_el_frame(), 1);
+        assert_eq!(diagnostics.record_unavailable_frame(), 3);
+        assert_eq!(diagnostics.record_el_frame(), 2);
+    }
+
+    fn subtitle_seek_fixture(name: &str) -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/subtitle-seek")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn long_cue_fixture() -> (String, SubtitleDecoder) {
+        let path = subtitle_seek_fixture("long.mkv");
+        let main = Demuxer::open_path(&path)
+            .unwrap()
+            .open_subtitle_decoder(1)
+            .unwrap();
+        (path, main)
+    }
+
+    #[test]
+    fn backfill_keeps_long_cue() {
+        let (path, main) = long_cue_fixture();
+        let mut backfill = SubtitleBackfill::open(&path, 1).unwrap();
+        backfill.index.as_ref().unwrap().wait_until_scanned();
+        let read_back = backfill
+            .active_at(Duration::from_secs(40), &main, 1)
+            .unwrap();
+        assert!(
+            !read_back.frames.is_empty(),
+            "LONG covers 0-50 s and must be recovered at 40 s"
+        );
+        assert!(!read_back.earlier_cues_pending);
+        // A cue that ended before the target is not among them.
+        let read_back = backfill
+            .active_at(Duration::from_secs(55), &main, 1)
+            .unwrap();
+        assert!(read_back.frames.is_empty());
+    }
+
+    #[test]
+    fn backfill_adds_cues_before_the_window_when_the_scan_finishes() {
+        let (path, main) = long_cue_fixture();
+        let mut backfill = SubtitleBackfill::open(&path, 1).unwrap();
+        let index = backfill.index.as_ref().unwrap();
+        index.wait_until_scanned();
+        // Go back to a scan that has not got anywhere yet.
+        {
+            let mut state = index.lock();
+            state.status = CueScanStatus::Scanning;
+            state.scanned_until = Duration::ZERO;
+        }
+        let target = Duration::from_secs(40);
+        let read_back = backfill.active_at(target, &main, 1).unwrap();
+        assert!(read_back.earlier_cues_pending);
+        assert!(
+            read_back.frames.is_empty(),
+            "only the 15 s window is read while the scan runs"
+        );
+        assert!(matches!(
+            backfill.earlier_active_at(target, &main, 1).unwrap(),
+            EarlierCues::Scanning
+        ));
+        backfill.index.as_ref().unwrap().lock().status = CueScanStatus::Complete;
+        let EarlierCues::Frames(frames) = backfill.earlier_active_at(target, &main, 1).unwrap()
+        else {
+            panic!("the finished scan must give the earlier cues");
+        };
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].start, Some(Duration::ZERO));
+        assert_eq!(frames[0].end, Some(Duration::from_secs(50)));
+    }
+
+    #[test]
+    fn backfill_window_still_finds_recent_cues_before_the_scan_finishes() {
+        let (path, main) = long_cue_fixture();
+        let mut backfill = SubtitleBackfill::open(&path, 1).unwrap();
+        backfill.index.as_ref().unwrap().wait_until_scanned();
+        {
+            let mut state = backfill.index.as_ref().unwrap().lock();
+            state.status = CueScanStatus::Scanning;
+            state.scanned_until = Duration::ZERO;
+        }
+        // NEXT is on 30-31 s, inside the window of a seek to 30.5 s.
+        let read_back = backfill
+            .active_at(Duration::from_millis(30_500), &main, 1)
+            .unwrap();
+        assert_eq!(read_back.frames.len(), 1);
+        assert_eq!(read_back.frames[0].start, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn seek_into_a_long_cue_shows_it() {
+        let request = MediaRequest::new(subtitle_seek_fixture("long.mkv"));
+        let config = PlaybackSessionConfig {
+            video_decode: VideoDecodePreference::Software,
+            ..Default::default()
+        };
+        let mut session = PlaybackSession::open(&request, config).unwrap();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        // Whether the scan finished before the seek or after it, the cue
+        // arrives, and without the playback thread waiting for the scan.
+        for _ in 0..2000 {
+            if let Some(frame) = session.next_subtitle_frame(target).unwrap() {
+                assert_eq!(frame.start, Some(Duration::ZERO));
+                assert_eq!(frame.end, Some(Duration::from_secs(50)));
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the 0-50 s cue never arrived after a seek to 40 s");
+    }
+
+    #[test]
+    fn switching_track_after_seek_keeps_new_track_cue() {
+        let request = MediaRequest::new(subtitle_seek_fixture("two-tracks.mkv"));
+        let config = PlaybackSessionConfig {
+            video_decode: VideoDecodePreference::Software,
+            ..Default::default()
+        };
+        let mut session = PlaybackSession::open(&request, config).unwrap();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        session.select_subtitle_track(Some(2), target).unwrap();
+        for _ in 0..500 {
+            session.video_frames.clear();
+            session.audio_frames.clear();
+            session.pump_once(PlaybackPumpDemand::Video).unwrap();
+            while let Some(frame) = session.next_subtitle_frame(target).unwrap() {
+                if frame.start.is_none_or(|start| start <= target)
+                    && frame.end.is_none_or(|end| end > target)
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("track 2 has a cue at 40-50 s, but none arrived after switching at 40 s");
+    }
+
+    fn open_switch_track_session() -> PlaybackSession {
+        let request = MediaRequest::new(subtitle_seek_fixture("switch-track.mkv"));
+        let config = PlaybackSessionConfig {
+            video_decode: VideoDecodePreference::Software,
+            ..Default::default()
+        };
+        PlaybackSession::open(&request, config).unwrap()
+    }
+
+    #[test]
+    fn switching_track_shows_the_cue_that_is_on_at_the_switch() {
+        let mut session = open_switch_track_session();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        session.select_subtitle_track(Some(2), target).unwrap();
+        for _ in 0..500 {
+            session.video_frames.clear();
+            session.audio_frames.clear();
+            session.pump_once(PlaybackPumpDemand::Video).unwrap();
+            if let Some(frame) = session.next_subtitle_frame(target).unwrap() {
+                assert_eq!(frame.start, Some(Duration::from_secs(35)));
+                assert_eq!(frame.end, Some(Duration::from_secs(45)));
+                assert_eq!(frame.track_id, 2);
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("track 2's 35-45 s cue is on at 40 s but never showed after switching");
+    }
+
+    #[test]
+    fn switching_track_while_paused_shows_the_cue_at_once() {
+        let mut session = open_switch_track_session();
+        let target = Duration::from_secs(40);
+        session.seek(target).unwrap();
+        // Nothing is pumped: a paused player only asks for the subtitle.
+        session.select_subtitle_track(Some(2), target).unwrap();
+        let frame = session
+            .next_subtitle_frame(target)
+            .unwrap()
+            .expect("the cue on at the switch must be there without playing");
+        assert_eq!(frame.start, Some(Duration::from_secs(35)));
+        assert_eq!(frame.end, Some(Duration::from_secs(45)));
     }
 }

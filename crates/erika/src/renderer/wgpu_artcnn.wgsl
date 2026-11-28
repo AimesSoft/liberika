@@ -21,7 +21,7 @@ struct TileParams {
     dispatch: vec4<u32>,
     // weight offset, bias offset (both in half4 units), relu, add residual
     layer: vec4<u32>,
-    // Nonlinear RGB -> Y coefficients. Unused by the planar-luma entry point.
+    // RGB -> Y, or planar channel weights (R normally, RG for P010 byte pairs).
     luma_coefficients: vec4<f32>,
 };
 
@@ -85,7 +85,7 @@ fn load_luma_or_zero(coord: vec2<i32>) -> f32 {
     if (!in_image(coord)) {
         return 0.0;
     }
-    return textureLoad(conv0_luma, coord, 0).x;
+    return dot(textureLoad(conv0_luma, coord, 0).rgb, params.luma_coefficients.xyz);
 }
 
 fn load_rgb_luma_or_zero(coord: vec2<i32>) -> f32 {

@@ -1,0 +1,11 @@
+[package]
+name = "linux_native_demo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+erika = { path = "../../crates/erika", features = ["wgpu"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }

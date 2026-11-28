@@ -1,0 +1,734 @@
+//! Browser bindings. The Web package owns WebCodecs, libass and the GPU surface;
+//! text layout and rasterization use the same implementation as native players.
+use crate::color_glyph::ColorBitmap;
+use crate::danmaku::{
+    DanmakuColor, DanmakuFontSelection, DanmakuItem, DanmakuLayoutConfig, DanmakuMode,
+    DanmakuTimeline, DanmakuViewport, DfmLayoutEngine, DfmPreparedLayout,
+};
+use crate::font::{FallbackFont, SubtitleFontAttachment};
+use crate::renderer::pipeline::{LumaUpscalerMode, UpscalerFamily};
+use crate::renderer::sr::{
+    catalog as sr_catalog, fold as sr_fold,
+    model::SrModel,
+    plan::{DeviceCapabilities, PARAMS_BYTES, SrPlan, WEB_UPSCALER_MODES},
+    reference::LumaRange,
+};
+use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array, Uint32Array};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use wasm_bindgen::prelude::*;
+
+thread_local! {
+    static EMOJI_PAINTER: std::cell::RefCell<Option<js_sys::Function>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Lets the page draw emoji: only the browser reaches the system's color fonts.
+/// `painter(text, height)` answers `{ width, height, rgba }`, with premultiplied
+/// pixels and the emoji in the middle, or nothing.
+#[wasm_bindgen(js_name = setEmojiPainter)]
+pub fn set_emoji_painter(painter: js_sys::Function) {
+    EMOJI_PAINTER.with(|slot| *slot.borrow_mut() = Some(painter));
+    crate::color_glyph::set_browser_painter(paint_emoji);
+}
+
+fn paint_emoji(text: &str, em: u32) -> Option<ColorBitmap> {
+    let picture = EMOJI_PAINTER.with(|slot| {
+        slot.borrow()
+            .as_ref()?
+            .call2(&JsValue::NULL, &text.into(), &em.into())
+            .ok()
+    })?;
+    if picture.is_null() || picture.is_undefined() {
+        return None;
+    }
+    let number = |key: &str| Reflect::get(&picture, &key.into()).ok()?.as_f64();
+    let (width, height) = (number("width")? as u32, number("height")? as u32);
+    let rgba = Uint8Array::new(&Reflect::get(&picture, &"rgba".into()).ok()?).to_vec();
+    if width == 0 || height == 0 || rgba.len() != (width * height * 4) as usize {
+        return None;
+    }
+    let em = em.max(1) as f32;
+    Some(ColorBitmap {
+        width,
+        height,
+        rgba,
+        left: 0.0,
+        em_width: width as f32 / em,
+        em_height: height as f32 / em,
+        advance: width as f32 / em,
+    })
+}
+
+/// Share the fallback face danmaku use with the libass WASM module; empty when
+/// this package carries none and the page was given none. Return an owned JS
+/// array so later Rust memory growth cannot invalidate it.
+#[wasm_bindgen(js_name = fallbackFont)]
+pub fn fallback_font() -> Uint8Array {
+    match crate::font::fallback_font() {
+        Some(font) => Uint8Array::from(&*font.data),
+        None => Uint8Array::new_with_length(0),
+    }
+}
+
+/// Give the player the fallback face of the device serving this page, and
+/// answer the families libass finds it under; empty when the bytes hold no such
+/// face, which leaves the player as it was.
+#[wasm_bindgen(js_name = setFallbackFont)]
+pub fn set_fallback_font(data: Vec<u8>, index: u32) -> String {
+    let font = FallbackFont {
+        data: Arc::from(data),
+        index,
+    };
+    let Some(families) = font.families() else {
+        return String::new();
+    };
+    crate::font::set_fallback_font(Some(font));
+    families
+}
+
+#[wasm_bindgen]
+pub struct WebDanmaku {
+    timeline: DanmakuTimeline,
+    engine: DfmLayoutEngine,
+    prepared: Option<DfmPreparedLayout>,
+    config: DanmakuLayoutConfig,
+    window: f64,
+    viewport: Option<DanmakuViewport>,
+    pending_size_at: Option<f64>,
+    atlas_version: u64,
+    atlas_size: (u32, u32, usize),
+    picture_version: u64,
+    size_deadline: Option<f64>,
+    fonts: Vec<SubtitleFontAttachment>,
+    font_generation: u64,
+}
+
+fn set(object: &Object, key: &str, value: JsValue) -> Result<(), JsValue> {
+    Reflect::set(object, &key.into(), &value).map(|_| ())
+}
+
+#[wasm_bindgen]
+impl WebDanmaku {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        let config = DanmakuLayoutConfig::default();
+        Self {
+            timeline: DanmakuTimeline::default(),
+            engine: DfmLayoutEngine::new(DanmakuTimeline::default(), config.clone()),
+            config,
+            prepared: None,
+            window: -100.0,
+            viewport: None,
+            pending_size_at: None,
+            atlas_version: 0,
+            atlas_size: (0, 0, 0),
+            picture_version: 0,
+            size_deadline: None,
+            fonts: Vec::new(),
+            font_generation: 0,
+        }
+    }
+    pub fn load(&mut self, text: &str) -> Result<usize, JsValue> {
+        self.timeline =
+            DanmakuTimeline::parse_auto(text).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.prepared = None;
+        self.engine.invalidate_placement_history();
+        Ok(self.timeline.len())
+    }
+    /// Append a track without dropping the already mounted comments.
+    pub fn append(&mut self, text: &str) -> Result<usize, JsValue> {
+        let track =
+            DanmakuTimeline::parse_auto(text).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let count = track.len();
+        let mut items = self.timeline.items().to_vec();
+        let base = items.iter().map(|i| i.id).max().unwrap_or(0);
+        items.extend(
+            track
+                .items()
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(n, mut item)| {
+                    item.id = base + n as u64 + 1;
+                    item
+                }),
+        );
+        self.timeline =
+            DanmakuTimeline::new(items).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.prepared = None;
+        Ok(count)
+    }
+    /// Show the viewer's own comment, bordered, in `color` (`0xRRGGBB`;
+    /// white when omitted).
+    pub fn send(&mut self, text: &str, seconds: f64, color: Option<u32>) -> Result<(), JsValue> {
+        if !seconds.is_finite() || text.trim().is_empty() {
+            return Ok(());
+        }
+        let color = color.map_or(DanmakuColor::WHITE, |rgb| {
+            DanmakuColor::rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+        });
+        let mut items = self.timeline.items().to_vec();
+        items.push(DanmakuItem {
+            id: items.iter().map(|i| i.id).max().unwrap_or(0) + 1,
+            pts: Duration::from_secs_f64(seconds.max(0.0)),
+            text: text.into(),
+            mode: DanmakuMode::Scroll,
+            font_size: 25.0,
+            color,
+            opacity: 1.0,
+            is_self: true,
+            special: None,
+        });
+        self.timeline =
+            DanmakuTimeline::new(items).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.prepared = None;
+        Ok(())
+    }
+    pub fn add_font(&mut self, name: &str, data: &[u8]) -> Result<(), JsValue> {
+        if data.len() > crate::font::MAX_MEMORY_SUBTITLE_FONT_BYTES {
+            return Err("Font exceeds 32 MiB".into());
+        }
+        if self.fonts.iter().map(|f| f.data.len()).sum::<usize>() + data.len()
+            > crate::font::MAX_MEMORY_SUBTITLE_FONT_TOTAL_BYTES
+        {
+            return Err("Fonts exceed 128 MiB".into());
+        }
+        self.fonts.push(SubtitleFontAttachment::new(
+            name,
+            None,
+            Vec::new(),
+            Arc::<[u8]>::from(data),
+        ));
+        self.font_generation += 1;
+        self.engine.set_font_selection(DanmakuFontSelection::new(
+            self.font_generation,
+            self.fonts.clone(),
+        ));
+        self.prepared = None;
+        Ok(())
+    }
+    pub fn configure(&mut self, json: &str, now_ms: f64) -> Result<(), JsValue> {
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let old = self.config.clone();
+        for (key, slot) in [
+            ("fontSize", &mut self.config.font_size),
+            ("opacity", &mut self.config.opacity),
+            ("area", &mut self.config.display_area),
+            ("duration", &mut self.config.scroll_duration_seconds),
+            ("speed", &mut self.config.scroll_speed_factor),
+        ] {
+            if let Some(n) = v.get(key).and_then(|n| n.as_f64()) {
+                if n.is_finite() {
+                    *slot = n as f32;
+                }
+            }
+        }
+        for (key, slot) in [
+            ("enabled", &mut self.config.enabled),
+            ("supersampling", &mut self.config.supersampling),
+            ("blockTop", &mut self.config.block_top),
+            ("blockBottom", &mut self.config.block_bottom),
+            ("blockScroll", &mut self.config.block_scroll),
+            ("mergeDuplicates", &mut self.config.merge_duplicates),
+            ("randomColors", &mut self.config.random_colors),
+        ] {
+            if let Some(b) = v.get(key).and_then(|b| b.as_bool()) {
+                *slot = b;
+            }
+        }
+        if let Some(words) = v.get("blockWords").and_then(|value| value.as_array()) {
+            self.config.block_words = words
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect();
+        }
+        self.config.font_size = self.config.font_size.clamp(1.0, 256.0);
+        self.config.opacity = self.config.opacity.clamp(0.0, 1.0);
+        self.config.scroll_duration_seconds = self.config.scroll_duration_seconds.clamp(1.0, 120.0);
+        self.config.scroll_speed_factor = self.config.scroll_speed_factor.clamp(0.1, 10.0);
+        if old.font_size != self.config.font_size {
+            let deadline = *self.size_deadline.get_or_insert(now_ms + 500.0);
+            self.pending_size_at = Some((now_ms + 120.0).min(deadline));
+        }
+        let mut paint = old.clone();
+        paint.font_size = self.config.font_size;
+        paint.opacity = self.config.opacity;
+        paint.enabled = self.config.enabled;
+        paint.random_colors = self.config.random_colors;
+        if paint != self.config {
+            self.prepared = None;
+            self.pending_size_at = None;
+        }
+        if let Some(p) = &mut self.prepared {
+            p.apply_paint_config(&self.config);
+        }
+        Ok(())
+    }
+    pub fn clear(&mut self) {
+        self.timeline = DanmakuTimeline::default();
+        self.prepared = None;
+        self.engine.invalidate_placement_history();
+    }
+    pub fn reset(&mut self) {
+        self.prepared = None;
+        self.engine.invalidate_placement_history();
+    }
+    pub fn frame(
+        &mut self,
+        seconds: f64,
+        width: u32,
+        height: u32,
+        scale: f32,
+        now_ms: f64,
+    ) -> Result<JsValue, JsValue> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err("Invalid media time".into());
+        }
+        let media_time = Duration::try_from_secs_f64(seconds)
+            .map_err(|_| JsValue::from_str("Media time exceeds supported range"))?;
+        let viewport = DanmakuViewport::with_scale(width.min(8192), height.min(8192), scale);
+        let size_due = self
+            .pending_size_at
+            .is_some_and(|deadline| now_ms >= deadline);
+        if self.prepared.is_none()
+            || self.viewport != Some(viewport)
+            || size_due
+            || seconds < self.window
+            || seconds > self.window + 5.0
+        {
+            self.engine.set_config(self.config.clone());
+            self.engine.recycle_raster_caches_if_needed();
+            let lookback = (self.config.scroll_duration_seconds as f64 * 1.3
+                / self.config.scroll_speed_factor as f64)
+                .max(4.0);
+            let start = media_time.saturating_sub(Duration::from_secs_f64(lookback));
+            let end = media_time.saturating_add(Duration::from_secs(20));
+            self.engine.sync_timeline(&self.timeline.window(start, end));
+            self.prepared = Some(self.engine.prepare(viewport, 1));
+            self.window = seconds;
+            self.viewport = Some(viewport);
+            self.pending_size_at = None;
+            self.size_deadline = None;
+        }
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("No prepared layout"))?;
+        let frame = prepared.frame_layout(media_time, 1);
+        let plan = self.engine.rasterizer_clone().render_plan_scaled(
+            &frame,
+            self.config.font_size / prepared.font_size().max(1.0),
+            prepared.atlas(),
+        );
+        let result = Object::new();
+        let mut glyphs = Vec::<f32>::with_capacity(plan.items.len() * 8);
+        let mut groups = Vec::<f32>::new();
+        let mut last = None;
+        for item in &plan.items {
+            // A group shares one paint; the border of the viewer's own
+            // comment is white beside its colored text.
+            let style = (
+                item.item_id,
+                item.color_rgba,
+                item.outline_rgba,
+                item.shadow_rgba,
+                item.shadow_offset,
+            );
+            if last != Some(style) {
+                groups.extend_from_slice(&[(glyphs.len() / 8) as f32, 0.0]);
+                groups.extend_from_slice(&item.color_rgba);
+                groups.extend_from_slice(&item.outline_rgba);
+                groups.extend_from_slice(&item.shadow_rgba);
+                groups.extend_from_slice(&item.shadow_offset);
+                last = Some(style);
+            }
+            let count = groups.len() - 15;
+            groups[count] += 1.0;
+            glyphs.extend_from_slice(&item.rect);
+            glyphs.extend_from_slice(&item.tex_rect);
+        }
+        set(
+            &result,
+            "glyphs",
+            Float32Array::from(glyphs.as_slice()).into(),
+        )?;
+        set(
+            &result,
+            "groups",
+            Float32Array::from(groups.as_slice()).into(),
+        )?;
+        let mut pictures = Vec::<f32>::with_capacity(plan.color_glyphs.len() * 9);
+        for glyph in &plan.color_glyphs {
+            pictures.extend_from_slice(&glyph.rect);
+            pictures.extend_from_slice(&glyph.tex_rect);
+            pictures.push(glyph.opacity);
+        }
+        set(
+            &result,
+            "pictures",
+            Float32Array::from(pictures.as_slice()).into(),
+        )?;
+        if let Some(atlas) = &plan.color_atlas
+            && atlas.version != self.picture_version
+        {
+            set(&result, "pictureWidth", atlas.width.into())?;
+            set(&result, "pictureHeight", atlas.height.into())?;
+            set(
+                &result,
+                "pictureAtlas",
+                Uint8Array::from(atlas.rgba.as_slice()).into(),
+            )?;
+            self.picture_version = atlas.version;
+        }
+        if let Some(atlas) = plan.atlas {
+            if atlas.version != self.atlas_version {
+                if let Some(update) = atlas.incremental_update_from(
+                    self.atlas_version,
+                    self.atlas_size.0,
+                    self.atlas_size.1,
+                    self.atlas_size.2,
+                ) {
+                    set(&result, "x", update.x.into())?;
+                    set(&result, "y", update.y.into())?;
+                    set(&result, "width", update.width.into())?;
+                    set(&result, "height", update.height.into())?;
+                    for (name, data) in [
+                        ("fill", &atlas.fill_alpha),
+                        ("outline", &atlas.outline_alpha),
+                    ] {
+                        let mut region =
+                            Vec::with_capacity(update.width as usize * update.height as usize);
+                        for y in update.y..update.y + update.height {
+                            let start = y as usize * atlas.stride + update.x as usize;
+                            region.extend_from_slice(&data[start..start + update.width as usize]);
+                        }
+                        set(&result, name, Uint8Array::from(region.as_slice()).into())?;
+                    }
+                } else {
+                    set(&result, "width", atlas.width.into())?;
+                    set(&result, "height", atlas.height.into())?;
+                    set(
+                        &result,
+                        "fill",
+                        Uint8Array::from(atlas.fill_alpha.as_slice()).into(),
+                    )?;
+                    set(
+                        &result,
+                        "outline",
+                        Uint8Array::from(atlas.outline_alpha.as_slice()).into(),
+                    )?;
+                }
+                self.atlas_size = (atlas.width, atlas.height, atlas.stride);
+                self.atlas_version = atlas.version;
+            }
+        }
+        Ok(result.into())
+    }
+}
+impl Default for WebDanmaku {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// WebGPU super-resolution shader compiler and tiled frame planner.
+///
+/// Reuses Erika's native SR network catalog, algebraic layer fusion, mpv hook
+/// shader parser, and WGSL code generator so the browser executes the exact
+/// same compute kernels as native wgpu/Metal/D3D11 builds.
+#[wasm_bindgen]
+pub struct WebSrPlanner {
+    caps: DeviceCapabilities,
+    custom: Option<Arc<SrModel>>,
+    plans: HashMap<u32, SrPlan>,
+    next_plan_id: u32,
+    active_plan_id: Option<u32>,
+}
+
+fn parse_device_capabilities(json: &str) -> Result<DeviceCapabilities, JsValue> {
+    let mut caps = DeviceCapabilities::default();
+    if !json.trim().is_empty() {
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        if let Some(f16) = v.get("shaderF16").and_then(|x| x.as_bool()) {
+            caps.shader_f16 = f16;
+        }
+        let u32_field = |key: &str, slot: &mut u32| {
+            if let Some(n) = v.get(key).and_then(|x| x.as_u64()) {
+                *slot = n.min(u32::MAX as u64) as u32;
+            }
+        };
+        let u64_field = |key: &str, slot: &mut u64| {
+            if let Some(n) = v.get(key).and_then(|x| x.as_u64()) {
+                *slot = n;
+            }
+        };
+        u32_field(
+            "maxComputeWorkgroupStorageSize",
+            &mut caps.max_compute_workgroup_storage_size,
+        );
+        u64_field(
+            "maxUniformBufferBindingSize",
+            &mut caps.max_uniform_buffer_binding_size,
+        );
+        u64_field(
+            "maxStorageBufferBindingSize",
+            &mut caps.max_storage_buffer_binding_size,
+        );
+        u64_field("maxBufferSize", &mut caps.max_buffer_size);
+        u32_field(
+            "maxComputeWorkgroupSizeX",
+            &mut caps.max_compute_workgroup_size_x,
+        );
+        u32_field(
+            "maxComputeWorkgroupSizeY",
+            &mut caps.max_compute_workgroup_size_y,
+        );
+        u32_field(
+            "maxComputeInvocationsPerWorkgroup",
+            &mut caps.max_compute_invocations_per_workgroup,
+        );
+        u32_field("maxTextureDimension2D", &mut caps.max_texture_dimension_2d);
+        u32_field(
+            "minUniformBufferOffsetAlignment",
+            &mut caps.min_uniform_buffer_offset_alignment,
+        );
+        u32_field(
+            "maxStorageBuffersPerShaderStage",
+            &mut caps.max_storage_buffers_per_shader_stage,
+        );
+    }
+    caps.validate()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(caps)
+}
+
+#[wasm_bindgen]
+impl WebSrPlanner {
+    #[wasm_bindgen(constructor)]
+    pub fn new(caps_json: &str) -> Result<WebSrPlanner, JsValue> {
+        let caps = parse_device_capabilities(caps_json)?;
+        Ok(Self {
+            caps,
+            custom: None,
+            plans: HashMap::new(),
+            next_plan_id: 1,
+            active_plan_id: None,
+        })
+    }
+
+    #[wasm_bindgen(js_name = availableModes)]
+    pub fn available_modes() -> Array {
+        let list = Array::new();
+        for mode in WEB_UPSCALER_MODES {
+            list.push(&JsValue::from_str(mode.label()));
+        }
+        list
+    }
+
+    #[wasm_bindgen(js_name = normalizeMode)]
+    pub fn normalize_mode(mode: &str) -> Result<String, JsValue> {
+        let parsed = LumaUpscalerMode::parse(mode)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown upscaler mode: {mode}")))?;
+        if parsed != LumaUpscalerMode::Off
+            && parsed != LumaUpscalerMode::Fsr1
+            && parsed.family() != UpscalerFamily::Network
+        {
+            return Err(JsValue::from_str(&format!(
+                "upscaler mode {} is platform-specific and unavailable on WebGPU",
+                parsed.label()
+            )));
+        }
+        Ok(parsed.label().to_string())
+    }
+
+    #[wasm_bindgen(js_name = loadCustomModel)]
+    pub fn load_custom_model(&mut self, name: &str, bytes: &[u8]) -> Result<JsValue, JsValue> {
+        let source =
+            sr_catalog::load_custom(name, bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let optimized = Arc::new(sr_fold::optimize(&source));
+        let info = Object::new();
+        set(&info, "name", JsValue::from_str(&optimized.name))?;
+        set(&info, "layers", (optimized.layers.len() as u32).into())?;
+        set(
+            &info,
+            "macsPerPixel",
+            (optimized.macs_per_pixel() as f64).into(),
+        )?;
+        set(
+            &info,
+            "parameters",
+            (optimized.parameter_count() as f64).into(),
+        )?;
+        self.custom = Some(optimized);
+        if self
+            .active_plan_id
+            .and_then(|id| self.plans.get(&id))
+            .is_some_and(|p| p.mode == LumaUpscalerMode::Custom)
+        {
+            self.active_plan_id = None;
+        }
+        Ok(info.into())
+    }
+
+    #[wasm_bindgen(js_name = clearCustomModel)]
+    pub fn clear_custom_model(&mut self) {
+        self.custom = None;
+        if self
+            .active_plan_id
+            .and_then(|id| self.plans.get(&id))
+            .is_some_and(|p| p.mode == LumaUpscalerMode::Custom)
+        {
+            self.active_plan_id = None;
+        }
+    }
+
+    #[wasm_bindgen(js_name = releasePlan)]
+    pub fn release_plan(&mut self, plan_id: u32) {
+        self.plans.remove(&plan_id);
+        if self.active_plan_id == Some(plan_id) {
+            self.active_plan_id = None;
+        }
+    }
+
+    pub fn compile(&mut self, mode: &str) -> Result<JsValue, JsValue> {
+        let parsed = LumaUpscalerMode::parse(mode)
+            .ok_or_else(|| JsValue::from_str(&format!("unknown upscaler mode: {mode}")))?;
+        if parsed == LumaUpscalerMode::Off {
+            self.active_plan_id = None;
+            return Ok(JsValue::NULL);
+        }
+        let plan = SrPlan::compile(parsed, self.custom.clone(), self.caps)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let plan_id = loop {
+            let candidate = self.next_plan_id;
+            self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
+            if !self.plans.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let result = Object::new();
+        set(&result, "planId", plan_id.into())?;
+        set(&result, "mode", JsValue::from_str(plan.mode.label()))?;
+        set(&result, "packed", plan.packed.into())?;
+        set(&result, "half", plan.half.into())?;
+        set(&result, "paramsBytesSize", (PARAMS_BYTES as u32).into())?;
+
+        let kernels = Array::new();
+        for kernel in &plan.kernels {
+            let entry = Object::new();
+            set(&entry, "source", JsValue::from_str(&kernel.source))?;
+            let flat_weights: Vec<f32> = if kernel.weights.is_empty() {
+                vec![0.0; 4]
+            } else {
+                kernel.weights.iter().flatten().copied().collect()
+            };
+            set(
+                &entry,
+                "weights",
+                Float32Array::from(flat_weights.as_slice()).into(),
+            )?;
+            set(&entry, "uniform", kernel.uniform.into())?;
+            set(&entry, "groupX", kernel.group[0].into())?;
+            set(&entry, "groupY", kernel.group[1].into())?;
+            set(&entry, "ring", kernel.ring.into())?;
+            set(&entry, "head", kernel.head.into())?;
+            set(&entry, "fused", kernel.fused.into())?;
+            kernels.push(&entry);
+        }
+        set(&result, "kernels", kernels.into())?;
+
+        self.plans.insert(plan_id, plan);
+        self.active_plan_id = Some(plan_id);
+        Ok(result.into())
+    }
+
+    #[wasm_bindgen(js_name = planFrame)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_frame(
+        &self,
+        width: u32,
+        height: u32,
+        target_width: u32,
+        target_height: u32,
+        luma_r: f32,
+        luma_g: f32,
+        luma_b: f32,
+        full_range: bool,
+    ) -> Result<JsValue, JsValue> {
+        let Some(plan_id) = self.active_plan_id else {
+            return Err(JsValue::from_str("no active upscaler mode compiled"));
+        };
+        self.plan_frame_for(
+            plan_id,
+            width,
+            height,
+            target_width,
+            target_height,
+            luma_r,
+            luma_g,
+            luma_b,
+            full_range,
+        )
+    }
+
+    #[wasm_bindgen(js_name = planFrameFor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_frame_for(
+        &self,
+        plan_id: u32,
+        width: u32,
+        height: u32,
+        target_width: u32,
+        target_height: u32,
+        luma_r: f32,
+        luma_g: f32,
+        luma_b: f32,
+        full_range: bool,
+    ) -> Result<JsValue, JsValue> {
+        let Some(plan) = self.plans.get(&plan_id) else {
+            return Err(JsValue::from_str("no compiled upscaler plan for planId"));
+        };
+        let frame = plan
+            .plan_frame(
+                width,
+                height,
+                target_width,
+                target_height,
+                [luma_r, luma_g, luma_b],
+                if full_range {
+                    LumaRange::Full
+                } else {
+                    LumaRange::Limited
+                },
+                self.caps,
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let result = Object::new();
+        set(&result, "outputWidth", frame.output_width.into())?;
+        set(&result, "outputHeight", frame.output_height.into())?;
+        set(&result, "virtualWidth", frame.virtual_width.into())?;
+        set(&result, "virtualHeight", frame.virtual_height.into())?;
+        set(&result, "packed", frame.packed.into())?;
+        set(&result, "arenaBytes", (frame.arena_bytes as f64).into())?;
+        set(&result, "tileWidth", frame.tile_width.into())?;
+        set(&result, "tileHeight", frame.tile_height.into())?;
+        set(&result, "tiles", frame.tiles.into())?;
+        set(&result, "paramsStride", frame.params_stride.into())?;
+        set(
+            &result,
+            "paramsBytes",
+            Uint8Array::from(frame.params_bytes.as_slice()).into(),
+        )?;
+        set(
+            &result,
+            "dispatches",
+            Uint32Array::from(frame.dispatches.as_slice()).into(),
+        )?;
+        Ok(result.into())
+    }
+}

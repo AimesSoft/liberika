@@ -1,6 +1,6 @@
 use crate::core::{ColorPrimaries, TransferFunction};
 use crate::ffmpeg::{D3d11vaTexture, Frame, PlanarFrame, Result as FfmpegResult};
-use crate::renderer::pipeline::{ColorRange, HdrMetadata, MatrixCoefficients};
+use crate::renderer::pipeline::{ColorRange, DoviSourceMetadata, HdrMetadata, MatrixCoefficients};
 
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 use std::sync::Arc;
@@ -26,9 +26,11 @@ pub struct VideoFrameDescriptor {
     pub range: ColorRange,
     pub matrix: MatrixCoefficients,
     pub hdr_metadata: Option<HdrMetadata>,
+    pub dovi_metadata: Option<DoviSourceMetadata>,
 }
 
 impl VideoFrameDescriptor {
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     fn from_frame(frame: &Frame) -> Self {
         Self {
             width: frame.width(),
@@ -41,6 +43,7 @@ impl VideoFrameDescriptor {
             range: frame.color_range(),
             matrix: frame.matrix_coefficients(),
             hdr_metadata: frame.hdr_metadata(),
+            dovi_metadata: frame.dovi_metadata(),
         }
     }
 }
@@ -211,6 +214,16 @@ impl VideoFramePayload {
             Self::AndroidHardwareBuffer(frame) => frame.descriptor.hdr_metadata,
             #[cfg(target_env = "ohos")]
             Self::OhosNativeBuffer(frame) => frame.descriptor.hdr_metadata,
+        }
+    }
+
+    pub fn dovi_metadata(&self) -> Option<DoviSourceMetadata> {
+        match self {
+            Self::Decoded(frame) => frame.dovi_metadata(),
+            #[cfg(target_os = "android")]
+            Self::AndroidHardwareBuffer(frame) => frame.descriptor.dovi_metadata,
+            #[cfg(target_env = "ohos")]
+            Self::OhosNativeBuffer(frame) => frame.descriptor.dovi_metadata,
         }
     }
 

@@ -424,6 +424,7 @@ impl super::Device {
             format: desc.format,
             copy_size: desc.copy_extent(),
             identity,
+            initial_usage: wgt::TextureUses::UNINITIALIZED,
         }
     }
 

@@ -1852,6 +1852,14 @@ impl super::InstanceShared {
                     get_device_properties.get_physical_device_properties2(phd, &mut properties2)
                 };
 
+                // HarmonyOS's x86_64 emulator loader advertises this optional
+                // extension but aborts in its properties entry point (API 24).
+                // Do not expose or query it there; the video shaders do not use it.
+                #[cfg(all(target_env = "ohos", target_arch = "x86_64"))]
+                capabilities
+                    .supported_extensions
+                    .retain(|ep| ep.extension_name_as_c_str() != Ok(khr::cooperative_matrix::NAME));
+
                 // Query cooperative matrix properties
                 if capabilities.supports_extension(khr::cooperative_matrix::NAME) {
                     let coop_matrix =

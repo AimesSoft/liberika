@@ -1,7 +1,11 @@
-# erika
+# liberika ArkTS SDK
 
-Native ArkTS/HarmonyOS SDK powered by Erika. This package is independent of
-Flutter and exposes the Erika presenter through an ArkTS-friendly API.
+[English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
+
+The OHPM package remains `erika`; imports and `Erika*` API names are unchanged.
+
+Native ArkTS/HarmonyOS SDK powered by liberika. This package is independent of
+Flutter and exposes the liberika presenter through an ArkTS-friendly API.
 
 The first package target is OpenHarmony arm64. The package contains the native
 N-API bridge and the matching `liberika_capi.so` runtime. A host application
@@ -13,6 +17,19 @@ provides an `XComponent` surface id through `attachSurface()` and drives
 ```sh
 ohpm install erika
 ```
+
+As of 2026-11-16, [OHPM](https://ohpm.openharmony.cn/#/en/detail/erika) lists 0.3.7 as the latest public version.
+This guide documents the 0.3.7 SDK.
+
+Native presenter operations are serialized on a dedicated owner thread. The ArkTS wrapper shown below retains synchronous method signatures; the native bridge also provides async entry points. `ErikaOhosPlayerFromId` has returned null since 0.3.4; use the bridge instead of retaining a raw native player pointer.
+
+## Player configuration
+
+`ErikaPlayerConfig` accepts `outputMode`, `edrHeadroom`, `upscaler`, and
+`videoAlphaMode`. The alpha mode defaults to `0` (opaque); `1` decodes a frame
+with color in the left half and alpha in the right half. The host surface must
+support transparent composition for the background to remain visible.
+Use the ArkTS wrapper, N-API bridge, and native runtime from the same package version.
 
 ## Usage
 
@@ -110,8 +127,8 @@ surface.
 
 ## HTTP options
 
-For HTTP(S) playback, `open` accepts per-request headers and a read-ahead
-window:
+For HTTP(S) playback, `open` accepts per-request headers, a read-ahead window,
+and a rewind budget:
 
 ```ts
 this.player.open('https://example.com/video.mp4', {
@@ -120,13 +137,18 @@ this.player.open('https://example.com/video.mp4', {
     'Referer': 'https://example.com/',
   },
   httpReadAheadBytes: 16 * 1024 * 1024,
+  httpBackBufferBytes: 89 * 1024 * 1024,
 });
 ```
 
 Headers are used for HEAD, Range GET, and prefetch requests. A positive
 `httpReadAheadBytes` overrides `ERIKA_HTTP_READAHEAD_BYTES`; zero or omission
-uses that environment variable when set, otherwise the 2 MiB default. These
-options are ignored for local files.
+uses that environment variable when set, otherwise the 2 MiB default. A
+positive `httpBackBufferBytes` overrides the 16 MiB rewind-budget default, which
+is how much already-played data stays cached so a rewind inside it is served
+without a network request; size it from the bitrate for high-bitrate media (a
+-10 s skip at 71 Mbps covers ~89 MB). These options are ignored for local
+files.
 
 The package is licensed under MPL-2.0. See `THIRD_PARTY_NOTICES.md` for the
 licenses of the bundled native dependencies.

@@ -1,0 +1,14 @@
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -130,6 +130,11 @@
+     // images_root and related stuff is zero-filled in calloc
+ 
+     unsigned flags = ASS_CPU_FLAG_ALL;
++#if CONFIG_ASM && ARCH_X86_64 && defined(_WIN32)
++    // Retain tile16 and 16-byte row alignment while enabling the upstream
++    // runtime CPU dispatch to SSE2/SSSE3 on Windows x64.
++    flags &= ~ASS_CPU_FLAG_X86_AVX2;
++#endif
+ #if CONFIG_LARGE_TILES
+     flags |= ASS_FLAG_LARGE_TILES;
+ #endif

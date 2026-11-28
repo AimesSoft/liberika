@@ -80,6 +80,9 @@ jobs:
       - name: Install dependencies
         run: dart pub get
         working-directory: packages/erika_flutter
+      - name: Verify package release contract
+        run: flutter test test/release_package_contract_test.dart
+        working-directory: packages/erika_flutter
       - name: Publish dry run
         run: dart pub publish --dry-run
         working-directory: packages/erika_flutter

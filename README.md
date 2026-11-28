@@ -1,8 +1,8 @@
 [English](readme/README.en.md) | [日本語](readme/README.ja.md)
 
-# Erika
+# liberika
 
-> 「GOOD！我是Erika，是NipaPlay里继mdk、video player、libmpv、media kit之后的第五个播放器内核。」
+> 「GOOD！我是liberika，是NipaPlay里继mdk、video player、libmpv、media kit之后的第五个播放器内核。」
 > 「即便算上你，也只有四个播放器内核！」
 
 **NipaPlay 的自研播放内核。** Rust 实现，可嵌入，从解码到渲染一手包办。
@@ -11,198 +11,158 @@
 > 而 [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) 来自《寒蝉鸣泣之时》古手梨花的口癖「にぱー☆」——社区里大家都叫她「梨花」。
 > 一个是台前的播放器，一个是幕后的引擎。同出一脉，互为表里。
 
-宿主应用只需提供一个渲染表面并发送播放命令——解码、时序同步、音视频渲染、字幕、弹幕、音频输出均由 Erika 内部完成，不经过宿主的渲染管线。
+宿主应用只需提供一个渲染表面并发送播放命令——解码、时序同步、音视频渲染、字幕、弹幕、音频输出均由 liberika 内部完成。原生视频层直接呈现；Flutter 纹理可交给宿主合成。
 
-## 特性
+当前版本：**0.3.8**。从 [文档目录](docs/README.md) 选择接入、构建或内核设计说明。
 
-- **硬件加速解码** — VideoToolbox (macOS/iOS/tvOS)、D3D11VA (Windows)、MediaCodec (Android)、AVCodec (HarmonyOS)，互操作不可用时明确回退软解
-- **零拷贝渲染** — Apple CVPixelBuffer → MTLTexture、Windows D3D11VA 纹理互操作、Android MediaCodec Surface → AHardwareBuffer/Vulkan、HarmonyOS AVCodec Surface → OHNativeBuffer/Vulkan；无法导入时明确回退 CPU upload
-- **HDR/EDR 输出** — Apple EDR、Windows HDR10，以及 Android FP16 extended-linear scRGB 协商与明确 SDR 回退
-- **原生 Metal 渲染器** — YCbCr 采样、色彩空间转换、tone mapping、字幕/弹幕合成，一次 render pass 完成 (macOS/iOS/tvOS)
-- **原生 Direct3D 11 渲染器** — Windows: D3D11VA 零拷贝纹理互操作、YCbCr 采样、HDR10 输出、字幕/弹幕 overlay 合成
-- **AI 超分** — ArtCNN 动漫亮度 2x 神经超分，支持 Metal、D3D11 与 wgpu/Vulkan compute，仅处理亮度并接入渲染管线
-- **音频输出** — CoreAudio (macOS) / AudioQueue (iOS/tvOS) / WASAPI (Windows) / AAudio (Android) / OHAudio (HarmonyOS)，f32 PCM ring buffer，音频时钟同步
-- **字幕** — SRT / WebVTT / ASS 解析，libass 渲染 (静态链接)，嵌入与外挂字幕轨
-- **弹幕** — Bilibili XML / JSON 解析，DFM+ 碰撞避让布局引擎，glyph atlas 原生 GPU 渲染
-- **播放引擎** — play / pause / stop / seek / 倍速，音频主时钟同步，vsync 量化调度
-- **C ABI** — opaque handle 设计，可从 C / C++ / Swift / Dart FFI / 任何 FFI 语言调用；以 `erika.h` 中的导出声明为准
-- **Flutter 插件** — macOS + iOS + tvOS + Windows + Android + HarmonyOS 原生视图/Texture 嵌入
-- **wgpu 后端** — Android 播放、overlay、截图与 Vulkan/GLES 恢复路径可用；HarmonyOS 走 Vulkan，用 OHNativeWindow 呈现、OHNativeBuffer 零拷贝导入；Linux 仍在规划中
+**浏览器也能直接播放 MKV，并保留随片 ASS 字幕和字体附件。** [打开在线演示](https://liberika.aimes-soft.com/demo/)，
+或 `npm install @aimessoft/liberika-web`。当前源码提供
+[Web / WASM 后端](docs/web.zh.md)，已接入 Erika Web：浏览器 WebCodecs 解码音视频，
+WASM 内的 libass 还原字幕字体、定位、描边与特效，Rust 弹幕与字幕按同一播放时钟
+交给 WebGL2 合成。网站可以保留自己的界面，服务器提供原文件和 HTTP Range，
+无需先在服务端拆出字幕或烧录进画面。
 
-## 快速开始
+0.3.8 带来 Windows D3D11 截图、HTTP 来源的响应校验与停滞恢复、可取消的打开，
+以及软件解码上传和字幕图集的性能改进。0.3.5–0.3.7 带来彩色 Emoji 弹幕、可选内嵌字体、
+Bilibili mode 7 高级弹幕、Linux 线性 dma-buf 输出，以及 Linux x64 / ARM64 的
+bundled、system 四种预编译包；详细变化与升级说明见 [更新日志](CHANGELOG.zh.md)。
 
-### Rust
+## 能力
 
-```rust
-use erika::{Player, PlayerConfig, MediaRequest};
+- 硬件解码与软件回退：VideoToolbox、D3D11VA、MediaCodec、AVCodec；Linux 提供 NVDEC / VA-API。
+- Metal、Direct3D 11 与 wgpu 呈现，合成视频、字幕和弹幕；支持 HDR/EDR、Dolby Vision 映射，以及 ArtCNN、Anime4K、FSR1 和平台超分（可用性取决于设备与后端）。
+- 本地文件与 HTTP(S) 播放，支持自定义请求头、后台预读和回退缓存。
+- 音频主时钟同步、暂停、seek、倍速、多音轨、外挂字幕和多轨弹幕。
+- Rust、C ABI、Flutter、SwiftPM 与 OpenHarmony ArkTS 接入。
+- 浏览器 JavaScript / TypeScript 接入：MKV 解封装、ASS 字体附件、统一字幕与弹幕合成，字幕和弹幕可独立双倍采样。
 
-let player = Player::new(PlayerConfig::default())?;
-player.open(MediaRequest::file("/path/to/video.mp4"))?;
-player.play()?;
+## 选择接入方式
+
+| 宿主 | 安装或入口 | 指南 |
+|---|---|---|
+| 浏览器 / JavaScript / TypeScript | `npm install @aimessoft/liberika-web`，或下载 `liberika-web-0.3.8.zip` | [Web 接入与部署](docs/web.zh.md) |
+| Flutter | `flutter pub add erika_flutter`，当前 0.3.8 | [插件使用指南](packages/erika_flutter/README.zh.md) |
+| Swift / Apple | Xcode 添加 `https://github.com/AimesSoft/liberika-swift`；SDK 最新公开版为 0.3.8（截至 2026-11-26） | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](packages/erika_ohos/README.zh.md) |
+| C / C++ | 下载匹配版本的 C ABI 归档与 `erika.h` | [原生接入](docs/integration.zh.md) |
+| Rust | Git 依赖，固定 `tag = "v0.3.8"` | [构建与依赖](docs/building.zh.md) |
+| Linux | x64 / ARM64，bundled / system 双模式，glibc 2.35 基线 | [Linux 接入](docs/linux.zh.md) |
+
+截至 2026-11-26，OHPM 公开的最新版本为 0.3.8。原生二进制从
+[GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8) 下载。
+
+### 浏览器
+
+```sh
+npm install @aimessoft/liberika-web
 ```
 
-### C ABI
+```js
+import { Player } from '@aimessoft/liberika-web';
 
-```c
-#include "erika.h"
-
-ErikaPresenterHandle *presenter = erika_presenter_create();
-erika_presenter_attach_metal_layer(presenter, (uint64_t)layer, w, h, scale);
-erika_presenter_open(presenter, "/path/to/video.mp4");
-erika_presenter_play(presenter);
-
-// 每个显示帧回调:
-ErikaPresenterStats stats;
-erika_presenter_render_tick(presenter, host_time, &stats);
+const player = await Player.create({ canvas });
+await player.open(fileOrURL);
+await player.play();
 ```
+
+先在[在线演示](https://liberika.aimes-soft.com/demo/)里试播，它直接从 npm CDN 加载同一个包。Vite 等打包器无需额外配置；
+`@aimessoft/liberika-web-nofont` 不含约 6 MB 的回退字体，由宿主提供字体。
+也可解压 Release 中的 `liberika-web-0.3.8.zip` 自行托管，或从源码构建：
+
+```sh
+# 准备 Emscripten、wasm-bindgen 等依赖后，一次构建全部 WASM 与运行时资源。
+cargo run -p xtask -- web build
+python3 scripts/serve_web.py
+```
+
+音视频编码由浏览器 WebCodecs 支持范围决定。
+构建依赖、完整示例和 Erika 接入说明见 [浏览器指南](docs/web.zh.md)。
 
 ### Flutter
 
 ```dart
+import 'package:erika_flutter/erika_flutter.dart';
+
 final player = ErikaPlayer();
 await player.open('/path/to/video.mp4');
 await player.play();
 
-// 推荐：完整播放器 UI 在 macOS/iOS/tvOS 使用原生 window overlay / 挖空路径
-ErikaWindowOverlayVideoView(player: player)
-
-// 兼容/诊断：Flutter platform view 路径
+// 放入 Widget 树；Apple 全播放器可选 ErikaWindowOverlayVideoView。
 ErikaVideoView(player: player)
 ```
 
-### Flutter package
+`ErikaTextureVideoView` 适合需要 Flutter 裁剪和颜色滤镜的视频；原生视频层适合
+Apple EDR、Windows HDR10 等直接呈现。平台差异和生命周期在插件指南中说明。
 
-`erika_flutter` 0.1.7 is published on [pub.dev](https://pub.dev/packages/erika_flutter)
-for macOS, iOS, tvOS, Windows, Android, and HarmonyOS/OpenHarmony. Add it to a
-Flutter app with:
+### Rust
+
+```toml
+[dependencies]
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.8" }
+```
+
+```rust
+use erika::{MediaRequest, Player, PlayerConfig};
+
+let player = Player::new(PlayerConfig::default());
+player.open(MediaRequest::new("/path/to/video.mp4"))?;
+player.play()?;
+```
+
+从源码接入前先准备对应平台的原生依赖。`Player` 用于控制和帧订阅；
+`PresenterRuntime` 托管渲染与音频。C ABI 对应入口为 `ErikaHandle` 和
+`ErikaPresenterHandle`，完整声明位于 [erika.h](crates/erika_capi/include/erika.h)。
+
+Linux Rust 宿主还需启用 `wgpu`，并在消费者 workspace 根 manifest 中配置 HAL 补丁；
+具体依赖、字体栈和构建要求见 [Linux 接入](docs/linux.zh.md)。
+
+## 平台
+
+| 平台 | 解码 | 渲染 | 音频 | 分发 |
+|---|---|---|---|---|
+| macOS 11+ | VideoToolbox / 软解 | Metal | CoreAudio | 预编译、Flutter、SwiftPM |
+| iOS 13+ | VideoToolbox / 软解 | Metal | AudioQueue | XCFramework、Flutter、SwiftPM |
+| tvOS 13+ | VideoToolbox / 软解 | Metal | AudioQueue | XCFramework、Flutter、SwiftPM |
+| Windows 10+ | D3D11VA / 软解 | D3D11 | WASAPI | x64 / ARM64 预编译、Flutter |
+| Android 8+ | MediaCodec / 软解 | wgpu Vulkan / GLES | AAudio | 四个 ABI 预编译、Flutter |
+| OpenHarmony API 18+ | AVCodec / 软解 | wgpu | OHAudio | arm64 预编译、Flutter、OHPM |
+| Linux（实验性） | NVDEC / VA-API / 软解 | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system 发布构建；Rust、C ABI、Flutter |
+| 浏览器 | WebCodecs | WebGL2 / Canvas | Web Audio | npm、Release Web 归档或源码构建 |
+
+各平台的视频表面和 HDR 路径在 [平台矩阵](docs/platform_matrix.zh.md) 中汇总。
+浏览器后端当前输出 SDR，已在 Chrome 验证；需要 HTTPS 或 localhost，以及
+WebCodecs 视频／音频解码、OffscreenCanvas、WebGL2 和 Web Audio。
+
+## 开发
 
 ```sh
-flutter pub add erika_flutter
+# Apple / Windows / Android / OpenHarmony：构建固定版本的原生依赖。
+cargo run -p xtask -- deps build --all --profile lgpl
+cargo build -p erika_capi
 ```
 
-The package downloads the matching verified native runtime during the platform
-build. Android downloads only the selected ABI archive; Linux and Web are not
-published targets yet.
-
-### OpenHarmony package
-
-The native ArkTS package `erika` 0.1.7 is published on
-[OHPM](https://ohpm.openharmony.cn/#/cn/detail/erika) for OpenHarmony arm64
-applications (API 18+). Install it with:
-
-```sh
-ohpm install erika
-```
-
-See the [OpenHarmony package guide](packages/erika_ohos/README.md) for the
-`ErikaPlayer` API and `XComponent` surface setup.
-
-### Swift package
-
-原生 macOS、iOS 和 tvOS 应用可通过 Swift Package Manager 使用
-[`ErikaSwift`](https://github.com/AimesSoft/ErikaSwift) 0.1.7。在 Xcode 的
-**Add Package Dependencies** 中输入：
-
-```text
-https://github.com/AimesSoft/ErikaSwift
-```
-
-SwiftPM 会自动下载对应的 Apple XCFramework，不需要安装 Rust、FFmpeg、
-CocoaPods 或 Flutter。
-
-## C ABI 接口族
-
-Erika 提供两组 C ABI 入口，适配不同嵌入场景：
-
-| 接口族 | 适用场景 | 渲染方式 |
-|--------|----------|----------|
-| `ErikaHandle` | 宿主自己管理渲染循环 | 宿主拉取帧数据 |
-| `ErikaPresenterHandle` | Erika 托管完整播放栈 | 宿主只需提供 surface 并驱动 `render_tick` |
-
-头文件: [`crates/erika_capi/include/erika.h`](crates/erika_capi/include/erika.h)
-
-## 平台支持
-
-| 平台 | 解码 | 渲染 | 音频 | 状态 |
-|------|------|------|------|------|
-| macOS 14+ | VideoToolbox | Metal | CoreAudio | **可用** |
-| iOS 16+ | VideoToolbox | Metal | AudioQueue | **可用** |
-| tvOS 13+ (Apple TV) | VideoToolbox | Metal | AudioQueue | **可用** |
-| Windows 10+ | D3D11VA | Direct3D 11 | WASAPI | **可用** |
-| Linux | — | wgpu (planned) | — | 规划中 |
-| Android 8+ | MediaCodec / software | wgpu (Vulkan + GLES fallback) | AAudio | **可用** |
-| HarmonyOS API 18+ | AVCodec（H.264/HEVC）/ 软解 | wgpu (Vulkan) + `OHNativeBuffer` 零拷贝导入 | OHAudio | **可用** |
+交叉编译需设置目标 triple；Linux 双模式入口为 `scripts/build_linux_release.sh`，
+均以 Ubuntu 22.04 构建，system 可使用自行安装的兼容 FFmpeg 8 共享库。
+构建参数在 [构建指南](docs/building.zh.md)，发布流程在 [发布指南](docs/releasing.zh.md)，
+代码约定在 [贡献指南](CONTRIBUTING.zh.md)。
 
 ## 仓库结构
 
-```
-crates/erika              核心播放库
-crates/erika_capi         C ABI 导出层
-crates/erika_ffmpeg_sys   FFmpeg 底层 bindings
-packages/erika_flutter    Flutter 插件 (macOS + iOS + tvOS + Windows + Android + HarmonyOS)
-packages/erika_ohos       OpenHarmony ArkTS / OHPM package
-examples/                 验证与演示程序
-xtask/                    原生依赖构建编排
-docs/                     架构与嵌入文档
-```
+| 目录 | 内容 |
+|---|---|
+| `crates/erika` | 播放、解码、时钟、字幕、弹幕与渲染 |
+| `crates/erika_capi` | C ABI 和公开头文件 |
+| `crates/erika_ffmpeg_sys` | FFmpeg bindings |
+| `packages/erika_flutter` | Flutter 插件 |
+| `packages/erika_ohos` | OpenHarmony ArkTS SDK |
+| `packages/erika_web` | 浏览器 Player、Worker、WebGL2 合成与 TypeScript 类型 |
+| `examples` | 原生、Flutter、ArkTS 与浏览器播放器示例 |
+| `xtask` | 原生依赖与完整 Web 包构建 |
+| `docs` | 接入与设计文档；`investigations/` 保存历史调查和验证记录 |
 
-## 文档
-
-- [架构总览](docs/architecture.zh.md) — 引擎设计、渲染后端、平台支持
-- [C ABI 参考手册](docs/capi_reference.zh.md) — 全部导出函数、状态码、所有权与线程约定
-- [原生接入指南](docs/integration.zh.md) — C/C++/Win32/Swift 等非 Flutter 宿主的端到端嵌入
-- [Swift SDK](https://github.com/AimesSoft/ErikaSwift) — macOS、iOS、tvOS 的 SwiftPM 包和原生视图
-- [构建与依赖指南](docs/building.zh.md) — xtask、native 依赖、交叉编译
-- [Flutter 嵌入](docs/flutter_embedding.zh.md) ・ [弹幕架构](docs/danmaku_architecture.md)
-- [平台能力矩阵](docs/platform_matrix.zh.md) — 区分可编译、CI 覆盖、真机验收与预编译发布
-- [发布与预编译产物](docs/releasing.md) — 各平台预编译 `erika_capi` 库下载与打包(英文)
-- [贡献 / 开发者指南](CONTRIBUTING.zh.md) — 仓库布局、线程模型、新增平台后端
-
-## 构建
-
-### 前置依赖
-
-- Rust 1.92+
-- Xcode Command Line Tools (macOS/iOS/tvOS)
-- MSVC 工具链 + Windows SDK (Windows，target `x86_64-pc-windows-msvc`)
-- Android SDK + NDK r29，以及对应 Android Rust target
-- DevEco Studio OpenHarmony Native SDK，以及 Rust `aarch64-unknown-linux-ohos` target
-- CMake, pkg-config
-
-### 构建原生依赖
-
-```sh
-# 构建 FFmpeg (LGPL profile)
-cargo run -p xtask -- deps build --profile lgpl
-
-# 构建全部依赖 (含 libass/FreeType/HarfBuzz/FriBidi)
-cargo run -p xtask -- deps build --all --profile lgpl
-
-# 查看依赖状态
-cargo run -p xtask -- deps status
-```
-
-### 编译与测试
-
-```sh
-cargo build -p erika
-cargo test --workspace
-```
-
-### 验证播放路径
-
-```sh
-# macOS
-export SAMPLE="/path/to/video.mp4"
-cargo run -p macos_native_demo -- "$SAMPLE"
-cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
-
-# Windows
-cargo run -p windows_native_demo -- "%SAMPLE%"
-```
+版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 ## 许可证
 
-Rust workspace: [MPL-2.0](LICENSE)
-
-原生依赖通过 `xtask` 独立管理构建 profile 和许可证边界。
+Rust workspace 使用 [MPL-2.0](LICENSE)。原生依赖的构建 profile 与许可说明见
+[构建指南](docs/building.zh.md#许可证-profile) 和 [第三方声明](packaging/THIRD_PARTY_NOTICES.md)。

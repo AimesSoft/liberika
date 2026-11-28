@@ -1,8 +1,8 @@
 [中文](../README.md) | [English](README.en.md) | [日本語](README.ja.md)
 
-# Erika
+# liberika
 
-> 「GOOD！私はErika、NipaPlayにおいてmdk、video player、libmpv、media kitに次ぐ5番目のプレイヤーカーネルです。」
+> 「GOOD！私はliberika、NipaPlayにおいてmdk、video player、libmpv、media kitに次ぐ5番目のプレイヤーカーネルです。」
 > 「あなたを数えても、プレイヤーカーネルは4つだけ！」
 
 **NipaPlay の自社開発再生コア。** Rust 実装、組み込み可能、デコードからレンダリングまで一手に引き受けます。
@@ -11,183 +11,163 @@
 > そして [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) は『ひぐらしのなく頃に』の古手梨花の口癖「にぱー☆」から——コミュニティではみんな「梨花」と呼んでいます。
 > 一方は表舞台のプレイヤー、もう一方は舞台裏のエンジン。同じ世界から生まれた、表裏一体の存在です。
 
-ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて Erika 内部で完結します。
+ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて liberika 内部で完結します。
+
+現在のリリースは **0.3.8** です。[ドキュメント一覧](../docs/README.ja.md) からガイドを選べます。
+
+**MKV 内の ASS 字幕と添付フォントを使って、ブラウザーで直接再生できます。**
+[オンラインデモを開く](https://liberika.aimes-soft.com/demo/)か、`npm install @aimessoft/liberika-web` を実行してください。
+現在のソースには [Web / WASM バックエンド](../docs/web.md) が含まれ、Erika Web に
+組み込み済みです。WebCodecs が映像・音声をデコードし、WASM の libass が字幕の
+フォント・配置・縁取り・エフェクトを描画します。Rust 弾幕と字幕は同じ再生クロックに
+従い、WebGL2 で合成されます。サイト独自の UI を維持したまま、サーバーは元ファイルを
+HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは不要です。
+
+0.3.8 では Windows D3D11 のスクリーンショット、HTTP ソースの応答検証と停滞からの復帰、
+キャンセル可能なオープン、ソフトウェアデコードのアップロードと字幕アトラスの高速化を追加しました。
+0.3.5–0.3.7 ではカラー Emoji 弾幕、組み込みフォントの選択、Bilibili mode 7 弾幕、Linux の線形
+dma-buf 出力、Linux x64 / ARM64 の各 bundled / system 計 4 種のビルド済みアーカイブを追加しています。変更と移行手順は
+[更新履歴](../CHANGELOG.ja.md)を参照してください。
 
 ## 機能
 
-- **ハードウェアアクセラレーション** -- VideoToolbox (macOS/iOS/tvOS)、D3D11VA (Windows)、MediaCodec (Android)、AVCodec (HarmonyOS)。相互運用不可時は明示的に software decode へ fallback
-- **ゼロコピーレンダリング** -- CVPixelBuffer → MTLTexture (Apple)、D3D11VA texture interop (Windows)、MediaCodec Surface → AHardwareBuffer/Vulkan (Android)、AVCodec Surface → OHNativeBuffer/Vulkan (HarmonyOS)。import 失敗時は明示的に CPU upload へ fallback
-- **HDR/EDR 出力** -- Apple EDR、Windows HDR10、Android FP16 extended-linear scRGB negotiation と明示的な SDR fallback
-- **Metal ネイティブレンダラー** -- YCbCr サンプリング、色空間変換、トーンマッピング、字幕/弾幕合成を単一レンダーパスで実行 (macOS/iOS/tvOS)
-- **Direct3D 11 ネイティブレンダラー** -- Windows: D3D11VA ゼロコピーテクスチャ相互運用、YCbCr サンプリング、HDR10 出力、字幕/弾幕 overlay 合成
-- **ニューラル超解像** -- ArtCNN によるアニメ輝度 2x 超解像。Metal、D3D11、wgpu/Vulkan compute で render pipeline に統合
-- **音声出力** -- CoreAudio (macOS) / AudioQueue (iOS/tvOS) / WASAPI (Windows) / AAudio (Android) / OHAudio (HarmonyOS)、f32 PCM リングバッファ、音声クロック同期
-- **字幕** -- SRT / WebVTT / ASS パーサー、libass レンダリング（静的リンク）、埋め込みおよび外部字幕トラック
-- **弾幕** -- Bilibili XML / JSON パーサー、DFM+ 衝突回避レーン配置エンジン、グリフアトラスによるネイティブ GPU レンダリング
-- **再生エンジン** -- play / pause / stop / seek / 再生速度制御、音声マスタークロック同期、vsync 量子化フレームスケジューリング
-- **C ABI** -- 不透明ハンドル設計で、C / C++ / Swift / Dart FFI / 任意の FFI 対応言語から呼び出し可能。正確なエクスポート集合は `erika.h` を参照
-- **Flutter プラグイン** -- macOS + iOS + tvOS + Windows + Android + HarmonyOS の native view / Texture embedding と platform-native high-dynamic-range surface path
-- **wgpu バックエンド** -- Android の playback、overlay、capture、bounded Vulkan/GLES recovery は利用可能。HarmonyOS は Vulkan で動作し、OHNativeWindow で present して OHNativeBuffer を zero-copy import します。Linux は引き続き計画中
+- VideoToolbox、D3D11VA、MediaCodec、AVCodec によるハードウェアデコードとソフトウェアフォールバック。Linux は実験的に NVDEC / VA-API に対応。
+- Metal、D3D11、wgpu による映像・字幕・弾幕の合成、HDR/EDR、Dolby Vision マッピング、ArtCNN・Anime4K・FSR1 とプラットフォームの超解像（対応状況はデバイスと backend に依存）。
+- ローカルファイルと HTTP(S)、カスタムヘッダー、先読みとリワインドキャッシュ。
+- 音声マスタークロック、再生・一時停止・シーク・倍速、トラック切替と外部字幕。
+- Rust、C ABI、Flutter、SwiftPM、OpenHarmony ArkTS から組み込み可能。
+- ブラウザーの JavaScript / TypeScript 組み込み：MKV の分離、ASS 添付フォント、字幕・弾幕の統合合成と独立したスーパーサンプリング。
 
-## クイックスタート
+## 組み込み
 
-### Rust
+| ホスト | インストール / 入口 | ガイド |
+|---|---|---|
+| ブラウザー / JavaScript / TypeScript | `npm install @aimessoft/liberika-web`、または `liberika-web-0.3.8.zip` | [Web 組み込み・配信](../docs/web.ja.md) |
+| Flutter | `flutter pub add erika_flutter`（0.3.8） | [プラグイン](../packages/erika_flutter/README.ja.md) |
+| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加。公開済み SDK 最新版は 2026-11-26 時点で 0.3.8 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.ja.md) |
+| C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
+| Rust | Git 依存を `v0.3.8` に固定 | [ビルド](../docs/building.ja.md) |
+| Linux | x64 / ARM64、bundled / system、glibc 2.35 基準 | [Linux](../docs/linux.md) |
 
-```rust
-use erika::{Player, PlayerConfig, MediaRequest};
+2026-11-26 時点の OHPM 公開最新バージョンは 0.3.8 です。
+ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8) にあります。
 
-let player = Player::new(PlayerConfig::default())?;
-player.open(MediaRequest::file("/path/to/video.mp4"))?;
-player.play()?;
+### ブラウザー
+
+```sh
+npm install @aimessoft/liberika-web
 ```
 
-### C ABI
+```js
+import { Player } from '@aimessoft/liberika-web';
 
-```c
-#include "erika.h"
-
-ErikaPresenterHandle *presenter = erika_presenter_create();
-erika_presenter_attach_metal_layer(presenter, (uint64_t)layer, w, h, scale);
-erika_presenter_open(presenter, "/path/to/video.mp4");
-erika_presenter_play(presenter);
-
-// ディスプレイティック毎に:
-ErikaPresenterStats stats;
-erika_presenter_render_tick(presenter, host_time, &stats);
+const player = await Player.create({ canvas });
+await player.open(fileOrURL);
+await player.play();
 ```
+
+まず[オンラインデモ](https://liberika.aimes-soft.com/demo/)で試せます。デモは同じパッケージを npm CDN から読み込みます。
+Vite などのバンドラーは設定不要です。`@aimessoft/liberika-web-nofont` は約 6 MB の
+フォールバックフォントを含まず、ホストがフォントを提供します。
+Release の `liberika-web-0.3.8.zip` を展開して自分で配信するか、ソースからビルドすることもできます。
+
+```sh
+# 先に Emscripten、wasm-bindgen などのビルド依存を準備します。
+cargo run -p xtask -- web build
+python3 scripts/serve_web.py
+```
+
+音声・映像コーデックは
+ブラウザーの WebCodecs 対応範囲に依存します。依存、サンプル、Erika への組み込みは
+[ブラウザーガイド（英語）](../docs/web.md) を参照してください。
 
 ### Flutter
 
 ```dart
+import 'package:erika_flutter/erika_flutter.dart';
+
 final player = ErikaPlayer();
 await player.open('/path/to/video.mp4');
 await player.play();
 
-// 推奨: フルプレイヤー UI では Erika のネイティブ Metal レイヤーを使います。
-ErikaWindowOverlayVideoView(player: player)
-
-// 互換/診断: Flutter platform view 埋め込みも引き続き利用できます。
+// Widget ツリーに追加。Apple の全画面プレイヤーにはネイティブ overlay も選べます。
 ErikaVideoView(player: player)
 ```
 
-### Flutter パッケージ
+Flutter のクリップやカラーフィルターには `ErikaTextureVideoView`、Apple EDR や
+Windows HDR10 にはネイティブ映像サーフェスを使います。選択とライフサイクルは
+プラグインガイドにまとめています。
 
-`erika_flutter` 0.1.7 は [pub.dev](https://pub.dev/packages/erika_flutter) で公開されています。
-macOS、iOS、tvOS、Windows、Android、HarmonyOS/OpenHarmony に対応しています。
-Flutter アプリには次のコマンドで追加できます：
+### Rust
+
+```toml
+[dependencies]
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.8" }
+```
+
+```rust
+use erika::{MediaRequest, Player, PlayerConfig};
+
+let player = Player::new(PlayerConfig::default());
+player.open(MediaRequest::new("/path/to/video.mp4"))?;
+player.play()?;
+```
+
+先にネイティブ依存を準備します。`Player` は制御とフレーム購読、`PresenterRuntime`
+はレンダリングと音声を担当します。C の入口は `ErikaHandle` と `ErikaPresenterHandle`、
+宣言は [erika.h](../crates/erika_capi/include/erika.h) にあります。
+
+Linux の Rust ホストでは `wgpu` と利用側 workspace のルート manifest の HAL パッチが
+必要です。ネイティブ依存、フォントライブラリ、構築設定は [Linux ガイド](../docs/linux.ja.md)を参照してください。
+
+## プラットフォーム
+
+| プラットフォーム | デコード | レンダリング | 音声 | 配布 |
+|---|---|---|---|---|
+| macOS 11+ | VideoToolbox / software | Metal | CoreAudio | バンドル、Flutter、SwiftPM |
+| iOS 13+ | VideoToolbox / software | Metal | AudioQueue | XCFramework、Flutter、SwiftPM |
+| tvOS 13+ | VideoToolbox / software | Metal | AudioQueue | XCFramework、Flutter、SwiftPM |
+| Windows 10+ | D3D11VA / software | D3D11 | WASAPI | x64 / ARM64 バンドル、Flutter |
+| Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | 4 ABI バンドル、Flutter |
+| OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 バンドル、Flutter、OHPM |
+| Linux（実験的） | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system リリースビルド；Rust、C ABI、Flutter |
+| ブラウザー | WebCodecs | WebGL2 / Canvas | Web Audio | Release の Web archive または JS / WASM ソースビルド |
+
+サーフェスと HDR の対応は [プラットフォーム表](../docs/platform_matrix.zh.md) にまとめています。
+ブラウザー版は現在 SDR 出力で、Chrome で検証済みです。HTTPS または localhost、
+WebCodecs の映像・音声デコード、OffscreenCanvas、WebGL2、Web Audio が必要です。
+
+## 開発
 
 ```sh
-flutter pub add erika_flutter
-```
-
-platform build 時に対応する検証済み native runtime を download します。Android
-では選択された ABI の archive だけを download します。Linux と Web はまだ公開対象ではありません。
-
-### OpenHarmony パッケージ
-
-ネイティブ ArkTS パッケージ `erika` 0.1.7 は
-[OHPM](https://ohpm.openharmony.cn/#/cn/detail/erika) で公開されています。
-OpenHarmony arm64（API 18 以上）のアプリには次のコマンドで追加できます：
-
-```sh
-ohpm install erika
-```
-
-このパッケージは Flutter に依存しません。`ErikaPlayer` API と
-`XComponent` サーフェスの設定は
-[OpenHarmony パッケージガイド](../packages/erika_ohos/README.md)を参照してください。
-
-## C ABI インターフェースファミリー
-
-異なる組み込みシナリオに対応する二つの C ABI エントリーポイントファミリーを提供します：
-
-| ファミリー | ユースケース | レンダリング |
-|-----------|-------------|-------------|
-| `ErikaHandle` | ホストが独自のレンダーループを管理 | ホストがフレームデータを取得 |
-| `ErikaPresenterHandle` | Erika が再生スタック全体を管理 | ホストはサーフェスを提供し `render_tick` を駆動 |
-
-ヘッダー: [`crates/erika_capi/include/erika.h`](../crates/erika_capi/include/erika.h)
-
-## プラットフォームサポート
-
-| プラットフォーム | デコード | レンダリング | 音声 | 状態 |
-|----------------|---------|-------------|------|------|
-| macOS 14+ | VideoToolbox | Metal | CoreAudio | **利用可能** |
-| iOS 16+ | VideoToolbox | Metal | AudioQueue | **利用可能** |
-| tvOS 13+ (Apple TV) | VideoToolbox | Metal | AudioQueue | **利用可能** |
-| Windows 10+ | D3D11VA | Direct3D 11 | WASAPI | **利用可能** |
-| Linux | -- | wgpu (計画中) | -- | 計画中 |
-| Android 8+ | MediaCodec / software | wgpu (Vulkan + GLES fallback) | AAudio | **利用可能**。SDR は検証済み、extended-linear scRGB は実装済み、API 35 HDR 実機の active path acceptance 待ち |
-| HarmonyOS API 18+ | AVCodec (H.264/HEVC) / software | wgpu (Vulkan) + `OHNativeBuffer` zero-copy import | OHAudio | **利用可能**。実機で検証済み、CI は未カバー |
-
-## リポジトリ構成
-
-```
-crates/erika              コア再生ライブラリ
-crates/erika_capi         C ABI エクスポート層
-crates/erika_ffmpeg_sys   FFmpeg 低レベルバインディング
-packages/erika_flutter    Flutter プラグイン (macOS + iOS + tvOS + Windows + Android + HarmonyOS)
-packages/erika_ohos       OpenHarmony ArkTS / OHPM パッケージ
-examples/                 検証・デモプログラム
-xtask/                    ネイティブ依存関係ビルドオーケストレーション
-docs/                     アーキテクチャと組み込みドキュメント
-```
-
-## ドキュメント
-
-- [アーキテクチャ](../docs/architecture.ja.md) — エンジン設計、レンダーバックエンド、プラットフォーム対応
-- [C ABI リファレンス](../docs/capi_reference.ja.md) — 全エクスポート関数、ステータスコード、所有権とスレッド規約
-- [組み込みガイド](../docs/integration.ja.md) — C/C++/Win32/Swift など非 Flutter ホストへの組み込み
-- [ビルドガイド](../docs/building.ja.md) — xtask、native 依存、クロスコンパイル
-- [Flutter 組み込み](../docs/flutter_embedding.ja.md) ・ [弾幕アーキテクチャ](../docs/danmaku_architecture.ja.md)
-- [リリースとプリビルドバイナリ](../docs/releasing.md) — プラットフォーム別 `erika_capi` ライブラリの配布とパッケージング（英語）
-- [コントリビュート / 開発者ガイド](../CONTRIBUTING.ja.md) — リポジトリ構成、スレッドモデル、プラットフォームバックエンドの追加
-
-## ビルド
-
-### 前提条件
-
-- Rust 1.92+
-- Xcode Command Line Tools (macOS/iOS/tvOS)
-- MSVC ツールチェーン + Windows SDK (Windows、ターゲット `x86_64-pc-windows-msvc`)
-- Android SDK + NDK r29 と対象 Android ABI の Rust target
-- DevEco Studio OpenHarmony Native SDK と Rust の `aarch64-unknown-linux-ohos` target
-- CMake, pkg-config
-
-### ネイティブ依存関係のビルド
-
-```sh
-# FFmpeg のビルド (LGPL プロファイル)
-cargo run -p xtask -- deps build --profile lgpl
-
-# 全依存関係のビルド (libass/FreeType/HarfBuzz/FriBidi 含む)
+# Apple / Windows / Android / OpenHarmony のネイティブ依存
 cargo run -p xtask -- deps build --all --profile lgpl
-
-# 依存関係の状態確認
-cargo run -p xtask -- deps status
+cargo build -p erika_capi
 ```
 
-### コンパイルとテスト
+クロスビルドでは target triple を指定します。Linux は `scripts/build_linux_release.sh` で両モードを Ubuntu 22.04 上で構築し、system は自分で導入した ABI 互換の FFmpeg 8 共有ライブラリも利用できます。
+[ビルド](../docs/building.ja.md)、[リリース](../docs/releasing.ja.md)、
+[開発者ガイド](../CONTRIBUTING.ja.md) に手順をまとめています。
 
-```sh
-cargo build -p erika
-cargo test --workspace
-```
+## リポジトリ
 
-### 再生パスの検証
+| ディレクトリ | 内容 |
+|---|---|
+| `crates/erika` | 再生、デコード、クロック、字幕、弾幕、レンダリング |
+| `crates/erika_capi` | C ABI と公開ヘッダー |
+| `crates/erika_ffmpeg_sys` | FFmpeg bindings |
+| `packages/erika_flutter` | Flutter プラグイン |
+| `packages/erika_ohos` | OpenHarmony ArkTS SDK |
+| `packages/erika_web` | ブラウザー Player、Worker、WebGL2 合成と TypeScript 型 |
+| `examples` | ネイティブ、Flutter、ArkTS、ブラウザープレイヤーのサンプル |
+| `xtask` | ネイティブ依存と Web パッケージのビルド |
+| `docs` | ガイドと設計。過去の調査・検証記録は `investigations/` |
 
-```sh
-# macOS
-export SAMPLE="/path/to/video.mp4"
-cargo run -p macos_native_demo -- "$SAMPLE"
-cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
-
-# Windows
-cargo run -p windows_native_demo -- "%SAMPLE%"
-```
+変更履歴は [CHANGELOG](../CHANGELOG.md) にあります。
 
 ## ライセンス
 
-Rust ワークスペース: [MPL-2.0](../LICENSE)
-
-ネイティブ依存関係のビルドプロファイルとライセンス境界は `xtask` を通じて独立管理されます。
+Rust workspace は [MPL-2.0](../LICENSE) です。ネイティブ依存のプロファイルとライセンスは
+[ビルドガイド](../docs/building.ja.md#ライセンス-profile) と
+[第三者ライセンス](../packaging/THIRD_PARTY_NOTICES.md) に記載しています。

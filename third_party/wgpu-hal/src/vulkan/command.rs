@@ -246,8 +246,13 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 bar.texture.format,
                 &self.device.private_caps,
             );
-            let (src_stage, src_access) = conv::map_texture_usage_to_barrier(bar.usage.from);
-            let src_layout = conv::derive_image_layout(bar.usage.from, bar.texture.format);
+            let from = if bar.usage.from == wgt::TextureUses::UNINITIALIZED {
+                bar.texture.initial_usage
+            } else {
+                bar.usage.from
+            };
+            let (src_stage, src_access) = conv::map_texture_usage_to_barrier(from);
+            let src_layout = conv::derive_image_layout(from, bar.texture.format);
             src_stages |= src_stage;
             let (dst_stage, dst_access) = conv::map_texture_usage_to_barrier(bar.usage.to);
             let dst_layout = conv::derive_image_layout(bar.usage.to, bar.texture.format);

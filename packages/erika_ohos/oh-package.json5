@@ -1,13 +1,13 @@
 {
   "name": "erika",
-  "version": "0.1.7",
-  "description": "Native ArkTS media SDK powered by the Erika engine",
+  "version": "0.3.8",
+  "description": "Native ArkTS media SDK powered by the liberika engine",
   "main": "Index.ets",
   "author": {
     "name": "Shinokawa",
     "url": "https://github.com/Shinokawa"
   },
-  "repository": "https://github.com/AimesSoft/Erika",
+  "repository": "https://github.com/AimesSoft/liberika",
   "license": "MPL-2.0",
   "keywords": [
     "media",

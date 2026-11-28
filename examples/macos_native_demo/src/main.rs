@@ -17,6 +17,7 @@ static SUBTITLE_PATH: OnceLock<String> = OnceLock::new();
 static DANMAKU_PATH: OnceLock<String> = OnceLock::new();
 static SMOKE_SECONDS: OnceLock<f64> = OnceLock::new();
 static EDR_HEADROOM: OnceLock<f32> = OnceLock::new();
+static SEEK_SEQUENCE: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
 
 unsafe extern "C" {
     fn erika_demo_run_app();
@@ -30,6 +31,7 @@ struct DemoState {
     presenter: PresenterRuntime,
     load_attempted: bool,
     overlay_logged: bool,
+    seek_cursor: usize,
 }
 
 impl DemoState {
@@ -44,10 +46,32 @@ impl DemoState {
             })?,
             load_attempted: false,
             overlay_logged: false,
+            seek_cursor: 0,
         })
     }
 
     fn render(&mut self, time_seconds: f64) {
+        if let Some(sequence) = SEEK_SEQUENCE.get() {
+            while self.seek_cursor < sequence.len() && time_seconds >= sequence[self.seek_cursor].0
+            {
+                let (trigger, position) = sequence[self.seek_cursor];
+                match self
+                    .presenter
+                    .seek(Duration::from_secs_f64(position.max(0.0)))
+                {
+                    Ok(()) => eprintln!(
+                        "Erika demo seek #{}(at {trigger:.1}s) -> {position:.1}s ok",
+                        self.seek_cursor + 1
+                    ),
+                    Err(error) => eprintln!(
+                        "Erika demo seek #{} -> {:.1}s failed: {error}",
+                        self.seek_cursor + 1,
+                        position
+                    ),
+                }
+                self.seek_cursor += 1;
+            }
+        }
         if !self.load_attempted {
             self.load_attempted = true;
             if let Some(uri) = MEDIA_URI.get() {
@@ -81,6 +105,16 @@ impl DemoState {
                 if !self.overlay_logged && stats.overlay_frames > 0 {
                     eprintln!("Erika demo overlay active through presenter runtime");
                     self.overlay_logged = true;
+                }
+                if SEEK_SEQUENCE.get().is_some() {
+                    eprintln!(
+                        "Erika demo seek stats: decoded={} rendered={} import_failures={} render_failures={} backpressure_drops={}",
+                        stats.decoded_video_frames,
+                        stats.rendered_video_frames,
+                        stats.import_failures,
+                        stats.render_failures,
+                        stats.video_frame_backpressure_drops
+                    );
                 }
             }
             Err(error) => eprintln!("Erika demo render failed: {error}"),
@@ -148,6 +182,7 @@ fn demo_danmaku_timeline() -> DanmakuTimeline {
             color: erika::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         })
         .expect("demo danmaku item is valid");
     danmaku
@@ -161,6 +196,20 @@ pub extern "C" fn erika_demo_attach_layer(layer: *mut c_void, width: u32, height
         if let Err(error) = demo.borrow_mut().presenter.attach_surface(surface) {
             eprintln!("Erika demo attach failed: {error}");
         }
+    });
+}
+
+/// Publishes the presenting display's EDR headroom.
+///
+/// The renderer negotiates its output mode on the render thread and no longer
+/// probes AppKit itself, so the AppKit side (the demo view) resolves the value
+/// on the main thread and pushes it here.
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_demo_set_display_headroom(headroom: f32, known: bool) {
+    DEMO.with(|demo| {
+        demo.borrow_mut()
+            .presenter
+            .set_output_headroom(headroom, known);
     });
 }
 
@@ -223,7 +272,7 @@ fn main() {
     let options = parse_args(&args).unwrap_or_else(|error| {
         eprintln!("{error}");
         eprintln!(
-            "usage: cargo run -p macos_native_demo -- [--edr [HEADROOM]] [--smoke-seconds N] [--subtitle PATH] [--ass-subtitle PATH] [--danmaku PATH] [media-path-or-uri]"
+            "usage: cargo run -p macos_native_demo -- [--edr [HEADROOM]] [--smoke-seconds N] [--subtitle PATH] [--ass-subtitle PATH] [--danmaku PATH] [--seek-sequence t:pos,t:pos] [media-path-or-uri]"
         );
         process::exit(2);
     });
@@ -234,6 +283,21 @@ fn main() {
         DANMAKU_PATH.set(path).expect("danmaku path is set once");
     }
 
+    if let Some(sequence) = options.seek_sequence {
+        let parsed: Vec<(f64, f64)> = sequence
+            .split(',')
+            .filter(|entry| !entry.trim().is_empty())
+            .map(|entry| {
+                let (trigger, position) = entry.split_once(':').unwrap_or((entry, "0"));
+                (
+                    trigger.trim().parse::<f64>().unwrap_or(0.0),
+                    position.trim().parse::<f64>().unwrap_or(0.0),
+                )
+            })
+            .collect();
+        eprintln!("Erika demo seek sequence: {parsed:?}");
+        SEEK_SEQUENCE.set(parsed).expect("seek sequence set once");
+    }
     if let Some(headroom) = options.edr_headroom {
         EDR_HEADROOM
             .set(headroom)
@@ -257,6 +321,7 @@ struct DemoOptions {
     media_uri: Option<String>,
     smoke_seconds: Option<f64>,
     edr_headroom: Option<f32>,
+    seek_sequence: Option<String>,
     subtitle_path: Option<String>,
     danmaku_path: Option<String>,
 }
@@ -265,11 +330,20 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
     let mut media_uri = None;
     let mut smoke_seconds = None;
     let mut edr_headroom = None;
+    let mut seek_sequence = None;
     let mut subtitle_path = None;
     let mut danmaku_path = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--seek-sequence" => {
+                index += 1;
+                seek_sequence = Some(
+                    args.get(index)
+                        .cloned()
+                        .ok_or("--seek-sequence requires a value like 3:14,5:16")?,
+                );
+            }
             "--edr" => {
                 let mut headroom = 4.0;
                 if let Some(value) = args.get(index + 1) {
@@ -341,6 +415,7 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
         media_uri,
         smoke_seconds,
         edr_headroom,
+        seek_sequence,
         subtitle_path,
         danmaku_path,
     })

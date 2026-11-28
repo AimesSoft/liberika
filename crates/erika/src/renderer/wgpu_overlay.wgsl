@@ -37,10 +37,10 @@ fn erika_overlay_vertex(@builtin(vertex_index) vertex_id: u32) -> VertexOut {
         1.0 - pixel.y / max(uniforms.viewport.y, 1.0) * 2.0,
     );
 
-    var out: VertexOut;
-    out.position = vec4<f32>(ndc, 0.0, 1.0);
-    out.tex_coord = uniforms.tex_rect.xy + unit * uniforms.tex_rect.zw;
-    return out;
+    return VertexOut(
+        vec4<f32>(ndc, 0.0, 1.0),
+        uniforms.tex_rect.xy + unit * uniforms.tex_rect.zw,
+    );
 }
 
 @fragment
@@ -58,6 +58,16 @@ fn erika_overlay_fragment(in: VertexOut) -> @location(0) vec4<f32> {
             uniforms.output_encoding == 1u,
         );
         return vec4<f32>(rgb, uniforms.color.a * sampled.r);
+    }
+    if (uniforms.overlay_mode == 2u) {
+        // Premultiplied, so the filter does not darken an emoji's edges.
+        let straight = sampled.rgb / max(sampled.a, 0.0001);
+        rgb = select(
+            straight,
+            pow(max(straight, vec3<f32>(0.0)), vec3<f32>(2.2)),
+            uniforms.output_encoding == 1u,
+        );
+        return vec4<f32>(rgb, uniforms.color.a * sampled.a);
     }
     return vec4<f32>(rgb, sampled.a);
 }

@@ -134,7 +134,10 @@ impl OverlayTimeline {
                 (Vec::new(), bitmaps.parts, changed)
             }
             Some(Err(error)) => {
-                eprintln!("Erika overlay subtitle render failed: {error}");
+                crate::trace::diagnostic_at(
+                    crate::trace::LogLevel::Warn,
+                    format!("Erika overlay subtitle render failed: {error}"),
+                );
                 (Vec::new(), Vec::new(), true)
             }
             None => (Vec::new(), Vec::new(), false),

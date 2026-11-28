@@ -1,10 +1,19 @@
 # Third-Party Notices
 
-Erika's own source code is licensed under **MPL-2.0** (see `LICENSE`).
+liberika's own source code is licensed under **MPL-2.0** (see `LICENSE`).
 
-The prebuilt `erika_capi` binaries in this bundle **statically link** the
-following third-party native libraries, built with Erika's `lgpl` dependency
-profile. Their licenses apply to the corresponding portions of the binary.
+The `bundled` Linux archives and the other native platforms **statically link**
+the following libraries using liberika's `lgpl` dependency profile. Their
+licenses apply to the corresponding portions of the binary. Check `MANIFEST.txt`
+for the dependency mode.
+
+**Linux `system` archives are different:** only patched libass and SoundTouch
+from this table remain embedded. FFmpeg, FreeType, HarfBuzz and FriBidi are
+external shared libraries; their versions, configurations and licenses depend
+on the installation. The FFmpeg SDK used to build/test the release is not
+shipped. `ERIKA_NATIVE_PROFILE=lgpl` does not relicense external FFmpeg.
+Both Linux modes retain system Fontconfig, PulseAudio, Vulkan/VA-API/DRM,
+libc/libstdc++ and GPU driver dependencies. See the bundle's `DEPENDENCIES.txt`.
 
 | Component | Version | License |
 |-----------|---------|---------|
@@ -17,12 +26,14 @@ profile. Their licenses apply to the corresponding portions of the binary.
 | zlib | 1.3.x | zlib |
 | SoundTouch | 2.3.2 | LGPL v2.1 |
 
-The Erika binary also embeds these assets:
+The liberika binary also embeds these assets:
 
 | Asset | Copyright / author | License |
 |-------|--------------------|---------|
 | Droid Sans Fallback (`subfont.ttf`) | Digitized data copyright Google Corporation © 2006; designed by Steve Matteson / Ascender Corporation | Apache-2.0 |
-| ArtCNN C4F16 / C4F32 model weights | Copyright © 2024 João Chrisóstomo | MIT |
+| ArtCNN C4F16 / C4F32 / R8F64 model weights (incl. DS/DN variants) | Copyright © 2024 João Chrisóstomo | MIT |
+| Anime4K v3.2 CNN model weights | Copyright © 2019-2021 bloc97 | MIT |
+| AMD FidelityFX Super Resolution 1.0 (EASU/RCAS, ported) | Copyright © 2021 Advanced Micro Devices, Inc. | MIT |
 
 The release archive includes the corresponding attribution and complete license
 texts under `licenses/`.
@@ -31,15 +42,22 @@ This software is based in part on the work of the FreeType Team. Portions of
 FFmpeg's DCT implementation derive from the Independent JPEG Group's work; see
 `licenses/LICENSE.FFmpeg.md` for FFmpeg's complete licensing notes.
 
+Linux builds use Vulkan-Headers v1.4.341 (Apache-2.0/MIT components) and
+nv-codec-headers n12.1.14.0 (MIT notices in the upstream headers). Their complete
+notices are copied into `licenses/linux-build-headers/`. No NVIDIA driver is
+included. Optional WSL builds also use DirectX-Headers v1.614.1 (MIT); its
+license is copied when that opt-in bridge is built. Normal Linux release
+archives do not enable the WSL D3D12 bridge.
+
 ## LGPL compliance (FFmpeg, FriBidi, SoundTouch)
 
 These binaries link LGPL components statically. To honor the LGPL's relinking
 requirement, the complete corresponding source and the reproducible build
 system that produced these binaries are publicly available:
 
-- **Erika source** (this exact build): the Git tag named in the release / the
+- **liberika source** (this exact build): the Git tag named in the release / the
   commit recorded in the bundle's `MANIFEST.txt`, at
-  <https://github.com/AimesSoft/Erika>.
+  <https://github.com/AimesSoft/liberika>.
 - **Native dependency build**: `xtask deps build --all --profile lgpl` plus the
   per-target build described in `docs/building.md` in that source tree.
 
@@ -51,7 +69,7 @@ SoundTouch 2.3.2 is bundled by the Cargo packages pinned in `Cargo.lock`
 (`soundtouch` 0.5.4 and `soundtouch-ffi` 0.4.1). Its corresponding source ships
 inside the `soundtouch-ffi` package downloaded by Cargo. SoundTouch is copyright
 © Olli Parviainen 2001–2022. A recipient can patch or replace that dependency
-and rebuild the complete Erika static library with Cargo to relink against a
+and rebuild the complete liberika static library with Cargo to relink against a
 modified SoundTouch. The LGPL v2.1 text is included at
 `licenses/LICENSE.LGPL-2.1`.
 

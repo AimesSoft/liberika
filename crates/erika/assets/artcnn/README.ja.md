@@ -20,3 +20,18 @@ python3 export_artcnn.py ArtCNN_C4F16.onnx artcnn_c4f16.bin \
 ```
 
 blob layout はスクリプトの header に記載されており、`src/renderer/metal/upscaler.rs` から利用されています。
+
+新しいモデルは Erika の汎用 network format（`.esr`、`src/renderer/sr/model.rs`）で保存しています。2026-11-02 に `main` から取得した ONNX を `export_artcnn_esr.py` で変換しました。
+
+| File | Model | Parameters |
+|------|-------|-----------|
+| `artcnn_c4f16_dn.esr` | C4F16 denoise variant | ~12K |
+| `artcnn_c4f32_ds.esr`、`artcnn_c4f32_dn.esr` | C4F32 denoise/sharpen、denoise variant | ~48K |
+| `artcnn_r8f64.esr` | 8 residual blocks、64 features、SiLU（desktop build のみ同梱） | ~926K |
+
+```sh
+python3 export_artcnn_esr.py ArtCNN_R8F64.onnx artcnn_r8f64.esr \
+    --test-vector ../../tests/data/artcnn/r8f64 --test-size 32x24
+```
+
+R16F96（約 420 万 parameters、8 MB）は同梱しません。同じ方法で変換し、`erika_presenter_load_upscaler_model` で読み込んでください。

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing Erika release tag to augment
+        description: Existing liberika release tag to augment
         required: true
         type: string
 

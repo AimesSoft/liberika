@@ -7,53 +7,92 @@ rust-version.workspace = true
 version.workspace = true
 build = "build.rs"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
-default = ["libass"]
+default = ["libass", "embedded-fallback-font", "artcnn-r8f64"]
 libass = []
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Carries Droid Sans Fallback, about 6 MB. Without it subtitles and danmaku use
+# the device's fonts: fine on macOS, Windows, Linux, Android and OpenHarmony. From
+# iOS 18 on, and on tvOS, nothing here can read the system's Chinese font, and a
+# browser page must be given one.
+embedded-fallback-font = []
+# The largest super resolution network, about 1.8 MB, desktop only.
+artcnn-r8f64 = []
 
 [dependencies]
 ab_glyph.workspace = true
 aho-corasick.workspace = true
 chardetng.workspace = true
-crossbeam-channel.workspace = true
 encoding_rs.workspace = true
+erika_plugin = { path = "../erika_plugin" }
 fontdb.workspace = true
 libc.workspace = true
-erika_ffmpeg_sys = { path = "../erika_ffmpeg_sys" }
 regex.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
-soundtouch.workspace = true
 thiserror.workspace = true
-ureq.workspace = true
+ttf-parser = "0.25"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+httpdate = "1.0.3"
+crossbeam-channel.workspace = true
+memmap2 = "0.9"
+ab_glyph_rasterizer = "0.1"
+erika_ffmpeg_sys = { path = "../erika_ffmpeg_sys" }
+naga = { version = "29.0", features = ["glsl-in", "wgsl-in", "wgsl-out", "msl-out-if-target-apple", "hlsl-out-if-target-windows"] }
+png.workspace = true
+reqwest.workspace = true
+soundtouch.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 wgpu = { version = "=29.0.3", optional = true }
 pollster = { version = "0.4.0", optional = true }
 bytemuck = { version = "1.25.0", features = ["derive"], optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+naga = { version = "29.0", features = ["glsl-in", "wgsl-in", "wgsl-out", "msl-out", "hlsl-out"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.130"
+js-sys = "=0.3.107"
+
 [build-dependencies]
 cc.workspace = true
+pkg-config.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+ash = "0.38.0"
 windows = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Direct3D",
   "Win32_Graphics_Direct3D_Fxc",
+  "Win32_Graphics_Direct3D_Dxc",
   "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D12",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_Media_Audio",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
+  "Win32_System_LibraryLoader",
+  "Win32_System_SystemInformation",
   "Win32_System_Variant",
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+ash = "0.38.0"
+
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 ash = "0.38.0"
 
 [target.'cfg(target_env = "ohos")'.dependencies]
@@ -72,3 +111,6 @@ objc2-quartz-core.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dev-dependencies]
 objc2.workspace = true
 objc2-metal.workspace = true
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-core = "0.62.2"

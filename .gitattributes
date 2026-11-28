@@ -2,3 +2,4 @@
 # conventional `-- ` mail signature. Do not report those structural bytes as
 # trailing-whitespace errors when patch files are committed as test inputs.
 *.patch -whitespace
+*.sh text eol=lf

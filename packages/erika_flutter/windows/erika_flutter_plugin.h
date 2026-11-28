@@ -15,7 +15,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -26,6 +29,7 @@
 namespace erika_flutter {
 
 class ErikaFlutterPlugin;
+class ErikaPresenterWorker;
 
 class ErikaEventStreamHandler
     : public flutter::StreamHandler<flutter::EncodableValue> {
@@ -48,9 +52,11 @@ class ErikaEventStreamHandler
 
 class ErikaFlutterPlugin : public flutter::Plugin {
  public:
-  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
+  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar,
+                                   FlutterDesktopMessengerRef messenger);
 
-  explicit ErikaFlutterPlugin(flutter::PluginRegistrarWindows* registrar);
+  ErikaFlutterPlugin(flutter::PluginRegistrarWindows* registrar,
+                     FlutterDesktopMessengerRef messenger);
   ~ErikaFlutterPlugin() override;
 
   ErikaFlutterPlugin(const ErikaFlutterPlugin&) = delete;
@@ -66,6 +72,7 @@ class ErikaFlutterPlugin : public flutter::Plugin {
 
  private:
   struct ErikaNativeLibrary;
+  struct ColdOpenTicket;
   struct ErikaOverlayWindow;
   struct ErikaFlutterTexture;
   struct PlayerHost;
@@ -91,6 +98,13 @@ class ErikaFlutterPlugin : public flutter::Plugin {
                                                  WPARAM wparam,
                                                  LPARAM lparam);
   void OnFrameTimer();
+  ErikaPresenterWorker& EnsureLogWorker();
+  void PostCompletion(std::function<void()> completion);
+  void DrainCompletions();
+  void DispatchNativeMethod(PlayerHost& host, std::string method,
+                            flutter::EncodableMap args,
+                            std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> result,
+                            std::shared_ptr<ColdOpenTicket> cold_open_ticket = {});
   std::optional<LRESULT> OnTopLevelWindowProc(HWND hwnd,
                                               UINT message,
                                               WPARAM wparam,
@@ -123,6 +137,8 @@ class ErikaFlutterPlugin : public flutter::Plugin {
   void HandleSmtcCommand(ErikaSmtcCommand command, uint64_t position_micros);
 
   flutter::PluginRegistrarWindows* registrar_ = nullptr;
+  // Retained so availability can be checked after the engine invalidates it.
+  FlutterDesktopMessengerRef native_messenger_ = nullptr;
   std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>>
       event_channel_;
   std::unique_ptr<flutter::EventSink<flutter::EncodableValue>> event_sink_;
@@ -130,6 +146,7 @@ class ErikaFlutterPlugin : public flutter::Plugin {
   std::unordered_map<int64_t, std::shared_ptr<ErikaFlutterTexture>> textures_;
   std::unique_ptr<ErikaOverlayWindow> overlay_window_;
   std::unique_ptr<ErikaWindowsSmtc> smtc_;
+  std::unique_ptr<ErikaPresenterWorker> log_worker_;
   int64_t active_player_id_ = 0;
   int64_t requested_flutter_view_id_ = 0;
   bool overlay_uses_secondary_window_ = false;
@@ -143,7 +160,11 @@ class ErikaFlutterPlugin : public flutter::Plugin {
   std::atomic<uint64_t> frame_timer_generation_{0};
   double frame_timer_target_fps_ = 0.0;
   double frame_timer_interval_ms_ = 0.0;
-  bool in_frame_timer_ = false;
+  bool joining_presenter_ = false;
+  std::mutex completion_mutex_;
+  std::deque<std::function<void()>> completions_;
+  bool completion_message_pending_ = false;
+  uint64_t event_sink_generation_ = 0;
 };
 
 }  // namespace erika_flutter

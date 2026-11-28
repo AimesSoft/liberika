@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Existing Erika native release version
+        description: Existing liberika native release version
         required: true
-        default: "0.1.7"
+        default: "0.3.0"
         type: string
       upload:
         description: Attach the Swift XCFramework to the existing release
@@ -21,7 +21,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Existing Erika native release version
+        description: Existing liberika native release version
         required: true
         type: string
       ref:
@@ -50,7 +50,7 @@ jobs:
       checksum: ${{ steps.binary.outputs.checksum }}
     env:
       GH_TOKEN: ${{ github.token }}
-      VERSION: ${{ inputs.version || '0.1.7' }}
+      VERSION: ${{ inputs.version || '0.3.0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,7 +108,7 @@ jobs:
           retention-days: 7
 
       - name: Attach binary target to the native release
-        if: inputs.upload && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call')
+        if: inputs.upload
         shell: bash
         run: |
           set -euo pipefail
@@ -120,3 +120,8 @@ jobs:
             --jq ".assets[] | select(.name == \"$name\") | .name")"
           test -z "$existing"
           gh release upload "v${VERSION}" "$archive" --repo "$GITHUB_REPOSITORY"
+          gh release download "v${VERSION}" --pattern SHA256SUMS --dir output \
+            --repo "$GITHUB_REPOSITORY"
+          printf '%s  %s\n' "${{ steps.binary.outputs.checksum }}" "$name" >> output/SHA256SUMS
+          gh release upload "v${VERSION}" output/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber

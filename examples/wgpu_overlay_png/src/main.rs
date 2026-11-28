@@ -3,6 +3,7 @@
 //! the wgpu overlay/subtitle compositing path (alpha-blended over the video).
 
 use erika::overlay::{OverlayFrame, OverlayViewport};
+use erika::renderer::pipeline::VideoRenderPipeline;
 use erika::renderer::wgpu::{VideoUniforms, WgpuRenderer};
 use erika::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
 
@@ -153,21 +154,6 @@ fn color_bars_nv12() -> (Vec<u8>, Vec<u8>) {
 }
 
 fn bars_uniforms() -> VideoUniforms {
-    VideoUniforms {
-        is_p010: 0,
-        full_range: 0,
-        source_transfer: 0,
-        target_transfer: 0,
-        tone_map: 0,
-        edr_output: 0,
-        input_mode: 0,
-        scene_linear: 0,
-        nits: [100.0, 100.0, 100.0, 100.0],
-        luma_coefficients: [0.2126, 0.7152, 0.0722, 0.0],
-        gamut_matrix_rows: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-        ],
-    }
+    let pipeline = VideoRenderPipeline::sdr_default();
+    VideoUniforms::from_pipeline(&pipeline, false, false)
 }

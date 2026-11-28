@@ -19,10 +19,10 @@ use ::windows::Win32::Graphics::Direct3D11::{
     D3D11_RENDER_TARGET_BLEND_DESC, D3D11_RESOURCE_MISC_SHARED, D3D11_SAMPLER_DESC,
     D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0,
     D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_ARRAY_SRV, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer,
-    ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout, ID3D11Multithread, ID3D11PixelShader,
-    ID3D11Query, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_TEXTURE3D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11BlendState,
+    ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout,
+    ID3D11Multithread, ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11Resource,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
@@ -43,25 +43,64 @@ use ::windows::core::{BOOL, IUnknown, Interface, PCSTR};
 
 use crate::core::{
     ColorPrimaries, FlutterTextureKind, LumaUpscalerBackendStatus, PlatformSurface, PlayerError,
-    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererRuntimeStats, Result,
-    SurfaceMetrics, TransferFunction, WgpuSurfaceKind,
+    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererResourceStats,
+    RendererRuntimeStats, Result, SurfaceMetrics, TransferFunction, WgpuSurfaceKind,
 };
-use crate::danmaku::{
-    DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan,
-};
-use crate::ffmpeg::Frame;
+use crate::danmaku::{DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuRenderPlan};
+use crate::ffmpeg::{Frame, PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
-use crate::renderer::d3d11_artcnn::D3d11ArtCnn;
+use crate::renderer::d3d11_sr::{D3d11Fsr1, UpscaledLuma};
+use crate::renderer::d3d11_sr_select::{D3d11Upscaler, SrAccelerator};
+use crate::renderer::d3d11_vsr::{D3d11VideoSuperResolution, VsrColorSpace, VsrMatrix, VsrOutput};
+use crate::renderer::gamut::{
+    GamutLut, GamutLutJob, GamutLutParams, LUT_SIZE_C, LUT_SIZE_H, LUT_SIZE_I, pack_rgba16f,
+};
 use crate::renderer::metal::{MetalRendererConfig, VideoAlphaMode};
 use crate::renderer::output::{
     ActiveOutputEncoding, OutputFallbackReason, OutputRuntimeStatus, OutputSurfaceFormat,
 };
 use crate::renderer::pipeline::{
     Chromaticity, LumaUpscalerMode, PrimariesCoordinates, SourceColorState, TargetColorState,
-    VideoRenderPipeline, VideoUniforms, primaries_coordinates,
+    UpscalerCapabilities, UpscalerDescriptor, UpscalerFamily, VideoRenderPipeline, VideoUniforms,
+    primaries_coordinates,
+};
+use crate::renderer::post_process::{
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
 };
 use crate::renderer::presentation::PresentationLayout;
+use crate::renderer::sr::reference::LumaRange;
 use crate::subtitle::AssColor;
+
+mod alpha_atlas;
+mod capture;
+mod danmaku;
+mod p010_upload;
+mod post_process;
+use danmaku::{D3d11DanmakuBatch, D3d11DanmakuDraws, D3d11DanmakuPipeline};
+use post_process::D3d11PostProcess;
+
+/// Probes upscaler and post-processing capabilities for the default Windows
+/// DXGI adapter when no D3D11 device has been created yet.
+pub fn probe_default_upscalers() -> UpscalerCapabilities {
+    capabilities_for_vendor(crate::renderer::d3d11_vsr::probe_default_vendor())
+}
+
+fn capabilities_for_vendor(
+    vendor: Option<crate::renderer::d3d11_vsr::VsrVendor>,
+) -> UpscalerCapabilities {
+    let mut modes = UpscalerCapabilities::bundled_portable_modes();
+    if let Some(vendor) = vendor {
+        modes.push(UpscalerDescriptor::for_mode_named(
+            LumaUpscalerMode::PlatformVideo,
+            vendor.display_name(),
+        ));
+    }
+    UpscalerCapabilities {
+        modes,
+        supports_custom_network: true,
+        supports_post_process: true,
+    }
+}
 
 const SDR_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const HDR10_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -76,6 +115,17 @@ struct VsOut {
     float2 texcoord : TEXCOORD0;
 };
 
+struct DoviUniforms {
+    float4 dovi_flags;
+    float4 dovi_pivots[6];
+    float4 dovi_bounds[3];
+    float4 dovi_coefficients[24];
+    float4 dovi_mmr[144];
+    float4 dovi_nonlinear_matrix[3];
+    float4 dovi_nonlinear_offset;
+    float4 dovi_lms_matrix[3];
+};
+
 cbuffer VideoConstants : register(b0) {
     uint is_p010;
     uint full_range;
@@ -88,6 +138,14 @@ cbuffer VideoConstants : register(b0) {
     float4 nits;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
+    float4 ipt_matrix_rows[9];
+    float4 tone_map_extra;
+    float4 tone_map_coeffs;
+    uint gamut_lut_enabled;
+    uint gamut_primaries;
+    uint gamut_reserved0;
+    uint gamut_reserved1;
+    DoviUniforms dovi;
     // xy scales native/packed luma coordinates; zw scales native chroma.
     // D3D11VA textures can be allocation-aligned beyond the visible frame.
     float4 texture_scales;
@@ -95,6 +153,7 @@ cbuffer VideoConstants : register(b0) {
 
 Texture2D lumaTex : register(t0);
 Texture2D chromaTex : register(t1);
+Texture3D gamutLut : register(t2);
 SamplerState videoSampler : register(s0);
 
 float source_peak_nits() {
@@ -184,26 +243,24 @@ float3 source_reference_to_nits(float3 rgb) {
     return max(rgb, float3(0.0, 0.0, 0.0)) * source_reference_white_nits();
 }
 
-float3 tone_map_nits(float3 input_nits) {
-    float source_peak = source_peak_nits();
-    float target_peak = target_peak_nits();
-    float3 x = max(input_nits, float3(0.0, 0.0, 0.0)) / target_peak;
-    float white = max(source_peak / target_peak, 1.0);
-    if (tone_map == 1u) {
-        float white2 = white * white;
-        return target_peak * clamp((x * (float3(1.0, 1.0, 1.0) + x / white2)) / (float3(1.0, 1.0, 1.0) + x), float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0));
-    }
-    if (tone_map == 2u) {
-        float knee = 0.75;
-        float denom = max(white - knee, 0.0001);
-        float3 knee3 = float3(knee, knee, knee);
-        float3 t = clamp((x - knee3) / denom, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0));
-        float3 shoulder = knee3 + (1.0 - knee) * (float3(1.0, 1.0, 1.0) - pow(float3(1.0, 1.0, 1.0) - t, float3(2.0, 2.0, 2.0)));
-        return target_peak * lerp(x, shoulder, step(knee3, x));
-    }
-    return target_peak * clamp(x, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0));
+float pq_code(float nits) {
+    return pq_inverse_eotf(clamp(nits, 0.0, 10000.0) / 10000.0);
 }
 
+float nits_from_pq(float code) {
+    return 10000.0 * pq_eotf(clamp(code, 0.0, 1.0));
+}
+
+// libplacebo pl_smoothstep with arbitrary edge order (HLSL smoothstep has
+// undefined results when edge0 >= edge1, and libplacebo's knee tuning term
+// deliberately uses reversed edges).
+float sstep(float edge0, float edge1, float x) {
+    float t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Simple primaries conversion (HDR10 output path); the tone-mapped path
+// converts primaries inside the IPT roundtrip instead.
 float3 apply_gamut_map(float3 rgb) {
     return float3(
         dot(gamut_matrix_rows[0].xyz, rgb),
@@ -212,8 +269,270 @@ float3 apply_gamut_map(float3 rgb) {
     );
 }
 
+// libplacebo st2094_pick_knee evaluated on absolute PQ codes. The source
+// pivot follows the scene average luminance when known and stays within
+// [10%, 80%] of the range; the destination pivot rescales it into the output
+// range and then adapts towards the 1:1 line (knee_adaptation 0.4).
+float2 st2094_pick_knee(float src_min, float src_max, float src_avg, float dst_min, float dst_max) {
+    const float knee_adaptation = 0.4;
+    const float min_knee = 0.1;
+    const float max_knee = 0.8;
+    const float def_knee = 0.4;
+    float src_knee_min = lerp(src_min, src_max, min_knee);
+    float src_knee_max = lerp(src_min, src_max, max_knee);
+    float dst_knee_min = lerp(dst_min, dst_max, min_knee);
+    float dst_knee_max = lerp(dst_min, dst_max, max_knee);
+    float fallback = lerp(src_min, src_max, def_knee);
+    float src_knee = clamp(src_avg > 0.0 ? src_avg : fallback, src_knee_min, src_knee_max);
+    float target = (src_knee - src_min) / max(src_max - src_min, 0.000001);
+    float adapted = lerp(dst_min, dst_max, target);
+    float tuning = 1.0 - sstep(max_knee, def_knee, target) * sstep(min_knee, def_knee, target);
+    float adaptation = lerp(knee_adaptation, 1.0, tuning);
+    float dst_knee = clamp(lerp(src_knee, adapted, adaptation), dst_knee_min, dst_knee_max);
+    return float2(src_knee, dst_knee);
+}
+
+// The tone-map curve evaluated on the IPT intensity axis (PQ codes),
+// mirroring libplacebo's tone-map functions. `param` is the per-operator
+// curve parameter from ToneMapConfig::curve_param (0 = operator default).
+float tone_map_curve_pq(float x_in, float param) {
+    float src_peak = source_peak_nits();
+    float dst_peak = target_peak_nits();
+    float src_avg = tone_map_extra.y;
+    float dst_black = tone_map_extra.z;
+    float in_min = 0.0;
+    float in_max = max(pq_code(src_peak), 0.000001);
+    float out_min = pq_code(dst_black);
+    float out_max = max(pq_code(dst_peak), 0.000001);
+    float out_range = max(out_max - out_min, 0.000001);
+    float x = clamp(x_in, in_min, in_max);
+    if (tone_map == 0u) {
+        // Clip: values within the source range pass through untouched.
+        return x;
+    }
+    if (tone_map == 1u) {
+        // Reinhard (output-relative, libplacebo pl_tone_map_reinhard).
+        //
+        // libplacebo evaluates this curve in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators (BT.2390, spline, ST 2094-10)
+        // work on encoded values. Running it on PQ codes bends the curve's
+        // meaning: against a 1000->203 nit target mid-tones darken badly, and
+        // the Mobius knee lands far below its intended position. Rescale to
+        // linear nits here and encode back at the end.
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
+        float contrast = param > 0.0 ? param : 0.5;
+        float offset = (1.0 - contrast) / max(contrast, 0.000001);
+        float scale = (peak + offset) / peak;
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
+        float mapped = t / (t + offset) * scale;
+        return pq_code(mapped * out_range_nits + out_min_nits);
+    }
+    if (tone_map == 2u) {
+        // Mobius: Mobius transform with a 1:1 linear region below the knee,
+        // also evaluated in linear nits (see the Reinhard note above). The
+        // knee j is relative to the output range, so the linear region ends
+        // at dst_black + j * (dst_peak - dst_black).
+        float in_max_nits = max(src_peak, 0.000001);
+        float out_min_nits = dst_black;
+        float out_range_nits = max(dst_peak - dst_black, 0.000001);
+        float peak = in_max_nits / out_range_nits;
+        float j = param > 0.0 ? param : 0.3;
+        float a = -j * j * (peak - 1.0) / (j * j - 2.0 * j + peak);
+        float b = (j * j - 2.0 * j * peak + peak) / max(peak - 1.0, 0.000001);
+        float scale = (b * b + 2.0 * b * j + j * j) / (b - a);
+        float t = clamp(nits_from_pq(x), 0.0, in_max_nits) / out_range_nits;
+        float mapped = t > j ? scale * (t + a) / (t + b) : t;
+        return pq_code(mapped * out_range_nits + out_min_nits);
+    }
+    if (tone_map == 3u) {
+        // ITU-R BT.2390 EETF with black-point compensation (the libplacebo
+        // version also compensates target black; the earlier port skipped it).
+        float knee_offset = param > 0.0 ? param : 1.0;
+        float max_lum = clamp(out_max / in_max, 0.0, 1.0);
+        float min_lum = out_min / in_max;
+        float ks = (1.0 + knee_offset) * max_lum - knee_offset;
+        float bp = min(max(1.0 / max(min_lum, 0.000001), 0.0), 4.0);
+        float u = x / in_max;
+        if (ks < 1.0 && u > ks) {
+            float tb = (u - ks) / (1.0 - ks);
+            float tb2 = tb * tb;
+            float tb3 = tb2 * tb;
+            u = (2.0 * tb3 - 3.0 * tb2 + 1.0) * ks
+              + (tb3 - 2.0 * tb2 + tb) * (1.0 - ks)
+              + (-2.0 * tb3 + 3.0 * tb2) * max_lum;
+        }
+        if (u < 1.0) {
+            u = u + min_lum * pow(1.0 - u, bp);
+            float gain = max_lum < 1.0
+                ? 1.0 / (1.0 + min_lum / max_lum * pow(1.0 - max_lum, bp))
+                : 1.0;
+            u = gain * (u - min_lum) + min_lum;
+        }
+        return u * in_max;
+    }
+    if (tone_map == 4u) {
+        // Spline: perceptually linear single-pivot polynomial, the default
+        // tone map of libplacebo and mpv's gpu-next renderer.
+        float contrast = param > 0.0 ? param : 0.3;
+        float fallback_avg = clamp(0.4 * src_peak, 100.0, 400.0);
+        float effective_src_avg = src_avg > 0.0 ? src_avg : fallback_avg;
+        float2 knee = st2094_pick_knee(
+            in_min,
+            in_max,
+            pq_code(effective_src_avg),
+            out_min,
+            out_max
+        );
+        float src_pivot = knee.x;
+        float dst_pivot = knee.y;
+        float slope0 = (dst_pivot - out_min) / max(src_pivot - in_min, 0.000001);
+        float ratio = clamp(1.5 * (in_max / out_max - 1.0), 0.2, 1.2);
+        float slope = pow(slope0, (1.0 - contrast) * ratio);
+        float in_min0 = in_min - src_pivot;
+        float in_max0 = in_max - src_pivot;
+        float out_min0 = out_min - dst_pivot;
+        float out_max0 = out_max - dst_pivot;
+        float pa = (out_min0 - slope * in_min0) / (in_min0 * in_min0);
+        float qa = (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0 * in_max0);
+        float qb = -3.0 * (slope * in_max0 - out_max0) / (2.0 * in_max0 * in_max0);
+        float xr = x - src_pivot;
+        float mapped = xr > 0.0
+            ? ((qa * xr + qb) * xr + slope) * xr
+            : (pa * xr + slope) * xr;
+        return mapped + dst_pivot;
+    }
+    if (tone_map == 5u) {
+        // ITU-R BT.2446 method A: Weber-law log compression from the source
+        // peak envelope and a standardized S-curve (mpv's recommended curve
+        // for well-mastered content).
+        float phdr = 1.0 + 32.0 * pow(src_peak / 10000.0, 1.0 / 2.4);
+        float psdr = 1.0 + 32.0 * pow(dst_peak / 10000.0, 1.0 / 2.4);
+        float t = pow(nits_from_pq(x) / max(src_peak, 0.000001), 1.0 / 2.4);
+        t = log(1.0 + (phdr - 1.0) * t) / log(phdr);
+        if (t <= 0.7399) {
+            t = 1.0770 * t;
+        } else if (t < 0.9909) {
+            t = (-1.1510 * t + 2.7811) * t - 0.6302;
+        } else {
+            t = 0.5 * t + 0.5;
+        }
+        t = (pow(psdr, t) - 1.0) / (psdr - 1.0);
+        // BT.1886 EOTF from the target black point and peak.
+        float lb = pow(max(dst_black, 0.0), 1.0 / 2.4);
+        float lw = pow(max(dst_peak, 0.0), 1.0 / 2.4);
+        return pq_code(pow((lw - lb) * t + lb, 2.4));
+    }
+    // SMPTE ST 2094-10 (DolbyVision's dynamic-metadata curve): rational
+    // Mobius interpolation in absolute nits; coefficients are solved per
+    // frame on the CPU from the same scene pivot.
+    float c1 = tone_map_coeffs.x;
+    float c2 = tone_map_coeffs.y;
+    float c3 = tone_map_coeffs.z;
+    float x_nits = nits_from_pq(x);
+    float y_nits = (c1 + c2 * x_nits) / max(1.0 + c3 * x_nits, 0.000001);
+    return pq_code(clamp(y_nits, 0.0, 10000.0));
+}
+
+float3 tone_map_nits(float3 input_nits) {
+    if (target_transfer == 3u) {
+        // HDR10 output: convert primaries by the gamut matrix and clamp to
+        // the PQ range (no tone mapping; the display does the HDR mapping).
+        return clamp(apply_gamut_map(max(input_nits, float3(0.0, 0.0, 0.0)) / source_reference_white_nits())
+            * source_reference_white_nits(), float3(0.0, 0.0, 0.0), float3(10000.0, 10000.0, 10000.0));
+    }
+    // libplacebo color map: RGB in source primaries (absolute nits) to
+    // HPE-LMS, PQ-encode, IPT, map the intensity axis and apply the
+    // hue-preserving chroma rule, then decode back to RGB in the target
+    // primaries. The primaries conversion happens inside this roundtrip.
+    float3 rgb = max(input_nits, float3(0.0, 0.0, 0.0));
+    float3 lms = float3(
+        dot(ipt_matrix_rows[0].xyz, rgb),
+        dot(ipt_matrix_rows[1].xyz, rgb),
+        dot(ipt_matrix_rows[2].xyz, rgb)
+    );
+    float3 lmspq = float3(pq_code(lms.r), pq_code(lms.g), pq_code(lms.b));
+    float3 ipt = float3(
+        dot(float3(0.4, 0.4, 0.2), lmspq),
+        dot(float3(4.455, -4.851, 0.396), lmspq),
+        dot(float3(0.8056, 0.3572, -1.1628), lmspq)
+    );
+    float i_orig = ipt.x;
+    ipt.x = tone_map_curve_pq(ipt.x, tone_map_extra.x);
+    // Libplacebo's chroma rule: clamp the saturation boost when brightening
+    // and desaturate (by the cubic hull term) when the mapping darkens.
+    float2 hull = float2(i_orig, ipt.x);
+    float2 hull_c = ((hull - float2(6.0, 6.0)) * hull + float2(9.0, 9.0)) * hull;
+    float ratio = min(i_orig / max(ipt.x, 0.000001), hull_c.y / max(hull_c.x, 0.000001));
+    ipt.yz = ipt.yz * ratio;
+    if (gamut_lut_enabled != 0u) {
+        // I axis spans the target's [black, peak] in PQ codes, matching
+        // libplacebo's gamut.min_luma/max_luma (tone_map_extra.z is the
+        // target black in nits, the same value the LUT was generated for).
+        float lut_min = pq_code(tone_map_extra.z);
+        float lut_max = max(pq_code(target_peak_nits()), 0.000001);
+        float lut_range = max(lut_max - lut_min, 0.000001);
+        float3 pos = float3(
+            clamp((ipt.x - lut_min) / lut_range, 0.0, 1.0),
+            clamp(2.0 * length(ipt.yz), 0.0, 1.0),
+            0.5 + 0.5 * atan2(ipt.z, ipt.y) / 3.14159265
+        );
+        // libplacebo's texel_scale: the lattice position must be remapped to
+        // the texel-center coordinate, otherwise the low end of the chroma
+        // axis (whose first texel stores zero chroma) leaks in and crushes
+        // saturation.
+        float3 idx = float3(
+            pos.x * (47.0 / 48.0) + 0.5 / 48.0,
+            pos.y * (31.0 / 32.0) + 0.5 / 32.0,
+            pos.z * (255.0 / 256.0) + 0.5 / 256.0
+        );
+        float3 sampled = gamutLut.Sample(videoSampler, idx).xyz;
+        ipt = float3(sampled.x, sampled.y - 0.5, sampled.z - 0.5);
+    }
+    float3 lmspq_out = float3(
+        dot(float3(1.0, 0.0975689, 0.205226), ipt),
+        dot(float3(1.0, -0.113876, 0.133217), ipt),
+        dot(float3(1.0, 0.0326151, -0.676887), ipt)
+    );
+    float3 lms_out = float3(
+        nits_from_pq(lmspq_out.r),
+        nits_from_pq(lmspq_out.g),
+        nits_from_pq(lmspq_out.b)
+    );
+    return float3(
+        dot(ipt_matrix_rows[6].xyz, lms_out),
+        dot(ipt_matrix_rows[7].xyz, lms_out),
+        dot(ipt_matrix_rows[8].xyz, lms_out)
+    );
+}
+
+// Hue-preserving gamut mapping: the linear gamut matrix can push highly
+// saturated wide-gamut colors outside the target gamut (negative
+// components). Blending those towards luma shifts hue - BT.2020 primary
+// red picks up blue and turns pink. Instead blend towards the naive clip
+// by an out-of-gamut smoothstep factor: slightly-out colors stay nearly
+// intact, strongly-out primaries land on the pure target primary with
+// their hue intact, matching mpv's perceptual gamut handling. Mirrors the
+// WGSL/MSL gamut_compress and the Rust reference in pipeline.rs tests.
+// Brightness overshoot (> 1) is left for the tone map.
+float3 gamut_compress(float3 rgb) {
+    float lo = min(rgb.r, min(rgb.g, rgb.b));
+    float outness = max(-lo, 0.0);
+    float k = smoothstep(0.0, 1.0, outness);
+    return lerp(rgb, clamp(rgb, 0.0, 1.0), k);
+}
+
 float3 target_nits_to_reference_linear(float3 input_nits) {
-    return max(input_nits, float3(0.0, 0.0, 0.0)) / target_reference_white_nits();
+    // libplacebo's encode maps [target black, target peak] onto [0, 1] where
+    // 1.0 is the target reference white, so the tone-map black-point
+    // compensation lands back on true black instead of lifting it.
+    float black = tone_map_extra.z;
+    float peak = target_peak_nits();
+    float range = max(peak - black, 0.0001);
+    return max(input_nits - float3(black, black, black), float3(0.0, 0.0, 0.0)) / range
+        * (range / target_reference_white_nits());
 }
 
 float3 target_reference_linear_to_output(float3 rgb) {
@@ -261,6 +580,12 @@ float4 final_output(float3 rgb, float alpha) {
 }
 
 void expand_ycbcr_range(float y_in, float2 cbcr_in, out float y, out float2 cbcr) {
+    if (is_p010 != 0u) {
+        // P010 stores 10-bit codes as code << 6 in a 16-bit UNORM texture.
+        const float p010_scale = 65535.0 / 65472.0;
+        y_in *= p010_scale;
+        cbcr_in *= p010_scale;
+    }
     if (full_range != 0u) {
         y = y_in;
         cbcr = cbcr_in - float2(0.5, 0.5);
@@ -273,6 +598,83 @@ void expand_ycbcr_range(float y_in, float2 cbcr_in, out float y, out float2 cbcr
     }
     y = (y_in - (16.0 / 255.0)) * (255.0 / 219.0);
     cbcr = (cbcr_in - float2(128.0 / 255.0, 128.0 / 255.0)) * (255.0 / 224.0);
+}
+
+// Dolby Vision RPU reshaping, ported from libplacebo's `pl_shader_dovi_reshape`
+// (the renderer behind mpv's Dolby Vision mapping). The base-layer signal is
+// reshaped per component through piecewise polynomial/MMR curves selected by
+// pivot comparison, where MMR coefficients mix all three raw components.
+float3 dovi_reshaped_signal(float3 sig_in) {
+    float3 sig = clamp(sig_in, 0.0, 1.0);
+    float result[3] = { sig.r, sig.g, sig.b };
+    float4 flags = dovi.dovi_flags;
+    for (uint c = 0; c < 3u; c++) {
+        uint segments = uint(flags[1u + c]);
+        if (segments == 0u) {
+            continue;
+        }
+        float s = result[c];
+        uint index = 0u;
+        for (uint i = 0u; i < 7u; i++) {
+            float4 pivot_row = dovi.dovi_pivots[2u * c + i / 4u];
+            float pivot = pivot_row[i % 4u];
+            if (s >= pivot) {
+                index = index + 1u;
+            }
+        }
+        float4 coeff = dovi.dovi_coefficients[8u * c + index];
+        if (coeff.w < 0.5) {
+            s = (coeff.z * s + coeff.y) * s + coeff.x;
+        } else {
+            uint base = 48u * c + uint(coeff.y);
+            uint order = uint(coeff.w);
+            float4 sig_x = float4(
+                sig.x * sig.y,
+                sig.x * sig.z,
+                sig.y * sig.z,
+                sig.x * sig.y * sig.z
+            );
+            s = coeff.x;
+            s = s + dot(dovi.dovi_mmr[base].xyz, sig);
+            s = s + dot(dovi.dovi_mmr[base + 1u], sig_x);
+            if (order >= 2u) {
+                float3 sig2 = sig * sig;
+                float4 sig_x2 = sig_x * sig_x;
+                s = s + dot(dovi.dovi_mmr[base + 2u].xyz, sig2);
+                s = s + dot(dovi.dovi_mmr[base + 3u], sig_x2);
+                if (order >= 3u) {
+                    s = s + dot(dovi.dovi_mmr[base + 4u].xyz, sig2 * sig);
+                    s = s + dot(dovi.dovi_mmr[base + 5u], sig_x2 * sig_x);
+                }
+            }
+        }
+        float4 bounds = dovi.dovi_bounds[c];
+        result[c] = clamp(s, bounds.x, bounds.y);
+    }
+    return float3(result[0], result[1], result[2]);
+}
+
+// Reshaped nonlinear signal to PQ-encoded IPT via the RPU's ycc_to_rgb matrix
+// and signal offsets. Applying the RPU offsets keeps integer offset codes
+// exactly on sample codes (2^bits/(2^bits-1) folded in on the CPU).
+float3 dovi_signal_to_pq_rgb(float3 sig) {
+    float3 reshaped = dovi_reshaped_signal(sig) - dovi.dovi_nonlinear_offset.xyz;
+    return float3(
+        dot(dovi.dovi_nonlinear_matrix[0].xyz, reshaped),
+        dot(dovi.dovi_nonlinear_matrix[1].xyz, reshaped),
+        dot(dovi.dovi_nonlinear_matrix[2].xyz, reshaped)
+    );
+}
+
+// Linearized BT.2020-referred HPE LMS back to linear RGB, using the composite
+// of the fixed HPE inverse with the RPU's rgb_to_lms matrix (premultiplied on
+// the CPU, matching libplacebo's dovi_lms2rgb).
+float3 dovi_lms_to_rgb(float3 lin) {
+    return float3(
+        dot(dovi.dovi_lms_matrix[0].xyz, lin),
+        dot(dovi.dovi_lms_matrix[1].xyz, lin),
+        dot(dovi.dovi_lms_matrix[2].xyz, lin)
+    );
 }
 
 VsOut vs_main(VsIn input) {
@@ -335,22 +737,38 @@ float4 ps_main(VsOut input) : SV_Target {
         ? sample_packed_luma(luma_coord)
         : lumaTex.Sample(videoSampler, luma_coord).r;
     float2 cbcr_sample = chromaTex.Sample(videoSampler, chroma_coord).rg;
-    float y;
-    float2 cbcr;
-    expand_ycbcr_range(y_sample, cbcr_sample, y, cbcr);
-
-    float kr = luma_coefficients.x;
-    float kg = max(luma_coefficients.y, 0.000001);
-    float kb = luma_coefficients.z;
+    bool dovi_enabled = dovi.dovi_flags.x != 0.0;
+    bool dovi_ycbcr_input = dovi_enabled && (base_input_mode == 0u || base_input_mode == 2u);
     float3 rgb;
-    rgb.r = y + 2.0 * (1.0 - kr) * cbcr.y;
-    rgb.b = y + 2.0 * (1.0 - kb) * cbcr.x;
-    rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
+    if (dovi_ycbcr_input) {
+        // The base layer carries the raw 12-bit DV signal (10-bit container,
+        // full range); range expansion and the YCbCr matrix are replaced by
+        // the RPU reshaping + ycc_to_rgb path.
+        float3 sig = float3(y_sample, cbcr_sample.x, cbcr_sample.y);
+        if (is_p010 != 0u) {
+            sig *= 65535.0 / 65472.0;
+        }
+        rgb = dovi_signal_to_pq_rgb(sig);
+    } else {
+        float y;
+        float2 cbcr;
+        expand_ycbcr_range(y_sample, cbcr_sample, y, cbcr);
+
+        float kr = luma_coefficients.x;
+        float kg = max(luma_coefficients.y, 0.000001);
+        float kb = luma_coefficients.z;
+        rgb.r = y + 2.0 * (1.0 - kr) * cbcr.y;
+        rgb.b = y + 2.0 * (1.0 - kb) * cbcr.x;
+        rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
+    }
     rgb = transfer_to_source_reference_linear(rgb);
-    rgb = apply_gamut_map(rgb);
+    if (dovi_ycbcr_input) {
+        rgb = dovi_lms_to_rgb(rgb);
+    }
     rgb = source_reference_to_nits(rgb);
     rgb = tone_map_nits(rgb);
     rgb = target_nits_to_reference_linear(rgb);
+    rgb = gamut_compress(rgb);
     rgb = target_reference_linear_to_output(rgb);
     float alpha = 1.0;
     if (packed_alpha) {
@@ -426,6 +844,11 @@ float4 overlay_ps_main(VsOut input) : SV_Target {
     if (overlay_mode == 1u) {
         float3 rgb = sdr_ui_color_to_target_output(color.rgb);
         return float4(rgb, color.a * sampled.r);
+    }
+    if (overlay_mode == 2u) {
+        // Premultiplied, so the filter does not darken an emoji's edges.
+        float3 rgb = sdr_ui_color_to_target_output(sampled.rgb / max(sampled.a, 0.0001));
+        return float4(rgb, color.a * sampled.a);
     }
     sampled.rgb = sdr_ui_color_to_target_output(sampled.rgb);
     return sampled;
@@ -525,9 +948,12 @@ impl OverlayUniforms {
             ui_nits: overlay_ui_nits(target),
         }
     }
+}
 
-    fn alpha_atlas_rect(
-        color: [f32; 4],
+impl OverlayUniforms {
+    /// An emoji from the premultiplied picture atlas, at `opacity`.
+    fn picture_rect(
+        opacity: f32,
         rect: [f32; 4],
         tex_rect: [f32; 4],
         viewport_w: u32,
@@ -538,9 +964,9 @@ impl OverlayUniforms {
             rect,
             tex_rect,
             viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
-            overlay_mode: 1,
+            overlay_mode: 2,
             reserved0: 0,
-            color,
+            color: [1.0, 1.0, 1.0, opacity],
             ui_nits: overlay_ui_nits(target),
         }
     }
@@ -560,6 +986,7 @@ pub struct D3d11RendererStats {
     pub surface_width: u32,
     pub surface_height: u32,
     pub rendered_frames: u64,
+    pub software_video_frames: u64,
     pub hardware_video_frames: u64,
     pub zero_copy_video_frames: u64,
     pub direct_zero_copy_video_frames: u64,
@@ -597,6 +1024,10 @@ struct D3d11DeviceState {
     overlay_constants: ID3D11Buffer,
     overlay_sampler: ID3D11SamplerState,
     overlay_blend: ID3D11BlendState,
+    danmaku_pipeline: D3d11DanmakuPipeline,
+    // The outer option tracks whether this device has been queried.
+    p010_upload_shader: Option<Option<ID3D11ComputeShader>>,
+    p010_chroma_staging: Option<p010_upload::ChromaStaging>,
 }
 
 struct AttachedSurface {
@@ -611,8 +1042,15 @@ struct AttachedSurface {
     // this resource again: opening its handle is not GPU consumer completion.
     published_texture: Option<ID3D11Texture2D>,
     render_target: Option<ID3D11RenderTargetView>,
+    linear_texture: Option<ID3D11Texture2D>,
     linear_render_target: Option<ID3D11RenderTargetView>,
     linear_shader_resource: Option<ID3D11ShaderResourceView>,
+    // Ping-pong GPU snapshots for alpha-blended composition surfaces while the
+    // host visual is translucent (`0 < Opacity < 1`). Dropped at full opacity.
+    blended_textures: [Option<ID3D11Texture2D>; 2],
+    blended_slot: usize,
+    blended_generation: u64,
+    blended_has_frame: bool,
 }
 
 impl AttachedSurface {
@@ -628,8 +1066,9 @@ impl AttachedSurface {
 }
 
 struct ImportedVideoFrame {
-    _frame: Frame,
+    _frame: Option<Frame>,
     _texture: ID3D11Texture2D,
+    _chroma_texture: Option<ID3D11Texture2D>,
     luma: ID3D11ShaderResourceView,
     chroma: ID3D11ShaderResourceView,
     width: u32,
@@ -638,23 +1077,120 @@ struct ImportedVideoFrame {
     _array_index: u32,
     frame_token: u64,
     constants: VideoUniforms,
+    source_color: SourceColorState,
 }
 
-struct FlutterTextureScene {
+struct PresentedAlphaPlacement {
+    x: i32,
+    y: i32,
+    color: u32,
+}
+
+struct PresentedOverlay {
+    viewport: crate::overlay::OverlayViewport,
+    subtitle_planes: Vec<crate::subtitle::SubtitleBitmapPlane>,
+    placements: Box<[PresentedAlphaPlacement]>,
+    alpha: std::sync::Arc<alpha_atlas::AlphaSnapshot>,
+}
+
+impl PresentedOverlay {
+    fn new(
+        frame: &OverlayFrame,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) -> Self {
+        Self {
+            viewport: frame.viewport,
+            subtitle_planes: frame.subtitle_planes.clone(),
+            placements: frame
+                .subtitle_alpha_planes
+                .iter()
+                .map(|b| PresentedAlphaPlacement {
+                    x: b.placement.x,
+                    y: b.placement.y,
+                    color: b.color_rgba,
+                })
+                .collect(),
+            alpha: alpha
+                .cloned()
+                .unwrap_or_else(|| alpha_atlas::AlphaSnapshot::new(&frame.subtitle_alpha_planes)),
+        }
+    }
+
+    fn update(
+        &mut self,
+        frame: &OverlayFrame,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) {
+        self.viewport = frame.viewport;
+        if self.subtitle_planes != frame.subtitle_planes {
+            self.subtitle_planes = frame.subtitle_planes.clone();
+        }
+        if self.placements.len() != frame.subtitle_alpha_planes.len()
+            || !self
+                .placements
+                .iter()
+                .zip(&frame.subtitle_alpha_planes)
+                .all(|(a, b)| {
+                    a.x == b.placement.x && a.y == b.placement.y && a.color == b.color_rgba
+                })
+        {
+            self.placements = frame
+                .subtitle_alpha_planes
+                .iter()
+                .map(|b| PresentedAlphaPlacement {
+                    x: b.placement.x,
+                    y: b.placement.y,
+                    color: b.color_rgba,
+                })
+                .collect();
+        }
+        if let Some(alpha) = alpha {
+            self.alpha = alpha.clone();
+        } else if !self.alpha.matches(&frame.subtitle_alpha_planes) {
+            self.alpha = alpha_atlas::AlphaSnapshot::new(&frame.subtitle_alpha_planes);
+        }
+    }
+
+    fn matches(&self, frame: &OverlayFrame) -> bool {
+        self.viewport == frame.viewport
+            && self.subtitle_planes == frame.subtitle_planes
+            && self.placements.len() == frame.subtitle_alpha_planes.len()
+            && self
+                .placements
+                .iter()
+                .zip(&frame.subtitle_alpha_planes)
+                .all(|(a, b)| {
+                    a.x == b.placement.x && a.y == b.placement.y && a.color == b.color_rgba
+                })
+            && self.alpha.matches(&frame.subtitle_alpha_planes)
+    }
+}
+
+struct PresentedScene {
     frame_token: u64,
     generation: u64,
     upscaler: LumaUpscalerMode,
-    overlay: Option<OverlayFrame>,
+    post_process_generation: u64,
+    overlay: Option<PresentedOverlay>,
     danmaku: Option<DanmakuRenderPlan>,
 }
 
-impl FlutterTextureScene {
-    fn new(frame_token: u64, upscaler: LumaUpscalerMode, context: RenderFrameContext<'_>) -> Self {
+impl PresentedScene {
+    fn new(
+        frame_token: u64,
+        upscaler: LumaUpscalerMode,
+        post_process_generation: u64,
+        context: RenderFrameContext<'_>,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
+    ) -> Self {
         Self {
             frame_token,
             generation: context.generation,
             upscaler,
-            overlay: context.overlay.cloned(),
+            post_process_generation,
+            overlay: context
+                .overlay
+                .map(|frame| PresentedOverlay::new(frame, alpha)),
             danmaku: context.danmaku.cloned(),
         }
     }
@@ -663,22 +1199,20 @@ impl FlutterTextureScene {
         &self,
         frame_token: u64,
         upscaler: LumaUpscalerMode,
+        post_process_generation: u64,
         context: RenderFrameContext<'_>,
     ) -> bool {
         self.frame_token == frame_token
             && self.generation == context.generation
             && self.upscaler == upscaler
+            && self.post_process_generation == post_process_generation
             && self.overlay_matches(context.overlay)
             && self.danmaku_matches(context.danmaku)
     }
 
     fn overlay_matches(&self, overlay: Option<&OverlayFrame>) -> bool {
         match (self.overlay.as_ref(), overlay) {
-            (Some(a), Some(b)) => {
-                a.viewport == b.viewport
-                    && a.subtitle_planes == b.subtitle_planes
-                    && a.subtitle_alpha_planes == b.subtitle_alpha_planes
-            }
+            (Some(a), Some(b)) => a.matches(b),
             (None, None) => true,
             _ => false,
         }
@@ -687,7 +1221,11 @@ impl FlutterTextureScene {
     fn danmaku_matches(&self, danmaku: Option<&DanmakuRenderPlan>) -> bool {
         match (self.danmaku.as_ref(), danmaku) {
             (Some(a), Some(b)) => {
-                a.viewport == b.viewport && a.atlas == b.atlas && a.items == b.items
+                a.viewport == b.viewport
+                    && a.atlas == b.atlas
+                    && a.items == b.items
+                    && a.color_atlas == b.color_atlas
+                    && a.color_glyphs == b.color_glyphs
             }
             (None, None) => true,
             _ => false,
@@ -698,13 +1236,17 @@ impl FlutterTextureScene {
         &mut self,
         frame_token: u64,
         upscaler: LumaUpscalerMode,
+        post_process_generation: u64,
         context: RenderFrameContext<'_>,
+        alpha: Option<&std::sync::Arc<alpha_atlas::AlphaSnapshot>>,
     ) {
         // A new video frame need not copy unchanged subtitle/HUD pixels or
         // danmaku instances. Retain each cached buffer until its own content
         // changes; keep exact comparisons rather than lossy fingerprints.
-        if !self.overlay_matches(context.overlay) {
-            self.overlay = context.overlay.cloned();
+        match (self.overlay.as_mut(), context.overlay) {
+            (Some(previous), Some(frame)) => previous.update(frame, alpha),
+            (None, Some(frame)) => self.overlay = Some(PresentedOverlay::new(frame, alpha)),
+            (_, None) => self.overlay = None,
         }
         if !self.danmaku_matches(context.danmaku) {
             self.danmaku = context.danmaku.cloned();
@@ -712,6 +1254,7 @@ impl FlutterTextureScene {
         self.frame_token = frame_token;
         self.generation = context.generation;
         self.upscaler = upscaler;
+        self.post_process_generation = post_process_generation;
     }
 }
 
@@ -794,8 +1337,12 @@ impl D3d11OutputMode {
     }
 
     fn target_color_for_source(self, source: SourceColorState) -> TargetColorState {
-        let _ = source;
-        self.target_color()
+        match self {
+            Self::Sdr if source.is_hdr() => {
+                TargetColorState::sdr_tone_map_target(ColorPrimaries::Bt709)
+            }
+            _ => self.target_color(),
+        }
     }
 }
 
@@ -810,6 +1357,17 @@ struct D3d11OverlayDraw {
     constants: OverlayUniforms,
 }
 
+struct D3d11SubtitleAlphaPage {
+    layout: alpha_atlas::Page,
+    texture: D3d11OverlayTexture,
+}
+
+struct D3d11SubtitleAlphaCache {
+    key: alpha_atlas::ContentKey,
+    pages: Box<[D3d11SubtitleAlphaPage]>,
+    scratch: Vec<u8>,
+}
+
 struct D3d11DanmakuAtlasCache {
     version: u64,
     width: u32,
@@ -817,6 +1375,124 @@ struct D3d11DanmakuAtlasCache {
     stride: usize,
     fill: D3d11OverlayTexture,
     outline: D3d11OverlayTexture,
+}
+
+enum D3d11SoftwareScratch {
+    Packed(PlanarFrame),
+    Yuv420pChroma {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    },
+    P010Chroma {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    },
+}
+
+enum D3d11SoftwareLuma<'a> {
+    Packed(&'a [u8]),
+    Borrowed(D3d11BorrowedLuma<'a>),
+}
+
+/// A raw initial-data pointer, never a Rust slice over decoder row padding.
+/// The frame remains borrowed until synchronous CreateTexture2D has returned.
+struct D3d11BorrowedLuma<'a> {
+    _frame: &'a Frame,
+    data: *const u8,
+    pitch: u32,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> D3d11BorrowedLuma<'a> {
+    fn new(
+        frame: &'a Frame,
+        (width, height): (usize, usize),
+        data: *const u8,
+        stride: usize,
+        row_bytes: usize,
+    ) -> std::result::Result<Option<Self>, ()> {
+        if (width, height) != (frame.width() as usize, frame.height() as usize) {
+            return Ok(None);
+        }
+        let pitch = u32::try_from(stride).map_err(|_| ())?;
+        let visible_span = height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(stride))
+            .and_then(|prefix| prefix.checked_add(row_bytes))
+            .ok_or(())?;
+        let raw = frame.as_ptr();
+        // Both callers check the visible layout first. The raw upload also
+        // checks an addressable ref-backed pitch * height span. CPU packing
+        // remains available when the backing covers only the visible rows.
+        unsafe {
+            if data != (*raw).data[0] {
+                return Err(());
+            }
+            let buffer = erika_ffmpeg_sys::av_frame_get_plane_buffer(raw.cast_mut(), 0);
+            if buffer.is_null() {
+                return if (*raw).buf[0].is_null() && (*raw).nb_extended_buf == 0 {
+                    Ok(None)
+                } else {
+                    Err(())
+                };
+            }
+            let buffer = &*buffer;
+            if buffer.data.is_null() {
+                return Err(());
+            }
+            let offset = (data as usize)
+                .checked_sub(buffer.data as usize)
+                .ok_or(())?;
+            if offset.checked_add(visible_span).ok_or(())? > buffer.size {
+                return Err(());
+            }
+            let Some(span) = stride.checked_mul(height) else {
+                return Ok(None);
+            };
+            if span > isize::MAX as usize
+                || (data as usize).checked_add(span).is_none()
+                || offset.checked_add(span).is_none_or(|end| end > buffer.size)
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Self {
+            _frame: frame,
+            data,
+            pitch,
+            width: width as u32,
+            height: height as u32,
+        }))
+    }
+
+    fn create_texture(
+        &self,
+        state: &D3d11DeviceState,
+        width: u32,
+        height: u32,
+        format: PlanarPixelFormat,
+    ) -> Result<D3d11OverlayTexture> {
+        if (width, height, format) != (self.width, self.height, PlanarPixelFormat::Nv12) {
+            return Err(PlayerError::Renderer(
+                "d3d11: borrowed luma layout mismatch".into(),
+            ));
+        }
+        // SAFETY: dimensions and R8 format are tied to the checked frame view.
+        // The frame borrow covers the synchronous call; padding is never a slice.
+        unsafe {
+            create_cpu_texture_from_ptr(
+                state,
+                self.width,
+                self.height,
+                DXGI_FORMAT_R8_UNORM,
+                self.data,
+                self.pitch,
+            )
+        }
+    }
 }
 
 impl D3d11DanmakuAtlasCache {
@@ -832,15 +1508,72 @@ pub struct D3d11Renderer {
     state: Option<D3d11DeviceState>,
     surface: Option<AttachedSurface>,
     current_video: Option<ImportedVideoFrame>,
-    flutter_scene: Option<FlutterTextureScene>,
+    software_scratch: Option<D3d11SoftwareScratch>,
+    /// Signalled once the GPU finished the last draw that read
+    /// `current_video` into a compositor-owned surface; `None` until a draw.
+    current_video_fence: Option<ID3D11Query>,
+    /// `MetalRendererConfig::compositor_handoff_timeout`.
+    handoff_timeout: Duration,
+    presented_scene: Option<PresentedScene>,
+    subtitle_alpha_cache: Option<D3d11SubtitleAlphaCache>,
     danmaku_atlas_cache: Option<D3d11DanmakuAtlasCache>,
+    danmaku_picture_cache: Option<(u64, D3d11OverlayTexture)>,
     requested_output_mode: crate::renderer::output::OutputMode,
     video_alpha_mode: VideoAlphaMode,
     upscaler_mode: LumaUpscalerMode,
-    upscaler: D3d11ArtCnn,
+    upscaler: D3d11Upscaler,
+    fsr1: D3d11Fsr1,
+    post_process: D3d11PostProcess,
+    /// NVIDIA RTX Video / Intel VSR, created on first use per device.
+    /// `Err` keeps the reason it is unavailable.
+    vsr: Option<std::result::Result<D3d11VideoSuperResolution, String>>,
+    vsr_frames: u64,
+    vsr_last_error: Option<String>,
+    scene_upscaler_status: LumaUpscalerBackendStatus,
     next_frame_token: u64,
     hdr10_output_unavailable: bool,
+    /// Cached perceptual gamut LUT (3D RGBA16F SRV), keyed the same way as
+    /// the wgpu/Metal caches: (source, target, target black PQ, target peak PQ).
+    gamut_lut: Option<(u32, u32, u32, u32, ID3D11ShaderResourceView)>,
+    /// Background generation for a cache miss; the fast `gamut_compress`
+    /// path renders until the LUT lands.
+    gamut_lut_job: Option<GamutLutJob>,
+    composition_blended: bool,
     stats: D3d11RendererStats,
+}
+
+/// Matrix-unit accelerators available beside the D3D11 renderer; the
+/// upscaler measures them against scalar compute per network.
+pub(crate) fn sr_accelerators(
+    device: &ID3D11Device,
+) -> Vec<std::result::Result<Box<dyn SrAccelerator>, String>> {
+    let mut accelerators = vec![
+        crate::renderer::d3d11_vk_coopmat::VkCoopMatUpscaler::new(device)
+            .map(|accelerator| Box::new(accelerator) as Box<dyn SrAccelerator>)
+            .map_err(|error| format!("Vulkan cooperative matrix: {error}")),
+    ];
+    // Shader Model 6.10 is a preview until Agility SDK 1.621; the backend
+    // only initializes when ERIKA_SR_D3D12_LINALG=1 and an SDK is configured.
+    if std::env::var("ERIKA_SR_D3D12_LINALG").as_deref() == Ok("1") {
+        accelerators.push(
+            crate::renderer::d3d11_d3d12_linalg::D3d12LinalgUpscaler::new(device)
+                .map(|accelerator| {
+                    Box::new(crate::renderer::d3d11_sr_select::LinalgAccelerator(
+                        accelerator,
+                    )) as Box<dyn SrAccelerator>
+                })
+                .map_err(|error| format!("D3D12 linalg: {error}")),
+        );
+    }
+    accelerators
+}
+
+/// Planes that replace the decoded ones for presentation.
+enum VideoOverride {
+    /// Network output: 2x luma, chroma stays at source resolution.
+    Luma(UpscaledLuma),
+    /// Video processor output: both planes at the target size.
+    Planes(VsrOutput),
 }
 
 impl D3d11Renderer {
@@ -853,14 +1586,28 @@ impl D3d11Renderer {
             state: None,
             surface: None,
             current_video: None,
-            flutter_scene: None,
+            software_scratch: None,
+            current_video_fence: None,
+            handoff_timeout: config.compositor_handoff_timeout,
+            presented_scene: None,
+            subtitle_alpha_cache: None,
             danmaku_atlas_cache: None,
+            danmaku_picture_cache: None,
             requested_output_mode: config.output_mode,
             video_alpha_mode: config.video_alpha_mode,
             upscaler_mode: config.luma_upscaler,
-            upscaler: D3d11ArtCnn::default(),
+            upscaler: D3d11Upscaler::new(sr_accelerators),
+            fsr1: D3d11Fsr1::default(),
+            post_process: D3d11PostProcess::default(),
+            vsr: None,
+            vsr_frames: 0,
+            vsr_last_error: None,
+            scene_upscaler_status: LumaUpscalerBackendStatus::Off,
             next_frame_token: 0,
             hdr10_output_unavailable: false,
+            gamut_lut: None,
+            gamut_lut_job: None,
+            composition_blended: false,
             stats: D3d11RendererStats::default(),
         })
     }
@@ -870,20 +1617,21 @@ impl D3d11Renderer {
     }
 
     fn retire_current_video(&mut self) -> Result<()> {
-        // Preserve main's HWND playback policy. Only compositor-owned surfaces
-        // need this additional handoff barrier. Do not grow the decoder pool or
-        // accumulate an unbounded queue of AVFrames on delayed/failed fences.
+        // Compositor draws and capture readbacks install a fence for their
+        // last video read. Capture can also run without an attached surface.
+        // Do not grow the decoder pool or accumulate an unbounded queue of
+        // AVFrames on delayed/failed fences.
+        // The barrier is the last draw that read the frame, not everything
+        // queued since: a hardware decoder's seek preroll can keep the GPU
+        // busy for hundreds of milliseconds after it.
         if self.current_video.is_some()
-            && self
-                .surface
-                .as_ref()
-                .is_some_and(|s| s.composition || s.flutter_texture)
+            && let (Some(state), Some(fence)) =
+                (self.state.as_ref(), self.current_video_fence.as_ref())
         {
-            if let Some(state) = self.state.as_ref() {
-                wait_for_gpu(&state.device, &state.context)?;
-            }
+            wait_for_fence(&state.context, fence, self.handoff_timeout)?;
         }
         self.current_video = None;
+        self.current_video_fence = None;
         Ok(())
     }
 
@@ -902,8 +1650,82 @@ impl D3d11Renderer {
         }
         // Flush only submits work. Complete the copy before another D3D device
         // opens this immutable snapshot. The extra GPU copy is texture-only.
-        wait_for_gpu(&state.device, &state.context)?;
+        wait_for_gpu(&state.device, &state.context, self.handoff_timeout)?;
         surface.published_texture = Some(snapshot);
+        Ok(())
+    }
+
+    fn publish_composition_blended_texture(&mut self) -> Result<()> {
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(());
+        };
+        if !surface.composition {
+            return Ok(());
+        }
+        let state = self.state.as_ref().expect("device ensured");
+        let source: ID3D11Texture2D = if matches!(surface.output_mode, D3d11OutputMode::Hdr10) {
+            let Some(linear) = surface.linear_texture.as_ref() else {
+                return Ok(());
+            };
+            linear.clone()
+        } else {
+            let Some(swapchain) = surface.swapchain.as_ref() else {
+                return Ok(());
+            };
+            unsafe { swapchain.GetBuffer(0) }
+                .map_err(|error| d3d_error("IDXGISwapChain1::GetBuffer(blended)", error))?
+        };
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { source.GetDesc(&mut src_desc) };
+        let next_slot = (surface.blended_slot + 1) % surface.blended_textures.len();
+        let reuse = surface.blended_textures[next_slot]
+            .as_ref()
+            .is_some_and(|existing| {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { existing.GetDesc(&mut desc) };
+                desc.Width == src_desc.Width
+                    && desc.Height == src_desc.Height
+                    && desc.Format == src_desc.Format
+            });
+        if !reuse {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: src_desc.Width.max(1),
+                Height: src_desc.Height.max(1),
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: src_desc.Format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut texture = None;
+            unsafe {
+                state
+                    .device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))
+                    .map_err(|error| {
+                        d3d_error("ID3D11Device::CreateTexture2D(blended snapshot)", error)
+                    })?;
+            }
+            surface.blended_textures[next_slot] = Some(texture.ok_or_else(|| {
+                PlayerError::Renderer("d3d11: blended snapshot texture was null".to_string())
+            })?);
+        }
+        let target = surface.blended_textures[next_slot]
+            .as_ref()
+            .expect("blended snapshot ensured");
+        unsafe {
+            state.context.CopyResource(target, &source);
+            state.context.Flush();
+        }
+        surface.blended_slot = next_slot;
+        surface.blended_generation = surface.blended_generation.wrapping_add(1).max(1);
+        surface.blended_has_frame = true;
         Ok(())
     }
 
@@ -928,8 +1750,195 @@ impl D3d11Renderer {
         let context = unsafe { frame_device.GetImmediateContext() }
             .map_err(|error| d3d_error("ID3D11Device::GetImmediateContext", error))?;
         self.retire_current_video()?;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
         self.set_device(frame_device, context)
+    }
+
+    /// Drops the renderer state when the GPU device is gone (TDR, driver
+    /// reset, adapter change) so the next call rebuilds everything through
+    /// `ensure_default_device` -> `set_device`, which already re-creates the
+    /// device-bound pipeline, swapchain, and targets. Without this probe a
+    /// removed device poisons every later call: errors repeat forever while
+    /// the host believes playback is alive.
+    fn drop_device_if_removed(&mut self) {
+        let removed = self
+            .state
+            .as_ref()
+            .is_some_and(|state| unsafe { state.device.GetDeviceRemovedReason() }.is_err());
+        if removed {
+            self.invalidate_device();
+            crate::trace::diagnostic_at(
+                crate::trace::LogLevel::Warn,
+                "erika d3d11: GPU device removed; renderer will rebuild on the next frame",
+            );
+        }
+    }
+
+    fn invalidate_device(&mut self) {
+        self.current_video = None;
+        self.current_video_fence = None;
+        self.subtitle_alpha_cache = None;
+        self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
+        self.presented_scene = None;
+        self.post_process.reset_device();
+        self.state = None;
+    }
+
+    fn upscaler_backend_status(&self) -> LumaUpscalerBackendStatus {
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Off => LumaUpscalerBackendStatus::Off,
+            UpscalerFamily::Network if self.state.is_none() => LumaUpscalerBackendStatus::Building,
+            UpscalerFamily::Network => self.upscaler.status(),
+            UpscalerFamily::Spatial => self.fsr1.status(),
+            UpscalerFamily::Platform
+                if self.upscaler_mode == LumaUpscalerMode::PlatformVideo
+                    && matches!(self.vsr, Some(Ok(_)))
+                    && self.vsr_last_error.is_none() =>
+            {
+                LumaUpscalerBackendStatus::VideoProcessor
+            }
+            _ => LumaUpscalerBackendStatus::Inactive,
+        }
+    }
+
+    /// Runs the selected upscaler for the current frame. Failures disable
+    /// the network for the session or skip the video processor for this
+    /// frame; presentation falls back to native sampling either way.
+    fn upscale_current_video(
+        &mut self,
+        target_rect: D3d11DrawRect,
+        native_luma: ID3D11ShaderResourceView,
+        frame_token: u64,
+    ) -> Option<VideoOverride> {
+        let (device, context) = {
+            let state = self.state.as_ref()?;
+            (state.device.clone(), state.context.clone())
+        };
+        let video = self.current_video.as_ref()?;
+        let (width, height) = (video.width, video.height);
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Network => {
+                let range = if video.constants.full_range != 0 {
+                    LumaRange::Full
+                } else {
+                    LumaRange::Limited
+                };
+                match self.upscaler.encode(
+                    &device,
+                    &context,
+                    &native_luma,
+                    width,
+                    height,
+                    range,
+                    Some(frame_token),
+                ) {
+                    Ok(output) => output.map(VideoOverride::Luma),
+                    Err(error) => {
+                        self.upscaler.record_runtime_failure(&error);
+                        report_upscaler_failure("frame_encode", self.upscaler_mode, &error);
+                        None
+                    }
+                }
+            }
+            UpscalerFamily::Spatial => {
+                let target = (
+                    (target_rect.width.round() as u32).clamp(width, width * 4),
+                    (target_rect.height.round() as u32).clamp(height, height * 4),
+                );
+                match self.fsr1.encode(
+                    &device,
+                    &context,
+                    &native_luma,
+                    (width, height),
+                    target,
+                    Some(frame_token),
+                ) {
+                    Ok(output) => output.map(VideoOverride::Luma),
+                    Err(error) => {
+                        report_upscaler_failure("frame_encode", self.upscaler_mode, &error);
+                        None
+                    }
+                }
+            }
+            UpscalerFamily::Platform if self.upscaler_mode == LumaUpscalerMode::PlatformVideo => {
+                // Vendor video super resolution is specified for SDR only.
+                let transfer = video.constants.source_transfer;
+                if transfer == 3 || transfer == 4 || video.constants.dovi.flags[0] != 0.0 {
+                    self.note_vsr_error("RTX Video / Intel VSR only process SDR video".to_string());
+                    return None;
+                }
+                let texture = video._texture.clone();
+                let array_index = video._array_index;
+                let coefficients = video.constants.luma_coefficients;
+                let full_range = video.constants.full_range != 0;
+                let vsr = self.vsr.get_or_insert_with(|| {
+                    D3d11VideoSuperResolution::new(&device).map_err(|error| error.to_string())
+                });
+                let vsr = match vsr {
+                    Ok(vsr) => vsr,
+                    Err(reason) => {
+                        let reason = reason.clone();
+                        self.note_vsr_error(reason);
+                        return None;
+                    }
+                };
+                let matrix = if (coefficients[0] - 0.299).abs() < 0.01 {
+                    VsrMatrix::Bt601
+                } else if (coefficients[0] - 0.2627).abs() < 0.01 {
+                    VsrMatrix::Bt2020
+                } else {
+                    VsrMatrix::Bt709
+                };
+                let target = (
+                    (target_rect.width.round() as u32).clamp(width, width * 4),
+                    (target_rect.height.round() as u32).clamp(height, height * 4),
+                );
+                match vsr.process(
+                    &context,
+                    &texture,
+                    array_index,
+                    (width, height),
+                    target,
+                    VsrColorSpace { matrix, full_range },
+                ) {
+                    Ok(output) => {
+                        self.vsr_frames = self.vsr_frames.saturating_add(1);
+                        self.vsr_last_error = None;
+                        Some(VideoOverride::Planes(output))
+                    }
+                    Err(error) => {
+                        self.note_vsr_error(error.to_string());
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn poll_upscalers(&mut self) {
+        let Some(device) = self.state.as_ref().map(|state| state.device.clone()) else {
+            return;
+        };
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Network => self.upscaler.poll(&device),
+            UpscalerFamily::Spatial => self.fsr1.poll(&device),
+            _ => {}
+        }
+    }
+
+    fn note_vsr_error(&mut self, reason: String) {
+        if self.vsr_last_error.as_deref() != Some(reason.as_str()) {
+            report_upscaler_failure(
+                "frame_encode",
+                self.upscaler_mode,
+                &PlayerError::Renderer(reason.clone()),
+            );
+            self.vsr_last_error = Some(reason);
+        }
     }
 
     fn set_device(&mut self, device: ID3D11Device, context: ID3D11DeviceContext) -> Result<()> {
@@ -939,11 +1948,20 @@ impl D3d11Renderer {
             }
         }
         let state = D3d11DeviceState::new(device, context)?;
-        if let Err(error) = self
-            .upscaler
-            .attach_device(&state.device, self.upscaler_mode)
-        {
-            report_upscaler_failure("pipeline_build", self.upscaler_mode, &error);
+        self.vsr = None;
+        self.fsr1.reset();
+        self.post_process.reset_device();
+        if self.upscaler_mode.family() == UpscalerFamily::Network {
+            if let Err(error) = self
+                .upscaler
+                .attach_device(&state.device, self.upscaler_mode)
+            {
+                report_upscaler_failure("pipeline_build", self.upscaler_mode, &error);
+            }
+        } else {
+            let _ = self
+                .upscaler
+                .attach_device(&state.device, LumaUpscalerMode::Off);
         }
         // The existing swap chain belongs to the previous device; ResizeBuffers
         // cannot migrate it. Drop it so recreate_surface_targets creates a new
@@ -955,12 +1973,19 @@ impl D3d11Renderer {
                 surface.output_texture = None;
             }
         }
+        // The cached LUT SRV belongs to the previous device, and D3D11 cannot
+        // bind a resource across devices. Drop it even when the key is
+        // unchanged: the CPU-side `gamut_lut_job` only holds parameters, so a
+        // later frame regenerates the texture on the new device and reuses it.
+        self.gamut_lut = None;
+        self.subtitle_alpha_cache = None;
         self.state = Some(state);
         self.recreate_surface_targets()?;
         Ok(())
     }
 
     fn recreate_surface_targets(&mut self) -> Result<()> {
+        self.presented_scene = None;
         let Some(surface) = self.surface.as_mut() else {
             return Ok(());
         };
@@ -1029,8 +2054,9 @@ impl D3d11Renderer {
         surface.render_target = Some(create_render_target(&state.device, swapchain)?);
         if matches!(output_mode, D3d11OutputMode::Hdr10) {
             trace("recreate_surface_targets: create_linear_render_target");
-            let (render_target, shader_resource) =
+            let (texture, render_target, shader_resource) =
                 create_linear_render_target(&state.device, width, height)?;
+            surface.linear_texture = Some(texture);
             surface.linear_render_target = Some(render_target);
             surface.linear_shader_resource = Some(shader_resource);
         }
@@ -1196,8 +2222,9 @@ impl D3d11Renderer {
         self.stats.zero_copy_video_frames += 1;
         self.stats.direct_zero_copy_video_frames += 1;
         let imported = ImportedVideoFrame {
-            _frame: retained_frame,
+            _frame: Some(retained_frame),
             _texture: texture,
+            _chroma_texture: None,
             luma,
             chroma,
             width: visible_width,
@@ -1212,9 +2239,294 @@ impl D3d11Renderer {
             frame_token,
             constants: constants_for_frame(source_color, texture_format, target_color)
                 .packed_alpha_right(self.video_alpha_mode.has_alpha()),
+            source_color,
         };
         self.retire_current_video()?;
         self.current_video = Some(imported);
+        if let Some(state) = self.state.as_mut() {
+            state.p010_chroma_staging = None;
+        }
+        Ok(())
+    }
+
+    fn try_upload_software_p010(&mut self, frame: &PlayerVideoFrame) -> Result<bool> {
+        let Some(decoded) = frame.frame.decoded_frame() else {
+            return Ok(false);
+        };
+        let Some(upload) = decoded.software_p010_upload() else {
+            return Ok(false);
+        };
+        let (width, height) = upload.dimensions();
+        let y = upload.luma();
+        let Some(luma) =
+            D3d11BorrowedLuma::new(decoded, (width, height), y.as_ptr(), y.stride(), width * 2)
+                .map_err(|()| {
+                    PlayerError::Renderer("d3d11: invalid ref-backed software P010 luma".into())
+                })?
+        else {
+            return Ok(false);
+        };
+        let (width, height) = (width as u32, height as u32);
+
+        self.ensure_default_device()?;
+        let state = self.state.as_mut().expect("device ensured");
+        if state.p010_upload_shader.is_none() {
+            let shader = p010_upload::create_shader(&state.device)?;
+            if shader.is_some() {
+                trace("software P010 in-place luma upload enabled");
+            }
+            state.p010_upload_shader = Some(shader);
+        }
+        if matches!(state.p010_upload_shader, Some(None)) {
+            return Ok(false);
+        }
+
+        let source_color = source_color_for_frame(frame);
+        let output_mode = self.select_output_mode_for_source(source_color)?;
+        let target_color = output_mode.target_color_for_source(source_color);
+        let mut chroma = match self.software_scratch.take() {
+            Some(D3d11SoftwareScratch::P010Chroma {
+                width: w,
+                height: h,
+                bytes,
+            }) if (w, h) == (width, height) => bytes,
+            Some(D3d11SoftwareScratch::Packed(planar))
+                if planar.format == PlanarPixelFormat::P010
+                    && (planar.width, planar.height) == (width, height) =>
+            {
+                // The old packed luma allocation is no longer needed.
+                planar.chroma
+            }
+            _ => Vec::new(),
+        };
+        let state = self.state.as_mut().expect("device ensured");
+        let result = p010_upload::upload(state, luma, &upload, &mut chroma);
+        self.software_scratch = Some(D3d11SoftwareScratch::P010Chroma {
+            width,
+            height,
+            bytes: chroma,
+        });
+        let planes = match result {
+            Ok(planes) => planes,
+            Err(error) => {
+                let state = self.state.as_mut().expect("device ensured");
+                if unsafe { state.device.GetDeviceRemovedReason() }.is_err() {
+                    return Err(error);
+                }
+                // A driver can pass the capability probe and still fail here.
+                // Keep this device on the CPU path; the caller uploads this
+                // frame that way.
+                state.p010_upload_shader = Some(None);
+                state.p010_chroma_staging = None;
+                p010_upload::fallback(&error.to_string());
+                return Ok(false);
+            }
+        };
+        self.publish_software_planes(
+            (width, height),
+            D3d11VideoTextureFormat::P010,
+            planes,
+            source_color,
+            target_color,
+        )?;
+        Ok(true)
+    }
+
+    fn upload_software_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        let borrowed = frame.frame.decoded_frame().and_then(|decoded| {
+            let upload = decoded.software_yuv420p_upload()?;
+            let (width, height) = upload.dimensions();
+            let y = upload.luma();
+            let luma =
+                D3d11BorrowedLuma::new(decoded, (width, height), y.as_ptr(), y.stride(), width)
+                    .ok()
+                    .flatten()?;
+            Some((upload, luma))
+        });
+        if let Some((upload, luma)) = borrowed {
+            if let Some(state) = self.state.as_mut() {
+                state.p010_chroma_staging = None;
+            }
+            let (width, height) = (frame.frame.width(), frame.frame.height());
+            let pitch = width
+                .div_ceil(2)
+                .checked_mul(2)
+                .ok_or_else(|| PlayerError::Renderer("d3d11: chroma row pitch overflow".into()))?;
+            let len = (pitch as usize)
+                .checked_mul(height.div_ceil(2) as usize)
+                .ok_or_else(|| PlayerError::Renderer("d3d11: CPU texture size overflow".into()))?;
+            let mut chroma = match self.software_scratch.take() {
+                Some(D3d11SoftwareScratch::Yuv420pChroma {
+                    width: w,
+                    height: h,
+                    bytes,
+                }) if (w, h) == (width, height) => bytes,
+                // Switching layouts releases the old packed Y/UV allocation;
+                // borrowed Y never leaves an idle full-size luma scratch behind.
+                _ => Vec::new(),
+            };
+            chroma.resize(len, 0);
+            let result = upload
+                .write_chroma_into(&mut chroma, pitch as usize)
+                .ok_or_else(|| {
+                    PlayerError::Renderer(format!(
+                        "d3d11: unsupported software video frame format {:?}",
+                        frame.frame.pixel_format()
+                    ))
+                })
+                .and_then(|()| {
+                    self.upload_software_planes(
+                        PlanarPixelFormat::Nv12,
+                        (width, height),
+                        D3d11SoftwareLuma::Borrowed(luma),
+                        &chroma,
+                        source_color_for_frame(frame),
+                    )
+                });
+            self.software_scratch = Some(D3d11SoftwareScratch::Yuv420pChroma {
+                width,
+                height,
+                bytes: chroma,
+            });
+            return result;
+        }
+        if self.try_upload_software_p010(frame)? {
+            return Ok(());
+        }
+        let (mut planar, previous_chroma) = match self.software_scratch.take() {
+            Some(D3d11SoftwareScratch::Packed(planar)) => (planar, None),
+            previous => (
+                PlanarFrame {
+                    format: PlanarPixelFormat::P010,
+                    width: 0,
+                    height: 0,
+                    luma: Vec::new(),
+                    chroma: Vec::new(),
+                },
+                previous,
+            ),
+        };
+        let converted = frame
+            .frame
+            .decoded_frame()
+            .and_then(|decoded| decoded.write_planar_frame(&mut planar));
+        if converted.is_none() {
+            self.software_scratch = previous_chroma.or(Some(D3d11SoftwareScratch::Packed(planar)));
+            return Err(PlayerError::Renderer(format!(
+                "d3d11: unsupported software video frame format {:?}",
+                frame.frame.pixel_format()
+            )));
+        }
+        // A successful format switch keeps only the new packed storage.
+        drop(previous_chroma);
+        if let Some(state) = self.state.as_mut() {
+            state.p010_chroma_staging = None;
+        }
+        let result = self.upload_planar_frame(&planar, source_color_for_frame(frame));
+        // CreateTexture2D copies the CPU initial data before returning. GPU
+        // texture ownership and retirement fences remain entirely unchanged.
+        self.software_scratch = Some(D3d11SoftwareScratch::Packed(planar));
+        result
+    }
+
+    fn upload_planar_frame(
+        &mut self,
+        planar: &PlanarFrame,
+        source_color: SourceColorState,
+    ) -> Result<()> {
+        self.upload_software_planes(
+            planar.format,
+            (planar.width, planar.height),
+            D3d11SoftwareLuma::Packed(&planar.luma),
+            &planar.chroma,
+            source_color,
+        )
+    }
+
+    fn upload_software_planes(
+        &mut self,
+        format: PlanarPixelFormat,
+        (width, height): (u32, u32),
+        luma: D3d11SoftwareLuma<'_>,
+        chroma: &[u8],
+        source_color: SourceColorState,
+    ) -> Result<()> {
+        self.ensure_default_device()?;
+        let output_mode = self.select_output_mode_for_source(source_color)?;
+        let target_color = output_mode.target_color_for_source(source_color);
+        let (texture_format, bytes_per_sample) = match format {
+            PlanarPixelFormat::Nv12 => (D3d11VideoTextureFormat::Nv12, 1),
+            PlanarPixelFormat::P010 => (D3d11VideoTextureFormat::P010, 2),
+        };
+        let state = self.state.as_ref().expect("device ensured");
+        // Separate planes support odd visible dimensions and retain 10-bit HDR
+        // samples without requiring hardware video-format texture support.
+        let luma_pitch = width
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| PlayerError::Renderer("d3d11: luma row pitch overflow".into()))?;
+        let chroma_pitch = width
+            .div_ceil(2)
+            .checked_mul(2 * bytes_per_sample)
+            .ok_or_else(|| PlayerError::Renderer("d3d11: chroma row pitch overflow".into()))?;
+        let luma = match luma {
+            D3d11SoftwareLuma::Packed(bytes) => create_cpu_texture(
+                state,
+                width,
+                height,
+                texture_format.luma_srv(),
+                bytes,
+                luma_pitch,
+            )?,
+            D3d11SoftwareLuma::Borrowed(luma) => {
+                luma.create_texture(state, width, height, format)?
+            }
+        };
+        let chroma = create_cpu_texture(
+            state,
+            width.div_ceil(2),
+            height.div_ceil(2),
+            texture_format.chroma_srv(),
+            chroma,
+            chroma_pitch,
+        )?;
+        self.publish_software_planes(
+            (width, height),
+            texture_format,
+            (luma, chroma),
+            source_color,
+            target_color,
+        )
+    }
+
+    fn publish_software_planes(
+        &mut self,
+        (width, height): (u32, u32),
+        texture_format: D3d11VideoTextureFormat,
+        (luma, chroma): (D3d11OverlayTexture, D3d11OverlayTexture),
+        source_color: SourceColorState,
+        target_color: TargetColorState,
+    ) -> Result<()> {
+        let frame_token = self.next_frame_token;
+        self.retire_current_video()?;
+        self.current_video = Some(ImportedVideoFrame {
+            _frame: None,
+            _texture: luma._texture,
+            _chroma_texture: Some(chroma._texture),
+            luma: luma.view,
+            // Each SRV retains its underlying texture after this upload returns.
+            chroma: chroma.view,
+            width,
+            height,
+            tex_rect: D3d11TexRect::FULL,
+            _array_index: 0,
+            frame_token,
+            constants: constants_for_frame(source_color, texture_format, target_color)
+                .packed_alpha_right(self.video_alpha_mode.has_alpha()),
+            source_color,
+        });
+        self.next_frame_token = self.next_frame_token.wrapping_add(1);
+        self.stats.software_video_frames += 1;
+        self.stats.cpu_video_frame_fallbacks += 1;
         Ok(())
     }
 
@@ -1248,14 +2560,34 @@ impl D3d11Renderer {
             .target_color()
     }
 
+    #[cfg(test)]
     fn prepare_overlay_draws(
         &mut self,
         frame: Option<&OverlayFrame>,
     ) -> Result<Vec<D3d11OverlayDraw>> {
+        self.prepare_overlay_draws_shared(frame, None)
+    }
+
+    fn prepare_overlay_draws_shared(
+        &mut self,
+        frame: Option<&OverlayFrame>,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+    ) -> Result<Vec<D3d11OverlayDraw>> {
+        self.prepare_overlay_draws_for_target(frame, owner, self.overlay_target_color())
+    }
+
+    fn prepare_overlay_draws_for_target(
+        &mut self,
+        frame: Option<&OverlayFrame>,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+        target: TargetColorState,
+    ) -> Result<Vec<D3d11OverlayDraw>> {
         let Some(frame) = frame else {
+            self.subtitle_alpha_cache = None;
             return Ok(Vec::new());
         };
         if frame.is_empty() {
+            self.subtitle_alpha_cache = None;
             return Ok(Vec::new());
         }
         self.ensure_default_device()?;
@@ -1267,7 +2599,6 @@ impl D3d11Renderer {
             as u64;
         let viewport_w = frame.viewport.width;
         let viewport_h = frame.viewport.height;
-        let target = self.overlay_target_color();
         let mut draws = Vec::new();
 
         for plane in &frame.subtitle_planes {
@@ -1285,7 +2616,7 @@ impl D3d11Renderer {
             }
             let texture = {
                 let state = self.state.as_ref().expect("device ensured");
-                create_overlay_texture(
+                create_cpu_texture(
                     state,
                     plane.width,
                     plane.height,
@@ -1303,46 +2634,100 @@ impl D3d11Renderer {
             });
         }
 
-        self.append_alpha_atlas_draws(frame, viewport_w, viewport_h, target, &mut draws)?;
+        self.append_alpha_atlas_draws(frame, owner, viewport_w, viewport_h, target, &mut draws)?;
         Ok(draws)
     }
 
     fn prepare_danmaku_draws(
         &mut self,
         plan: Option<&DanmakuRenderPlan>,
-    ) -> Result<Vec<D3d11OverlayDraw>> {
+    ) -> Result<D3d11DanmakuDraws> {
+        self.prepare_danmaku_draws_for_target(plan, self.overlay_target_color())
+    }
+
+    fn prepare_danmaku_draws_for_target(
+        &mut self,
+        plan: Option<&DanmakuRenderPlan>,
+        target: TargetColorState,
+    ) -> Result<D3d11DanmakuDraws> {
         let Some(plan) = plan else {
-            return Ok(Vec::new());
+            return Ok(D3d11DanmakuDraws::default());
         };
         if plan.is_empty() {
-            return Ok(Vec::new());
+            return Ok(D3d11DanmakuDraws::default());
         }
         self.ensure_default_device()?;
-        let Some(atlas) = plan.atlas.as_ref() else {
-            return Ok(Vec::new());
-        };
-        if !atlas.is_valid() {
-            return Err(PlayerError::Renderer(format!(
-                "d3d11: danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
-                atlas.fill_alpha.len(),
-                atlas.outline_alpha.len(),
-                atlas.required_len(),
-                atlas.width,
-                atlas.height,
-                atlas.stride
-            )));
-        }
         let viewport_w = plan.viewport.width;
         let viewport_h = plan.viewport.height;
-        let target = self.overlay_target_color();
-        let mut draws = Vec::with_capacity(plan.items.len() * 3);
-        let (fill, outline) = self.prepare_danmaku_atlas_textures(atlas)?;
-        for item in &plan.items {
-            self.append_danmaku_glyph_draws(
-                item, &fill, &outline, viewport_w, viewport_h, target, &mut draws,
-            );
+        let mut draws = D3d11DanmakuDraws::default();
+        if let Some(atlas) = plan.atlas.as_ref().filter(|_| !plan.items.is_empty()) {
+            if !atlas.is_valid() {
+                return Err(PlayerError::Renderer(format!(
+                    "d3d11: danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
+                    atlas.fill_alpha.len(),
+                    atlas.outline_alpha.len(),
+                    atlas.required_len(),
+                    atlas.width,
+                    atlas.height,
+                    atlas.stride
+                )));
+            }
+            let (fill, outline) = self.prepare_danmaku_atlas_textures(atlas)?;
+            draws.text = D3d11DanmakuBatch::upload(
+                self.state.as_ref().expect("device ensured"),
+                plan,
+                fill,
+                outline,
+                target,
+            )?;
+        }
+        // Preserve the existing premultiplied color-atlas path, including
+        // emoji-only plans with no monochrome glyph atlas.
+        if let Some(atlas) = plan
+            .color_atlas
+            .as_ref()
+            .filter(|_| !plan.color_glyphs.is_empty())
+        {
+            let texture = self.prepare_danmaku_picture_texture(atlas)?;
+            for glyph in &plan.color_glyphs {
+                draws.pictures.push(D3d11OverlayDraw {
+                    texture: texture.clone(),
+                    constants: OverlayUniforms::picture_rect(
+                        glyph.opacity,
+                        glyph.rect,
+                        glyph.tex_rect,
+                        viewport_w,
+                        viewport_h,
+                        target,
+                    ),
+                });
+            }
         }
         Ok(draws)
+    }
+
+    fn prepare_danmaku_picture_texture(
+        &mut self,
+        atlas: &DanmakuColorAtlas,
+    ) -> Result<D3d11OverlayTexture> {
+        if let Some((version, texture)) = &self.danmaku_picture_cache
+            && *version == atlas.version
+        {
+            return Ok(texture.clone());
+        }
+        let texture = {
+            let state = self.state.as_ref().expect("device ensured");
+            create_cpu_texture(
+                state,
+                atlas.width,
+                atlas.height,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                &atlas.rgba,
+                atlas.width * 4,
+            )?
+        };
+        self.danmaku_picture_cache = Some((atlas.version, texture.clone()));
+        Ok(texture)
     }
 
     fn prepare_danmaku_atlas_textures(
@@ -1374,7 +2759,7 @@ impl D3d11Renderer {
         let (fill, outline) = {
             let state = self.state.as_ref().expect("device ensured");
             (
-                create_overlay_texture(
+                create_cpu_texture(
                     state,
                     atlas.width,
                     atlas.height,
@@ -1382,7 +2767,7 @@ impl D3d11Renderer {
                     &atlas.fill_alpha,
                     atlas.stride as u32,
                 )?,
-                create_overlay_texture(
+                create_cpu_texture(
                     state,
                     atlas.width,
                     atlas.height,
@@ -1436,144 +2821,264 @@ impl D3d11Renderer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn append_danmaku_glyph_draws(
-        &self,
-        item: &DanmakuGlyphInstance,
-        fill_texture: &D3d11OverlayTexture,
-        outline_texture: &D3d11OverlayTexture,
+    fn append_alpha_atlas_draws(
+        &mut self,
+        frame: &OverlayFrame,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
         viewport_w: u32,
         viewport_h: u32,
         target: TargetColorState,
         draws: &mut Vec<D3d11OverlayDraw>,
-    ) {
-        if item.shadow_rgba[3] > 0.0 {
-            let mut rect = item.rect;
-            rect[0] += item.shadow_offset[0];
-            rect[1] += item.shadow_offset[1];
-            draws.push(D3d11OverlayDraw {
-                texture: outline_texture.clone(),
-                constants: OverlayUniforms::alpha_atlas_rect(
-                    item.shadow_rgba,
-                    rect,
-                    item.tex_rect,
-                    viewport_w,
-                    viewport_h,
-                    target,
-                ),
-            });
-        }
-        if item.outline_rgba[3] > 0.0 {
-            draws.push(D3d11OverlayDraw {
-                texture: outline_texture.clone(),
-                constants: OverlayUniforms::alpha_atlas_rect(
-                    item.outline_rgba,
-                    item.rect,
-                    item.tex_rect,
-                    viewport_w,
-                    viewport_h,
-                    target,
-                ),
-            });
-        }
-        draws.push(D3d11OverlayDraw {
-            texture: fill_texture.clone(),
-            constants: OverlayUniforms::alpha_atlas_rect(
-                item.color_rgba,
-                item.rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-                target,
-            ),
-        });
+    ) -> Result<()> {
+        let state = self.state.as_ref().expect("device ensured");
+        let limit = if unsafe { state.device.GetFeatureLevel() }.0 >= D3D_FEATURE_LEVEL_11_0.0 {
+            16384
+        } else {
+            8192 // Device creation accepts feature levels 10.0 and above.
+        };
+        self.append_alpha_pages_shared(frame, owner, viewport_w, viewport_h, target, draws, limit)
     }
 
-    fn append_alpha_atlas_draws(
+    #[cfg(test)]
+    fn append_alpha_pages(
         &mut self,
         frame: &OverlayFrame,
         viewport_w: u32,
         viewport_h: u32,
         target: TargetColorState,
         draws: &mut Vec<D3d11OverlayDraw>,
+        limit: u32,
+    ) -> Result<()> {
+        self.append_alpha_pages_shared(frame, None, viewport_w, viewport_h, target, draws, limit)
+    }
+
+    fn append_alpha_pages_shared(
+        &mut self,
+        frame: &OverlayFrame,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+        limit: u32,
     ) -> Result<()> {
         let bitmaps = &frame.subtitle_alpha_planes;
-        let mut atlas_width = 0usize;
-        let mut atlas_height = 0usize;
-        for bitmap in bitmaps {
-            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
-                continue;
-            }
-            atlas_width += bitmap.placement.width as usize;
-            atlas_height = atlas_height.max(bitmap.placement.height as usize);
+        if bitmaps.is_empty() {
+            self.subtitle_alpha_cache = None;
+            return Ok(());
         }
-        if atlas_width == 0 || atlas_height == 0 {
+        if let Some(cache) = &self.subtitle_alpha_cache
+            && cache.key.matches(bitmaps, limit)
+        {
+            self.stats.overlay_alpha_atlas_reuses += cache.pages.len() as u64;
+            Self::append_subtitle_alpha_draws(
+                bitmaps,
+                &cache.pages,
+                viewport_w,
+                viewport_h,
+                target,
+                draws,
+            );
             return Ok(());
         }
 
-        let mut pixels = vec![0u8; atlas_width * atlas_height];
-        let mut cursor_x = 0usize;
-        let mut placements = Vec::new();
-        for (index, bitmap) in bitmaps.iter().enumerate() {
-            let bw = bitmap.placement.width as usize;
-            let bh = bitmap.placement.height as usize;
-            if bw == 0 || bh == 0 {
-                continue;
-            }
-            if !bitmap.is_valid() {
-                return Err(PlayerError::Renderer(format!(
-                    "d3d11: overlay alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
-                    bitmap.alpha.len(),
-                    bitmap.required_len(),
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    bitmap.stride
-                )));
-            }
-            for row in 0..bh {
-                let src = row * bitmap.stride;
-                let dst = row * atlas_width + cursor_x;
-                pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
-            }
-            placements.push((index, cursor_x));
-            cursor_x += bw;
+        let layouts = alpha_atlas::layout(bitmaps, limit)?;
+        if layouts.is_empty() {
+            self.subtitle_alpha_cache = None;
+            return Ok(());
         }
-
-        let texture = {
-            let state = self.state.as_ref().expect("device ensured");
-            create_overlay_texture(
-                state,
-                atlas_width as u32,
-                atlas_height as u32,
+        let key = alpha_atlas::ContentKey::new_for_overlay(frame, owner, limit, &layouts);
+        let mut pages = Vec::with_capacity(layouts.len());
+        let pixel_capacity = layouts.iter().try_fold(0usize, |capacity, page| {
+            page.pixel_len().map(|len| capacity.max(len))
+        })?;
+        // Limit spare capacity to one largest page so a small, static atlas
+        // cannot retain a much larger buffer. Size fresh allocations up front.
+        let mut pixels = self
+            .subtitle_alpha_cache
+            .as_mut()
+            .map(|cache| mem::take(&mut cache.scratch))
+            .filter(|pixels| {
+                (pixel_capacity..=pixel_capacity.saturating_mul(2)).contains(&pixels.capacity())
+            })
+            .unwrap_or_else(|| Vec::with_capacity(pixel_capacity));
+        for page in layouts {
+            page.write_pixels(bitmaps, &mut pixels)?;
+            let texture = create_cpu_texture(
+                self.state.as_ref().expect("device ensured"),
+                page.width,
+                page.height,
                 DXGI_FORMAT_R8_UNORM,
                 &pixels,
-                atlas_width as u32,
-            )?
-        };
-        self.stats.overlay_alpha_atlas_uploads += 1;
-        for (index, atlas_x) in placements {
-            let bitmap = &bitmaps[index];
-            draws.push(D3d11OverlayDraw {
-                texture: texture.clone(),
-                constants: OverlayUniforms::alpha_atlas(
-                    bitmap.color_rgba,
-                    bitmap.placement.x,
-                    bitmap.placement.y,
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    atlas_x as u32,
-                    atlas_width as u32,
-                    atlas_height as u32,
-                    viewport_w,
-                    viewport_h,
-                    target,
-                ),
+                page.width,
+            )?;
+            // CreateTexture2D has copied initial data before returning, just
+            // as when the old per-page Vec was dropped here. Only this CPU
+            // scratch is reused; every GPU page remains immutable.
+            self.stats.overlay_alpha_atlas_uploads += 1;
+            pages.push(D3d11SubtitleAlphaPage {
+                layout: page,
+                texture,
             });
         }
+        // Build every page before replacing the previous entry. On error the
+        // old cache remains valid but is never drawn for different alpha data.
+        Self::append_subtitle_alpha_draws(bitmaps, &pages, viewport_w, viewport_h, target, draws);
+        self.subtitle_alpha_cache = key.map(|(key, remaining_bytes)| {
+            let scratch_budget = remaining_bytes.saturating_sub(mem::size_of::<Vec<u8>>());
+            let scratch = if pixels.capacity() <= scratch_budget {
+                pixels.clear();
+                pixels
+            } else {
+                Vec::new()
+            };
+            D3d11SubtitleAlphaCache {
+                key,
+                pages: pages.into_boxed_slice(),
+                scratch,
+            }
+        });
         Ok(())
     }
 
+    fn append_subtitle_alpha_draws(
+        bitmaps: &[crate::subtitle::SubtitleAlphaBitmap],
+        pages: &[D3d11SubtitleAlphaPage],
+        viewport_w: u32,
+        viewport_h: u32,
+        target: TargetColorState,
+        draws: &mut Vec<D3d11OverlayDraw>,
+    ) {
+        for cached in pages {
+            let page = &cached.layout;
+            // Pages and tiles retain libass painter order, including overlapping
+            // outline/shadow/fill layers. Never sort by size or color.
+            for tile in &page.tiles {
+                let bitmap = &bitmaps[tile.bitmap];
+                let mut constants = OverlayUniforms::alpha_atlas(
+                    bitmap.color_rgba,
+                    bitmap.placement.x,
+                    bitmap.placement.y,
+                    tile.width,
+                    tile.height,
+                    tile.atlas_x,
+                    page.width,
+                    page.height,
+                    viewport_w,
+                    viewport_h,
+                    target,
+                );
+                constants.rect[0] += tile.x as f32;
+                constants.rect[1] += tile.y as f32;
+                constants.tex_rect[1] = 1.0 / page.height as f32;
+                draws.push(D3d11OverlayDraw {
+                    // Draws own COM clones: evicting the cache never mutates or
+                    // releases resources still referenced by pending draws.
+                    texture: cached.texture.clone(),
+                    constants,
+                });
+            }
+        }
+    }
+
+    /// Return a cached (or freshly generated) perceptual gamut LUT SRV for
+    /// the given uniforms, or `None` while the fast path is active or the
+    /// background generation is still pending. Callers must then mask
+    /// `gamut_lut_enabled` off so the shader keeps the fast path.
+    fn gamut_lut_view(
+        &mut self,
+        uniforms: &VideoUniforms,
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        if uniforms.gamut_lut_enabled == 0 {
+            return Ok(None);
+        }
+        let packed = uniforms._gamut_primaries;
+        let source = packed >> 8;
+        let target = packed & 0xff;
+        // The LUT's I axis spans [target black, target peak] in PQ codes;
+        // either endpoint changing invalidates the cached LUT.
+        let black_pq = d3d_quantize_luma_pq(uniforms.tone_map_extra[2]);
+        let peak_pq = d3d_quantize_luma_pq(uniforms.nits[1]);
+        if let Some((s, t, b, p, srv)) = &self.gamut_lut {
+            if *s == source && *t == target && *b == black_pq && *p == peak_pq {
+                return Ok(Some(srv.clone()));
+            }
+        }
+        let params = GamutLutParams {
+            source: d3d_code_to_primaries(source),
+            target: d3d_code_to_primaries(target),
+            // Same target black the shader derives from tone_map_extra.z.
+            min_luma: d3d_pq_code_for_lut(uniforms.tone_map_extra[2]),
+            max_luma: d3d_pq_code_for_lut(uniforms.nits[1]),
+        };
+        let job_params = self
+            .gamut_lut_job
+            .as_ref()
+            .map(GamutLutJob::params)
+            .filter(|job_params| *job_params == params);
+        if job_params.is_none() {
+            // First request (or the key changed): spawn generation and keep
+            // the fast path for this frame.
+            self.gamut_lut_job = Some(GamutLutJob::spawn(params));
+            return Ok(None);
+        }
+        let Some(lut) = self.gamut_lut_job.as_ref().and_then(GamutLutJob::poll) else {
+            return Ok(None);
+        };
+        self.gamut_lut_job = None;
+        let state = self.state.as_ref().expect("device ensured for gamut lut");
+        // Pack (I, P+0.5, T+0.5) into RGBA16F bytes laid out I x C x H.
+        let texels = pack_rgba16f(&lut.texels, 1.0);
+        let initial = [D3D11_SUBRESOURCE_DATA {
+            pSysMem: texels.as_ptr() as *const c_void,
+            SysMemPitch: (LUT_SIZE_I * 4 * 2) as u32,
+            SysMemSlicePitch: (LUT_SIZE_I * LUT_SIZE_C * 4 * 2) as u32,
+        }];
+        let desc = D3D11_TEXTURE3D_DESC {
+            Width: LUT_SIZE_I as u32,
+            Height: LUT_SIZE_C as u32,
+            Depth: LUT_SIZE_H as u32,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe {
+            state
+                .device
+                .CreateTexture3D(&desc, Some(initial.as_ptr()), Some(&mut texture))
+                .map_err(|error| d3d_error("ID3D11Device::CreateTexture3D(gamut lut)", error))?;
+        }
+        let resource = texture
+            .expect("gamut lut texture created")
+            .cast::<ID3D11Resource>()
+            .map_err(|error| d3d_error("cast to ID3D11Resource", error))?;
+        let mut srv = None;
+        unsafe {
+            state
+                .device
+                .CreateShaderResourceView(&resource, None, Some(&mut srv))
+                .map_err(|error| {
+                    d3d_error("ID3D11Device::CreateShaderResourceView(gamut lut)", error)
+                })?;
+        }
+        let srv = srv.expect("gamut lut srv created");
+        self.gamut_lut = Some((source, target, black_pq, peak_pq, srv.clone()));
+        Ok(Some(srv))
+    }
+
     fn render_video(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        self.render_video_shared(context, None)
+    }
+
+    fn render_video_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        owner: Option<&std::sync::Arc<OverlayFrame>>,
+    ) -> Result<bool> {
         if self.current_video.is_none() {
             return Ok(false);
         }
@@ -1589,16 +3094,26 @@ impl D3d11Renderer {
             .as_ref()
             .expect("video checked")
             .frame_token;
-        if flutter_texture
-            && self.surface.as_ref().unwrap().published_texture.is_some()
-            && self
-                .flutter_scene
-                .as_ref()
-                .is_some_and(|scene| scene.matches(frame_token, self.upscaler_mode, context))
+        // A network that finished building must refresh an unchanged
+        // (paused) frame, so the cached scene is keyed on the backend too.
+        self.poll_upscalers();
+        let upscaler_status = self.upscaler_backend_status();
+        if upscaler_status != self.scene_upscaler_status {
+            self.scene_upscaler_status = upscaler_status;
+            self.presented_scene = None;
+        }
+        // Keep pumping clocks/ASS/danmaku at display cadence; only suppress
+        // draws whose complete visible scene already reached this surface.
+        // Pending LUT work must still be polled on a paused frame.
+        let post_generation = self.post_process.generation();
+        if self.gamut_lut_job.is_none()
+            && self.presented_scene.as_ref().is_some_and(|scene| {
+                scene.matches(frame_token, self.upscaler_mode, post_generation, context)
+            })
         {
             return Ok(true);
         }
-        let overlay_draws = self.prepare_overlay_draws(context.overlay)?;
+        let overlay_draws = self.prepare_overlay_draws_shared(context.overlay, owner)?;
         let danmaku_draws = self.prepare_danmaku_draws(context.danmaku)?;
         let (video_width, video_height, frame_token, native_luma) = {
             let video = self.current_video.as_ref().expect("video checked");
@@ -1624,110 +3139,266 @@ impl D3d11Renderer {
         );
         let upscale_requested = !self.video_alpha_mode.has_alpha()
             && self.upscaler_mode.is_enabled()
-            && self.upscaler.status() == LumaUpscalerBackendStatus::Scalar
             && target_rect.width > video_width as f32;
-        let upscaled_luma = if upscale_requested {
-            let (device, device_context) = {
-                let state = self.state.as_ref().expect("device ensured");
-                (state.device.clone(), state.context.clone())
+        let mut video_constants = {
+            let video = self.current_video.as_ref().expect("video checked");
+            video.constants
+        };
+        let gamut_lut = self.gamut_lut_view(&video_constants)?;
+        if gamut_lut.is_none() {
+            // Background generation pending: keep the fast gamut_compress
+            // path until the LUT lands.
+            video_constants.gamut_lut_enabled = 0;
+        }
+        // Complete fallible preparation before upscaling can submit reads of
+        // the decoder frame. Retain target handles across that mutable call.
+        let (rtv, linear_target, fence) = {
+            let state = self.state.as_ref().expect("device ensured");
+            let surface = self.surface.as_ref().expect("surface ensured");
+            let rtv = surface.render_target.clone().ok_or_else(|| {
+                PlayerError::Renderer("d3d11: no render target attached".to_string())
+            })?;
+            let linear_target = if matches!(surface.output_mode, D3d11OutputMode::Hdr10) {
+                Some((
+                    surface.linear_render_target.clone().ok_or_else(|| {
+                        PlayerError::Renderer("d3d11: no linear render target attached".to_string())
+                    })?,
+                    surface.linear_shader_resource.clone().ok_or_else(|| {
+                        PlayerError::Renderer(
+                            "d3d11: no linear shader resource attached".to_string(),
+                        )
+                    })?,
+                ))
+            } else {
+                None
             };
-            match self.upscaler.encode(
-                &device,
-                &device_context,
-                &native_luma,
-                video_width,
-                video_height,
-                Some(frame_token),
-            ) {
-                Ok(output) => output,
-                Err(error) => {
-                    self.upscaler.record_runtime_failure(&error);
-                    report_upscaler_failure("frame_encode", self.upscaler_mode, &error);
+            // Once capture installs a retirement fence, keep tracking readers
+            // when HWND playback resumes, including the upscaler's reads.
+            let fence =
+                if surface.composition || flutter_texture || self.current_video_fence.is_some() {
+                    Some(create_d3d11_event_query(&state.device)?)
+                } else {
                     None
-                }
-            }
+                };
+            (rtv, linear_target, fence)
+        };
+        let video_override = if upscale_requested {
+            self.upscale_current_video(target_rect, native_luma.clone(), frame_token)
+        } else {
+            None
+        };
+        let post_format = if linear_target.is_some() {
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        } else {
+            SDR_SWAPCHAIN_FORMAT
+        };
+        let post_stage = self.post_process.stage();
+        let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+            (physical.width.max(1), physical.height.max(1))
+        } else {
+            (
+                target_rect.width.round().max(1.0) as u32,
+                target_rect.height.round().max(1.0) as u32,
+            )
+        };
+        let post_rtv = if self.post_process.is_enabled() {
+            let device = self.state.as_ref().expect("device ensured").device.clone();
+            self.post_process
+                .prepare(&device, post_w, post_h, post_format)
         } else {
             None
         };
         let video = self.current_video.as_ref().expect("video checked");
         let state = self.state.as_ref().expect("device ensured");
         let surface = self.surface.as_ref().expect("surface ensured");
-        let rtv = surface
-            .render_target
+        let scene_rtv = linear_target
             .as_ref()
-            .ok_or_else(|| PlayerError::Renderer("d3d11: no render target attached".to_string()))?;
-        let linear_target = if matches!(surface.output_mode, D3d11OutputMode::Hdr10) {
-            Some((
-                surface.linear_render_target.as_ref().ok_or_else(|| {
-                    PlayerError::Renderer("d3d11: no linear render target attached".to_string())
-                })?,
-                surface.linear_shader_resource.as_ref().ok_or_else(|| {
-                    PlayerError::Renderer("d3d11: no linear shader resource attached".to_string())
-                })?,
-            ))
-        } else {
-            None
-        };
-        let scene_rtv = linear_target.map_or(rtv, |(linear_rtv, _)| linear_rtv);
+            .map_or(&rtv, |(linear_rtv, _)| linear_rtv);
+        let clear_color = [
+            0.0,
+            0.0,
+            0.0,
+            if self.video_alpha_mode.has_alpha() {
+                0.0
+            } else {
+                1.0
+            },
+        ];
         unsafe {
-            state.context.ClearRenderTargetView(
-                scene_rtv,
-                &[
-                    0.0,
-                    0.0,
-                    0.0,
-                    if self.video_alpha_mode.has_alpha() {
-                        0.0
-                    } else {
-                        1.0
-                    },
-                ],
-            );
+            state.context.ClearRenderTargetView(scene_rtv, &clear_color);
         }
-        state.draw_video(video, upscaled_luma.as_ref(), scene_rtv, target_rect)?;
-        if !overlay_draws.is_empty() {
-            // Subtitle coordinates are produced in the video-frame viewport.
-            // Composite them through the same aspect-fit viewport as the video
-            // so resizing the window cannot stretch the subtitle independently.
-            state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
+        let draw_result: Result<()> = (|| {
+            let full_surface_rect = D3d11DrawRect {
+                x: 0.0,
+                y: 0.0,
+                width: physical.width.max(1) as f32,
+                height: physical.height.max(1) as f32,
+            };
+            if let Some(post_rtv) = post_rtv.as_ref()
+                && post_stage == PostProcessStage::Output
+            {
+                unsafe {
+                    state.context.ClearRenderTargetView(post_rtv, &clear_color);
+                }
+                state.draw_video(
+                    video,
+                    video_constants,
+                    video_override.as_ref(),
+                    gamut_lut.as_ref(),
+                    post_rtv,
+                    target_rect,
+                )?;
+                if !overlay_draws.is_empty() {
+                    state.draw_overlays(&overlay_draws, post_rtv, target_rect)?;
+                }
+                if !danmaku_draws.is_empty() {
+                    state.draw_danmaku(&danmaku_draws, post_rtv, full_surface_rect)?;
+                }
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [0.0, 0.0, post_w as f32, post_h as f32],
+                    (physical.width, physical.height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                let post_viewport = D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: post_w as f32,
+                    Height: post_h as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                };
+                self.post_process
+                    .draw(&state.context, scene_rtv, post_viewport, &post_uniforms);
+            } else {
+                if let Some(post_rtv) = post_rtv.as_ref() {
+                    unsafe {
+                        state.context.ClearRenderTargetView(post_rtv, &clear_color);
+                    }
+                    state.draw_video(
+                        video,
+                        video_constants,
+                        video_override.as_ref(),
+                        gamut_lut.as_ref(),
+                        post_rtv,
+                        D3d11DrawRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: post_w as f32,
+                            height: post_h as f32,
+                        },
+                    )?;
+                    let post_uniforms = PostProcessUniforms::new(
+                        (post_w, post_h),
+                        [
+                            target_rect.x,
+                            target_rect.y,
+                            target_rect.width,
+                            target_rect.height,
+                        ],
+                        (physical.width, physical.height),
+                        self.stats.rendered_frames as f64 / 60.0,
+                        self.stats.rendered_frames,
+                    );
+                    let post_viewport = D3D11_VIEWPORT {
+                        TopLeftX: target_rect.x,
+                        TopLeftY: target_rect.y,
+                        Width: target_rect.width.max(1.0),
+                        Height: target_rect.height.max(1.0),
+                        MinDepth: 0.0,
+                        MaxDepth: 1.0,
+                    };
+                    self.post_process.draw(
+                        &state.context,
+                        scene_rtv,
+                        post_viewport,
+                        &post_uniforms,
+                    );
+                } else {
+                    state.draw_video(
+                        video,
+                        video_constants,
+                        video_override.as_ref(),
+                        gamut_lut.as_ref(),
+                        scene_rtv,
+                        target_rect,
+                    )?;
+                }
+                if !overlay_draws.is_empty() {
+                    // Subtitle coordinates are produced in the video-frame viewport.
+                    // Composite them through the same aspect-fit viewport as the video
+                    // so resizing the window cannot stretch the subtitle independently.
+                    state.draw_overlays(&overlay_draws, scene_rtv, target_rect)?;
+                }
+                if !danmaku_draws.is_empty() {
+                    state.draw_danmaku(&danmaku_draws, scene_rtv, full_surface_rect)?;
+                }
+            }
+            if let Some((_, linear_srv)) = linear_target.as_ref() {
+                state.draw_encode(
+                    linear_srv,
+                    &rtv,
+                    physical.width,
+                    physical.height,
+                    video.constants,
+                )?;
+            }
+            Ok(())
+        })();
+        // Protect the last read even if a later pass or Present fails.
+        if let Some(fence) = fence {
+            unsafe { state.context.End(&fence) };
+            self.current_video_fence = Some(fence);
         }
-        if !danmaku_draws.is_empty() {
-            state.draw_overlays(
-                &danmaku_draws,
-                scene_rtv,
-                D3d11DrawRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: physical.width.max(1) as f32,
-                    height: physical.height.max(1) as f32,
-                },
-            )?;
+        draw_result?;
+        let need_blended = surface.composition && self.composition_blended;
+        let _ = (state, surface);
+        if need_blended {
+            self.publish_composition_blended_texture()?;
         }
-        if let Some((_, linear_srv)) = linear_target {
-            state.draw_encode(
-                linear_srv,
-                rtv,
-                physical.width,
-                physical.height,
-                video.constants,
-            )?;
-        }
-        if let Some(swapchain) = surface.swapchain.as_ref() {
-            present_swapchain(swapchain, "IDXGISwapChain1::Present1")?;
-        }
+        let submitted = match self
+            .surface
+            .as_ref()
+            .expect("surface ensured")
+            .swapchain
+            .as_ref()
+        {
+            Some(swapchain) => present_swapchain(swapchain, "IDXGISwapChain1::Present1")?,
+            None => true,
+        };
         if flutter_texture {
             self.publish_flutter_texture()?;
-            if let Some(scene) = self.flutter_scene.as_mut() {
-                scene.update(frame_token, self.upscaler_mode, context);
-            } else {
-                self.flutter_scene = Some(FlutterTextureScene::new(
+        }
+        // A full/occluded DXGI queue is not a successful presentation. Keep
+        // the scene dirty and retry on the next tick, including while paused.
+        if submitted {
+            // Preparation built or verified the cache for this input. Share
+            // its immutable alpha-only owner or mask snapshot, and only after
+            // publication succeeds. An over-budget scene keeps the owned path.
+            let alpha = self
+                .subtitle_alpha_cache
+                .as_ref()
+                .map(|cache| &cache.key.snapshot);
+            if let Some(scene) = self.presented_scene.as_mut() {
+                scene.update(
                     frame_token,
                     self.upscaler_mode,
+                    post_generation,
                     context,
+                    alpha,
+                );
+            } else {
+                self.presented_scene = Some(PresentedScene::new(
+                    frame_token,
+                    self.upscaler_mode,
+                    post_generation,
+                    context,
+                    alpha,
                 ));
             }
+            self.stats.rendered_frames += 1;
         }
-        self.stats.rendered_frames += 1;
         if !danmaku_draws.is_empty() {
             self.stats.danmaku_passes += 1;
             self.stats.danmaku_items += danmaku_draws.len() as u64;
@@ -1760,7 +3431,7 @@ impl D3d11Renderer {
             .surface
             .as_ref()
             .is_some_and(|surface| surface.flutter_texture && surface.published_texture.is_some())
-            && self.flutter_scene.is_none()
+            && self.presented_scene.is_none()
         {
             return Ok(());
         }
@@ -1790,7 +3461,10 @@ impl D3d11Renderer {
             }
         }
         self.publish_flutter_texture()?;
-        self.flutter_scene = None;
+        if let Some(surface) = self.surface.as_mut() {
+            surface.blended_has_frame = false;
+        }
+        self.presented_scene = None;
         trace("render_clear: done");
         self.stats.rendered_frames += 1;
         Ok(())
@@ -1847,19 +3521,39 @@ impl RendererBackend for D3d11Renderer {
             output_texture: None,
             published_texture: None,
             render_target: None,
+            linear_texture: None,
             linear_render_target: None,
             linear_shader_resource: None,
+            blended_textures: [None, None],
+            blended_slot: 0,
+            blended_generation: 0,
+            blended_has_frame: false,
         });
         self.hdr10_output_unavailable = false;
+        self.presented_scene = None;
         self.stats.attached = true;
         self.recreate_surface_targets()?;
         self.render_clear(0.0)
     }
 
     fn detach_surface(&mut self) -> Result<()> {
-        self.retire_current_video()?;
+        // Keep `current_video` alive across surface switches (matching Metal
+        // and Wgpu) so a paused video immediately redraws when re-attached to
+        // another view (for example full player <-> mini player). Wait on the
+        // last draw fence first so the retiring swapchain is no longer reading
+        // the frame textures before we drop the surface.
+        if self.current_video.is_some()
+            && let (Some(state), Some(fence)) =
+                (self.state.as_ref(), self.current_video_fence.as_ref())
+        {
+            wait_for_fence(&state.context, fence, self.handoff_timeout)?;
+        }
+        self.current_video_fence = None;
+        self.presented_scene = None;
         self.surface = None;
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
         self.stats.attached = false;
         self.stats.surface_width = 0;
         self.stats.surface_height = 0;
@@ -1878,6 +3572,7 @@ impl RendererBackend for D3d11Renderer {
         }
         surface.metrics = metrics;
         self.hdr10_output_unavailable = false;
+        self.presented_scene = None;
         let flutter_texture = surface.flutter_texture;
         self.recreate_surface_targets()?;
         if flutter_texture && self.current_video.is_none() {
@@ -1893,8 +3588,13 @@ impl RendererBackend for D3d11Renderer {
     }
 
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        self.drop_device_if_removed();
         if frame.frame.d3d11va_texture().is_some() {
-            return self.import_d3d11va_frame(frame);
+            let result = self.import_d3d11va_frame(frame);
+            if result.is_err() {
+                self.stats.import_failures += 1;
+            }
+            return result;
         }
         if frame.frame.has_hw_frames_context() {
             self.stats.hardware_video_frames += 1;
@@ -1902,15 +3602,17 @@ impl RendererBackend for D3d11Renderer {
                 "d3d11: hardware frame is not importable as D3D11VA".to_string(),
             ));
         }
-        self.stats.cpu_video_frame_fallbacks += 1;
-        Err(PlayerError::Renderer(
-            "d3d11: software frames require WgpuFallback or a CPU upload path".to_string(),
-        ))
+        self.upload_software_frame(frame)
     }
 
     fn clear_current_frame(&mut self) -> Result<()> {
         self.retire_current_video()?;
+        if let Some(state) = self.state.as_mut() {
+            state.p010_chroma_staging = None;
+        }
+        self.subtitle_alpha_cache = None;
         self.danmaku_atlas_cache = None;
+        self.danmaku_picture_cache = None;
         if self.surface.is_some() {
             self.render_clear(0.0)?;
         }
@@ -1921,8 +3623,57 @@ impl RendererBackend for D3d11Renderer {
         Ok(())
     }
 
+    fn advance_empty_danmaku_scene(&mut self, previous_generation: u64, generation: u64) {
+        if self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| surface.swapchain.is_some() && !surface.flutter_texture)
+            && let Some(scene) = self.presented_scene.as_mut()
+            && scene.generation == previous_generation
+            && scene
+                .danmaku
+                .as_ref()
+                .is_none_or(DanmakuRenderPlan::is_empty)
+        {
+            scene.generation = generation;
+        }
+    }
+
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        self.drop_device_if_removed();
         self.render_video(context)
+    }
+
+    fn capture_current_frame(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<crate::core::RendererFrameCapture>> {
+        self.drop_device_if_removed();
+        self.capture_rgba(context, width, height)
+    }
+
+    fn prefers_shared_overlay(&self) -> bool {
+        true
+    }
+
+    fn render_current_frame_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        owner: &std::sync::Arc<OverlayFrame>,
+    ) -> Result<bool> {
+        self.drop_device_if_removed();
+        self.render_video_shared(context, Some(owner))
+    }
+
+    fn resource_stats(&self) -> RendererResourceStats {
+        let upscaler_bytes = self.upscaler.allocated_bytes() + self.fsr1.allocated_bytes();
+        RendererResourceStats {
+            upscaler_bytes,
+            renderer_tracked_bytes: upscaler_bytes,
+            ..RendererResourceStats::default()
+        }
     }
 
     fn runtime_stats(&self) -> RendererRuntimeStats {
@@ -1937,7 +3688,7 @@ impl RendererBackend for D3d11Renderer {
             danmaku_draw_items: self.stats.danmaku_items,
             overlay_alpha_atlas_uploads: self.stats.overlay_alpha_atlas_uploads,
             overlay_alpha_atlas_reuses: self.stats.overlay_alpha_atlas_reuses,
-            software_video_frames: 0,
+            software_video_frames: self.stats.software_video_frames,
             hardware_video_frames: self.stats.hardware_video_frames,
             zero_copy_video_frames: self.stats.zero_copy_video_frames,
             direct_zero_copy_video_frames: self.stats.direct_zero_copy_video_frames,
@@ -1951,14 +3702,11 @@ impl RendererBackend for D3d11Renderer {
             hdr10_output_failures: self.stats.hdr10_output_failures,
             hdr10_output_active: self.stats.hdr10_output_active,
             upscaler_mode: self.upscaler_mode,
-            upscaler_backend: if self.upscaler_mode.is_enabled() && self.state.is_none() {
-                LumaUpscalerBackendStatus::Building
-            } else {
-                self.upscaler.status()
-            },
+            upscaler_backend: self.upscaler_backend_status(),
             upscaler_fallbacks: self.upscaler.fallback_count(),
-            upscaled_frames: self.upscaler.upscaled_frames(),
+            upscaled_frames: self.upscaler.upscaled_frames() + self.vsr_frames + self.fsr1.frames(),
             last_upscaler_encode_duration: self.upscaler.last_encode_duration(),
+            last_gpu_duration: self.upscaler.last_gpu_duration(),
             ..Default::default()
         }
     }
@@ -1993,10 +3741,79 @@ impl RendererBackend for D3d11Renderer {
     fn set_luma_upscaler(&mut self, mode: LumaUpscalerMode) {
         self.upscaler_mode = mode;
         if let Some(state) = self.state.as_ref() {
-            if let Err(error) = self.upscaler.set_mode(&state.device, mode) {
+            let network = if mode.family() == UpscalerFamily::Network {
+                mode
+            } else {
+                LumaUpscalerMode::Off
+            };
+            if let Err(error) = self.upscaler.set_mode(&state.device, network) {
                 report_upscaler_failure("mode_switch", mode, &error);
             }
+            if mode.family() == UpscalerFamily::Platform && mode != LumaUpscalerMode::PlatformVideo
+            {
+                report_upscaler_failure(
+                    "mode_switch",
+                    mode,
+                    &PlayerError::Renderer(format!("{} is not available on Windows", mode.label())),
+                );
+            }
         }
+    }
+
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        match self.upscaler_mode.family() {
+            UpscalerFamily::Off => (None, None),
+            UpscalerFamily::Network => (self.upscaler.reason(), Some(self.upscaler.engine())),
+            UpscalerFamily::Spatial => (self.fsr1.last_failure().map(str::to_string), Some("fsr1")),
+            UpscalerFamily::Platform if self.upscaler_mode == LumaUpscalerMode::PlatformVideo => {
+                match &self.vsr {
+                    Some(Ok(vsr)) => (
+                        self.vsr_last_error.clone(),
+                        Some(match vsr.vendor() {
+                            crate::renderer::d3d11_vsr::VsrVendor::Nvidia => "nvidia_rtx_video",
+                            crate::renderer::d3d11_vsr::VsrVendor::Intel => "intel_vsr",
+                        }),
+                    ),
+                    Some(Err(reason)) => (Some(reason.clone()), None),
+                    None => (self.vsr_last_error.clone(), None),
+                }
+            }
+            UpscalerFamily::Platform => (
+                Some(format!(
+                    "{} is not available on Windows",
+                    self.upscaler_mode.label()
+                )),
+                None,
+            ),
+        }
+    }
+
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        self.presented_scene = None;
+        match self.state.as_ref() {
+            Some(state) => self.upscaler.set_custom_model(&state.device, model),
+            None => self.upscaler.store_custom_model(model),
+        }
+    }
+
+    fn supported_upscalers(&self) -> UpscalerCapabilities {
+        let vendor = match self.state.as_ref() {
+            Some(state) => crate::renderer::d3d11_vsr::detect_vendor(&state.device),
+            None => crate::renderer::d3d11_vsr::probe_default_vendor(),
+        };
+        capabilities_for_vendor(vendor)
+    }
+
+    fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.presented_scene = None;
+        self.post_process.set_shader(shader);
+    }
+
+    fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.post_process.status_info()
     }
 
     fn composition_swapchain_ptr(&self) -> Option<*mut std::ffi::c_void> {
@@ -2015,6 +3832,30 @@ impl RendererBackend for D3d11Renderer {
         }
         let unknown: IUnknown = surface.published_texture.as_ref()?.cast().ok()?;
         Some(unknown.into_raw())
+    }
+
+    fn set_composition_blended(&mut self, enabled: bool) {
+        if self.composition_blended == enabled {
+            return;
+        }
+        self.composition_blended = enabled;
+        if enabled {
+            // Force the next render tick to redraw even when paused so the
+            // blended composition surface immediately receives the current frame.
+            self.presented_scene = None;
+        } else if let Some(surface) = self.surface.as_mut() {
+            surface.blended_textures = [None, None];
+            surface.blended_has_frame = false;
+        }
+    }
+
+    fn composition_blended_texture(&self) -> Option<(*mut std::ffi::c_void, u64)> {
+        let surface = self.surface.as_ref()?;
+        if !surface.composition || !surface.blended_has_frame {
+            return None;
+        }
+        let texture = surface.blended_textures[surface.blended_slot].as_ref()?;
+        Some((Interface::as_raw(texture), surface.blended_generation))
     }
 }
 
@@ -2095,6 +3936,7 @@ impl D3d11DeviceState {
         let overlay_constants = create_overlay_constants_buffer(&device)?;
         let overlay_sampler = create_sampler(&device)?;
         let overlay_blend = create_overlay_blend_state(&device)?;
+        let danmaku_pipeline = D3d11DanmakuPipeline::new(&device)?;
         Ok(Self {
             device,
             context,
@@ -2110,13 +3952,23 @@ impl D3d11DeviceState {
             overlay_constants,
             overlay_sampler,
             overlay_blend,
+            danmaku_pipeline,
+            p010_upload_shader: None,
+            p010_chroma_staging: None,
         })
     }
 
+    /// Draw the imported video frame. `constants` is the per-frame uniform
+    /// payload the caller already resolved (including any
+    /// `gamut_lut_enabled` mask for a still-generating LUT); the stored
+    /// `ImportedVideoFrame.constants` is left untouched so a later present
+    /// can re-enable the LUT once it lands.
     fn draw_video(
         &self,
         video: &ImportedVideoFrame,
-        upscaled_luma: Option<&ID3D11ShaderResourceView>,
+        constants: VideoUniforms,
+        video_override: Option<&VideoOverride>,
+        gamut_lut: Option<&ID3D11ShaderResourceView>,
         render_target: &ID3D11RenderTargetView,
         target: D3d11DrawRect,
     ) -> Result<()> {
@@ -2131,25 +3983,29 @@ impl D3d11DeviceState {
         let stride = mem::size_of::<VideoVertex>() as u32;
         let offset = 0u32;
         let vertices = video_vertices(D3d11TexRect::FULL);
-        let mut common = video.constants;
-        if upscaled_luma.is_some() {
-            common = common.packed_d2s_luma_input();
-        }
+        // Upscaled planes cover exactly the visible region.
+        let (luma_view, luma_scale) = match video_override {
+            Some(VideoOverride::Luma(luma)) => (luma.view.clone(), [1.0, 1.0]),
+            Some(VideoOverride::Planes(planes)) => (planes.luma.clone(), [1.0, 1.0]),
+            None => (
+                video.luma.clone(),
+                [video.tex_rect.width, video.tex_rect.height],
+            ),
+        };
+        let (chroma_view, chroma_scale) = match video_override {
+            Some(VideoOverride::Planes(planes)) => (planes.chroma.clone(), [1.0, 1.0]),
+            _ => (
+                video.chroma.clone(),
+                [video.tex_rect.width, video.tex_rect.height],
+            ),
+        };
         let constants = D3d11VideoConstants {
-            common,
+            common: constants,
             texture_scales: [
-                if upscaled_luma.is_some() {
-                    1.0
-                } else {
-                    video.tex_rect.width
-                },
-                if upscaled_luma.is_some() {
-                    1.0
-                } else {
-                    video.tex_rect.height
-                },
-                video.tex_rect.width,
-                video.tex_rect.height,
+                luma_scale[0],
+                luma_scale[1],
+                chroma_scale[0],
+                chroma_scale[1],
             ],
         };
         unsafe {
@@ -2184,20 +4040,16 @@ impl D3d11DeviceState {
             self.context.PSSetShader(&self.pixel_shader, None);
             self.context
                 .PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
-            self.context.PSSetShaderResources(
-                0,
-                Some(&[
-                    Some(upscaled_luma.cloned().unwrap_or_else(|| video.luma.clone())),
-                    Some(video.chroma.clone()),
-                ]),
-            );
+            let srvs = [Some(luma_view), Some(chroma_view), gamut_lut.cloned()];
+            self.context.PSSetShaderResources(0, Some(&srvs));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context
                 .OMSetRenderTargets(Some(&[Some(render_target.clone())]), None);
             self.context.OMSetBlendState(None, None, u32::MAX);
             self.context.Draw(6, 0);
-            self.context.PSSetShaderResources(0, Some(&[None, None]));
+            self.context
+                .PSSetShaderResources(0, Some(&[None, None, None]));
         }
         Ok(())
     }
@@ -2270,6 +4122,22 @@ impl D3d11DeviceState {
             }
             self.context.PSSetShaderResources(0, Some(&[None]));
             self.context.OMSetBlendState(None, None, u32::MAX);
+        }
+        Ok(())
+    }
+
+    fn draw_danmaku(
+        &self,
+        draws: &D3d11DanmakuDraws,
+        render_target: &ID3D11RenderTargetView,
+        target_rect: D3d11DrawRect,
+    ) -> Result<()> {
+        if let Some(text) = &draws.text {
+            self.danmaku_pipeline
+                .draw(self, text, render_target, target_rect);
+        }
+        if !draws.pictures.is_empty() {
+            self.draw_overlays(&draws.pictures, render_target, target_rect)?;
         }
         Ok(())
     }
@@ -2392,6 +4260,31 @@ fn aspect_fit_rect(
         y: rect.y,
         width: rect.width,
         height: rect.height,
+    }
+}
+
+fn d3d_pq_code_for_lut(nits: f32) -> f32 {
+    let m1 = 0.1593017578125_f32;
+    let m2 = 78.84375_f32;
+    let c1 = 0.8359375_f32;
+    let c2 = 18.8515625_f32;
+    let c3 = 18.6875_f32;
+    let p = (nits / 10000.0).clamp(0.0, 1.0).powf(m1);
+    ((c1 + c2 * p) / (1.0 + c3 * p).max(0.000_001)).powf(m2)
+}
+
+/// Quantize a luminance (nits) to its PQ code for the LUT cache key, matching
+/// the wgpu/Metal quantizers. 16-bit PQ resolution keeps the sub-1-nit target
+/// blacks of SDR targets distinct.
+fn d3d_quantize_luma_pq(nits: f32) -> u32 {
+    (d3d_pq_code_for_lut(nits) * 65535.0) as u32
+}
+
+fn d3d_code_to_primaries(code: u32) -> ColorPrimaries {
+    match code {
+        1 => ColorPrimaries::Bt2020,
+        2 => ColorPrimaries::DisplayP3,
+        _ => ColorPrimaries::Bt709,
     }
 }
 
@@ -2537,8 +4430,11 @@ fn release_backbuffer_views(context: &ID3D11DeviceContext, surface: &mut Attache
     surface.render_target = None;
     surface.output_texture = None;
     surface.published_texture = None;
+    surface.linear_texture = None;
     surface.linear_render_target = None;
     surface.linear_shader_resource = None;
+    surface.blended_textures = [None, None];
+    surface.blended_has_frame = false;
 }
 
 fn create_d3d11_event_query(device: &ID3D11Device) -> Result<ID3D11Query> {
@@ -2570,15 +4466,29 @@ fn d3d11_event_query_complete(context: &ID3D11DeviceContext, query: &ID3D11Query
     Ok(complete.as_bool())
 }
 
-fn wait_for_gpu(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<()> {
+fn wait_for_gpu(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    timeout: Duration,
+) -> Result<()> {
     let query = create_d3d11_event_query(device)?;
     unsafe {
         context.End(&query);
+    }
+    wait_for_fence(context, &query, timeout)
+}
+
+fn wait_for_fence(
+    context: &ID3D11DeviceContext,
+    fence: &ID3D11Query,
+    timeout: Duration,
+) -> Result<()> {
+    unsafe {
         context.Flush();
     }
     let started = Instant::now();
-    while !d3d11_event_query_complete(context, &query)? {
-        if started.elapsed() >= Duration::from_millis(100) {
+    while !d3d11_event_query_complete(context, fence)? {
+        if started.elapsed() >= timeout {
             return Err(PlayerError::Renderer(
                 "d3d11: compositor GPU handoff timed out; retaining the current decoder frame"
                     .into(),
@@ -2663,7 +4573,11 @@ fn create_linear_render_target(
     device: &ID3D11Device,
     width: u32,
     height: u32,
-) -> Result<(ID3D11RenderTargetView, ID3D11ShaderResourceView)> {
+) -> Result<(
+    ID3D11Texture2D,
+    ID3D11RenderTargetView,
+    ID3D11ShaderResourceView,
+)> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width.max(1),
         Height: height.max(1),
@@ -2712,6 +4626,7 @@ fn create_linear_render_target(
             })?;
     }
     Ok((
+        texture,
         render_target.ok_or_else(|| {
             PlayerError::Renderer("d3d11: linear render target view was null".to_string())
         })?,
@@ -2721,7 +4636,7 @@ fn create_linear_render_target(
     ))
 }
 
-fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<()> {
+fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Result<bool> {
     let params = DXGI_PRESENT_PARAMETERS {
         DirtyRectsCount: 0,
         pDirtyRects: ptr::null_mut(),
@@ -2733,9 +4648,10 @@ fn present_swapchain(swapchain: &IDXGISwapChain1, operation: &'static str) -> Re
     // for a full DXGI queue here: dropping one presentation keeps window
     // interaction responsive while decode/audio continue normally.
     if status == DXGI_ERROR_WAS_STILL_DRAWING {
-        return Ok(());
+        return Ok(false);
     }
-    status.ok().map_err(|error| d3d_error(operation, error))
+    status.ok().map_err(|error| d3d_error(operation, error))?;
+    Ok(status.0 == 0) // S_OK; retry occluded/status-only presentations.
 }
 
 fn create_plane_srv(
@@ -2774,7 +4690,7 @@ fn create_plane_srv(
     view.ok_or_else(|| PlayerError::Renderer("d3d11: shader resource view was null".to_string()))
 }
 
-fn create_overlay_texture(
+fn create_cpu_texture(
     state: &D3d11DeviceState,
     width: u32,
     height: u32,
@@ -2784,9 +4700,56 @@ fn create_overlay_texture(
 ) -> Result<D3d11OverlayTexture> {
     if width == 0 || height == 0 || bytes_per_row == 0 {
         return Err(PlayerError::Renderer(
-            "d3d11: overlay texture dimensions must be non-zero".to_string(),
+            "d3d11: CPU texture dimensions must be non-zero".to_string(),
         ));
     }
+    let required_len = (bytes_per_row as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| PlayerError::Renderer("d3d11: CPU texture size overflow".into()))?;
+    if data.len() < required_len {
+        return Err(PlayerError::Renderer(format!(
+            "d3d11: CPU texture has {} bytes, expected at least {required_len}",
+            data.len()
+        )));
+    }
+    // SAFETY: this initialized slice covers the full checked CPU texture span.
+    unsafe {
+        create_cpu_texture_from_ptr(state, width, height, format, data.as_ptr(), bytes_per_row)
+    }
+}
+
+/// The caller must keep visible source bytes readable and the full
+/// `bytes_per_row * height` span allocated until CreateTexture2D returns.
+/// Row padding need not be initialized; no Rust reference spans that padding.
+unsafe fn create_cpu_texture_from_ptr(
+    state: &D3d11DeviceState,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    data: *const u8,
+    bytes_per_row: u32,
+) -> Result<D3d11OverlayTexture> {
+    // SAFETY: passed through the checked initialized-data span.
+    unsafe {
+        create_cpu_texture_with_view_from_ptr(
+            state,
+            (width, height),
+            (format, format),
+            (data, bytes_per_row),
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        )
+    }
+}
+
+/// The caller must keep the initial data valid under the same contract as
+/// create_cpu_texture_from_ptr and use compatible texture/view formats.
+unsafe fn create_cpu_texture_with_view_from_ptr(
+    state: &D3d11DeviceState,
+    (width, height): (u32, u32),
+    (format, srv_format): (DXGI_FORMAT, DXGI_FORMAT),
+    (data, bytes_per_row): (*const u8, u32),
+    bind_flags: u32,
+) -> Result<D3d11OverlayTexture> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
@@ -2798,12 +4761,12 @@ fn create_overlay_texture(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        BindFlags: bind_flags,
         CPUAccessFlags: 0,
         MiscFlags: 0,
     };
     let subresource = D3D11_SUBRESOURCE_DATA {
-        pSysMem: data.as_ptr() as *const c_void,
+        pSysMem: data as *const c_void,
         SysMemPitch: bytes_per_row,
         SysMemSlicePitch: bytes_per_row.saturating_mul(height),
     };
@@ -2812,11 +4775,11 @@ fn create_overlay_texture(
         state
             .device
             .CreateTexture2D(&desc, Some(&subresource), Some(&mut texture))
-            .map_err(|error| d3d_error("ID3D11Device::CreateTexture2D(overlay)", error))?;
+            .map_err(|error| d3d_error("ID3D11Device::CreateTexture2D(cpu)", error))?;
     }
-    let texture = texture
-        .ok_or_else(|| PlayerError::Renderer("d3d11: overlay texture was null".to_string()))?;
-    let view = create_texture2d_srv(state, &texture, format)?;
+    let texture =
+        texture.ok_or_else(|| PlayerError::Renderer("d3d11: CPU texture was null".to_string()))?;
+    let view = create_texture2d_srv(state, &texture, srv_format)?;
     Ok(D3d11OverlayTexture {
         _texture: texture,
         view,
@@ -3094,6 +5057,8 @@ fn source_color_for_frame(frame: &PlayerVideoFrame) -> SourceColorState {
     .range(frame.frame.color_range())
     .matrix(frame.frame.matrix_coefficients())
     .hdr_metadata(frame.frame.hdr_metadata())
+    .dovi(frame.frame.dovi_metadata())
+    .measured_scene_avg_nits(frame.scene_avg_nits)
 }
 
 fn constants_for_frame(
@@ -3217,13 +5182,19 @@ fn trace(message: &str) {
 }
 
 fn report_upscaler_failure(stage: &str, mode: LumaUpscalerMode, error: &PlayerError) {
-    eprintln!("Erika D3D11 ArtCNN disabled after {stage} failure: {error}");
+    crate::trace::diagnostic_at(
+        crate::trace::LogLevel::Warn,
+        format!(
+            "Erika D3D11 upscaler {} disabled after {stage} failure: {error}",
+            mode.label()
+        ),
+    );
     crate::trace::diagnostic(
         serde_json::json!({
             "event": "luma_upscaler",
             "stage": stage,
             "renderer": "d3d11",
-            "requestedMode": format!("{mode:?}"),
+            "requestedMode": mode.label(),
             "activeBackend": "inactive",
             "reason": error.to_string(),
             "fallback": "native_luma_sampling",
@@ -3257,9 +5228,243 @@ fn d3d_error(operation: &'static str, error: ::windows::core::Error) -> PlayerEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::danmaku::DanmakuGlyphInstance;
+
+    fn software_test_renderer() -> D3d11Renderer {
+        gpu_test_renderer(
+            ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP,
+            D3D_FEATURE_LEVEL_11_0,
+        )
+    }
+
+    pub(super) fn gpu_test_renderer(
+        driver: ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
+        feature_level: D3D_FEATURE_LEVEL,
+    ) -> D3d11Renderer {
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                driver,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[feature_level]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .expect("create GPU test device");
+        }
+        // These tests check rendered pixels and device recovery, not real-time
+        // latency. Software rendering on a busy CI runner can exceed the
+        // production 100 ms handoff budget, especially on the first frame.
+        let mut renderer = D3d11Renderer::with_config(MetalRendererConfig {
+            compositor_handoff_timeout: Duration::from_secs(10),
+            ..MetalRendererConfig::default()
+        })
+        .unwrap();
+        renderer
+            .set_device(device.unwrap(), context.unwrap())
+            .unwrap();
+        renderer
+    }
 
     #[test]
-    fn flutter_scene_ignores_clock_ticks_but_detects_output_changes() {
+    fn software_device_invalidation_rebuilds_flutter_targets_and_preserves_pixels() {
+        use crate::core::FlutterTextureHandle;
+        let mut renderer = software_test_renderer();
+        renderer
+            .attach_surface(PlatformSurface::FlutterTexture(FlutterTextureHandle::new(
+                FlutterTextureKind::WindowsTextureRegistrar,
+                1,
+                4,
+                4,
+                1.0,
+            )))
+            .unwrap();
+        let upload = |renderer: &mut D3d11Renderer| {
+            renderer
+                .upload_planar_frame(
+                    &PlanarFrame {
+                        format: PlanarPixelFormat::Nv12,
+                        width: 4,
+                        height: 4,
+                        luma: vec![235; 16],
+                        chroma: vec![128; 8],
+                    },
+                    SourceColorState::new(ColorPrimaries::Bt709, TransferFunction::Bt1886),
+                )
+                .unwrap();
+            assert!(
+                renderer
+                    .render_current_frame(RenderFrameContext::new(Duration::ZERO, 1))
+                    .unwrap()
+            );
+        };
+        upload(&mut renderer);
+        let old_device = renderer.state.as_ref().unwrap().device.clone();
+        let old_image = renderer
+            .surface
+            .as_ref()
+            .unwrap()
+            .published_texture
+            .as_ref()
+            .unwrap()
+            .clone();
+        let before = read_bgra_pixel(renderer.state.as_ref().unwrap(), &old_image);
+        assert_eq!(before, [255, 255, 255, 255]);
+
+        // Exercise the native teardown/rebuild that a removal HRESULT selects,
+        // without resetting the user's GPU or disrupting other applications.
+        renderer.invalidate_device();
+        upload(&mut renderer);
+        let state = renderer.state.as_ref().unwrap();
+        let image = renderer
+            .surface
+            .as_ref()
+            .unwrap()
+            .published_texture
+            .as_ref()
+            .unwrap();
+        assert_ne!(state.device.as_raw(), old_device.as_raw());
+        assert_ne!(image.as_raw(), old_image.as_raw());
+        assert_eq!(
+            unsafe { image.GetDevice() }.unwrap().as_raw(),
+            state.device.as_raw()
+        );
+        assert_eq!(read_bgra_pixel(state, image), before);
+    }
+
+    #[test]
+    fn software_p010_upload_preserves_odd_dimensions_and_sample_precision() {
+        use ::windows::Win32::Graphics::Direct3D11::{
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
+        };
+        let mut renderer = software_test_renderer();
+        let luma: Vec<u8> = [64u16, 128, 256, 512, 1000, 1023, 940, 128, 64]
+            .into_iter()
+            .flat_map(|value| (value << 6).to_le_bytes())
+            .collect();
+        let chroma: Vec<u8> = [64u16, 960, 128, 896, 512, 512, 960, 64]
+            .into_iter()
+            .flat_map(|value| (value << 6).to_le_bytes())
+            .collect();
+        renderer
+            .upload_planar_frame(
+                &PlanarFrame {
+                    format: PlanarPixelFormat::P010,
+                    width: 3,
+                    height: 3,
+                    luma: luma.clone(),
+                    chroma: chroma.clone(),
+                },
+                SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq),
+            )
+            .unwrap();
+        let video = renderer.current_video.as_ref().unwrap();
+        assert_eq!(video.constants.is_p010, 1);
+        assert_eq!(video.tex_rect, D3d11TexRect::FULL);
+        let state = renderer.state.as_ref().unwrap();
+        for (view, width, height, format, expected, pitch) in [
+            (&video.luma, 3, 3, DXGI_FORMAT_R16_UNORM, luma, 6usize),
+            (
+                &video.chroma,
+                2,
+                2,
+                DXGI_FORMAT_R16G16_UNORM,
+                chroma,
+                8usize,
+            ),
+        ] {
+            unsafe {
+                let texture: ID3D11Texture2D = view.GetResource().unwrap().cast().unwrap();
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                texture.GetDesc(&mut desc);
+                assert_eq!(
+                    (desc.Width, desc.Height, desc.Format),
+                    (width, height, format)
+                );
+                desc.Usage = D3D11_USAGE_STAGING;
+                desc.BindFlags = 0;
+                desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+                let mut staging = None;
+                state
+                    .device
+                    .CreateTexture2D(&desc, None, Some(&mut staging))
+                    .unwrap();
+                let staging = staging.unwrap();
+                state.context.CopyResource(&staging, &texture);
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                state
+                    .context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .unwrap();
+                let mut actual = Vec::new();
+                for row in 0..height as usize {
+                    actual.extend_from_slice(std::slice::from_raw_parts(
+                        mapped
+                            .pData
+                            .cast::<u8>()
+                            .add(row * mapped.RowPitch as usize),
+                        pitch,
+                    ));
+                }
+                state.context.Unmap(&staging, 0);
+                assert_eq!(actual, expected);
+            }
+        }
+        assert_eq!(renderer.runtime_stats().software_video_frames, 1);
+        assert_eq!(renderer.runtime_stats().hdr_source_frames, 1);
+    }
+
+    #[test]
+    fn software_wmv_uploads_to_native_d3d11() {
+        use crate::ffmpeg::{DecoderBackend, DecoderOutputFrame, Demuxer, StreamSelection};
+        use crate::renderer::VideoFramePayload;
+        let mut renderer = software_test_renderer();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/software/wmv2-wmav2.asf");
+        let mut demuxer = Demuxer::open_path(path).unwrap();
+        demuxer
+            .set_stream_selection(StreamSelection::only([0]))
+            .unwrap();
+        let mut decoder = demuxer.open_decoder(0).unwrap();
+        let mut uploads = 0;
+        while let Some(packet) = demuxer.read_packet().unwrap() {
+            decoder.send_packet(&packet).unwrap();
+            while let DecoderOutputFrame::Frame(frame) = decoder.receive_frame().unwrap() {
+                let player_frame = PlayerVideoFrame {
+                    frame: VideoFramePayload::from_decoded(frame).unwrap(),
+                    decode_backend: DecoderBackend::Software,
+                    pts: None,
+                    media_time: Duration::ZERO,
+                    late_by: None,
+                    generation: 0,
+                    scene_avg_nits: None,
+                };
+                renderer.upload_player_frame(&player_frame).unwrap();
+                let video = renderer.current_video.as_ref().unwrap();
+                assert_eq!((video.width, video.height), (160, 90));
+                assert_eq!(video.constants.is_p010, 0);
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { video._texture.GetDesc(&mut desc) };
+                assert_eq!(desc.Format, DXGI_FORMAT_R8_UNORM);
+                assert_eq!((desc.Width, desc.Height), (160, 90));
+                uploads += 1;
+            }
+        }
+        assert_eq!(uploads, 20);
+        assert_eq!(renderer.runtime_stats().software_video_frames, uploads);
+        assert_eq!(renderer.runtime_stats().hardware_video_frames, 0);
+        assert_eq!(renderer.runtime_stats().zero_copy_video_frames, 0);
+        renderer.clear_current_frame().unwrap();
+        assert!(renderer.current_video.is_none());
+    }
+
+    #[test]
+    fn presented_scene_ignores_clock_ticks_but_detects_output_changes() {
         use crate::overlay::OverlayViewport;
         use crate::subtitle::SubtitleBitmapPlane;
         let mut overlay = OverlayFrame {
@@ -3269,37 +5474,43 @@ mod tests {
             subtitle_alpha_planes: vec![],
             subtitle_changed: true,
         };
-        let scene = FlutterTextureScene::new(
+        let scene = PresentedScene::new(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay)),
+            None,
         );
         overlay.pts = Duration::from_secs(2);
         overlay.subtitle_changed = false;
         let context = RenderFrameContext::new(Duration::from_secs(2), 1).overlay(Some(&overlay));
-        assert!(scene.matches(7, LumaUpscalerMode::Off, context));
-        assert!(!scene.matches(8, LumaUpscalerMode::Off, context));
-        assert!(!scene.matches(7, LumaUpscalerMode::ArtCnnC4F16, context));
+        assert!(scene.matches(7, LumaUpscalerMode::Off, 0, context));
+        assert!(!scene.matches(8, LumaUpscalerMode::Off, 0, context));
+        assert!(!scene.matches(7, LumaUpscalerMode::Off, 1, context));
+        assert!(!scene.matches(7, LumaUpscalerMode::ArtCnnC4F16, 0, context));
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2).overlay(Some(&overlay))
         ));
         overlay.subtitle_planes[0].rgba[0] = 0; // Includes HUD pixel changes.
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).overlay(Some(&overlay))
         ));
         assert!(!scene.matches(
             7,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1)
         ));
     }
 
     #[test]
-    fn flutter_scene_reuses_unchanged_cpu_buffers_across_video_frames() {
+    fn presented_scene_reuses_unchanged_cpu_buffers_across_video_frames() {
         use crate::danmaku::DanmakuViewport;
         use crate::overlay::OverlayViewport;
         use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
@@ -3331,19 +5542,19 @@ mod tests {
             shadow_rgba: [0.0; 4],
             shadow_offset: [0.0; 2],
         });
-        let mut scene = FlutterTextureScene::new(
+        let mut scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan)),
+            None,
         );
         let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
             .rgba
             .as_ptr();
-        let alpha = scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
-            .alpha
-            .as_ptr();
+        let alpha = scene.overlay.as_ref().unwrap().alpha.alpha(0).as_ptr();
         let items = scene.danmaku.as_ref().unwrap().items.as_ptr();
         for token in 2..=121 {
             overlay.pts = Duration::from_millis(token * 10);
@@ -3352,9 +5563,9 @@ mod tests {
             let context = RenderFrameContext::new(overlay.pts, 1)
                 .overlay(Some(&overlay))
                 .danmaku(Some(&plan));
-            assert!(!scene.matches(token, LumaUpscalerMode::Off, context));
-            scene.update(token, LumaUpscalerMode::Off, context);
-            assert!(scene.matches(token, LumaUpscalerMode::Off, context));
+            assert!(!scene.matches(token, LumaUpscalerMode::Off, 0, context));
+            scene.update(token, LumaUpscalerMode::Off, 0, context, None);
+            assert!(scene.matches(token, LumaUpscalerMode::Off, 0, context));
             assert_eq!(
                 scene.overlay.as_ref().unwrap().subtitle_planes[0]
                     .rgba
@@ -3362,9 +5573,7 @@ mod tests {
                 rgba
             );
             assert_eq!(
-                scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0]
-                    .alpha
-                    .as_ptr(),
+                scene.overlay.as_ref().unwrap().alpha.alpha(0).as_ptr(),
                 alpha
             );
             assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
@@ -3377,17 +5586,14 @@ mod tests {
         let context = RenderFrameContext::new(overlay.pts, 1)
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
-        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context);
-        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, 0, context));
+        scene.update(121, LumaUpscalerMode::Off, 0, context, None);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, 0, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0].rgba[0],
             17
         );
-        assert_eq!(
-            scene.overlay.as_ref().unwrap().subtitle_alpha_planes[0].alpha[0],
-            23
-        );
+        assert_eq!(scene.overlay.as_ref().unwrap().alpha.alpha(0)[0], 23);
         assert_eq!(scene.danmaku.as_ref().unwrap().items.as_ptr(), items);
 
         let rgba = scene.overlay.as_ref().unwrap().subtitle_planes[0]
@@ -3397,9 +5603,9 @@ mod tests {
         let context = RenderFrameContext::new(overlay.pts, 1)
             .overlay(Some(&overlay))
             .danmaku(Some(&plan));
-        assert!(!scene.matches(121, LumaUpscalerMode::Off, context));
-        scene.update(121, LumaUpscalerMode::Off, context);
-        assert!(scene.matches(121, LumaUpscalerMode::Off, context));
+        assert!(!scene.matches(121, LumaUpscalerMode::Off, 0, context));
+        scene.update(121, LumaUpscalerMode::Off, 0, context, None);
+        assert!(scene.matches(121, LumaUpscalerMode::Off, 0, context));
         assert_eq!(
             scene.overlay.as_ref().unwrap().subtitle_planes[0]
                 .rgba
@@ -3411,12 +5617,15 @@ mod tests {
         scene.update(
             121,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2),
+            None,
         );
         assert!(scene.overlay.is_none() && scene.danmaku.is_none());
         assert!(scene.matches(
             121,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 2)
         ));
     }
@@ -3539,6 +5748,24 @@ mod tests {
     }
 
     fn read_bgra_pixel(state: &D3d11DeviceState, texture: &ID3D11Texture2D) -> [u8; 4] {
+        read_bgra_pixels(state, texture)[0]
+    }
+
+    pub(super) fn read_bgra_pixels(
+        state: &D3d11DeviceState,
+        texture: &ID3D11Texture2D,
+    ) -> Vec<[u8; 4]> {
+        read_texture_rows(state, texture, 4)
+            .chunks_exact(4)
+            .map(|pixel| pixel.try_into().unwrap())
+            .collect()
+    }
+
+    pub(super) fn read_texture_rows(
+        state: &D3d11DeviceState,
+        texture: &ID3D11Texture2D,
+        bytes_per_pixel: usize,
+    ) -> Vec<u8> {
         use ::windows::Win32::Graphics::Direct3D11::{
             D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
         };
@@ -3567,14 +5794,25 @@ mod tests {
                 .context
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .unwrap();
-            let bytes = *(mapped.pData as *const [u8; 4]);
+            let row_bytes = desc.Width as usize * bytes_per_pixel;
+            let mut pixels = Vec::with_capacity(row_bytes * desc.Height as usize);
+            for row in 0..desc.Height as usize {
+                let bytes = std::slice::from_raw_parts(
+                    mapped
+                        .pData
+                        .cast::<u8>()
+                        .add(row * mapped.RowPitch as usize),
+                    row_bytes,
+                );
+                pixels.extend_from_slice(bytes);
+            }
             state.context.Unmap(&staging, 0);
-            bytes
+            pixels
         }
     }
 
     #[test]
-    fn flutter_scene_detects_danmaku_motion_and_visibility_changes() {
+    fn presented_scene_detects_danmaku_motion_and_visibility_changes() {
         use crate::danmaku::DanmakuViewport;
         let mut plan = DanmakuRenderPlan::empty(Duration::ZERO, 1, DanmakuViewport::new(8, 8));
         plan.items.push(DanmakuGlyphInstance {
@@ -3586,27 +5824,32 @@ mod tests {
             shadow_rgba: [0.0; 4],
             shadow_offset: [0.0; 2],
         });
-        let scene = FlutterTextureScene::new(
+        let scene = PresentedScene::new(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan)),
+            None,
         );
         plan.media_time = Duration::from_secs(1);
         assert!(scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
         plan.items[0].rect[0] = 2.0;
         assert!(!scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
         plan.items.clear();
         assert!(!scene.matches(
             1,
             LumaUpscalerMode::Off,
+            0,
             RenderFrameContext::new(Duration::ZERO, 1).danmaku(Some(&plan))
         ));
     }
@@ -3659,6 +5902,7 @@ mod tests {
             output_mode: crate::renderer::metal::MetalOutputMode::Sdr,
             luma_upscaler: LumaUpscalerMode::ArtCnnC4F16,
             video_alpha_mode: VideoAlphaMode::Opaque,
+            ..MetalRendererConfig::default()
         })
         .unwrap();
 
@@ -3730,6 +5974,48 @@ mod tests {
 
         assert_eq!(hdr10.scene_linear, 1);
         assert_eq!(sdr.scene_linear, 0);
+    }
+
+    #[test]
+    fn hlsl_evaluates_reinhard_and_mobius_in_linear_nits() {
+        // libplacebo runs these two curves in the linear PL_HDR_NORM domain
+        // and only the PQ-domain operators work on encoded values; evaluating
+        // them on PQ codes moved the Mobius knee far below its intended
+        // position. The HLSL is compiled by the D3D11 runtime, not by the Rust
+        // build, so this pins the source shape rather than executing it.
+        let source = std::str::from_utf8(SHADER_SOURCE).unwrap();
+        for branch in ["if (tone_map == 1u)", "if (tone_map == 2u)"] {
+            let start = source.find(branch).expect("branch");
+            let rest = &source[start..];
+            let end = rest.find("\n    }").expect("branch end");
+            let body = &rest[..end];
+            assert!(
+                body.contains("float out_range_nits = max(dst_peak - dst_black, 0.000001);"),
+                "{branch} must scale in linear nits"
+            );
+            assert!(
+                body.contains("nits_from_pq(x)"),
+                "{branch} must decode the PQ code before the curve"
+            );
+            assert!(
+                body.contains("return pq_code("),
+                "{branch} must re-encode the result"
+            );
+        }
+    }
+
+    #[test]
+    fn hlsl_gamut_lut_samples_the_target_black_to_peak_axis() {
+        // libplacebo's LUT I axis is [target black, target peak]; a backend
+        // that samples `ipt.x / peak` again would diverge from the generated
+        // LUT. The lattice position must also be remapped to the texel-center
+        // coordinate (libplacebo's `texel_scale`), or the zero-chroma texel at
+        // the low end of the C axis crushes saturation.
+        let source = std::str::from_utf8(SHADER_SOURCE).unwrap();
+        assert!(source.contains("float lut_min = pq_code(tone_map_extra.z);"));
+        assert!(source.contains("clamp((ipt.x - lut_min) / lut_range, 0.0, 1.0)"));
+        assert!(source.contains("pos.y * (31.0 / 32.0) + 0.5 / 32.0"));
+        assert!(source.contains("pos.x * (47.0 / 48.0) + 0.5 / 48.0"));
     }
 
     #[test]

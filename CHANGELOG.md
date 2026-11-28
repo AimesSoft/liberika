@@ -1,6 +1,560 @@
 # Changelog
 
+[中文](CHANGELOG.zh.md) · [日本語](CHANGELOG.ja.md)
+
 ## Unreleased
+
+### Browser
+
+- The Web runtime is published to npm as `@aimessoft/liberika-web`, and as `@aimessoft/liberika-web-nofont` without the fallback font; Vite bundles it without configuration.
+- A page can load the runtime from another origin, such as an npm CDN; `Player.create` takes `workerURL` for hosts that serve `worker.js` themselves.
+- `package.json` in the build output carries the Cargo workspace version (it had stayed at 0.1.8).
+
+## 0.3.8 - 2026-11-20
+
+### Windows
+
+- D3D11 screenshots: SDR readback of the current frame with subtitles and
+  optional danmaku, HDR tone mapped, straight-alpha RGBA. Capture leaves live
+  output settings intact, bounds its GPU readback and does not apply
+  super-resolution (#215).
+- Flutter cancels superseded HTTP opens on Windows and macOS (#259).
+- Reading stats or calling an unsupported method no longer triggers a redraw (#265).
+- libass uses its SSE2 and SSSE3 code paths (#237).
+- Backport the dav1d MSVC header feature-probe fix (#263).
+
+### macOS and iOS
+
+- Ordinary SDR video on macOS uses a Metal path specialized for content without
+  Dolby Vision (#268).
+- Metal performs fewer subtitle atlas comparisons and encoder bindings (#228).
+- Video is opaque when Flutter omits `alphaVideo` on macOS (#242).
+- Flutter reports native playback and open errors on Apple platforms (#239).
+
+### HTTP sources
+
+- Verify response identity and read sidecar files across short responses (#246).
+- Resume stalled reads and deliver verified buffered data (#253).
+- Honour a bounded `Retry-After` when resuming playback (#257).
+
+### Subtitles and danmaku
+
+- Skip unused playback subtitle rasterization for hosts that only export frames;
+  attaching a surface restores the current subtitle overlay, including while paused (#197).
+- libass bitmap import never reads row padding (#223, #270).
+- ASS events replay from a single transferred log (#226).
+- The first danmaku layout appears without redundant Presents or flicker, and a
+  frame upload keeps the generation a danmaku edit advanced (#266, #269).
+- Danmaku timing no longer jitters with pump latency (#217).
+- Danmaku atlas planes are initialized independently (#218).
+
+### Playback and rendering
+
+- Keep seek-cancelled source reads distinct from I/O failures, wait for the next
+  demux command, and clear stale AVIO errors before seeking (#205).
+- A full demux queue wakes on packet or control events (#241).
+- Software video planes upload directly on Metal and D3D11 (#230); software
+  conversion buffers are reused and P010 packing is faster (#222); D3D11 software
+  P010 upload uses less CPU (#267).
+- D3D11 reuses subtitle atlases and their upload storage, and skips presenting
+  unchanged scenes (#236, #264).
+
+### Integration
+
+- Document the explicit `wgpu-hal` patch required by external Rust workspaces and
+  compile a separate consumer in Linux CI. Windows dependency builds now resolve
+  `host` to the MSVC target directory expected by Cargo (#213).
+
+## 0.3.7 - 2026-11-13
+
+### Linux release packages
+
+- Add x86_64 and ARM64 archives in both `bundled` and `system` variants,
+  all built on Ubuntu 22.04 / glibc 2.35. Each includes shared/static C ABI
+  libraries, headers, licenses and a dependency report.
+- `bundled` embeds FFmpeg and the subtitle stack; `system` uses ABI-compatible
+  FFmpeg 8 shared libraries, including user-installed builds. Neither is fully
+  static: desktop audio, Fontconfig and GPU driver interfaces remain external.
+- Gate publishing on native builds for all four combinations, ELF/ABI checks
+  and C ABI playback tests in clean Ubuntu 22.04 environments. Flutter Linux
+  consumes an extracted library through `ERIKA_LIBRARY_DIR`, not automatic downloads.
+
+### Danmaku
+
+- Support Bilibili mode 7 advanced comments.
+- Fix whole-comment opacity in D3D11 and wgpu by applying opacity after
+  composing each comment's text, outline and shadow.
+
+### Native texture output
+
+- `PresenterRuntime::export_frame_dmabuf(w, h, scale)` delivers the same
+  composite as `export_frame_texture` as one linear RGBA8 dma-buf (fourcc
+  `ABGR8888`, modifier 0, with the row pitch and offset the driver reports), so
+  a host that imports a dma-buf — GTK's `GdkDmabufTexture`, EGL, a Wayland
+  compositor — needs no Vulkan device of its own. `ExternalTextureInfo`,
+  `ExternalTextureKind` and the C API are unchanged.
+
+## 0.3.6 - 2026-11-07
+
+### Release packages
+
+- Static libraries no longer carry debug info, which makes release packages much
+  smaller: macOS arm64 goes from about 122 MB to about 47 MB. Crashes still show
+  function names, but not files and lines.
+
+### Colour emoji
+
+- Danmaku draw emoji in their own colours, not as boxes and not tinted with the
+  comment's colour. `sbix` and `CBDT` bitmaps and `COLR` vectors are all read.
+- Flags, skin tones, families and keycaps are composed into one glyph by
+  HarfBuzz, and drawn one by one when the font has no composed glyph. A build
+  without `libass` has no HarfBuzz, so it draws them one by one too.
+- Emoji sit centred on the line, with the same outline and shadow as the text.
+- Emoji in subtitles stay monochrome: libass only produces alpha bitmaps.
+- `DanmakuRenderPlan` gains `color_atlas` and `color_glyphs`. Embedders drawing
+  danmaku themselves must draw this layer too, or emoji stay invisible. Web:
+  the browser's fonts draw them, and `Player` needs no change.
+
+### Fallback font
+
+- Subtitles and danmaku try the system's fonts for missing text, and use the embedded
+  Droid Sans Fallback when those cannot be read. Android reads the face for each
+  language from `fonts.xml`, and fonts stay memory-mapped. From iOS 18 on, and on tvOS,
+  Chinese still relies on the embedded font: PingFang keeps its outlines in Apple's
+  `hvgl` table, which FreeType cannot read.
+- `system_font::fallback()` names the face a device offers. Nothing is copied: only
+  the face in use is mapped.
+- `font::embedded_fallback_font()` and `erika_embedded_fallback_font()` give the
+  embedded font, so a host can pass it to its own page and carry one copy.
+- Web: the new `liberika-web-nofont` package has no font and takes one through
+  `Player.create({ fallbackFont })`.
+
+### Build what you need
+
+- Release packages stay as they are. The switches below make a smaller build from
+  source; with all of them off it is the smallest (see
+  [Building](docs/building.md#build-what-you-need)).
+- `embedded-fallback-font`, on by default, is about 6 MB. Without it nothing is left
+  when the system's fonts cannot be read.
+- `artcnn-r8f64`, on by default, carries R8F64, the largest super resolution
+  network, about 1.8 MB.
+- `xtask deps build --ffmpeg` picks what of FFmpeg a build carries: `full` by
+  default, `slim` for the smallest, `common` or `slim` with groups in between.
+  `ERIKA_FFMPEG_SET` makes Cargo link that build.
+
+## 0.3.5 - 2026-11-07
+
+- Fix the Windows native video window covering Flutter playback controls in 0.3.4. Restore video below the transparent Flutter host while preserving native HDR output. Flutter applications must update the plugin and rebuild; replacing only the native DLL does not apply this fix.
+- Load the system Vulkan runtime on Windows for cooperative-matrix super resolution, avoiding incompatible app-local Vulkan loaders. Add loader and adapter diagnostics; unavailable acceleration keeps the existing scalar fallback.
+- Normalize repeated leading UTF-8 BOMs in external subtitles so ASS and other text formats can be probed correctly. Subtitle-add failures return to the caller without emitting a global playback error; the open video remains usable.
+
+## 0.3.4 - 2026-11-06
+
+### Super resolution (#193, #194)
+
+- Super resolution is rebuilt around one backend-neutral network description
+  (`renderer/sr/`): ArtCNN, Anime4K and runtime-loaded networks are lowered to
+  it, linear layers are folded exactly into their neighbours (ArtCNN needs
+  26-33% fewer multiply-adds; dedicated weights for the one-pixel image border
+  keep the output identical), and every GPU backend is checked against its CPU
+  reference.
+- New modes: ArtCNN C4F16 DN, C4F32 DS/DN and R8F64 (desktop only);
+  Anime4K v3.2 Upscale CNN x2 S/M/L/VL/UL and Upscale+Denoise S/M/L/VL/UL;
+  AMD FSR 1.0 (EASU + RCAS, fused); `PlatformVideo` (NVIDIA RTX Video Super
+  Resolution / Intel VSR through the D3D11 video processor on Windows,
+  VideoToolbox low-latency super resolution on Apple); `MetalFxSpatial`; and
+  `Custom`, a network loaded at runtime from an Erika `.esr` file or an mpv
+  FSRCNNX/Anime4K shader with `erika_presenter_load_upscaler_model` (FSRCNNX
+  weights are LGPL and are not bundled).
+- Windows (D3D11): kernels are generated per layer with constant-buffer
+  weights, `groupshared` input staging, fused epilogues and a fused
+  depth-to-space head; Anime4K's final layer is accumulated while the earlier
+  layers run, and FSR1 fetches with `GatherRed`. Shaders compile on a
+  background thread and are cached on disk, so switching modes no longer
+  stalls rendering. On an RTX 5060 Ti, 1080p input: ArtCNN C4F16 2.44 ms (was
+  12.4 ms), C4F32 7.3 ms (was 39.4 ms), Anime4K S/M/L/VL/UL
+  0.35/0.78/0.83/2.07/4.11 ms, FSR1 to 4K 0.31 ms.
+- Windows Tensor Core backends: a Vulkan `VK_KHR_cooperative_matrix` executor
+  and an opt-in D3D12 SM 6.10 linalg preview share textures and fences with
+  D3D11. The fastest of scalar, cooperative matrix and linalg is measured on
+  real frames per network and frame size; the matrix backends win for the
+  wide models (C4F32, R8F64).
+- Apple (Metal): Metal 4 tensor ops on M5/A19, `simdgroup_matrix` on
+  M1-M4/A14+, fp16 accumulators where the reference still matches, and
+  Anime4K's final layer computed as per-layer partials. On an M5 Pro, 1080p
+  input: C4F16 2.65 ms, C4F32 6.35 ms, Anime4K UL 7.3 ms, FSR1 to 4K 0.77 ms.
+- wgpu (Linux, Android, OpenHarmony, Windows wgpu fallback): every network
+  mode and `Fsr1` now run (previously legacy ArtCNN only), with generated
+  WGSL kernels, fp16 where the adapter supports it, 16x16 cooperative
+  matrices on Vulkan adapters that expose them, and per-adapter kernel choices
+  refined by timing a few variants on the first frames. On an RTX 5060 Ti
+  through Vulkan, C4F16 takes 2.77 ms for 1080p input (was 12.6 ms) and
+  C4F32 11.4 ms (was 73 ms). Android and OpenHarmony hardware has not been
+  benchmarked yet.
+- The upscaled luma is a plain 2x `R16_FLOAT` texture on D3D11 and Metal;
+  GPU time is reported in `lastGpuMicros`, and the diagnostics `upscaler`
+  object adds `engine`, `reason` and `lastGpuMs`.
+- New backend states report how a mode runs: `CooperativeMatrix`,
+  `LinalgMatrix`, `VideoProcessor`, `VideoToolbox`, `MetalFx` and
+  `TensorOps`. Backends that cannot run a mode keep native sampling and report
+  `Inactive`.
+
+### Flutter plugins: one owner thread per presenter (#93)
+
+- Windows: each presenter now owns a native worker thread for creation,
+  commands, surface changes, rendering, capture and destruction. Frame
+  requests are coalesced, and the platform thread only delivers method
+  results, events, SMTC updates and window/composition operations.
+- Linux and OpenHarmony use the same owner, so rendering and native commands
+  no longer run on the platform thread. OpenHarmony's N-API functions gain
+  `...Async` variants; the legacy `ErikaOhosPlayerFromId` C helper now
+  returns null.
+- macOS, iOS and tvOS: create, every native command, rendering, polling,
+  capture and destroy run on the presenter's own thread; the display link
+  only wakes it. A slow `open`, `seek` or `dispose` no longer blocks the UI
+  thread or delays frames.
+- `ERIKA_FLUTTER_FRAME_TRACE=1` logs which thread ran each tick and command.
+
+### Fixes
+
+- Windows Flutter plugin: the window overlay is placed above the host window
+  again, so video is no longer hidden behind it, and closing the app no
+  longer crashes when an event channel is torn down after its messenger.
+
+## 0.3.3 - 2026-11-01
+
+- Added mute that keeps the volume: `PresenterRuntime::set_muted`, C
+  `erika_presenter_set_muted`, JSON `setMuted` and `volume`
+  (`{volume, muted}`), Flutter `ErikaPlayer.setMuted` and `getVolume`. A
+  volume set while muted applies on unmute; `volume()` reports the chosen
+  volume either way.
+- Diagnostics name the container: `media.container` carries `format`, the
+  demuxer's short name (`matroska,webm`, `mov,mp4,m4a,3gp,3g2,mj2`), and
+  `bitRate`, the overall bit rate the container states or FFmpeg estimates.
+  The JSON method `container` (`{format, bitRate, mediaOpen}`) reads them
+  without a whole snapshot; Rust has `Player::container()` (`ContainerInfo`).
+- A video track names the Dolby Vision profile its container signals
+  (`dvcC`/`dvvC`): `TrackInfo::dolby_vision_profile`, and
+  `dolbyVisionProfile` in the JSON `tracks` method and in the diagnostics
+  `media.video`.
+- A video track whose own bit rate is not stated is inferred from the overall
+  bit rate again when the file carries subtitle tracks: subtitles that state
+  no bit rate no longer count as unknown streams.
+- Fixed macOS keeping the first screen's EDR headroom under the fallback
+  timer (`ERIKA_FLUTTER_TARGET_FPS`, or a CVDisplayLink that would not
+  start): screen changes are observed while a surface is attached, whichever
+  driver ticks it (#140).
+- The browser build uses wasm-bindgen 0.2.130 and js-sys 0.3.107, so an app
+  that also depends on wgpu 30 resolves on Linux; building the Web package
+  needs `wasm-bindgen-cli` 0.2.130 (#188).
+
+## 0.3.2 - 2026-10-31
+
+- Fixed the Flutter Windows plugin writing past `ErikaOpenOptions` when it
+  opens media: it still cleared the second reserved slot that 0.3.1 gave to
+  `start_position_micros`. MSVC stops the build on it (C4789 as an error),
+  and without that check it overwrote the stack. The Swift mirrors of the
+  struct on iOS, tvOS and macOS now name `startPositionMicros`; their layout
+  was already the header's. A packaging test checks every mirror's size and
+  every reserved slot written against the header.
+
+## 0.3.1 - 2026-10-31
+
+- Added opening at a position: `MediaRequest::with_start_position`, C
+  `ErikaOpenOptions.start_position_micros` (the first reserved slot, so zeroed
+  structs keep opening at the start), `erika_presenter_set_open_start_position`
+  for hosts whose open path cannot carry it, the JSON `open` argument
+  `startPositionMicros` and method `setOpenStartPosition`, and Flutter
+  `ErikaPlayer.open(startPosition:)`. The engine seeks before its worker
+  starts, so the first frame presented is the one at that position.
+- Added an explicit end of media: `PlayerEvent::Ended` and C
+  `ErikaEventKind_Ended` (14) follow the `Stopped` state a natural end brings;
+  a stop asked for sends none. Flutter `ErikaEventKind.ended`.
+- Added a subtitle delay for embedded and external tracks alike:
+  `PresenterRuntime::set_subtitle_delay`, C
+  `erika_presenter_set_subtitle_delay`, JSON `setSubtitleDelay` /
+  `subtitleDelay`, Flutter `ErikaPlayer.setSubtitleDelay`. Cues stay kept that
+  long past their end so a delayed cue still shows.
+- Added what the subtitles say now: JSON `subtitleText` (text cues showing,
+  the delay applied; ASS dialogue without its override tags) and Flutter
+  `ErikaPlayer.subtitleText`.
+- Fixed OpenHarmony text subtitles rendering as solid rectangles by enabling
+  libass and building its text dependencies in native builds (#180).
+- Added Rust `PresenterRuntime::capture_frame_rgba_with_danmaku` and C
+  `erika_presenter_capture_frame_rgba_with_danmaku` for off-screen host
+  composition, including enabled danmaku at the requested capture size.
+  The existing screenshot API continues to exclude danmaku (#175).
+- Added `export_frame_texture` with immutable, owned native frame handles for
+  host composition without a window, Flutter, CPU pixel readback or an output
+  texture copy. The wgpu renderer exports Linux Vulkan OPAQUE_FD allocations and
+  Apple Metal textures, including subtitles and enabled danmaku. Added C
+  creation/export/info/release entry points, a Vulkan C importer and a standalone
+  cross-version wgpu host example without a UI framework dependency. The
+  export loop also drives audio, lays out danmaku with the on-screen background
+  planner at the host's content scale, and rejects unsupported sizes before any
+  playback work (#175).
+
+## 0.3.0 - 2026-10-25
+
+### Default behavior changes
+
+- Enabled native subtitle supersampling by default. Subtitle and danmaku
+  supersampling now default to on in both native and Web backends, with the
+  existing size limits, native subtitle CPU fallback and explicit opt-out
+  controls preserved.
+- Software video decoders now use frame and slice threading (FFmpeg picks the
+  count) for playback as well as exports; `ERIKA_VIDEO_DECODE_THREADS=1`
+  restores single-threaded decoding. Forced to software, 4K H.264 at 3x
+  presented 72 fps with no late drops where one thread presented 7 fps and
+  dropped 481 frames in 15 s, and the time from a seek to the first picture
+  fell from 2.8 s to 0.43 s (median). `ERIKA_HWDEC=software` makes software
+  decoding the default on every platform, for measuring it.
+
+### Features and fixes
+
+- Renamed the project and repositories to liberika and liberika-swift. The
+  `erika` Rust crate, `erika_*` C ABI and existing SDK package names remain
+  compatible.
+- Added `liberika-web-0.3.0.zip` to the Release, containing the complete Web
+  runtime, demo page and licenses, with its digest in `SHA256SUMS`.
+- Added container chapters to presenter JSON (`chapters`), available to
+  hosts without changing the existing C structs (#172).
+- Fixed embedded subtitle delivery while paused, long cues spanning a seek,
+  and the active cue after switching subtitle tracks during paused playback
+  (#171).
+- Fixed iOS/tvOS static linking of optional export and diagnostics symbols:
+  only symbols present in the selected native archive are force-linked, while
+  older pinned runtimes remain linkable (#170).
+- Added the failure reason to the `erika_play` trace so failed playback starts
+  can be diagnosed from logs.
+- Treat ordinary undelivered HTTP tail ranges within the final 4 MiB as EOF;
+  range verification and changed-entity errors remain errors (#169).
+- Fixed a danmaku memory spike when comments contain characters the embedded
+  fallback font does not cover, such as emoji. The danmaku system font
+  fallback now checks character coverage with zero-copy lookups before
+  loading a face and keeps a bounded set of fallback faces resident with LRU
+  eviction while preserving the existing font fallback order, so a single
+  uncovered character no longer copies every system font (about 1.65 GB in
+  the reported macOS case) into memory.
+- Removed the duplicate Web fallback-font asset. libass now uses the complete
+  font already embedded in the Rust WASM, eliminating a separate font request
+  and about 6.07 MiB of package data (2.74 MiB with gzip). Incremental Web builds
+  also remove the old standalone font file.
+- Added a browser backend and `cargo run -p xtask -- web build` to bundle the
+  native Rust danmaku engine, patched libass/text libraries and an FFmpeg
+  demuxer as WASM. WebCodecs decodes audio/video, Web Audio drives the clock,
+  and WebGL2 composites video, subtitles and danmaku.
+- Added browser MKV playback with embedded ASS/SSA and font attachments,
+  external ASS/SSA/SRT/WebVTT, independent subtitle/danmaku supersampling,
+  live style updates, appended danmaku files, local comments, track selection,
+  chapters and PNG capture. Local files use chunked reads; remote sources use
+  a bounded HTTP Range cache.
+- Integrated the Web backend into Erika's browser application and verified it
+  in Chrome with H.264/AAC/ASS MKV, VP9/Opus WebM, 2,000 comments, playback
+  controls, screenshots, UI transitions and player cleanup. Web distribution
+  is available as a Release archive and from source; see the
+  [browser guide](docs/web.md).
+- Fixed HTTP(S) reads and persistent prefetch for origins that ignore Range
+  and return `200` with the whole file, including HLS playlists and segments
+  without Content-Length. Replayed prefixes are discarded before caching,
+  bounded reads stop at the requested length, and EOF can supply the total size.
+  Retries reject changed entity validators instead of mixing file versions.
+  Entity validation failures also block synchronous fallback and later reads;
+  weak ETags cannot authorize resuming a partial response.
+- Added a process-wide diagnostics log ring, read with the new
+  `erika_log_read_json`. It keeps operational diagnostics (with a level and
+  timestamp), operational failures that previously went to bare stderr, and
+  FFmpeg warnings and errors through an `av_log` bridge that never blocks,
+  folds repeats and rate-limits floods. Exports are redacted (URL query strings
+  and user info, credentials, home directories). Existing stderr, logcat and
+  hilog output is unchanged; `ERIKA_FFMPEG_LOG_CAPTURE=0` turns FFmpeg capture
+  off, and Linux builds against a shared system FFmpeg capture only with
+  `ERIKA_FFMPEG_LOG_CAPTURE=1`.
+- Added `erika_presenter_get_diagnostics_json`, a one-call JSON snapshot of the
+  decoder and hardware path, presenter counters, output/HDR, resources,
+  upscaler, audio, buffer depths and timing. Timing adds counters that did not
+  exist before: frames the scheduler dropped for being late, late frames shown
+  after the drop budget ran out, presentation cadence and jitter, and audio
+  clock drift, corrections and snaps. Existing structs are unchanged.
+- `erika_presenter_invoke_json` is now a discoverable pass-through: one
+  dispatch table backs it, `listMethods` returns that table with arguments and
+  results, `invokeJson` nests a call, `listMethods`/`getLogs` accept a NULL
+  handle, and unknown methods return `"code": "unknown_method"`. The table adds
+  `getDiagnosticsSnapshot`, `getLogs`, `setDebugHudEnabled`,
+  `setOutputHeadroom`, `trackSelection`, `getDanmakuConfig`,
+  `setSubtitleFont` and `setSubtitleStyle`; Android's JSON bridge falls back to
+  it for methods it does not implement itself.
+- Fixed decoder reporting when FFmpeg drops VideoToolbox or D3D11VA after the
+  decoder opened: when the hwaccel fails to initialise (or is not offered for
+  the stream), FFmpeg renegotiates and decodes in software, while liberika kept
+  reporting the hardware backend with no fallback. The format negotiation is
+  now recorded; the playback session emits a decoder change
+  (`hwaccel_<backend>_to_software`, or `…_restored` when the hardware returns)
+  with the software pixel format and the reason, counts the fallback, and tags
+  frames with the backend that actually decoded them.
+- Added `erika_export_frame` and `erika_frame_export_result_free`: a headless
+  single-frame export that returns the picture shown at a media time as RGBA or
+  PNG, scaled within optional bounds, from its own demuxer and multi-threaded
+  software decoder.
+- Added frame export sessions: `erika_frame_export_session_open`,
+  `erika_frame_export_session_frame` and `erika_frame_export_session_close`
+  open a media once and take pictures from it one after another. A request
+  after the previous one continues decoding from where the decoder stopped
+  when no keyframe lies between (the demuxer's seek index tells), and seeks
+  otherwise. 60 pictures 100 ms apart from a 4096x1744 H.264 file took 23.9 s
+  through one `erika_export_frame` call each (60 opens and seeks) and 1.0 s
+  through a session (one seek, 335 frames decoded). The JSON
+  method table gains `exportFrame` and `exportFrames` (scope `global`); each
+  table entry now says whether it is `blocking` and whether it `writesFiles`.
+- Frame exports tone map HDR sources (PQ, HLG, Dolby Vision) to SDR with the
+  arithmetic the video renderer applies for an SDR display (ITU-R BT.2390 EETF
+  against a 203-nit target, BT.2020 to BT.709 gamut mapping, gamma 2.2) instead
+  of FFmpeg's plain conversion, and set `ERIKA_FRAME_EXPORT_TONE_MAPPED` in
+  `reserved_flags` of the result. Against a screenshot of the player on an SDR
+  display, a 4K HDR10 frame differs by 0.1 to 0.3 of 255 on average (7 to 9
+  before).
+
+- Fixed `erika_presenter_select_subtitle_track` (and `Player::select_subtitle_track`)
+  failing with `ErikaStatus 3` when asked for no subtitle while no media was
+  open, which is how a host clears the subtitle before opening: it now succeeds
+  and changes nothing.
+
+## 0.2.1 - 2026-10-02
+
+### Playback and HTTP(S)
+
+- Restored software decoding fallback when a native hardware decoder cannot
+  handle the source, including WMV/WMA and 8/10-bit AV1 through bundled dav1d.
+  Windows D3D11 now handles software-decoded frame uploads consistently.
+- HTTP I/O is cancellable during connection, TLS, response headers, and body
+  reads. Source and demux teardown cancel I/O and join owned workers; stop
+  releases HTTP buffers while preserving replay, and close destroys the session.
+- Enforced the read-ahead window at every persistent-stream stripe boundary.
+
+### Flutter and OpenHarmony
+
+- Added `httpBackBufferBytes` to Flutter and standalone OpenHarmony open
+  options. All existing SDK bridges forward the rewind budget to the native
+  engine; zero or omission keeps the 16 MiB default.
+- iOS samples danmaku and subtitles at the display presentation target, using
+  a coalescing timestamp mailbox and optional `erika_presenter_render_tick_with_timing`.
+  Older libraries retain the legacy render-tick behavior.
+
+### Experimental Linux support
+
+- Added native and Flutter Linux playback on X11/Wayland, PulseAudio output,
+  NVDEC/VA-API hardware decoding, and software fallback.
+- Added native Wayland video subsurfaces, experimental direct VA-API Vulkan
+  frame import, and opt-in WSL D3D12 GPU plane copies. Physical Linux HDR and
+  Intel/AMD direct frame import remain unverified; Linux requires a source
+  build and is not included in the prebuilt release archives.
+- Fixed P010 interpolation to retain full signal precision.
+
+## 0.2.0 - 2026-09-23
+
+### Playback
+
+- HTTP(S) prefetch now uses one persistent stream with an open-ended GET
+  (`bytes=anchor-`), avoiding a request and server seek on every 4 MiB piece
+  without downloading overlapping tails. The worker stops reading its socket
+  when the read-ahead window fills; seeks retire the old stream through an
+  epoch counter. Short responses and body errors resume at the reached offset
+  with the entity validator replayed; repeated failures fall back to bounded
+  synchronous requests. Cache appends preserve byte continuity, and final
+  partial reads return at the known EOF without waiting for a full buffer.
+- The rewind budget is host-tunable via `http_back_buffer_bytes` on the open
+  options (the first reserved slot — ABI and layout unchanged; zero keeps the
+  16 MiB default). Hosts playing high-bitrate media should size it from the
+  bitrate: a -10 s skip at 71 Mbps covers ~89 MB, which the fixed default
+  could not hold.
+- Capped synchronous HTTP(S) range requests at 4 MiB so a large window no longer demands
+  unrealistic sustained bandwidth (a single 32 MiB request needed ~18 Mbps to
+  survive ureq's 15 s body deadline); failed background work degrades to
+  synchronous fetches instead of killing the read, and an origin that keeps
+  delivering bytes licenses more resume attempts than the flat three-attempt
+  rule.
+- Surface the media source's own error (HTTP status, timeout) in demux errors
+  rather than a bare `Input/output error (-5)`.
+
+### Renderer
+
+#### Dolby Vision and HDR tone mapping
+
+- Dolby Vision RPU mapping via libplacebo-style piecewise polynomial/MMR
+  reshaping, followed by the RPU nonlinear matrix, PQ linearization, and
+  LMS→RGB composite. Profile 5/8 VUI tags are forced to BT.2020/PQ.
+- Profile 5 falls back to software decode on mobile backends (MediaCodec /
+  generic AvCodec) that cannot attach RPU side data to hardware frames;
+  VideoToolbox and D3D11VA keep hardware decode.
+- Profile 7 FEL/MEL RPUs are no longer rejected outright. An RPU whose
+  `disable_residual_flag` asks for an enhancement layer still applies its
+  base-layer reshaping curves, color matrices, and L1 trims — dropping the
+  whole RPU threw those away and left the frame as plain HDR10. The
+  un-composable residual is reported through the new `Frame::dovi_el_status()`
+  and one throttled `dovi_el_not_composed` diagnostic per stream, matching
+  libplacebo's split between `nlq_active` and "consumers that have not bound an
+  enhancement layer must not look at these fields".
+- Per-frame Dolby Vision L1 brightness (`min_pq`/`max_pq`/`avg_pq`) drives the
+  tone-map source peak and scene-average pivot; the static mastering-display
+  (L0) peak still decides output-mode negotiation and whether tone mapping /
+  the perceptual gamut LUT are enabled.
+- Tone mapping switched to a libplacebo-style IPT-domain color map with
+  **BT.2390 EETF as the default** operator, plus spline, BT.2446 method A,
+  SMPTE ST 2094-10, Mobius, Reinhard, and clip. Black-point compensation uses
+  `target black = target peak / contrast_ratio` (auto 1000:1 for SDR).
+- Perceptual gamut mapping via a CPU-generated 48×32×256 IPT 3D LUT
+  (following libplacebo's lattice and index mapping) when a tone-mapped HDR
+  source is compressed into a smaller gamut; generated on a background thread
+  so the first wide-gamut frame does not stall the render thread. Chroma
+  rolloff is currently a simplified dead-zone blend rather than libplacebo's
+  full per-hue boundary search.
+- Scene-adaptive HDR10: software-decoded PQ frames without DoVi L1 get a
+  CPU-measured scene-average luminance (`luma_stats`) that drives the
+  tone-map pivot, mirroring mpv's `--hdr-compute-peak`.
+- Metal EDR negotiation reads the presenting screen rather than
+  `NSScreen.mainScreen`, and Auto HDR is decided from that display's
+  capability. Callers must set `CAMetalLayer.delegate` (examples updated).
+- Metal: the perceptual gamut LUT is only marked active when the texture
+  resolved for the frame actually matches its (source, target, target-peak)
+  key. A headroom or primaries change while a new LUT generates used to bind
+  the 1x1x1 placeholder with `gamut_lut_enabled` still set, rendering black
+  frames until generation finished. D3D11 now masks the uniform the same way
+  while its LUT is still generating.
+- ST 2094-10 tone mapping picks its knee in the PQ domain, matching
+  libplacebo's internal rescale, and `ToneMapConfig::curve_param` now tunes
+  its knee adaptation (default 0.70, libplacebo's `param_def`). Previously the
+  parameter had no effect and the knee was selected in linear nits.
+- The tone map, its black-point compensation, and the perceptual gamut LUT are
+  enabled from the static mastering-display (L0) peak rather than the
+  per-frame Dolby Vision L1 peak, so dark scenes no longer drop them for a
+  frame and then restore them.
+- Metal EDR / extended-linear output linearizes subtitle and danmaku colors
+  before compositing into the linear drawable; previously they were written
+  gamma-encoded, making mid-tones and colored text too bright.
+- HDR10 scene-luma measurement honors the frame's color range: limited (TV)
+  range luma planes are expanded over the legal code span like the shaders'
+  `expand_ycbcr_range`, instead of being measured as full range. The
+  measurement also distinguishes `yuv420p10le` (10-bit code in bits `[9:0]`)
+  from P010 (left-aligned in `[15:6]`); treating both as P010 measured
+  software Main10 HDR10 as near-black.
+- The perceptual gamut LUT's I axis now spans the target's `[black, peak]` in
+  PQ codes (libplacebo's `gamut.min_luma`/`max_luma`) instead of
+  `[0, peak]`; generation and all three backends' samplers agree, and the
+  cache key includes the target black, so a `contrast_ratio` change
+  regenerates the LUT. SDR targets shift their gamut mapping by up to ~3.5%
+  of the I axis; HDR/EDR targets are unchanged (black = 0).
+- A degenerate ST 2094-10 anchor set (duplicated/non-finite points) falls back
+  to the identity curve (Clip) instead of zero coefficients, which the shader
+  would have rendered as a black frame.
+
+## 0.1.8 - 2026-09-07
+
+### Compatibility
+
+- The presenter configuration ABI now includes packed-alpha video and native
+  compositing options. Native embedders must rebuild against the matching
+  `erika.h` and runtime; do not mix configuration structs from older releases
+  with the 0.1.8 binaries. Flutter packages pin matching native artifacts.
 
 ### C API
 
@@ -39,11 +593,29 @@
   audio queue depth. Presenter feedback retains its capture time, playback intent,
   generation, and output epoch; stale feedback and silence-only callbacks cannot
   drive clock correction. Each new output first establishes a progress baseline.
+- Avoid replaying already queued audio when video decoding resumes in the
+  foreground, and defer iOS foreground resume until the host is ready while
+  recovering audio interruptions.
+- Smooth playback-rate changes with a bounded old-rate audio bridge while
+  preserving audio-master synchronization at non-default rates.
 - When the first audio stream cannot be decoded, try the remaining audio
   streams in container order and report all decoder failures if none can be
   opened.
 - Added packed-alpha video presentation with premultiplied GPU output on
   Windows and macOS, including native backdrop-aware overlay composition.
+- Raised the playback-rate ceiling to 16x.
+
+### Windows rendering
+
+- Fixed DWM crashes and striped video caused by unsafe D3D11 frame reuse, kept
+  native opaque playback on its HDR-capable path, and corrected fill sizing.
+- Added an explicit SDR Flutter texture path and synchronized GPU texture
+  handoff. Player shutdown now joins the danmaku worker before unloading its DLL.
+
+### SDK distribution
+
+- Added a Swift SDK binary archive and unified native, Flutter, OpenHarmony,
+  and Swift package releases behind the native version tag.
 
 ## 0.1.7 - 2026-08-16
 
@@ -214,7 +786,7 @@
 - Added charset detection and transcoding for external text subtitles, including
   GBK, Big5, Shift_JIS, and UTF-16, with UTF-8 passthrough and guarded fallback
   for low-confidence or binary input.
-- libass now registers Erika's bundled Droid Sans Fallback on every platform,
+- libass now registers liberika's bundled Droid Sans Fallback on every platform,
   not just iOS/Android, and targets without a system font provider default to
   that family instead of an unresolvable `Arial`.
 - Added subtitle fallback and selective override styling: custom font family and
@@ -228,7 +800,7 @@
   `ErikaPlayer.open` accepts `httpHeaders` on Android, iOS, macOS, and Windows,
   and applies them to the probe, ranged reads, retries, and prefetch requests.
   The original open functions remain compatible and use an empty header list.
-- Rejects caller-supplied transport headers managed by Erika and invalid HTTP
+- Rejects caller-supplied transport headers managed by liberika and invalid HTTP
   field names or values. External subtitle and danmaku sidecars remain on the
   headerless path and do not inherit media request headers.
 - Hardened HTTP range input against ignored `Range` requests, incorrect response

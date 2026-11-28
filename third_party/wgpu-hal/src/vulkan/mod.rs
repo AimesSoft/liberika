@@ -729,6 +729,10 @@ pub struct Texture {
     copy_size: crate::CopyExtent,
     identity: ResourceIdentity<vk::Image>,
 
+    // Externally initialized images must not discard their contents on the
+    // first wgpu-core UNINITIALIZED transition.
+    initial_usage: wgt::TextureUses,
+
     // The `drop_guard` field must be the last field of this struct so it is dropped last.
     // Do not add new fields after it.
     drop_guard: Option<crate::DropGuard>,
@@ -737,6 +741,16 @@ pub struct Texture {
 impl crate::DynTexture for Texture {}
 
 impl Texture {
+    /// Set the state of an initialized external image before handing it to wgpu.
+    ///
+    /// # Safety
+    /// The image must be in the layout/access state corresponding to `usage`,
+    /// owned by this device's queue family, and synchronized before submission.
+    /// Call only before the texture has been used by a command encoder.
+    pub unsafe fn set_external_initial_usage(&mut self, usage: wgt::TextureUses) {
+        self.initial_usage = usage;
+    }
+
     /// # Safety
     ///
     /// - The image handle must not be manually destroyed

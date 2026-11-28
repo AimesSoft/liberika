@@ -22,19 +22,24 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Erika version to package
+        description: liberika version to package
         required: true
-        default: "0.1.7"
+        default: "0.1.8"
         type: string
       publish:
         description: Publish the validated HAR to OHPM
         required: true
         default: false
         type: boolean
+      build_flutter_bridge:
+        description: Also rebuild the Flutter OHOS bridge against the released core
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       version:
-        description: Erika version to package
+        description: liberika version to package
         required: true
         type: string
       ref:
@@ -55,7 +60,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ERIKA_NATIVE_VERSION: "${{ inputs.version || '0.1.7' }}"
+  ERIKA_NATIVE_VERSION: "${{ inputs.version }}"
   OHPM_CLI_URL: "https://repo.huaweicloud.com/harmonyos/ohpm/5.1.0/commandline-tools-linux-x64-5.1.0.840.zip"
   OHPM_CLI_SHA256: "1dcefa4741dc289277560b2802040e0c45b433898d8db453d711d5376e0478f1"
 
@@ -68,6 +73,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve native release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${ERIKA_NATIVE_VERSION:-$(awk -F'"' '/"version"/ {print $4; exit}' packages/erika_ohos/oh-package.json5)}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "ERIKA_NATIVE_VERSION=$version" >> "$GITHUB_ENV"
 
       - uses: openharmony-rs/setup-ohos-sdk@b312caf8a43bb836aa24c08f65f97e1f09a89cad
         id: ohos_sdk
@@ -106,6 +119,46 @@ jobs:
           test -n "$runtime"
           cp "$runtime" packages/erika_ohos/src/main/cpp/liberika_capi.so
           test -f packages/erika_ohos/src/main/cpp/liberika_capi.so
+
+      - name: Rebuild Flutter OHOS bridge with the released core
+        if: github.event_name == 'workflow_dispatch' && inputs.build_flutter_bridge
+        shell: bash
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.ohos_sdk.outputs.ohos_sdk_native }}
+        run: |
+          set -euo pipefail
+          cmake -S packages/erika_flutter/ohos/src/main/cpp \
+            -B "$RUNNER_TEMP/erika-flutter-bridge" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$OHOS_SDK_NATIVE/build/cmake/ohos.toolchain.cmake" \
+            -DOHOS_ARCH=arm64-v8a \
+            -DOHOS_SDK_NATIVE="$OHOS_SDK_NATIVE"
+          cmake --build "$RUNNER_TEMP/erika-flutter-bridge" --target erika_flutter_plugin
+          bridge="$RUNNER_TEMP/erika-flutter-bridge/liberika_flutter.so"
+          test -s "$bridge"
+          "$OHOS_SDK_NATIVE/llvm/bin/llvm-readelf" -h "$bridge" | grep -Eq 'Machine:.*AArch64'
+          cmp packages/erika_ohos/src/main/cpp/liberika_capi.so \
+            "$RUNNER_TEMP/erika-flutter-bridge/liberika_capi.so"
+          output="$RUNNER_TEMP/erika-flutter-ohos-rebuild"
+          mkdir -p "$output"
+          cp "$bridge" "$output/"
+          git archive --format=tar.gz HEAD:packages/erika_flutter \
+            > "$output/erika_flutter-${ERIKA_NATIVE_VERSION}-source.tar.gz"
+          {
+            echo "version: $ERIKA_NATIVE_VERSION"
+            echo "bridge/source commit: $(git rev-parse HEAD)"
+            echo "core: reused unchanged from v${ERIKA_NATIVE_VERSION}"
+            echo "Use the matching ArkTS source; replacing only the native bridge does not fix argument forwarding."
+          } > "$output/MANIFEST.txt"
+          (cd "$output" && sha256sum liberika_flutter.so *.tar.gz MANIFEST.txt > SHA256SUMS)
+
+      - name: Upload rebuilt Flutter bridge and matching source
+        if: github.event_name == 'workflow_dispatch' && inputs.build_flutter_bridge
+        uses: actions/upload-artifact@v4
+        with:
+          name: erika-flutter-ohos-rebuild-${{ env.ERIKA_NATIVE_VERSION }}
+          path: ${{ runner.temp }}/erika-flutter-ohos-rebuild/*
+          if-no-files-found: error
 
       - name: Install Hvigor
         working-directory: packages/erika_ohos
@@ -228,7 +281,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: erika-ohos-${{ inputs.version || '0.1.7' }}
+          name: erika-ohos-${{ env.ERIKA_NATIVE_VERSION }}
           path: |
             ${{ runner.temp }}/erika.har
             ${{ runner.temp }}/erika-ohos-smoke.hap
@@ -237,9 +290,8 @@ jobs:
   publish:
     name: Publish ArkTS package to OHPM
     if: >-
-      (github.event_name == 'workflow_call' && inputs.publish) ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish &&
-       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+      inputs.publish &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -247,7 +299,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: erika-ohos-${{ inputs.version || '0.1.7' }}
+          name: erika-ohos-${{ env.ERIKA_NATIVE_VERSION }}
           path: ${{ runner.temp }}/erika-ohos-release
 
       - uses: actions/setup-node@v4
@@ -296,7 +348,10 @@ jobs:
           expect <<'EXPECT'
           set timeout 3600
           set prompt_count 0
+          # HAR uploads can exceed OHPM's default 60-second request timeout.
+          # The outer Expect/job budgets remain one hour.
           spawn -noecho node $env(OHPM_CLI) publish $env(OHPM_HAR) \
+            --fetch_timeout 360000 \
             --publish_registry https://ohpm.openharmony.cn/ohpm \
             --publish_id $env(OHPM_PUBLISH_ID) \
             --key_path $env(OHPM_KEY_PATH)

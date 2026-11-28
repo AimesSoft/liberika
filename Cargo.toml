@@ -3,12 +3,14 @@ members = [
   "crates/erika",
   "crates/erika_capi",
   "crates/erika_ffmpeg_sys",
+  "crates/erika_plugin",
   "examples/capi_smoke",
   "examples/ffmpeg_audio_decode",
   "examples/ffmpeg_decode",
   "examples/ffmpeg_demux",
   "examples/ffmpeg_probe",
   "examples/ffmpeg_probe_source",
+  "examples/playback_rate_check",
   "examples/playback_tick",
   "examples/player_tick",
   "examples/coreaudio_smoke",
@@ -16,12 +18,14 @@ members = [
   "examples/danmaku_perf_lab",
   "examples/metal_presenter_check",
   "examples/ffmpeg_videotoolbox",
+  "examples/frame_export_bench",
   "examples/metal_import_videotoolbox",
   "examples/metal_overlay_check",
   "examples/playback_audio_tick",
   "examples/render_pipeline_plan",
   "examples/macos_native_demo",
   "examples/windows_native_demo",
+  "examples/linux_native_demo",
   "examples/wgpu_video_png",
   "examples/wgpu_decode_png",
   "examples/wgpu_window_check",
@@ -33,9 +37,9 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MPL-2.0"
-repository = "https://github.com/AimesSoft/Erika"
+repository = "https://github.com/AimesSoft/liberika"
 rust-version = "1.92"
-version = "0.1.7"
+version = "0.3.8"
 
 [workspace.dependencies]
 ab_glyph = "0.2.32"
@@ -45,11 +49,14 @@ sha2 = "0.10.9"
 bitflags = "2.10.0"
 bindgen = "0.72.1"
 cc = "1.2.47"
+pkg-config = "0.3.32"
+png = "0.17.16"
 chardetng = "0.1"
 crossbeam-channel = "0.5.15"
 encoding_rs = "0.8"
 fontdb = "0.23.0"
 regex = "1.12.3"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rustc-hash = "2.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -66,6 +73,8 @@ objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"
 objc2-quartz-core = "0.3.2"
 thiserror = "2.0.17"
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "time", "sync", "net", "macros"] }
+tokio-util = "0.7.18"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 windows = "0.62.2"
 
@@ -77,7 +86,8 @@ codegen-units = 1
 lto = "thin"
 
 [patch.crates-io]
-# wgpu-hal 29 does not yet route raw-window-handle's OhosNdk variant through
-# VK_OHOS_surface. Keep the small OpenHarmony WSI adaptation in-tree so Vulkan
-# presentation is reproducible for downstream HarmonyOS builds.
+# Adds OpenHarmony WSI and preserves initialized external Vulkan image contents
+# for Linux direct import. Cargo does not propagate workspace patches through
+# git/path dependencies: external Rust consumers need the patch in their own
+# root manifest too; see docs/linux.md.
 wgpu-hal = { path = "third_party/wgpu-hal" }

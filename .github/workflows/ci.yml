@@ -20,8 +20,13 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
+  changes:
+    uses: ./.github/workflows/ci-select.yml
+
   quality:
     name: Quality (Ubuntu)
+    needs: changes
+    if: needs.changes.outputs.quality == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -29,61 +34,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: subosito/flutter-action@v2
+      - name: Test CI path and matrix selection
+        run: python3 -B scripts/test_ci_paths.py -v
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
-          channel: stable
-          cache: true
+          key: quality-host-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Verify playback fixture checksums
         working-directory: crates/erika/testdata/playback
         run: sha256sum --check SHA256SUMS
+      - name: Verify software playback fixture checksums
+        working-directory: crates/erika/testdata/software
+        run: sha256sum --check SHA256SUMS
+      - name: Verify subtitle seek fixture checksums
+        working-directory: crates/erika/testdata/subtitle-seek
+        run: sha256sum --check SHA256SUMS
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+      - name: Check C API and package binding alignment
+        env:
+          CXX: g++
+        run: python3 packaging/tests/test_api_alignment.py -v
+      - name: Test Linux bundle and ABI contracts
+        run: python3 packaging/tests/test_linux_bundle.py -v
       - name: Check license policy
         run: cargo run --locked -p xtask -- check license
+      - name: Test native dependency plans
+        run: cargo test --locked -p xtask
       - name: Verify vendored Cargo patches
         run: cargo run --locked -p xtask -- check cargo-patches
-      - name: Get Flutter dependencies
-        working-directory: packages/erika_flutter
-        run: flutter pub get
-      - name: Analyze Flutter package
-        working-directory: packages/erika_flutter
-        run: flutter analyze --no-pub
-      - name: Test Flutter package
-        working-directory: packages/erika_flutter
-        run: flutter test --no-pub --reporter expanded
-      - name: Validate pub package
-        working-directory: packages/erika_flutter
-        env:
-          PUB_HOSTED_URL: https://pub.dev
-        run: flutter pub publish --dry-run
-      - name: Test Flutter package outside the monorepo
-        env:
-          PUB_HOSTED_URL: https://pub.dev
-        run: |
-          set -euo pipefail
-          work="$(mktemp -d)"
-          trap 'rm -rf "$work"' EXIT
-          mkdir -p "$work/erika_flutter"
-          git archive HEAD:packages/erika_flutter | tar -x -C "$work/erika_flutter"
-          test ! -e "$work/crates"
-          cd "$work/erika_flutter"
-          flutter pub get
-          flutter analyze --no-pub
-          flutter test --no-pub --reporter expanded
 
   rust-macos:
     name: Rust (macOS ${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
     timeout-minutes: 150
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            target: aarch64-apple-darwin
-            runner: macos-26
-          - arch: x64
-            target: x86_64-apple-darwin
-            runner: macos-26
+      matrix: ${{ fromJSON(needs.changes.outputs.macos_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +88,12 @@ jobs:
         with:
           path: third_party
           key: native-v2-macos-${{ matrix.target }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: ${{ matrix.target }}-${{ env.PROFILE }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'arm64' }}
       - name: Build native dependencies
         run: |
           cargo run --locked -p xtask -- deps build --all \
@@ -127,9 +123,38 @@ jobs:
           ERIKA_NATIVE_TARGET="${{ matrix.target }}"
           cargo clippy --locked -p erika --all-targets --all-features
           --no-deps
+      - name: Build wgpu_decode_png example
+        if: matrix.arch == 'arm64'
+        run: |
+          # Link against libclang_rt.osx to resolve __isPlatformVersionAtLeast,
+          # a symbol the sanitizer runtime needs but that may be weakly referenced.
+          # See commits acae10f and 3498b8e for context.
+          RT_DIR="$(dirname "$(find "$(dirname "$(xcrun -f clang)")/../lib/clang" -name libclang_rt.osx.a | head -1)")"
+          echo "clang_rt dir: $RT_DIR"
+          ERIKA_NATIVE_PROFILE="$PROFILE" \
+          ERIKA_NATIVE_TARGET="${{ matrix.target }}" \
+          RUSTFLAGS="-C link-arg=-L$RT_DIR -C link-arg=-lclang_rt.osx" \
+            cargo build --locked -p wgpu_decode_png --release --target "${{ matrix.target }}"
+      - name: Package erika-capi bundle
+        if: matrix.arch == 'arm64'
+        run: >-
+          bash packaging/bundle.sh erika-capi-macos-arm64
+          dist/erika-capi-macos-arm64.zip
+          "target/${{ matrix.target }}/release/liberika_capi.a"
+      - name: Upload test artifacts
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dv-test-macos-arm64
+          path: |
+            target/aarch64-apple-darwin/release/wgpu_decode_png
+            dist/erika-capi-macos-arm64.zip
+          if-no-files-found: error
 
   ios:
     name: iOS device staticlib
+    needs: changes
+    if: needs.changes.outputs.ios == 'true'
     runs-on: macos-26
     timeout-minutes: 150
     env:
@@ -145,7 +170,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party
-          key: native-v2-ios-device-aarch64-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+          key: native-v2-ios-aarch64-apple-ios-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+          restore-keys: |
+            native-v2-ios-device-aarch64-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: aarch64-apple-ios-${{ env.PROFILE }}-min${{ env.IPHONEOS_DEPLOYMENT_TARGET }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Build iOS native dependencies
         run: >-
           cargo run --locked -p xtask -- deps build --all
@@ -155,10 +188,12 @@ jobs:
           ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="aarch64-apple-ios" \
           cargo rustc --locked -p erika_capi --lib --release \
               --target aarch64-apple-ios \
-              --no-default-features --features libass --crate-type staticlib
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
 
   tvos:
     name: tvOS simulator staticlib
+    needs: changes
+    if: needs.changes.outputs.tvos == 'true'
     runs-on: macos-26
     timeout-minutes: 150
     env:
@@ -174,7 +209,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party
-          key: native-v2-tvos-simulator-aarch64-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+          key: native-v2-tvos-aarch64-apple-tvos-sim-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+          restore-keys: |
+            native-v2-tvos-simulator-aarch64-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: aarch64-apple-tvos-sim-${{ env.PROFILE }}-min${{ env.TVOS_DEPLOYMENT_TARGET }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Build tvOS native dependencies
         run: >-
           cargo run --locked -p xtask -- deps build --all
@@ -188,26 +231,17 @@ jobs:
           cargo +nightly rustc -Z build-std=std,panic_abort --locked \
               -p erika_capi --lib --release \
               --target aarch64-apple-tvos-sim \
-              --no-default-features --features libass --crate-type staticlib
+              --no-default-features --features libass,embedded-fallback-font,artcnn-r8f64 --crate-type staticlib
 
   windows:
     name: Windows ${{ matrix.arch }} build
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            host_arch: AMD64
-            target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            msys2: true
-          - arch: arm64
-            host_arch: ARM64
-            target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            msys2: false
+      matrix: ${{ fromJSON(needs.changes.outputs.windows_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -243,16 +277,51 @@ jobs:
       - name: Install build tools (nasm, meson, ninja, LLVM/libclang)
         shell: pwsh
         run: |
+          # The Chocolatey community feed answers 503/504 for minutes at a time,
+          # and choco can exit 0 without installing anything when it does.
+          function Install-ChocoPackage([string[]] $Arguments, [scriptblock] $Installed) {
+            foreach ($attempt in 1..4) {
+              choco @Arguments -y --no-progress | Out-Host
+              if ($LASTEXITCODE -eq 0 -and (& $Installed)) { return $true }
+              if ($attempt -lt 4) { Start-Sleep -Seconds (20 * $attempt) }
+            }
+            return $false
+          }
+          function Test-Command([string] $Name) { [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+          # A restored dependency cache may not need the tool; the step that
+          # does need it names it when it is missing.
+          function Expect([bool] $Ok, [string] $What) {
+            if (-not $Ok) { Write-Host "::warning::Could not install $What from Chocolatey after retries." }
+          }
+          $nasmDir = "C:\Program Files\NASM"
           if ("${{ matrix.arch }}" -eq "x64") {
-            choco install -y --no-progress nasm zip
-          } elseif (-not (Get-Command make -ErrorAction SilentlyContinue)) {
-            choco install -y --no-progress make
+            Expect (Install-ChocoPackage @("install", "nasm") { Test-Path (Join-Path $nasmDir "nasm.exe") }) "nasm"
+            Expect (Install-ChocoPackage @("install", "zip") { Test-Command "zip" }) "zip"
+          } elseif (-not (Test-Command "make")) {
+            Expect (Install-ChocoPackage @("install", "make") { Test-Command "make" }) "make"
           }
           pip install --quiet meson ninja
+          $llvmVersion = "22.1.8"
           $llvmBin = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path (Join-Path $llvmBin "libclang.dll"))) {
-            choco install llvm -y --no-progress
+          $libclang = Join-Path $llvmBin "libclang.dll"
+          # VS 2026's STL requires Clang 22 or newer when bindgen parses C++.
+          $minimum = if ("${{ matrix.arch }}" -eq "x64") { [version]"22.0" } else { [version]"0.0" }
+          function Test-Libclang {
+            (Test-Path $libclang) -and [version](Get-Item $libclang).VersionInfo.ProductVersion -ge $minimum
           }
+          if (-not (Test-Libclang)) {
+            $choco = if ("${{ matrix.arch }}" -eq "x64") { @("upgrade", "llvm", "--version=$llvmVersion") } else { @("install", "llvm") }
+            if (-not (Install-ChocoPackage $choco { Test-Libclang })) {
+              # Same installer, straight from the LLVM release.
+              $asset = if ("${{ matrix.arch }}" -eq "x64") { "win64" } else { "woa64" }
+              $installer = Join-Path $env:RUNNER_TEMP "LLVM-$llvmVersion-$asset.exe"
+              curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 10 --output $installer `
+                "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/LLVM-$llvmVersion-$asset.exe"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+            }
+          }
+          if (-not (Test-Libclang)) { Write-Error "LLVM/libclang $minimum or newer is not installed."; exit 1 }
           "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
@@ -262,6 +331,12 @@ jobs:
         with:
           path: third_party
           key: native-v2-windows-${{ matrix.target }}-${{ hashFiles('xtask/src/main.rs', 'third_party/patches/**') }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          key: ${{ matrix.target }}-${{ env.PROFILE }}-${{ hashFiles('Cargo.lock', '.github/workflows/ci.yml', 'xtask/**', 'third_party/patches/**') }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.arch == 'x64' }}
       - name: Verify FFmpeg make shell
         shell: pwsh
         run: |
@@ -279,3 +354,15 @@ jobs:
           ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="${{ matrix.target }}" \
             cargo build --locked -p erika_capi --release \
               --target "${{ matrix.target }}"
+      - name: Test software decode and native D3D11 upload
+        shell: bash
+        run: |
+          ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="${{ matrix.target }}" \
+            cargo test --locked -p erika --lib --target "${{ matrix.target }}" software_
+      - name: Test D3D11 screenshot pixels with WARP
+        shell: bash
+        run: |
+          ERIKA_NATIVE_PROFILE="$PROFILE" ERIKA_NATIVE_TARGET="${{ matrix.target }}" \
+          ERIKA_D3D11_CAPTURE_TEST_DRIVER=warp \
+            cargo test --locked -p erika --lib --target "${{ matrix.target }}" \
+              renderer::d3d11::capture::tests

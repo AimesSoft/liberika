@@ -28,12 +28,7 @@ const WORKGROUP_X: u32 = 8;
 const WORKGROUP_Y: u32 = 8;
 
 fn mode_label(mode: LumaUpscalerMode) -> &'static str {
-    match mode {
-        LumaUpscalerMode::Off => "off",
-        LumaUpscalerMode::ArtCnnC4F16 => "artcnn_c4f16",
-        LumaUpscalerMode::ArtCnnC4F16Ds => "artcnn_c4f16_ds",
-        LumaUpscalerMode::ArtCnnC4F32 => "artcnn_c4f32",
-    }
+    mode.label()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -54,6 +49,7 @@ pub enum WgpuArtCnnStatus {
 pub enum WgpuArtCnnInput<'a> {
     PlanarLuma {
         view: &'a wgpu::TextureView,
+        p010_le_bytes: bool,
     },
     NonlinearRgb {
         view: &'a wgpu::TextureView,
@@ -69,9 +65,16 @@ impl WgpuArtCnnInput<'_> {
         }
     }
 
-    fn luma_coefficients(self) -> [f32; 3] {
+    pub(crate) fn luma_coefficients(self) -> [f32; 3] {
         match self {
-            Self::PlanarLuma { .. } => [0.0; 3],
+            Self::PlanarLuma {
+                p010_le_bytes: true,
+                ..
+            } => [1.0 / 257.0, 256.0 / 257.0, 0.0],
+            Self::PlanarLuma {
+                p010_le_bytes: false,
+                ..
+            } => [1.0, 0.0, 0.0],
             Self::NonlinearRgb {
                 luma_coefficients, ..
             } => luma_coefficients,
@@ -247,6 +250,13 @@ impl WgpuArtCnnCapability {
         if !mode.is_enabled() {
             return reasons;
         }
+        if !mode.is_legacy_artcnn() {
+            reasons.push(format!(
+                "upscaler mode {} is not implemented by the wgpu backend",
+                mode.label()
+            ));
+            return reasons;
+        }
         if config.tile_width == 0 || config.tile_height == 0 {
             reasons.push("tile dimensions must be non-zero".to_string());
             return reasons;
@@ -356,7 +366,7 @@ pub struct WgpuArtCnnFailure {
 }
 
 impl WgpuArtCnnFailure {
-    fn new(
+    pub(crate) fn new(
         stage: WgpuArtCnnFailureStage,
         mode: LumaUpscalerMode,
         input_kind: Option<WgpuArtCnnInputKind>,
@@ -756,6 +766,7 @@ pub struct WgpuArtCnn {
     pending_encode: Option<PendingEncode>,
     last_failure: Option<WgpuArtCnnFailure>,
     stats: WgpuArtCnnStats,
+    timestamps: Option<wgpu::QuerySet>,
 }
 
 impl WgpuArtCnn {
@@ -779,6 +790,7 @@ impl WgpuArtCnn {
             pending_encode: None,
             last_failure: None,
             stats: WgpuArtCnnStats::default(),
+            timestamps: None,
         }
     }
 
@@ -796,6 +808,11 @@ impl WgpuArtCnn {
 
     pub fn stats(&self) -> WgpuArtCnnStats {
         self.stats
+    }
+
+    /// Optional timestamps for measuring the retained legacy baseline.
+    pub fn set_timestamp_queries(&mut self, queries: Option<wgpu::QuerySet>) {
+        self.timestamps = queries;
     }
 
     pub fn last_failure(&self) -> Option<&WgpuArtCnnFailure> {
@@ -1086,7 +1103,7 @@ impl WgpuArtCnn {
             ],
         });
         let conv0_bind_group = match input {
-            WgpuArtCnnInput::PlanarLuma { view } => {
+            WgpuArtCnnInput::PlanarLuma { view, .. } => {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("erika-wgpu-artcnn-conv0-luma-bind-group"),
                     layout: &resources.conv0_luma_layout,
@@ -1168,7 +1185,13 @@ impl WgpuArtCnn {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("erika-wgpu-artcnn-pass"),
-                timestamp_writes: None,
+                timestamp_writes: self.timestamps.as_ref().map(|query_set| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }
+                }),
             });
             for (index, record) in records.iter().enumerate() {
                 let dynamic_offset =

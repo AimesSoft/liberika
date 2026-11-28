@@ -1,6 +1,7 @@
 pub mod avcodec;
 #[cfg(feature = "wgpu")]
 pub mod gles;
+pub mod pixel_layout;
 
 pub mod ohaudio {
     use std::collections::VecDeque;

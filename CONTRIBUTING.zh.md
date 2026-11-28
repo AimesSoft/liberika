@@ -1,8 +1,8 @@
-# 为 Erika 贡献
+# 为 liberika 贡献
 
 > [English](CONTRIBUTING.md) | [日本語](CONTRIBUTING.ja.md)
 
-Erika 是 NipaPlay 的自研播放内核:一个 Rust 引擎,从 demux/decode 一路负责到 GPU
+liberika 是 NipaPlay 的自研播放内核:一个 Rust 引擎,从 demux/decode 一路负责到 GPU
 呈现、音频、字幕和弹幕,并通过 C ABI 和 Flutter 插件暴露给宿主。本文档是上手地图。
 
 另见:[architecture.zh.md](docs/architecture.zh.md)(引擎设计)、
@@ -76,14 +76,13 @@ third_party/              构建出的原生依赖(gitignore 输出)
 
 `crates/erika_capi` 是所有非 Rust 宿主的稳定接入面。改它时:
 
-- **把 panic 留在里面。** 每个导出都把函数体包在 `catch_unwind`,把 panic 映射为
-  `ErikaStatus_Panic`——绝不让 unwind 穿越边界。
+- **控制 panic。** 在支持恢复的位置使用 `catch_unwind`，并将捕获的 panic 映射为适合返回类型的错误和消息。目前部分导出没有捕获，abort 构建无法恢复；见 [panic 安全](docs/capi_reference.zh.md#panic-安全)。
 - **尊重所有权。** 交出的字符串归调用方所有、由配套 `*_free` 释放;新增的要在
   [capi_reference.md](docs/capi_reference.md) 里记录。
 - **同步重生成 / 手改 `erika.h`** 以匹配,并给新函数加注释。
 - **⚠️ 同步 Swift 镜像结构体。** macOS/iOS/tvOS 插件在 Swift 侧手写镜像了 C 结构体(如
   `ErikaPresenterStats`)。若你改了 `erika.h` 里的结构体,必须**同时**更新
-  `packages/erika_flutter` 里的**两个** Swift 镜像文件;不匹配会破坏栈,可能表现为
+  `packages/erika_flutter` 中 macOS、iOS、tvOS 三个平台的 Swift 镜像文件;不匹配会破坏栈,可能表现为
   误导性的 autorelease-pool 崩溃,而非明显的布局错误。
 
 ## 测试
@@ -95,7 +94,7 @@ cargo fmt --all
 ```
 
 - 平台相关代码以 `#[cfg]` 门控;改某个 `cfg` 分支时,保持 `macos` / `ios` / `windows` /
-  `android` / fallback 各分支都能编译。本地测不了的目标交给 CI。
+  `android` / `tvos` / `ohos` / `linux` / fallback 各分支都能编译。本地测不了的目标交给 CI。
 - 神经超分权重会在 `tests/artcnn_upscaler.rs`（Metal）和
   `tests/wgpu_artcnn.rs`（分块 wgpu）中对照 onnxruntime 参考验证；修改 kernel 前必须
   重新核对对应路径。
@@ -120,3 +119,7 @@ cargo fmt --all
 保持改动聚焦;注明你构建/测试过的平台,以及留给 CI 的平台。在同一个 PR 里更新相关文档。
 较大的特性(新后端、ABI 改动)在 PR 描述里附一段简短设计说明,有助于评审跟进线程与所有权
 的影响。
+
+## 文档维护位置
+
+文档入口为 [docs/README.md](docs/README.md)。 SDK 用法放在各 package README，接入与内核设计放在 `docs/`，带日期的调查结果放在 `docs/investigations/`，只提交结论、关键数据和复现方法，不提交原始日志、截图或抓取数据。新增主题加入文档目录，API 变更同步对应三语指南。

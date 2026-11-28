@@ -53,6 +53,9 @@ pub(crate) struct PcmSpscRing {
     last_applied_volume: AtomicU32,
 }
 
+// The Android and HarmonyOS audio paths call all of it; tests build it on
+// every platform.
+#[cfg_attr(not(any(target_os = "android", target_env = "ohos")), allow(dead_code))]
 impl PcmSpscRing {
     pub(crate) fn new(capacity_frames: usize, channels: usize) -> Option<Self> {
         if capacity_frames == 0 || channels == 0 {

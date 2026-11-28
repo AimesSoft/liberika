@@ -1,4 +1,4 @@
-# Erika C ABI 参考手册
+# liberika C ABI 参考手册
 
 本文档描述 `erika_capi` 导出的稳定 C ABI，声明在
 [`crates/erika_capi/include/erika.h`](../crates/erika_capi/include/erika.h)。该
@@ -12,23 +12,135 @@ ABI 是所有非 Rust 宿主（C、C++、Swift、Dart FFI、Win32……）的唯
 
 ## 两个 handle 族
 
-Erika 暴露两个相互独立的入口，每个集成选其一。
+liberika 暴露两个相互独立的入口，每个集成选其一。
 
 | Handle | 模型 | 谁渲染 | 适用 |
 |--------|------|--------|------|
 | `ErikaHandle` | **拉取（Pull）** | 宿主 | 你拥有渲染循环、自己拉取解码帧 / 驱动自己的合成器。 |
-| `ErikaPresenterHandle` | **推送（Push）** | Erika | 你把一个原生 surface 交给 Erika，每个显示帧调一次 `render_tick`。Erika 负责解码、时序、音频、overlay 和呈现。 |
+| `ErikaPresenterHandle` | **推送（Push）** | liberika | 你把一个原生 surface 交给 liberika，每个显示帧调一次 `render_tick`。liberika 负责解码、时序、音频、overlay 和呈现。 |
 
 `ErikaPresenterHandle` 是推荐路径，也是 Flutter 插件和原生 demo 所用的。它在
-**macOS、iOS、tvOS、Windows、Android、HarmonyOS** 上编译。surface attach 按平台不同：
+**macOS、iOS、tvOS、Windows、Android、Linux、HarmonyOS** 上编译。surface attach 按平台不同：
 Apple 使用 Metal，Windows 使用 HWND/D3D11，Android/HarmonyOS 使用 wgpu/Vulkan surface。
+Linux 通过 wgpu 支持 X11/Wayland。
 HarmonyOS Flutter bridge 因 ArkTS 平台通道本身传递序列化结构化值，使用 presenter 的 JSON
 辅助入口。其它不支持的平台上 `erika_presenter_create` 可能仍导出但返回 `NULL`；请同时按平台
 守卫 presenter 用法，并检查 create 是否成功。
 
 两个族不共享状态；一个进程可同时使用两者，但单个媒体会话只活在一个 handle 里。
 
+### Linux Flutter 纹理读回
+
+```c
+ErikaStatus erika_presenter_copy_flutter_frame_rgba(
+    ErikaPresenterHandle *handle, uint8_t *out_rgba, uintptr_t capacity,
+    uint32_t *out_width, uint32_t *out_height);
+```
+
+每次 `erika_presenter_render_tick` 后调用 `erika_presenter_copy_flutter_frame_rgba`
+可取走最近的合成帧，包含视频、字幕、弹幕和 HUD。调用方持有输出内存，容量至少为
+纹理宽 × 高 × 4 字节；成功时写入紧密 RGBA8 像素与物理尺寸。不返回引擎内存，
+无需调用 free。没有待取帧时返回 `ErikaStatus_NoEvent`；容量不足时返回错误，
+该帧仍会被消费，应等待下一次 tick 后重试。与同一 presenter 的其它操作串行调用。
+此接口经 CPU 内存复制，不提供零拷贝。
+
+## Headless GIF 导出
+
+`erika_export_gif` 独立于上述两个 handle 族。它创建私有的 demuxer、软件解码器、
+缩放器、GIF encoder 和 muxer，不需要窗口或 surface，也不会干扰正在播放的实例。
+
+```c
+ErikaGifExportOptions options = {
+    .input_uri = "/path/input.mp4",
+    .output_path = "/path/output.gif",
+    .start_millis = 5000,
+    .end_millis = 10000,
+    .frames_per_second = 10,
+    .output_width = 640,
+    .output_height = 360,
+    .quality = ErikaGifExportQuality_High,
+    .loop_count = 0,
+};
+ErikaGifExportResult result = {0};
+ErikaStatus status = erika_export_gif(&options, &result);
+```
+
+该调用是同步的；Flutter 等 UI 宿主必须把它放到 worker thread 或 isolate 中执行。
+`start_millis` 与 `end_millis` 选择导出区间；`output_width` 与 `output_height`
+是精确输出尺寸。普通质量使用双线性缩放，高质量使用 Lanczos 缩放。只有完整编码成功后，临时同目录文件才会重命名为目标文件。
+除非 `overwrite` 为 true，否则已有目标会被拒绝。`loop_count` 沿用 FFmpeg GIF 语义：
+`-1` 不循环、`0` 无限循环、正数表示循环次数。HTTP 输入可使用与
+`ErikaOpenOptions` 相同的请求头和 read-ahead 覆盖参数。
+
+## Headless 单帧导出
+
+`erika_export_frame` 同样独立于两个 handle 族。它创建私有的 demuxer 和多线程软件解码器，
+跳到 `position_millis` 之前的关键帧后向前解码，返回该媒体时间显示的画面：时间不晚于它的最后一帧
+（位置早于第一帧时为第一帧）。
+
+```c
+ErikaFrameExportOptions options = {
+    .input_uri = "/path/input.mkv",
+    .position_millis = 60000,
+    .max_width = 640,
+    .max_height = 640,
+    .format = ErikaFrameExportFormat_Png,
+};
+ErikaFrameExportResult result = {0};
+if (erika_export_frame(&options, &result) == ErikaStatus_Ok) {
+    /* result.data 中是 result.data_len 字节的 PNG 文件。 */
+    erika_frame_export_result_free(&result);
+}
+```
+
+该调用是同步的；UI 宿主必须把它放到 worker thread 或 isolate 中执行。`max_width` 与
+`max_height` 限定画面尺寸（0 表示该边不限）：保持显示宽高比，且不会大于视频本身，两者都为 0
+时返回视频原尺寸。`ErikaFrameExportFormat_Rgba` 返回每行恰好 `width * 4` 字节、alpha 为 255
+的像素；`ErikaFrameExportFormat_Png` 返回 8 位 RGB 的 PNG 文件。色彩转换按帧的色彩空间与范围；
+未标注的 YUV 源在高清及以上按 BT.709、其余按 BT.601。HDR 源（PQ、HLG、杜比视界）会按 Erika 渲染器在 SDR 显示器上使用的
+运算做色调映射到 SDR（ITU-R BT.2390 EETF，目标 203 nit，BT.2020 到 BT.709 的色域映射，gamma 2.2），
+并在 `result.reserved_flags` 置位 `ERIKA_FRAME_EXPORT_TONE_MAPPED`；SDR 源仍用普通色彩转换。结果给出画面所在时间
+（`timestamp_micros`）、解码后的视频尺寸与媒体时长（未知为 0）。位置不早于已知时长时返回
+`ErikaStatus_PlayerError`。HTTP 输入可使用与 `ErikaOpenOptions` 相同的请求头和 read-ahead
+覆盖参数。`data` 归 liberika 所有，直到调用 `erika_frame_export_result_free`；该函数会清空结果，
+可重复调用。
+
+### 连续取多帧
+
+`erika_export_frame` 每取一张都要重新打开媒体并 seek。要从同一媒体取多张时，只打开一次
+`ErikaFrameExportSession`，再逐张向它索取；demuxer 与解码器保持打开。
+
+```c
+ErikaFrameExportSessionOptions open = { .input_uri = "/path/input.mkv" };
+ErikaFrameExportSession *session = NULL;
+if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
+    for (uint64_t ms = 60000; ms < 66000; ms += 100) {
+        ErikaFrameExportRequest request = {
+            .position_millis = ms, .max_width = 640, .max_height = 640,
+            .format = ErikaFrameExportFormat_Png,
+        };
+        ErikaFrameExportResult result = {0};
+        if (erika_frame_export_session_frame(session, &request, &result) == ErikaStatus_Ok) {
+            erika_frame_export_result_free(&result);
+        }
+    }
+    erika_frame_export_session_close(session);
+}
+```
+
+若上一次解码位置到本次请求之间没有关键帧（demuxer 的 seek 索引可以判断；没有索引时，请求在
+两秒内或最长关键帧间隔的一半以内），就接着解码；否则 seek 到请求之前的关键帧。请求可以任意顺序，
+时间递增最省。结果、尺寸、格式与色调映射同 `erika_export_frame`。某次请求失败后会话仍可使用。
+同一会话上的调用相互串行，所有调用都是同步的。`erika_frame_export_session_close` 接受 `NULL`；
+关闭时不得有调用在执行，之后也不得再调用。
+
 ## 约定
+
+### 内嵌字体
+
+`erika_embedded_fallback_font(uintptr_t *out_length)` 返回库内嵌的字体和长度，没有内嵌时返回
+`NULL`。这段内存随进程存在，不用释放。主机为浏览器页面提供服务时可以把它传给页面，页面就不用
+自带字体。
 
 ### 状态码
 
@@ -36,24 +148,25 @@ HarmonyOS Flutter bridge 因 ArkTS 平台通道本身传递序列化结构化值
 
 | 值 | 码 | 含义 |
 |----|----|------|
-| `ErikaStatus_Ok` | 0 | 成功。清空线程局部错误。 |
+| `ErikaStatus_Ok` | 0 | 成功。多数返回状态的调用会清空线程局部错误；事件处理见下文。 |
 | `ErikaStatus_NullPointer` | 1 | 必需的 handle 或 out 指针为 `NULL`（或 surface 指针为 0）。 |
 | `ErikaStatus_InvalidUtf8` | 2 | 某个 `const char*` 参数不是合法 UTF-8。 |
 | `ErikaStatus_PlayerError` | 3 | 引擎拒绝该调用；读取错误信息（见下）。 |
-| `ErikaStatus_Panic` | 4 | 在边界处捕获到 Rust panic。该调用除 panic 前已完成的部分外无效；handle 应视为可疑状态。 |
+| `ErikaStatus_Panic` | 4 | 捕获到 Rust panic。调用可能已部分修改状态；handle 应视为可疑状态。 |
 | `ErikaStatus_NoEvent` | 5 | 仅 `*_poll_event`：队列为空（非错误）。 |
 
 务必检查返回值。`Ok` 和 `NoEvent` 是仅有的非错误结果。
 
 ### panic 安全
 
-ABI 永不让 unwind 穿越 FFI 边界。每个入口都把函数体包在 `catch_unwind` 里；panic
-会变成 `ErikaStatus_Panic` 并设置错误信息。你可以跨边界调用，无需担心 C++
-`noexcept`/SEH。
+许多返回状态的操作会捕获 Rust panic，返回 `ErikaStatus_Panic` 并设置错误信息；
+但这不是所有入口的保证。例如 `erika_create`、`erika_destroy` 和字符串辅助函数没有
+捕获包装。捕获范围外的 panic 或配置为 panic 时 abort 的构建可能终止进程。调用时仍须
+提供有效参数。
 
 ### 错误信息（线程局部）
 
-任何非 `Ok`/`NoEvent` 的结果，Erika 会把一条可读信息存进**线程局部**槽。读取：
+许多失败调用会将可读信息存入**线程局部**槽，但并非所有错误都会更新它。例如某些输出指针为 `NULL` 时会直接返回 `NullPointer`，消息可能为空或仍是之前的内容。可在同一线程读取：
 
 ```c
 char *msg = erika_last_error_message();   // 堆分配，可能为 NULL
@@ -61,12 +174,14 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 ```
 
 因为是线程局部的，要**在发起失败调用的同一线程**上读取，且在该线程下一次调用之前读取
-（之后一次 `Ok` 会清空它）。`erika_last_error_message` 返回的是你拥有的副本——用
+（后续多数成功调用会清空它）。轮询到 `Error`、`VideoDecoderChanged` 或
+`AudioOutputChanged` 事件时，也应立即在轮询线程读取消息；其他事件可能清空它。
+`erika_last_error_message` 返回的是你拥有的副本——用
 `erika_string_free` 释放。
 
 ### 字符串所有权
 
-Erika 返回的任何 `char*` 都是堆分配、归调用方所有：
+liberika 返回的任何 `char*` 都是堆分配、归调用方所有：
 
 - 独立字符串（如 `erika_last_error_message`）→ 用 `erika_string_free` 释放。
 - 内嵌在 `ErikaTrackInfo` 中的字符串 → 用 `erika_track_info_free(&track)`
@@ -74,10 +189,10 @@ Erika 返回的任何 `char*` 都是堆分配、归调用方所有：
 - 内嵌在 `ErikaDanmakuTrackInfo` 中的字符串 → 用
   `erika_danmaku_track_info_free(&track)` 释放。
 
-切勿用 libc `free()` 释放这些；始终用配套的 Erika 释放函数，使分配在同一 allocator
+切勿用 libc `free()` 释放这些；始终用配套的 liberika 释放函数，使分配在同一 allocator
 上跨越 ABI。
 
-你传入的 `const char*` 参数仅在调用期间被借用；Erika 会复制所需内容。它们必须是
+你传入的 `const char*` 参数仅在调用期间被借用；liberika 会复制所需内容。它们必须是
 NUL 结尾的 UTF-8。
 
 ### 计数数组惯用法
@@ -145,14 +260,17 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 `uri` 是本地文件路径或 HTTP(S) URL。`erika_open_with_headers` 用于为 HTTP(S) 播放
 设置请求头；`headers` 只在调用期间读取，调用返回后即可释放。`header_count` 大于零时
 `headers` 不能为 NULL。请求头会用于 HEAD、Range GET 和预取请求。
-认证信息和 Cookie 不会写入 Erika 日志。`seek` 单位为微秒。
+认证信息和 Cookie 不会写入 liberika 日志。`seek` 单位为微秒。
 
 `erika_open_with_options` 是 `erika_open_with_headers` 的超集：通过 `ErikaOpenOptions`
 结构体把请求头数组与逐请求调参打包在一起。`options` 传 NULL 表示全部使用默认值。
 `http_read_ahead_bytes` 覆盖本次请求的 HTTP(S) 预读窗口（字节）。`0` 会优先采用进程级
 环境变量 `ERIKA_HTTP_READAHEAD_BYTES`，未设置时使用 2 MiB 默认值；显式非零值优先于
 该环境变量。
-`reserved` 中的非零值会被拒绝，以便未来增加字段时不改变旧宿主的行为。预读窗口只
+`http_back_buffer_bytes` 覆盖 HTTP(S) 回看预算（字节）——即播放位置之后保留多少已播
+数据，落在这个范围内的回退不需要发起网络请求。`0` 使用 16 MiB 默认值；播放高码率
+媒体的宿主应按码率取值（约 15 秒 × 码率，例如 71 Mbps 下 -10 秒回退覆盖 ~89 MB）。
+`reserved` 中的非零值会被拒绝，以便未来增加字段时不改变旧宿主的行为。这两个参数只
 影响 HTTP(S) 播放，本地文件不受影响。
 
 ```c
@@ -160,13 +278,14 @@ typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;   /* 0 = 环境变量，否则 2 MiB */
-  uint64_t reserved[3];             /* 必须为零 */
+  uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB 回看预算 */
+  uint64_t reserved[2];             /* 必须为零 */
 } ErikaOpenOptions;
 ```
 
-`open` 和 `play` 都会
-异步入队；应观察 `StateChanged`、`DurationChanged` 和 `Error` 事件获取最终结果，
-不要阻塞宿主 UI 线程。
+`open` 会同步探测媒体流并转入 `Ready`；`play` 才是异步入队。
+应在宿主 UI 线程之外执行可能阻塞的 open，并串行调用同一 handle 的所有接口。
+通过 `StateChanged`、`DurationChanged` 和 `Error` 事件观察后续播放变化。
 
 ### 轨道与字幕
 
@@ -227,8 +346,8 @@ Android extended-linear 输出。
 
 ## `ErikaPresenterHandle` —— 推送模型
 
-Erika 拥有完整栈；宿主提供 surface 并调用 `render_tick`。
-**macOS / iOS / tvOS / Windows / Android / HarmonyOS。**
+liberika 拥有完整栈；宿主提供 surface 并调用 `render_tick`。
+**macOS / iOS / tvOS / Windows / Android / HarmonyOS / Linux。**
 
 ### 生命周期与配置
 
@@ -240,6 +359,11 @@ ErikaPresenterHandle *erika_presenter_create_with_output_mode_and_alpha(int32_t 
                                                                         int32_t video_alpha_mode);
 void                  erika_presenter_destroy(ErikaPresenterHandle *handle);
 ```
+
+从 v0.1.8 起，`ErikaPresenterConfig` 为四字段、16 字节；v0.1.7 为三字段、
+12 字节。此结构体按值传递，两个版本不具备二进制兼容性。C/C++ 调用方及手写
+Swift/FFI 镜像必须使用配套头文件和原生库重新编译，不透明视频应将
+`video_alpha_mode` 初始化为 `0`。
 
 `ErikaPresenterConfig` 选择输出模式（`Sdr`、Apple `AppleEdr`、Android
 `ExtendedLinear`）、请求的 EDR/scRGB 内容 headroom 上限、初始亮度超分，以及
@@ -265,7 +389,11 @@ ErikaStatus erika_presenter_close(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_seek(ErikaPresenterHandle *, uint64_t position_micros);
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
+ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *, bool muted);       // 保留音量
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
+ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle *, const char *name,
+                                               const uint8_t *data, uintptr_t len);
+ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
 ErikaStatus erika_presenter_set_subtitle_font(ErikaPresenterHandle *, const char *family, const char *file_path);
 ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubtitleStyle style);
@@ -274,11 +402,22 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 
 `set_playback_rate(1.0)` 为正常速度。`erika_presenter_open_with_options` 是
 `erika_open_with_options` 的推送模型对应版本，接受同样的
-`ErikaOpenOptions`（请求头加 `http_read_ahead_bytes`；见
-[`erika_open_with_options`](#erikahandle--拉取模型)）。`set_upscaler` 在运行时切换神经亮度超分（见
-[`erika_presenter_get_upscaler_status`](#诊断与截图)）。Metal 与具备 compute 能力的
-wgpu renderer，以及 feature level 11.0+ 的 D3D11 renderer 会执行 ArtCNN；其他后端保留原生 luma sampling，并明确报告
-`Inactive` 回退。
+`ErikaOpenOptions`（请求头加 `http_read_ahead_bytes` / `http_back_buffer_bytes`；见
+[`erika_open_with_options`](#erikahandle--拉取模型)）。`set_upscaler` 在运行时切换亮度超分（见
+[`erika_presenter_get_upscaler_status`](#诊断与截图)）。模式值按族分组：1-15 为 ArtCNN，16-31 为
+Anime4K，32-47 为空间 shader（`Fsr1`），48-63 为平台缩放器（`PlatformVideo`、`MetalFxSpatial`），
+64 为 `Custom`。网络类模式把解码后的亮度平面放大 2 倍；`Fsr1` 与 `MetalFxSpatial` 把亮度直接缩放到
+呈现尺寸；`PlatformVideo` 缩放整帧。Metal 与 D3D11 运行各自支持的全部模式；wgpu renderer（Linux、
+Android、OpenHarmony、Windows 的 wgpu 回退）运行全部网络模式（ArtCNN 1-7、Anime4K、`Custom`）和 `Fsr1`，`PlatformVideo` 与 `MetalFxSpatial` 在这里报告 `Inactive`。当前后端无法运行的模式保留原生
+luma sampling，报告 `Inactive`，原因见诊断 `upscaler` 对象。Web 没有超分。各平台支持情况见
+[集成指南](integration.zh.md#超分)。
+
+`erika_presenter_load_upscaler_model` 从内存加载 `ErikaLumaUpscalerMode_Custom` 使用的网络
+（`name` 为标签，`data`/`len` 为文件内容）；`erika_presenter_clear_upscaler_model` 将其清除。之后用
+`set_upscaler(handle, ErikaLumaUpscalerMode_Custom)` 选用。数据可以是 Erika `.esr` 网络（用
+`crates/erika/assets/artcnn/export_artcnn_esr.py` 导出 ArtCNN ONNX），或 FSRCNNX / Anime4K CNN 方言的
+mpv hook shader。只解析权重，从不执行 shader 代码。liberika 不打包 FSRCNNX 与 RAVU/NNEDI3（GPL/LGPL），
+需要由宿主提供这类文件。
 
 `set_subtitle_font` 与 `set_subtitle_style` 设置字幕的**回退**外观。family 或
 path 传空即清除该项。颜色为 `0xRRGGBBAA`，默认不透明白色文字（`0xFFFFFFFF`）与
@@ -329,7 +468,7 @@ override 覆盖 ASS 对白自带的样式。它是 `erika.h` 中 `ERIKA_SUBTITLE
 传 `0` 则全部保持回退语义，未知位会被丢弃。覆盖时字号仍与分辨率无关——`font_size`
 为 `48` 时，无论脚本声明何种 `PlayResY` 都落在同样的像素上。边距则不然：libass 让
 覆盖用的 margin 保持脚本自身的单位，因此在容器内的 ASS 轨上它随该脚本的 `PlayResY`
-缩放，而在纯文本字幕（Erika 按画面尺寸生成脚本）上就是像素。
+缩放，而在纯文本字幕（liberika 按画面尺寸生成脚本）上就是像素。
 
 `ErikaHttpHeader` 定义如下：
 
@@ -382,6 +521,25 @@ ErikaStatus erika_presenter_tracks(ErikaPresenterHandle *, ErikaTrackInfo *out_t
 ```
 
 语义同 `ErikaHandle` 的轨道函数。
+
+### 音频、资源与内存字体接口
+
+```c
+ErikaStatus erika_presenter_audio_only_tick( ErikaPresenterHandle *handle, ErikaPresenterStats *out_stats);
+ErikaStatus erika_presenter_clear_subtitle_memory_fonts(ErikaPresenterHandle *handle);
+ErikaStatus erika_presenter_get_resource_status( ErikaPresenterHandle *handle, ErikaPresenterResourceStatus *out_status);
+ErikaStatus erika_presenter_get_subtitle_memory_font_info( ErikaPresenterHandle *handle, uint64_t font_id, ErikaSubtitleMemoryFontInfo *out_info);
+ErikaStatus erika_presenter_get_subtitle_memory_font_status( ErikaPresenterHandle *handle, ErikaSubtitleMemoryFontStatus *out_status);
+ErikaStatus erika_presenter_register_subtitle_memory_font( ErikaPresenterHandle *handle, const uint8_t *data, uintptr_t data_len, uint64_t *out_font_id);
+ErikaStatus erika_presenter_select_subtitle_memory_fonts( ErikaPresenterHandle *handle, const uint64_t *font_ids, uintptr_t font_count);
+void erika_subtitle_memory_font_info_free(ErikaSubtitleMemoryFontInfo *info);
+void erika_subtitle_memory_font_status_free( ErikaSubtitleMemoryFontStatus *status);
+```
+
+`audio_only_tick` 用于无视频表面的音频调度；`get_resource_status` 返回渲染器资源快照。
+内存字体先注册取得 ID，再按顺序选择回退字体；状态与信息内的分配用对应 `_free` 释放。
+
+`ErikaSubtitleMemoryFontFace` 包含 face index、字体族 JSON、PostScript 名称、weight、italic 与 monospaced。`ErikaSubtitleMemoryFontInfo.faces` 和内嵌字符串随 `erika_subtitle_memory_font_info_free` 一并释放。
 
 ### 弹幕
 
@@ -455,7 +613,7 @@ Android extended-linear 应把 Flutter Hybrid Composition `SurfaceView` 对应�
 后才设置 `extended_linear`，只有直接 `SurfaceView` 才设置
 `direct_composition = true`，并把宿主探测失败保留在 `fallback_reason`。
 `desired_headroom = 0` 表示系统 auto；正数是 surface 上限，可用于 API 35 per-`SurfaceView`
-`setDesiredHdrHeadroom`。Erika 仍会自行
+`setDesiredHdrHeadroom`。liberika 仍会自行
 验证 Vulkan、`Rgba16Float` 和 `ADATASPACE_SCRGB_LINEAR`；任何一项失败都会回退 SDR，
 且原因可查询。
 
@@ -485,10 +643,18 @@ ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresente
 
 仅限 Windows。当 presenter 通过
 `attach_wgpu_surface_with_output_capabilities`（`direct_composition = true`）attach，
-且以透明视频 alpha 模式或 overlay 混合播放时，Erika 会为目标 HWND 创建预乘 alpha 的
+且以透明视频 alpha 模式或 overlay 混合播放时，liberika 会为目标 HWND 创建预乘 alpha 的
 composition swap chain。此 getter 以 **AddRef 后的 `IUnknown*`** 返回它：调用者拥有返回的
-COM 引用，必须自行 `Release`。解码器/设备丢失后应重新获取——Erika 会重建 swap chain
+COM 引用，必须自行 `Release`。解码器/设备丢失后应重新获取——liberika 会重建 swap chain
 并暴露新对象；指针未变说明没有重建。
+
+### Windows Flutter 纹理
+
+```c
+ErikaStatus erika_presenter_windows_flutter_texture_iunknown(ErikaPresenterHandle *, void **out_texture);
+```
+
+仅限 Windows，其他平台不导出此符号。返回最新已完成且不可变的 SDR Flutter GPU 帧，类型为 **已 AddRef 的 `IUnknown*`**。调用方拥有该引用，必须 `Release`；使用帧期间应保留引用，纹理内容在其整个生命周期内不会改变。输出指针为空时返回 `NullPointer`；presenter 有效但尚无已完成 Flutter 纹理时返回 `PlayerError`，并将输出置空。应先驱动渲染再请求帧。
 
 ### 渲染循环与事件
 
@@ -499,7 +665,7 @@ ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *, ErikaEvent *out_e
 ```
 
 每个显示帧调一次 `render_tick`（如来自 `CADisplayLink`、`CVDisplayLink` 或 Windows
-帧调度器）。`time_seconds` 是该帧的宿主显示时钟（秒）——Erika 用它做 vsync 量化调度，
+帧调度器）。`time_seconds` 是该帧的宿主显示时钟（秒）——liberika 用它做 vsync 量化调度，
 所以传**呈现时间戳**，不是 wall-clock 增量。若 `out_stats` 非 `NULL`，会填入流水线
 计数器快照。`poll_event` 非阻塞，空闲时返回 `NoEvent`。
 
@@ -510,6 +676,14 @@ PCM 供给和音频时钟反馈由独立音频线程执行，渲染阻塞不会�
 
 `get_stats` 填入同样的 `ErikaPresenterStats` 快照，但不渲染帧。当宿主采样计数器的
 节奏与显示循环不同时用它；它不推进呈现。
+
+### 按显示目标时间渲染
+
+```c
+ErikaStatus erika_presenter_render_tick_with_timing( ErikaPresenterHandle *handle, double time_seconds, const double *presentation_delay_seconds, ErikaPresenterStats *out_stats);
+```
+
+可选 delay 是从调用入口到显示目标的秒数，范围 ±0.25 秒，传 NULL 保留旧采样行为。视频、字幕和弹幕使用同一目标快照，不改变播放时钟。
 
 ### JSON 桥
 
@@ -523,7 +697,7 @@ char *erika_presenter_render_tick_json(ErikaPresenterHandle *, double time_secon
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 ```
 
-返回的字符串归 Erika 所有，必须用 `erika_string_free` 释放。`poll_event_json`
+返回的字符串归 liberika 所有，必须用 `erika_string_free` 释放。`poll_event_json`
 在无事件时返回 `NULL`——不是信封——所以 `NULL` 表示空闲而非错误。
 
 三者的返回值都包在同一层信封里：
@@ -533,21 +707,37 @@ char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 { "ok": false, "status": 3, "error": "<message>" }
 ```
 
-`arguments_json` 必须是 JSON 对象。`method` 选择操作，与 C 入口一一对应：
-`open`、`play`、`pause`、`stop`、`close`、`seek`、`setPlaybackRate`、`setVolume`、
-`setUpscaler`、`setSubtitleScale`、`getUpscalerStatus`、`getOutputStatus`、
-`getPresenterStats`、`tracks`、`addExternalSubtitle`、`removeSubtitleTrack`、
-`selectAudioTrack`、`selectSubtitleTrack`，以及弹幕系列（`loadDanmakuFile`、
-`loadDanmakuJson`、`addDanmakuTrackFile`、`addDanmakuTrackJson`、
-`removeDanmakuTrack`、`setDanmakuTrackEnabled`、`setDanmakuTrackOffset`、
-`setDanmakuGlobalOffset`、`danmakuTracks`、`clearDanmaku`、`setDanmakuEnabled`、
-`setDanmakuConfig`），以及字幕字体与资源状态系列（`selectSubtitleMemoryFonts`、
-`clearSubtitleMemoryFonts`、`getSubtitleMemoryFontStatus`、`getResourceStatus`）。
-未知 method 返回 `ok: false`，不会中止。权威分发表见
-`crates/erika_capi/src/presenter_json.rs`。
+`arguments_json` 必须是 JSON 对象。`method` 选择
+`crates/erika_capi/src/presenter_json.rs` 中分派表（`JSON_METHODS`）的一项。分派表
+与 C 入口对应：播放（`open`、`play`、`pause`、`stop`、`close`、`seek`、
+`setPlaybackRate`、`setVolume`）、轨道与字幕（`tracks`、`trackSelection`、
+`selectAudioTrack`、`selectSubtitleTrack`、`addExternalSubtitle`、
+`removeSubtitleTrack`、`setSubtitleScale`、`setSubtitleFont`、`setSubtitleStyle`、
+字幕内存字体系列）、弹幕系列（含 `getDanmakuConfig`）、输出与超分（`setUpscaler`、
+`getUpscalerStatus`、`loadUpscalerModelFile`、`clearUpscalerModel`、`setOutputHeadroom`、`getOutputStatus`、`setDebugHudEnabled`）、
+计数（`getPresenterStats`、`getResourceStatus`），以及下文的诊断
+（`getDiagnosticsSnapshot`、`getLogs`）。
 
-这层桥只是便利封装，不是第二套 API：它调用的就是上面这些函数，没有额外能力。
-能在平台通道上传结构体的宿主应优先用类型化入口。
+`erika_presenter_invoke_json` 同时是进入内核的通用透传通道：
+
+- `listMethods` 返回分派表本身——`{schema: 1, fields, methods: [{name, scope, summary,
+  arguments: [{name, type, required}], returns, blocking, writesFiles}]}`——宿主（或其后的智能体）无需改代码
+  就能发现并转发能力。登记一项能力 = 在 `invoke` 加一个 `match` 分支，并在
+  `JSON_METHODS` 加一项；两者不一致时单元测试会失败。
+- 每一项还带 `blocking`（调用在调用线程上做完才返回，耗时随输入增长：媒体长度、文件大小）和
+  `writesFiles`（调用会在磁盘上创建文件，结果列出路径）；顶层 `fields` 写明这两个字段。
+  `exportFrame`、`exportFrames` 用上面的单帧导出从媒体取画面：给出 `outputPath` / `outputDir` 时写
+  PNG 或 RGBA 文件并返回路径，`exportFrame` 不给 `outputPath` 时返回 base64 编码的字节。
+- `scope` 为 `global` 的方法（`listMethods`、`getLogs`、`exportFrame`、`exportFrames`）接受 `NULL` 句柄。
+- `invokeJson`（`{method, arguments}`）调用表中另一方法，并把它的完整信封作为
+  `value` 返回。会在原生侧拆信封的平台插件（Linux、鸿蒙、Android）用它原样转发 Dart
+  的 `ErikaPlayer.invokeJson`。
+- 未知方法返回 `{"ok": false, "status": 3, "code": "unknown_method", "method":
+  "<名称>", "error": "unsupported Erika presenter method: <名称>"}`；`arguments_json`
+  格式错误时带 `"code": "invalid_arguments"`。两者都不会中止。
+
+这层桥调用的就是上面这些函数，没有额外能力。能在平台通道上传结构体的宿主也可以用
+类型化入口。
 
 ### 诊断与截图
 
@@ -556,18 +746,27 @@ ErikaStatus erika_presenter_get_upscaler_status(ErikaPresenterHandle *, ErikaUps
 ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutputStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle *, uint32_t width, uint32_t height,
+                                                         uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
-`get_upscaler_status` 报告请求的超分模式、当前后端（off / inactive / building /
-scalar / simdgroup-matrix）、fallback 次数、超分帧数，以及最近的 encode/GPU 耗时
-（微秒）。
+`get_upscaler_status` 报告请求的超分模式、当前后端（`Off`、`Inactive`、`Building`、`Scalar`、
+`SimdgroupMatrix`、`CooperativeMatrix`、`LinalgMatrix`、`VideoProcessor`、`VideoToolbox`、`MetalFx`、
+`TensorOps`）、fallback 次数、超分帧数，以及最近的 encode/GPU 耗时（微秒）。`Inactive` 表示该模式在此处
+无法运行、使用原生采样（原因见诊断）；`Building` 表示 kernel 正在后台编译，期间使用原生采样。
+`CooperativeMatrix` 是与 D3D11 并行的 Vulkan `VK_KHR_cooperative_matrix`；`LinalgMatrix` 是可选的
+D3D12 SM 6.10 预览；`VideoProcessor` 是 D3D11 video processor 厂商扩展（NVIDIA RTX Video / Intel VSR）；
+`TensorOps` 是 Metal 4 tensor ops（M5/A19）。D3D11 现在也会通过 timestamp query 在 `last_gpu_micros`
+中报告 GPU 耗时。
+
+`loadUpscalerModelFile`（`{path, name?}`）与 `clearUpscalerModel` 是上述加载/清除函数在 JSON 桥上的对应方法。
 
 `get_output_status` 返回实际协商到的输出，而不只是请求值。13 个字段如下：
 
 | 字段 | 含义 |
 |------|------|
 | `requested_mode` | 创建时请求的 `ErikaPresenterOutputMode`。 |
-| `active_encoding` | 实际的 `SdrSrgb`、`AppleEdr`、`AndroidExtendedLinearScRgb` 或 `Hdr10Pq` encoding。 |
+| `active_encoding` | 实际的 `SdrSrgb`、`AppleEdr`、`AndroidExtendedLinearScRgb`、`Hdr10Pq` 或 `LinuxExtendedLinearScRgb` encoding。 |
 | `surface_format` | 实际 8-bit UNORM、10-bit UNORM 或 16-bit float surface class。 |
 | `native_data_space` | Android `ANativeWindow` dataspace；`406913024` 为 `SCRGB_LINEAR`，`-1` 表示不可用/不适用。 |
 | `requested_headroom` | 清洗后的请求内容 headroom 上限，最小 `1.0`。 |
@@ -597,9 +796,16 @@ Fallback 数值是稳定 ABI；新增原因只能追加，不能重排 `0..8`：
 `capture_frame_rgba` 是**截图**：把当前合成帧（视频 + 字幕，不含弹幕）离屏渲染进调用方
 分配的 RGBA8 缓冲，按请求的 `width`×`height`（与显示 surface 尺寸无关）。
 `out_capacity` 至少为 `width*height*4`。尚无可用帧时返回 `PlayerError`。Metal 与
-wgpu（包括 Android）已实现截图；当前 D3D11 backend 尚未实现。截图始终使用 SDR RGBA8
+wgpu（包括 Android）已实现截图；Windows D3D11 自 0.3.8 起也支持截图。截图始终使用 SDR RGBA8
 离屏 target，并对 HDR/extended-linear 内容 tone-map，因此即使显示输出是 Apple EDR、
 HDR10 或 Android extended-linear scRGB，返回字节仍是 SDR。
+
+D3D11 截图返回非预乘 alpha（straight alpha）的 RGBA，保留打包透明视频的颜色，供 PNG 编码使用；
+不会改变当前 surface、输出模式或已发布的 Flutter 纹理。视频使用普通缩放，
+不应用 ArtCNN/FSR/VSR 超分增强。GPU 读回有等待上限，超时返回错误，不会提前
+把仍被 GPU 读取的帧归还解码池。如果销毁时再次超时且设备仍有效，会保留该帧及
+关联的解码池资源直到进程退出，并记录警告。
+
 
 ```c
 uint32_t w = 1920, h = 1080;
@@ -609,6 +815,122 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 }
 free(rgba);
 ```
+
+自行合成 UI 的宿主（例如 Wayland 上的 Dioxus）可改用
+`erika_presenter_capture_frame_rgba_with_danmaku`，参数相同，额外包含已启用的弹幕。
+弹幕使用当前播放时钟、轨道选择、偏移、字体和绘制设置，按请求的像素尺寸独立布局，
+scale factor 为 1；捕获无需绑定 surface，也不要求先调用 `render_tick`。
+新接口不含调试 HUD，SDR RGBA8、缓冲区和错误约定与截图接口一致。
+捕获会同步准备并缓存短时间窗口；调整尺寸、seek 或修改弹幕配置后，下一次调用可能
+重新准备布局。音频输出仍需常规 `render_tick`；`audio_only_tick` 会暂停视频解码。
+
+Rust 对应入口为 `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`：
+
+```rust,ignore
+if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
+    // 将紧排 RGBA8 像素上传到宿主自己的纹理。
+}
+```
+
+此路径将像素读回 CPU，不导出共享 GPU 纹理，也不要求宿主与 liberika 的 wgpu 版本一致。
+
+原生 GPU 输出使用 `erika_presenter_create_for_texture_export(config)` 创建 presenter，
+每帧调用 `erika_presenter_export_frame_texture(p, w, h, scale, &frame)`，通过
+`erika_texture_frame_get_info` 取得借用句柄。消费端 GPU 完成且导入别名销毁后调用
+`erika_texture_frame_release`。此循环也驱动音频。已实现 Linux Vulkan OPAQUE_FD
+和 Apple Metal，公开接口没有 wgpu 类型；格式、同步、所有权与宿主导入示例见
+[原生纹理输出](external_textures.zh.md)。
+
+### 智能体诊断（JSON）
+
+```c
+ErikaStatus erika_presenter_get_diagnostics_json(ErikaPresenterHandle *, char **out_json);
+ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t since_seq,
+                                char **out_json);
+```
+
+新的诊断数据一律以 JSON 文档返回，不给上面的结构体加字段（Apple 插件手写镜像这些
+结构体，加字段会迫使动态库与插件锁步升级）。两个符号都应按可选方式加载，缺失即视为
+“不支持”。返回 `Ok` 时 `*out_json` 是调用方所有的 UTF-8 文档，用 `erika_string_free`
+释放；其它状态下为 `NULL`。每个文档带 `schema`（当前为 `1`），同一 schema 内只增字段。
+取不到的值为 `null`，不会填假的 0。时长单位为毫秒（微秒精度）。
+
+#### 诊断快照
+
+`erika_presenter_get_diagnostics_json` 一次取全。它只读 presenter 字段、渲染/音频计数
+和无锁的播放计数：不解码、不渲染，也从不等待播放线程（macOS release 构建播放中实测
+单次中位数约 0.3 ms，含 JSON 编码）。线程规则与其它句柄调用相同。
+
+| 段 | 内容 |
+|----|------|
+| `schema`、`capturedAtUnixMs` | 文档版本与采集时刻（墙钟）。 |
+| `playback` | `state`、`playing`、`mediaTimeSeconds`、`durationSeconds`、`playbackRate`、`generation`、`audioOnly`（后台暂停视频解码）、`buffering` `{active, events, currentMs, totalMs}`。 |
+| `media` | `container`（`format` 为解复用器短名，如 `matroska,webm`；`bitRate` 为整体码率），以及选中的 `video`（`codec`、`profile`、`level`、`width`、`height`、`pixelFormat`、`frameRate`、`bitRate`、`dolbyVisionProfile`）、`audio`（`codec`、`sampleRate`、`channels`、`sampleFormat`、`bitRate`）、`subtitle`；未知或没有则为 `null`。 |
+| `decoder` | 最近一次解码器切换，可直接查询而不再只靠事件：`requestedBackend`、`activeBackend`、`previousBackend`、`hardware`、`fellBack`、`fallbackCount`、`stage`、`reason`、`codec`、`pixelFormat`、`lineSizes`。首次切换前为 `null`。 |
+| `video` | 解码/渲染帧、硬件/软件/零拷贝/直接零拷贝/共享句柄帧、`cpuFallbackFrames`、`importFailures`、`renderFailures`、`backpressureDrops`、`rejectedImportRoute`。 |
+| `presenter` | surface 挂载与尺寸，最近一次 tick/pump/音频/字幕/视频/时钟/弹幕规划/渲染/GPU 耗时，测试帧/叠加/字幕/弹幕计数。 |
+| `output` | 请求模式、实际编码、surface 格式、dataspace、请求/实际余量（未知为 `null`）、回退原因标签与计数。 |
+| `hdr` | HDR 源帧、HDR10 输出帧、色调映射到 SDR 的帧、元数据更新/失败、输出失败、`outputActive`。 |
+| `resources` | 与 `ErikaPresenterResourceStatus` 相同。 |
+| `upscaler` | 请求模式与实际后端（标签）、`engine`（如 `scalar_compute`、`cooperative_matrix`、`linalg_matrix`、`metal4_tensor_ops`、`simdgroup_matrix`、`fsr1`、`metalfx_spatial`、`vt_low_latency_super_resolution`、`nvidia_rtx_video`、`intel_vsr`）、`reason`（模式为 `Inactive` 或降级的原因）、回退次数、超分帧数、最近编码耗时、`lastGpuMs`。 |
+| `audio` | 输出状态、configured/started、音量、推入帧、失败数、队列帧与 `queuedMs`、读/写/欠载帧、环形缓冲 `ringDroppedFrames`、设备恢复 `recovery`。 |
+| `buffers` | 播放线程发布的队列深度 `playback`（`demuxPackets`、`pendingVideoPackets`、`decodedVideoFrames`、`decodedAudioFrames`、`decodedSubtitleFrames`，形如 `{queued, capacity}`；`demuxEof`、`updatedAgoMs`；open 前为 `null`）、presenter 帧通道、`audioOutputQueuedMs`。 |
+| `timing.scheduler` | `leadTimeMs`、`dropToleranceMs`、`maxConsecutiveDrops`；`presentedFrames`；`lateDroppedFrames`（因超过丢帧容忍度被丢弃，过去没有计数）；`forcedLatePresents`（超过容忍度但连续丢帧额度用尽而照常显示）；`maxDropBurst`、`maxDroppedLateMs`、`lastDropAgoMs`、`seekPrerollDroppedFrames`；最近 128 个已呈现帧的 `lateByMs` 窗口 `{samples, meanMs, p50Ms, p95Ms, maxMs}`；`lateHistogram`（`le10ms` … `gt120ms`）。 |
+| `timing.presentation` | 在 liberika 渲染处测得，并非显示器真实 vsync：`ticks` 与 `tickIntervalMs`；`uploadedFrames`、`newFramesPresented`、`supersededBeforePresent`；`frameIntervalMs` 与 `jitterMs`（相对源帧间隔÷倍速的绝对偏差）；`longFrames`（在屏时长超过 `longFrameFactor` = 1.5 个源帧间隔）；`lastPresentAgoMs`。 |
+| `timing.clock` | 音频主时钟纠偏（过去只写 trace）：模式、同步参数（`deadbandMs`、`maxCorrectionPerFrameMs`、`snapThresholdMs`、`audioLeadTimeMs`）、`observations`、`corrections`、`snaps`、`forwardCorrections`、`backwardCorrections`、`lastDriftMs`（正值：音频领先播放时钟）、`maxAbsDriftMs`、`appliedTotalMs`、`lastCorrectionAgoMs`、`lastSnapAgoMs`、`absDriftMs` 窗口。 |
+
+`timing` 与 `buffers.playback` 中的计数在 presenter 打开新媒体时清零。
+
+#### 日志环形缓冲
+
+`erika_log_read_json` 导出进程级内存环形缓冲（最多 2000 条 / 512 KiB，单条正文上限
+4 KiB）。无需句柄，任意线程可调用。收集内容：
+
+- liberika 原本写到 stderr / logcat / hilog 的全部运维诊断（这些输出保持不变）；
+- 过去是裸 `eprintln!` 的运维失败（音频 configure/push/start/pause/reset、渲染器
+  clear、字幕渲染与解码器打开、WASAPI、D3D11 设备移除、超分被禁用）；
+- 警告及以上的 FFmpeg `av_log` 消息。回调是进程级的，所有播放器共享：在栈缓冲里格式化，
+  从不阻塞（争用时计入 `droppedContended`），只差数字/地址的连续重复合并为一条并计
+  `count`，FFmpeg 新条目每秒最多 50 条（其余计入 `rateLimited`）。FFmpeg 自身的 stderr
+  输出照旧。`ERIKA_FFMPEG_LOG_CAPTURE=0` 关闭捕获；使用发行版共享 FFmpeg（Linux 系统库）
+  时默认不捕获，需 `ERIKA_FFMPEG_LOG_CAPTURE=1`，因为进程里其它库可能占用该回调。
+
+参数：`limit` 过滤后最新的条数（`0` = 全部保留条目）；`min_level` 为 `ErikaLogLevel`
+（`Trace` 0 … `Error` 4）或 `-1` 表示全部；`since_seq` 只取 `seq >= since_seq` 的条目
+（传上次的 `nextSeq` 即增量读取）。
+
+```json
+{
+  "schema": 1,
+  "capacity": { "entries": 2000, "bytes": 524288, "entryTextBytes": 4096 },
+  "retained": 15, "retainedBytes": 6011, "oldestSeq": 1, "nextSeq": 16,
+  "evicted": 0, "rateLimited": 0, "droppedContended": 0,
+  "ffmpegCapture": "active", "redacted": true,
+  "entries": [
+    { "seq": 3, "unixMs": 1761134400123, "level": "error", "source": "ffmpeg",
+      "event": null, "count": 1,
+      "message": "[mpeg4 @ 0x…] Failed setup for format videotoolbox_vld: hwaccel initialisation returned error." },
+    { "seq": 4, "unixMs": 1761134400140, "level": "warn", "source": "erika",
+      "event": "video_decoder", "count": 2, "lastUnixMs": 1761134400410,
+      "data": { "event": "video_decoder", "stage": "open_avcodec_to_software" } }
+  ]
+}
+```
+
+条目按时间从旧到新。结构化诊断解析为 `data`，其它行为 `message`。`ffmpegCapture` 取值
+`not_installed`（尚未用到 FFmpeg）、`active`、`disabled`、
+`shared_library_opt_in_required`。
+
+级别：已知严重程度的调用点显式传入；FFmpeg 的 PANIC/FATAL/ERROR → `error`、
+WARNING → `warn`；libass 0–1 → `error`、2 → `warn`。其它结构化诊断按 `event`/`stage`
+名称给默认级别：fatal/panic 为 `error`；失败、超时、资源不可用/丢失/被拒/缺失、卡住与
+回退（包括 `*_to_software`、`*_to_bytebuffer` 路径）为 `warn`；其余为 `info`。
+
+脱敏在导出时进行：URL 的用户信息以及 `?`/`#` 之后的全部内容、凭据类 `key=value` /
+`key: value` 与 JSON 键（`token`、`api_key`、`access_token`、`authorization`、
+`cookie`、`X-Emby-Token` 等）、`Bearer`/`Basic` 凭据、当前用户主目录（替换为 `~`），以及
+其它 `/Users/<user>`、`/home/<user>`、`C:\Users\<user>` 路径段。缓冲只存在于进程内存，
+按需读取。
 
 ## 枚举
 
@@ -622,11 +944,11 @@ free(rgba);
 | `ErikaFlutterTextureKind` | `Unknown` `MacOsTextureRegistrar` `IosTextureRegistrar` `AndroidSurfaceTexture` `WindowsTextureRegistrar` `LinuxTextureRegistrar` |
 | `ErikaVideoAlphaMode` | `Opaque` `PackedAlphaRight` |
 | `ErikaPresenterOutputMode` | `Auto` `Sdr` `AppleEdr` `ExtendedLinear` |
-| `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` |
+| `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` `LinuxExtendedLinearScRgb` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
 | `ErikaOutputFallbackReason` | `None` `DisplayHdrUnsupported` `HybridCompositionRequired` `WgpuBackendNotVulkan` `Rgba16FloatSurfaceFormatUnavailable` `NativeWindowDataSpaceApiUnavailable` `ScrgbDataSpaceVerificationFailed` `SurfaceConfigureFailed` `LegacyAppleEdrUnsupported` |
-| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` |
-| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` |
+| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` `ArtCnnC4F16Dn` `ArtCnnC4F32Ds` `ArtCnnC4F32Dn` `ArtCnnR8F64` `Anime4kS` `Anime4kM` `Anime4kL` `Anime4kVl` `Anime4kUl` `Anime4kDenoiseS` `Anime4kDenoiseM` `Anime4kDenoiseL` `Anime4kDenoiseVl` `Anime4kDenoiseUl` `Fsr1` `PlatformVideo` `MetalFxSpatial` `Custom` |
+| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` `CooperativeMatrix` `LinalgMatrix` `VideoProcessor` `VideoToolbox` `MetalFx` `TensorOps` |
 
 ## 结构体
 
@@ -639,7 +961,7 @@ free(rgba);
 - **`ErikaOutputStatus`** —— 上文“诊断与截图”说明的 13 字段协商输出快照。
 - **`ErikaDanmakuConfig`** —— 完整弹幕布局/外观配置（字号、不透明度、显示区域、滚动
   时序、碰撞/堆叠开关、屏蔽模式、阴影样式）。`font_size` 是 NipaPlay/Flutter 的*逻辑*
-  字号；Erika 会乘以 surface scale 得到 glyph 像素。
+  字号；liberika 会乘以 surface scale 得到 glyph 像素。
 - **`ErikaDanmakuTrackInfo`** `{ id, enabled, offset_micros, item_count, char *name, char *source }` —
   用 `erika_danmaku_track_info_free` 释放。
 - **`ErikaVideoParams`** `{ width, height, primaries, transfer }` —— 通过

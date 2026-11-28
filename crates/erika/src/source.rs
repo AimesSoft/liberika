@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 #[cfg(target_os = "android")]
 use std::collections::HashMap;
 use std::env;
@@ -7,21 +8,39 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "android")]
-use std::sync::{Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+mod http;
+
+use http::HttpIo;
+pub use http::{ClaimedColdOpenCancellation, ColdOpenCancellation, SourceCancellation};
 
 use crate::core::MediaSourceHint;
 use crate::trace;
 
 #[derive(Debug, Error)]
 pub enum SourceError {
+    #[error("source read cancelled")]
+    Cancelled,
     #[error("io error: {0}")]
     Io(String),
     #[error("http error: {0}")]
     Http(String),
+    /// An answer whose position cannot be trusted: a 206 without
+    /// Content-Range on a resumed offset, or a served start that disagrees
+    /// with the request. Distinct from `Http` so the tail rule of issue #163
+    /// (an undelivered final range ends the read as EOF) never normalizes a
+    /// server that misanswers ranges -- that must stay an error.
+    #[error("http range verification error: {0}")]
+    HttpRangeVerification(String),
+    #[error("http error: resource changed or cannot be safely validated during Range retry")]
+    HttpEntityChanged,
     #[error("unsupported source URI: {0}")]
     Unsupported(String),
     #[error("invalid owned file descriptor URI: {0}")]
@@ -46,9 +65,18 @@ impl ByteRange {
 }
 
 pub trait MediaSource: Send {
+    fn set_cold_open_cancellation(&mut self, _: Option<ColdOpenCancellation>) {}
     fn uri(&self) -> &str;
     fn len(&mut self) -> Result<Option<u64>>;
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>>;
+
+    /// Release expendable read-ahead storage while keeping later reads valid.
+    fn release_buffer(&mut self) {}
+
+    /// Return a thread-safe handle that can interrupt a blocked source read.
+    fn cancellation(&self) -> Option<SourceCancellation> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -337,27 +365,148 @@ fn parse_owned_fd_value(value: &str, uri: &str) -> Result<i32> {
 
 pub struct HttpRangeSource {
     uri: String,
-    agent: ureq::Agent,
+    agent: HttpIo,
     http_headers: Vec<(String, String)>,
     content_length: Option<u64>,
+    /// Set once a completed probe answered `None` (chunked / connection-close
+    /// origin). Without it every piece fetch re-issues the HEAD + range probe
+    /// because `content_length` stays `None`.
+    length_probed: bool,
     cache_start: u64,
     cache_bytes: Vec<u8>,
+    /// Strong identity observed in bytes accepted by this source, across seeks
+    /// and worker replacement. Headers without retained bytes never bind it.
+    entity_validator: Option<Arc<str>>,
+    /// Cache depth target: how much *unread* data to keep buffered ahead of the
+    /// reader. Deeper windows ride out longer origin hiccups; the cost is
+    /// memory. This is deliberately not the on-the-wire request size -- see
+    /// `HTTP_REQUEST_MAX_BYTES`.
     read_ahead_bytes: u64,
-    prefetch: Option<PendingHttpFetch>,
+    /// Largest body a single request may ask for: `read_ahead_bytes` capped by
+    /// `HTTP_REQUEST_MAX_BYTES`. The window is filled by successive requests of
+    /// at most this size instead of one request for the whole window.
+    request_bytes: u64,
+    /// How much already-played data stays in the cache (the rewind budget).
+    /// `HTTP_CACHE_RETAIN_BYTES` is the default; hosts sizing by media bitrate
+    /// override it through the open options (`http_back_buffer_bytes`).
+    cache_retain_bytes: u64,
+    /// One persistent prefetch stream (`bytes=anchor-`), delivering stripes in
+    /// file order. Multiple open-ended streams would download overlapping
+    /// tails, even if their handoffs were assigned different stripe indices.
+    /// When the window is full the worker stops reading its socket, letting
+    /// TCP flow control throttle the origin without per-piece requests.
+    streams: Option<StreamSession>,
+    /// Next stripe index the reader expects to append (`streams` frontier).
+    stream_frontier: u64,
+    /// The consumer position the window budget is measured against, updated
+    /// by every read.
+    stream_reader_end: u64,
+    /// Consecutive failed background workers. A failed worker is never fatal
+    /// (the read path falls back to a synchronous fetch), but retrying on
+    /// every read would hammer a sick origin, so spawning parks after a few
+    /// and resumes once a synchronous fetch proves the origin is alive.
+    prefetch_failures: u32,
+    /// Sticky across worker replacement and buffer release: a failed entity
+    /// check must never become an unvalidated synchronous fallback.
+    entity_changed: Arc<AtomicBool>,
 }
 
-struct PendingHttpFetch {
-    range: ByteRange,
-    handle: JoinHandle<Result<HttpRangeResponse>>,
+/// Handoff channel between the stream workers and the reader thread.
+///
+/// Workers never touch `cache_bytes` (the reader thread owns it); they hand
+/// completed stripes over under this lock and the reader appends them on its
+/// own schedule. `epoch` is the re-anchoring counter: a seek bumps it and
+/// workers of older epochs exit without touching anything.
+struct StreamShared {
+    inner: Mutex<StreamInner>,
+    signal: Condvar,
+    demand: tokio::sync::Notify,
+    entity_changed: Arc<AtomicBool>,
 }
+
+struct StreamSession {
+    shared: Arc<StreamShared>,
+    io: HttpIo,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        {
+            let mut inner = lock_stream(&self.shared);
+            inner.stopped = true;
+            inner.epoch = inner.epoch.wrapping_add(1);
+        }
+        self.io.cancel();
+        self.shared.signal.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct StreamInner {
+    epoch: u64,
+    /// Completed stripes waiting for the reader, by stripe index.
+    pending: BTreeMap<u64, StripeHandoff>,
+    /// The worker finished (EOF or failure); no further stripes will arrive.
+    worker_done: bool,
+    /// Whether completion was a failure (counted by the reader once).
+    worker_failed: bool,
+    failure_acked: bool,
+    /// Body bytes received so far, for the reader's stall detection.
+    progress_bytes: u64,
+    last_progress: Instant,
+    /// Absolute byte position past which no worker may start another stripe:
+    /// the reader's position plus the configured window, published by every
+    /// read. Workers self-throttle against this rather than a "window full"
+    /// flag, because a flag is only refreshed when the reader reads -- a reader
+    /// parked on a full packet queue would otherwise leave the workers
+    /// unbounded, and a fast origin then prefetches the whole resource.
+    window_end: u64,
+    /// Current requested read end if cache coverage is insufficient, else zero.
+    uncovered_read_end: u64,
+    /// Exclusive ownership of the partial stripe during the current body read.
+    reading_partial: Option<StreamReadPartial>,
+    idle_race_read: Option<(u64, Instant)>,
+    /// Set when the source is dropped: every worker exits.
+    stopped: bool,
+}
+
+struct StripeHandoff {
+    start: u64,
+    bytes: Vec<u8>,
+    validator: Option<Arc<str>>,
+}
+
+// A single in-flight read, never an additional response or buffer copy. The
+// reader can take the bytes only after observed network idleness and only when
+// they cover its entire uncovered request. The worker reclaims ownership when
+// that same body read completes, preserving its original stripe boundary.
+struct StreamReadPartial {
+    epoch: u64,
+    index: u64,
+    end: u64,
+    read_started: Instant,
+    idle_recovery: bool,
+    handoff: Option<StripeHandoff>,
+}
+
+// A healthy response chunk disarms this by completing the existing read. No
+// timer or extra wakeup is installed: blocked readers already recheck coverage.
+const HTTP_IDLE_PREFIX_GRACE: Duration = Duration::from_secs(1);
+const HTTP_IDLE_RACE_GRACE: Duration = Duration::from_secs(5);
 
 /// Bytes fetched for one HTTP range request plus the resource total reported
 /// by the server (`Content-Range` on 206, `Content-Length` on a whole-file
-/// 200). The total lets callers backfill `content_length` when HEAD is
-/// unavailable (e.g. servers answering HEAD with 405).
+/// 200), or measured at EOF of a whole-file 200. The total lets callers
+/// backfill `content_length` when HEAD or length headers are unavailable.
 struct HttpRangeResponse {
     bytes: Vec<u8>,
     total_length: Option<u64>,
+    validator: Option<String>,
+    /// Strong tag actually observed on a response contributing retained bytes.
+    strong_etag: Option<String>,
 }
 
 impl HttpRangeSource {
@@ -368,7 +517,7 @@ impl HttpRangeSource {
     }
 
     pub fn with_http_headers(uri: impl Into<String>, http_headers: Vec<(String, String)>) -> Self {
-        Self::with_http_headers_and_read_ahead(uri, http_headers, None)
+        Self::with_http_headers_and_window(uri, http_headers, None, None)
     }
 
     /// `read_ahead`: explicit read-ahead window in bytes; `None` (or `Some(0)`)
@@ -379,18 +528,46 @@ impl HttpRangeSource {
         http_headers: Vec<(String, String)>,
         read_ahead: Option<u64>,
     ) -> Self {
-        let agent = http_agent();
+        Self::with_http_headers_and_window(uri, http_headers, read_ahead, None)
+    }
+
+    /// `back_buffer`: how much already-played data the cache retains behind
+    /// the reader, i.e. the rewind budget; `None` (or `Some(0)`) uses the
+    /// 16 MiB engine default. High-bitrate sources need more -- a -10 s skip
+    /// at 71 Mbps covers ~89 MB, which a fixed 16 MiB tail cannot hold.
+    pub fn with_http_headers_and_window(
+        uri: impl Into<String>,
+        http_headers: Vec<(String, String)>,
+        read_ahead: Option<u64>,
+        back_buffer: Option<u64>,
+    ) -> Self {
+        let agent = HttpIo::new();
         Self {
             uri: uri.into(),
             agent,
             http_headers,
             content_length: None,
+            length_probed: false,
             cache_start: 0,
             cache_bytes: Vec::new(),
+            entity_validator: None,
             read_ahead_bytes: read_ahead
                 .filter(|bytes| *bytes > 0)
-                .unwrap_or_else(http_read_ahead_bytes),
-            prefetch: None,
+                .unwrap_or_else(http_read_ahead_bytes)
+                .min(HTTP_READ_AHEAD_MAX_BYTES),
+            request_bytes: read_ahead
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or_else(http_read_ahead_bytes)
+                .min(HTTP_REQUEST_MAX_BYTES),
+            cache_retain_bytes: back_buffer
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or(HTTP_CACHE_RETAIN_BYTES)
+                .min(HTTP_READ_AHEAD_MAX_BYTES),
+            streams: None,
+            stream_frontier: 0,
+            stream_reader_end: 0,
+            prefetch_failures: 0,
+            entity_changed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -411,175 +588,1546 @@ impl HttpRangeSource {
         Some(self.cache_bytes[start_index..end_index].to_vec())
     }
 
-    fn cached_prefix(&self, range: ByteRange) -> Option<Vec<u8>> {
-        let length = range.length?;
-        let end = range.start.checked_add(length)?;
-        let cache_end = self.cache_end();
-        if range.start < self.cache_start || range.start >= cache_end || end <= cache_end {
-            return None;
+    /// Cut the part of the cache that is further than `HTTP_CACHE_RETAIN_BYTES`
+    /// behind the reader.
+    ///
+    /// The retained tail is what turns a small rewind into a cache hit instead
+    /// of a fresh download. Trimming only once the tail is
+    /// `HTTP_CACHE_TRIM_SLACK` over budget keeps the O(n) buffer move rare
+    /// (once per few MiB of playback) instead of once per read.
+    fn trim_cache(&mut self, range: ByteRange) {
+        if range.length.is_none() {
+            return;
         }
-        let start_index = usize::try_from(range.start - self.cache_start).ok()?;
-        let end_index = usize::try_from(cache_end - self.cache_start).ok()?;
-        Some(self.cache_bytes[start_index..end_index].to_vec())
+        // Measured from the *start* of the current read, never past it: the tail
+        // is what a rewind can hit, but nothing the current read needs may be
+        // dropped (a read larger than the retention budget still has to be
+        // served from the cache it started in).
+        let retain_floor = range.start.saturating_sub(self.cache_retain_bytes);
+        let drop = retain_floor.saturating_sub(self.cache_start);
+        if drop < HTTP_CACHE_TRIM_SLACK {
+            return;
+        }
+        let drop = drop.min(self.cache_bytes.len() as u64) as usize;
+        self.cache_bytes.drain(..drop);
+        self.cache_start = self.cache_start.saturating_add(drop as u64);
+        http_trace_log(format!(
+            "{{\"event\":\"http_cache_trim\",\"dropped\":{},\"cache_start\":{},\"cache_end\":{}}}",
+            drop,
+            self.cache_start,
+            self.cache_end(),
+        ));
     }
 
     fn fetch_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
-        let response = fetch_http_range(
-            &self.agent,
-            &self.uri,
-            &self.http_headers,
-            range,
-            "http_range",
-        )?;
+        self.check_entity()?;
+        let first_io = self.agent.cold_open.take().map(|ticket| {
+            let mut io = self.agent.clone();
+            io.cold_open = Some(ticket);
+            io
+        });
+        let fetch_io = first_io.as_ref().unwrap_or(&self.agent);
+        let response = if range.length.is_none() {
+            fetch_http_to_end(
+                fetch_io,
+                &self.uri,
+                &self.http_headers,
+                range.start,
+                self.content_length,
+                self.entity_validator.as_deref().map(str::to_owned),
+            )
+        } else {
+            fetch_http_range_with_validator(
+                fetch_io,
+                &self.uri,
+                &self.http_headers,
+                range,
+                "http_range",
+                self.entity_validator.as_deref().map(str::to_owned),
+            )
+        }
+        .inspect_err(|error| {
+            if matches!(error, SourceError::HttpEntityChanged) {
+                self.entity_changed.store(true, Ordering::Release);
+            }
+        })?;
+        self.check_entity()?;
         if self.content_length.is_none() {
             self.content_length = response.total_length;
         }
+        if !response.bytes.is_empty() {
+            self.retain_entity_validator(response.strong_etag.as_deref())?;
+        }
+        // A synchronous fetch that worked proves the origin is alive: let the
+        // background prefetch chain resume.
+        self.prefetch_failures = 0;
         Ok(response.bytes)
     }
 
+    fn retain_entity_validator(&mut self, validator: Option<&str>) -> Result<()> {
+        let Some(value) = validator.filter(|value| strong_etag(value.as_bytes()).is_some()) else {
+            return Ok(());
+        };
+        if let Some(expected) = self.entity_validator.as_deref() {
+            if expected != value {
+                self.entity_changed.store(true, Ordering::Release);
+                return Err(SourceError::HttpEntityChanged);
+            }
+        } else {
+            self.entity_validator = Some(Arc::from(value));
+        }
+        Ok(())
+    }
+
+    fn check_entity(&self) -> Result<()> {
+        if self.entity_changed.load(Ordering::Acquire) {
+            return Err(SourceError::HttpEntityChanged);
+        }
+        Ok(())
+    }
+
     fn fetch_length(&mut self, range: ByteRange) -> Result<Option<u64>> {
-        let requested_length = range.length.unwrap_or(0);
         Ok(match range.length {
             Some(length) => {
-                let mut length = length.max(self.read_ahead_bytes);
+                // At least the caller's request with a capped piece of look-ahead,
+                // and never more than one request body may carry. A caller asking
+                // for more than the cap gets a short read (the read loops re-issue
+                // the rest), which keeps "no request body exceeds the cap" an
+                // invariant instead of a property of today's callers.
+                let mut wanted = length.max(self.request_bytes).min(HTTP_REQUEST_MAX_BYTES);
                 if let Some(total) = self.content_length.or_else(|| self.len().ok().flatten()) {
                     if range.start >= total {
                         return Ok(Some(0));
                     }
-                    length = length.min(total.saturating_sub(range.start));
+                    // Never ask past the end of the resource either.
+                    wanted = wanted.min(total.saturating_sub(range.start));
                 }
-                Some(length.max(requested_length))
+                Some(wanted)
             }
             None => None,
         })
     }
 
-    fn take_prefetch(&mut self, range: ByteRange) -> Option<Result<(u64, Vec<u8>)>> {
-        let pending = self.prefetch.as_ref()?;
-        if !range_contains(pending.range, range) {
-            let _ = self.prefetch.take();
-            return None;
-        }
-        if !pending.is_finished() {
-            // The pending fetch covers the requested bytes and they are needed
-            // now: joining the in-flight thread is expected to be much cheaper
-            // than issuing a duplicate synchronous download of the same range.
-            http_trace_log(format!(
-                "{{\"event\":\"http_prefetch_pending\",\"decision\":\"join\",\"start\":{},\"length\":{},\"requested_start\":{},\"requested_length\":{}}}",
-                pending.range.start,
-                pending
-                    .range
-                    .length
-                    .map_or_else(|| "null".to_string(), |length| length.to_string()),
-                range.start,
-                range
-                    .length
-                    .map_or_else(|| "null".to_string(), |length| length.to_string()),
-            ));
-        }
-
-        let pending = self.prefetch.take()?;
-        let join_started = Instant::now();
-        let start = pending.range.start;
-        let result = pending
-            .handle
-            .join()
-            .map_err(|_| SourceError::Http("http prefetch thread panicked".to_string()))
-            .and_then(|response| response);
-        http_trace_log(format!(
-            "{{\"event\":\"http_prefetch_join\",\"start\":{},\"length\":{},\"elapsed_ms\":{:.3}}}",
-            start,
-            pending
-                .range
-                .length
-                .map_or_else(|| "null".to_string(), |length| length.to_string()),
-            join_started.elapsed().as_secs_f64() * 1000.0,
-        ));
-        Some(result.map(|response| {
-            if self.content_length.is_none() {
-                self.content_length = response.total_length;
-            }
-            (start, response.bytes)
-        }))
+    /// Whether a fetch window `[start, start + length)` runs to the end of the
+    /// resource, i.e. `fetch_length` truncated it at `content_length`. Windows
+    /// that reach the total are boundary traffic: players skip into the
+    /// closing moments of a file and read to its natural end, and origins
+    /// mishandle the final range (a 206 that promises the tail and delivers
+    /// nothing). An empty or failed answer there ends the read instead of
+    /// failing the session (issue #163); anywhere else an uncovered read
+    /// stays an error.
+    fn window_ends_at_total(&self, start: u64, length: u64) -> bool {
+        self.content_length
+            .is_some_and(|total| start.saturating_add(length) >= total)
     }
 
-    fn maybe_start_prefetch(&mut self, range: ByteRange) {
-        if self.prefetch.is_some() || self.cache_bytes.is_empty() {
-            return;
-        }
-        let Some(length) = range.length else {
+    /// Some(total) while an empty read at `offset` is a fetch failure rather
+    /// than the resource's end: the resource is known to hold more than the
+    /// tail slack beyond it. A fetch whose request window was truncated by
+    /// the resource total starts at most `HTTP_REQUEST_MAX_BYTES` short of
+    /// it, so the slack mirrors the largest window a tail flush can leave
+    /// uncovered and this guard agrees with the fetch-side
+    /// `window_ends_at_total` rule.
+    fn uncovered_read(&self, offset: u64) -> Option<u64> {
+        let total = self.content_length?;
+        (offset < total && total - offset > HTTP_TAIL_EOF_SLACK_BYTES).then_some(total)
+    }
+
+    /// Append stripes the workers completed since the last read. Called
+    /// before the hit checks so they see everything that has already arrived.
+    /// A sync fetch that ran past the frontier (the fallback path) may have
+    /// covered a stripe already; such stripes are skipped or trimmed instead
+    /// of being spliced twice.
+    fn drain_stripes(&mut self) {
+        let Some(shared) = self
+            .streams
+            .as_ref()
+            .map(|session| Arc::clone(&session.shared))
+        else {
             return;
         };
+        loop {
+            let handoff = {
+                let mut inner = lock_stream(&shared);
+                let handoff = inner.pending.remove(&self.stream_frontier).or_else(|| {
+                    let demand = inner.uncovered_read_end;
+                    let epoch = inner.epoch;
+                    let stopped = inner.stopped || inner.worker_done;
+                    let partial = inner.reading_partial.as_mut()?;
+                    let start = partial.handoff.as_ref()?.start;
+                    if !stopped
+                        && partial.epoch == epoch
+                        && partial.index == self.stream_frontier
+                        && start < demand
+                        && demand <= partial.end
+                        && (partial.idle_recovery
+                            || partial.read_started.elapsed() >= HTTP_IDLE_PREFIX_GRACE)
+                        && !self.agent.is_cancelled()
+                    {
+                        partial.handoff.take()
+                    } else {
+                        None
+                    }
+                });
+                match handoff {
+                    Some(handoff) => {
+                        self.stream_frontier += 1;
+                        handoff
+                    }
+                    None => break,
+                }
+            };
+            if handoff.start > self.cache_end() {
+                // Never disguise a hole as contiguous media. Retire the stream
+                // and let the synchronous path fetch from the real cache end.
+                self.kill_streams();
+                self.prefetch_failures = self.prefetch_failures.saturating_add(1);
+                return;
+            }
+            if handoff.start.saturating_add(handoff.bytes.len() as u64) > self.cache_end()
+                && self
+                    .retain_entity_validator(handoff.validator.as_deref())
+                    .is_err()
+            {
+                self.kill_streams();
+                return;
+            }
+            if handoff.start == self.cache_end() {
+                self.cache_bytes.extend_from_slice(&handoff.bytes);
+            } else if let Ok(skip) = usize::try_from(self.cache_end() - handoff.start)
+                && skip < handoff.bytes.len()
+            {
+                self.cache_bytes.extend_from_slice(&handoff.bytes[skip..]);
+            }
+            self.update_stream_backpressure();
+        }
+    }
+
+    /// Publish the window boundary the workers self-throttle against: the
+    /// reader's position plus the configured read-ahead. The budget is measured
+    /// from the consumer position, never from `cache_start`: the retained tail
+    /// behind the reader must not count against the window or the streams would
+    /// pause forever.
+    ///
+    /// This is the reader's only lever over the workers, and it must be an
+    /// absolute position rather than a "window full" flag: a flag is a snapshot
+    /// the reader refreshes only when it reads, so a reader parked on a full
+    /// packet queue would leave the workers unbounded and a fast origin would
+    /// prefetch the whole resource.
+    fn update_stream_backpressure(&mut self) {
+        let Some(shared) = self
+            .streams
+            .as_ref()
+            .map(|session| Arc::clone(&session.shared))
+        else {
+            return;
+        };
+        let window_end = self.stream_reader_end.saturating_add(self.read_ahead_bytes);
+        let mut inner = lock_stream(&shared);
+        inner.uncovered_read_end = if self.cache_end() < self.stream_reader_end {
+            self.stream_reader_end
+        } else {
+            0
+        };
+        if inner.window_end != window_end {
+            inner.window_end = window_end;
+            shared.signal.notify_all();
+        }
+    }
+
+    /// Close every worker (a seek re-anchored the window, the resource ended,
+    /// or the source is going away). Dropping the session cancels I/O and
+    /// wakes the worker, then joins it before releasing the handoff storage.
+    fn kill_streams(&mut self) {
+        self.stream_frontier = 0;
+        self.streams.take();
+    }
+
+    /// Spawn the persistent stream at `cache_end`, or re-anchor it after a
+    /// failure while bytes are still missing ahead.
+    ///
+    /// The open-ended GET pays the origin's request/seek cost once. A single
+    /// stream covers the window without downloading any byte twice, handing
+    /// stripes to the reader and pausing between stripes when the window fills.
+    fn ensure_streams(&mut self) {
+        if self.entity_changed.load(Ordering::Acquire) {
+            self.kill_streams();
+            return;
+        }
+        if self.cache_bytes.is_empty() {
+            return;
+        }
         let Some(total) = self.content_length else {
             return;
         };
-        let Some(end) = range.start.checked_add(length) else {
-            return;
-        };
-        let cache_end = self.cache_end();
-        if end > cache_end || cache_end >= total {
+        if self.cache_end() >= total {
+            self.kill_streams();
             return;
         }
-        let remaining = cache_end.saturating_sub(end);
-        if remaining > self.read_ahead_bytes / 2 {
+        if let Some(shared) = self
+            .streams
+            .as_ref()
+            .map(|session| Arc::clone(&session.shared))
+        {
+            let (done, newly_failed) = {
+                let mut inner = lock_stream(&shared);
+                let newly_failed = inner.worker_done && inner.worker_failed && !inner.failure_acked;
+                if newly_failed {
+                    inner.failure_acked = true;
+                }
+                (inner.worker_done, u32::from(newly_failed))
+            };
+            self.prefetch_failures = self.prefetch_failures.saturating_add(newly_failed);
+            self.update_stream_backpressure();
+            if !done {
+                return;
+            }
+            // Completion may have raced the read's earlier drain. Preserve the
+            // final handoffs before retiring the worker or reopening its tail.
+            self.drain_stripes();
+            self.kill_streams();
+            if self.cache_end() >= total {
+                return;
+            }
+        }
+        if self.entity_changed.load(Ordering::Acquire)
+            || self.prefetch_failures >= HTTP_PREFETCH_MAX_FAILURES
+        {
             return;
         }
-        let length = self.read_ahead_bytes.min(total.saturating_sub(cache_end));
-        if length == 0 {
-            return;
-        }
-        let prefetch_range = ByteRange {
-            start: cache_end,
-            length: Some(length),
-        };
-        self.prefetch = Some(PendingHttpFetch::spawn(
-            self.uri.clone(),
-            self.http_headers.clone(),
-            prefetch_range,
-        ));
-    }
-}
-
-impl PendingHttpFetch {
-    fn spawn(uri: String, http_headers: Vec<(String, String)>, range: ByteRange) -> Self {
-        http_trace_log(format!(
-            "{{\"event\":\"http_prefetch_start\",\"start\":{},\"length\":{}}}",
-            range.start,
-            range
-                .length
-                .map_or_else(|| "null".to_string(), |length| length.to_string()),
-        ));
-        let handle = thread::spawn(move || {
-            let agent = http_agent();
-            fetch_http_range(&agent, &uri, &http_headers, range, "http_prefetch_range")
+        let anchor = self.cache_end();
+        let shared = Arc::new(StreamShared {
+            inner: Mutex::new(StreamInner {
+                epoch: 1,
+                pending: BTreeMap::new(),
+                worker_done: false,
+                worker_failed: false,
+                failure_acked: false,
+                progress_bytes: 0,
+                last_progress: Instant::now(),
+                window_end: anchor.saturating_add(self.read_ahead_bytes),
+                uncovered_read_end: if anchor < self.stream_reader_end {
+                    self.stream_reader_end
+                } else {
+                    0
+                },
+                reading_partial: None,
+                idle_race_read: None,
+                stopped: false,
+            }),
+            signal: Condvar::new(),
+            demand: tokio::sync::Notify::new(),
+            entity_changed: Arc::clone(&self.entity_changed),
         });
-        Self { range, handle }
+        let epoch = lock_stream(&shared).epoch;
+        let worker_shared = Arc::clone(&shared);
+        let io = self.agent.child();
+        let worker_io = io.clone();
+        let uri = self.uri.clone();
+        let http_headers = self.http_headers.clone();
+        let validator = self.entity_validator.as_deref().map(str::to_owned);
+        let worker = thread::Builder::new()
+            .name("erika-http-stream".to_string())
+            .spawn(move || {
+                stream_worker_main(
+                    Arc::clone(&worker_shared),
+                    worker_io,
+                    uri,
+                    http_headers,
+                    epoch,
+                    anchor,
+                    total,
+                    validator,
+                );
+                // Every exit, including cancellation, must wake a foreground
+                // reader waiting for bytes that will no longer arrive.
+                lock_stream(&worker_shared).worker_done = true;
+                worker_shared.signal.notify_all();
+            })
+            .expect("spawn HTTP stream worker");
+        self.streams = Some(StreamSession {
+            shared,
+            io,
+            worker: Some(worker),
+        });
+        self.stream_frontier = 0;
+        self.stream_reader_end = self.cache_end();
     }
 
-    fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+    /// Wait until the streams have delivered coverage through `end`.
+    ///
+    /// Returns true when `cache_end >= end` (the caller re-checks its slice),
+    /// false when the workers are dead, stalled, or the wait budget ran out
+    /// and the caller must fall back to the synchronous path. Progress resets
+    /// the stall clock: a slow origin is waited out, a dead one is not.
+    fn wait_for_stream_coverage(&mut self, end: u64) -> bool {
+        let Some(shared) = self
+            .streams
+            .as_ref()
+            .map(|session| Arc::clone(&session.shared))
+        else {
+            return false;
+        };
+        let started = Instant::now();
+        // AVIO's final read normally extends past EOF. All existing bytes are
+        // sufficient; waiting for the rest of that buffer can never succeed.
+        let end = self.content_length.map_or(end, |total| end.min(total));
+        loop {
+            self.drain_stripes();
+            if self.streams.is_none() {
+                return false;
+            }
+            self.update_stream_backpressure();
+            if self.cache_end() >= end {
+                return true;
+            }
+            let inner = lock_stream(&shared);
+            if self.agent.is_cancelled()
+                || inner.stopped
+                || inner.worker_done
+                || inner.last_progress.elapsed() >= HTTP_STREAM_STALL
+                || started.elapsed() >= HTTP_STREAM_WAIT_BUDGET
+            {
+                return false;
+            }
+            let mut wait = Duration::from_millis(500);
+            if let Some((offset, read_started)) = inner.idle_race_read
+                && inner.uncovered_read_end > offset
+            {
+                let elapsed = read_started.elapsed();
+                if elapsed >= HTTP_IDLE_RACE_GRACE {
+                    shared.demand.notify_one();
+                } else {
+                    // Existing foreground demand on a verified stalled read:
+                    // wake at its unchanged grace deadline if it comes first.
+                    wait = wait.min(HTTP_IDLE_RACE_GRACE - elapsed);
+                }
+            }
+            let _ = shared.signal.wait_timeout(inner, wait);
+        }
+    }
+
+    /// Make the cache cover `range`, downloading only what is missing.
+    fn fetch_missing(&mut self, range: ByteRange) -> Result<()> {
+        let Some(length) = range.length else {
+            // Open-ended read (whole sidecar files): stream to EOF in capped
+            // pieces. The previous shape asked for the entire tail in one
+            // request, which meets the same body deadline on a slow link.
+            return self.stream_to_eof(range.start);
+        };
+        let end = range.start.saturating_add(length);
+        if self.cache_bytes.is_empty() {
+            // Nothing is buffered, so there is no anchor to continue from:
+            // start the window at the read. A server ignoring Range will replay
+            // the whole file; the fetch discards its prefix before caching.
+            return self.reanchor_window(range);
+        }
+        if range.start < self.cache_start {
+            // A rewind past the retained tail: nothing in the cache sits before
+            // the read. Re-anchor the window here -- this is the one path that
+            // still discards the buffered future, and it matches what every
+            // player does once a seek lands past its back buffer.
+            return self.reanchor_window(range);
+        }
+        if range.start > self.cache_end().saturating_add(HTTP_REQUEST_MAX_BYTES) {
+            // A forward jump beyond the window: downloading the gap would cost
+            // more than starting over at the read.
+            return self.reanchor_window(range);
+        }
+        let mut pieces = 0;
+        while self.cache_end() < end {
+            if pieces >= HTTP_FETCH_MAX_PIECES_PER_READ {
+                // Walking away here would make the caller see a short (or empty,
+                // i.e. EOF) read for bytes that exist, so fail loudly instead.
+                return Err(SourceError::Http(format!(
+                    "origin answered {pieces} short pieces without covering bytes {}..{end}",
+                    range.start,
+                )));
+            }
+            pieces += 1;
+            let start = self.cache_end();
+            let Some(request_length) = self.fetch_length(ByteRange {
+                start,
+                length: Some(end - start),
+            })?
+            else {
+                break;
+            };
+            if request_length == 0 {
+                break;
+            }
+            let fetched = match self.fetch_range(ByteRange {
+                start,
+                length: Some(request_length),
+            }) {
+                Ok(fetched) => fetched,
+                Err(error @ SourceError::Http(_))
+                    if self.window_ends_at_total(start, request_length) =>
+                {
+                    // The final range of the resource is boundary traffic: a
+                    // 206 that promises the tail and delivers nothing, a proxy
+                    // dropping the last body, a status the origin only serves
+                    // for the edge. Whatever the delivery failure, the fetch
+                    // already retried, and a window that runs to the resource
+                    // total ends the read instead of the session (issue #163).
+                    // Unverifiable answers (HttpRangeVerification) and entity
+                    // changes stay errors: those must fail loudly.
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_tail_eof\",\"start\":{},\"length\":{},\"error\":\"{}\"}}",
+                        start,
+                        request_length,
+                        json_escape(&error.to_string()),
+                    ));
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if fetched.is_empty() {
+                // An empty answer when bytes are known to exist is not EOF,
+                // unless the piece window runs to the end of the resource and
+                // the empty answer marks the boundary (issue #163). Checked
+                // after the fetch: a successful response may be the first to
+                // name the total for an origin whose length probe failed.
+                if self.content_length.is_some_and(|total| start < total)
+                    && !self.window_ends_at_total(start, request_length)
+                {
+                    return Err(SourceError::Http(format!(
+                        "origin answered an empty body for bytes {start}.. although the resource is larger"
+                    )));
+                }
+                break;
+            }
+            self.cache_bytes.extend_from_slice(&fetched);
+            // A short answer (a server that caps response sizes, or EOF before
+            // the read is covered) just means the loop owes another piece.
+        }
+        Ok(())
+    }
+
+    /// Start a fresh window at the read position, discarding what the cache held
+    /// (including any stream workers anchored to the old window).
+    fn reanchor_window(&mut self, range: ByteRange) -> Result<()> {
+        self.kill_streams();
+        let Some(request_length) = self.fetch_length(range)? else {
+            return Ok(());
+        };
+        if request_length == 0 {
+            self.cache_start = range.start;
+            self.cache_bytes.clear();
+            return Ok(());
+        }
+        let fetched = match self.fetch_range(ByteRange {
+            start: range.start,
+            length: Some(request_length),
+        }) {
+            Ok(fetched) => fetched,
+            Err(error @ SourceError::Http(_))
+                if self.window_ends_at_total(range.start, request_length) =>
+            {
+                // Same boundary rule as `fetch_missing`: a window that runs to
+                // the resource total may meet an origin that cannot deliver
+                // the final bytes, and that ends the read (issue #163).
+                http_trace_log(format!(
+                    "{{\"event\":\"http_tail_eof\",\"start\":{},\"length\":{},\"error\":\"{}\"}}",
+                    range.start,
+                    request_length,
+                    json_escape(&error.to_string()),
+                ));
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+        self.cache_start = range.start;
+        self.cache_bytes = fetched;
+        if self.cache_bytes.is_empty()
+            && self.content_length.is_some_and(|total| range.start < total)
+            && !self.window_ends_at_total(range.start, request_length)
+        {
+            // Checked after the fetch: a successful response may be the first
+            // to name the total for an origin whose length probe failed.
+            return Err(SourceError::Http(format!(
+                "origin answered an empty body for bytes {}.. although the resource is larger",
+                range.start,
+            )));
+        }
+        http_trace_log(format!(
+            "{{\"event\":\"http_cache_reanchored\",\"start\":{},\"bytes\":{}}}",
+            range.start,
+            self.cache_bytes.len(),
+        ));
+        Ok(())
+    }
+
+    /// Read a sidecar to EOF with one entity history across capped requests.
+    fn stream_to_eof(&mut self, start: u64) -> Result<()> {
+        self.kill_streams();
+        self.cache_start = start;
+        self.cache_bytes = Vec::new();
+        self.cache_bytes = self.fetch_range(ByteRange::suffix_from(start))?;
+        Ok(())
     }
 }
 
-fn http_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(Duration::from_secs(15)))
-        .timeout_recv_body(Some(Duration::from_secs(60)))
-        .build()
-        .into()
+fn lock_stream(shared: &StreamShared) -> MutexGuard<'_, StreamInner> {
+    shared
+        .inner
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn hand_off_stripe(
+    shared: &StreamShared,
+    epoch: u64,
+    index: u64,
+    start: u64,
+    bytes: Vec<u8>,
+    validator: Option<Arc<str>>,
+) {
+    let mut inner = lock_stream(shared);
+    if inner.stopped || inner.epoch != epoch || bytes.is_empty() {
+        return;
+    }
+    inner.pending.insert(
+        index,
+        StripeHandoff {
+            start,
+            bytes,
+            validator,
+        },
+    );
+    shared.signal.notify_all();
+}
+
+fn mark_worker_done(shared: &StreamShared, failed: bool) {
+    let mut inner = lock_stream(shared);
+    inner.worker_done = true;
+    inner.worker_failed = failed;
+    shared.signal.notify_all();
+    drop(inner);
+    http_trace_log(format!(
+        "{{\"event\":\"http_stream_worker_done\",\"worker\":0,\"failed\":{failed}}}"
+    ));
+}
+
+enum StreamOpened {
+    RetryAfter {
+        delay: Duration,
+        status: u16,
+    },
+    Body {
+        response: reqwest::Response,
+        skip_bytes: u64,
+    },
+    Eof,
+}
+
+/// Accept one positive delta-seconds value or a future HTTP-date.
+/// Absolute dates use only the local reception clock; Date/Age are not clock
+/// synchronization. Skew may reject a hint, but cannot extend the stall budget.
+fn stream_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let mut values = response.headers().get_all("retry-after").iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if values.next().is_some() || value.is_empty() {
+        return None;
+    }
+    if value.bytes().all(|b| b.is_ascii_digit()) {
+        let seconds = value.parse::<u64>().ok()?;
+        return (seconds > 0).then(|| Duration::from_secs(seconds));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    let delay = date.duration_since(std::time::SystemTime::now()).ok()?;
+    (!delay.is_zero()).then_some(delay)
+}
+
+/// Opens a worker's persistent GET: open-ended (`bytes=offset-`), so the
+/// origin seeks once and streams. `416` means the offset sits at/past EOF.
+/// The timeouts are per-worker and generous -- a background stream must not
+/// be killed by the 15 s response deadline that shapes the synchronous path.
+#[cfg(test)]
+fn open_stream_response(
+    io: &HttpIo,
+    uri: &str,
+    http_headers: &[(String, String)],
+    offset: u64,
+    validator: Option<String>,
+) -> Result<StreamOpened> {
+    open_stream_response_with_identity(io, uri, http_headers, offset, validator, None)
+}
+
+fn open_stream_response_with_identity(
+    io: &HttpIo,
+    uri: &str,
+    http_headers: &[(String, String)],
+    offset: u64,
+    validator: Option<String>,
+    identity: Option<Arc<str>>,
+) -> Result<StreamOpened> {
+    validate_resume_validator(validator.as_deref())?;
+    let range = ByteRange {
+        start: offset,
+        length: None,
+    };
+    let mut request = io
+        .client()
+        .get(uri)
+        .header("Range", http_range_header(range));
+    for (name, value) in http_headers {
+        request = request.header(name, value);
+    }
+    let inherited_identity = identity.as_deref().filter(|_| {
+        !http_headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+        })
+    });
+    if let Some(validator) = inherited_identity.or(validator.as_deref()) {
+        request = request.header("If-Range", validator);
+    }
+    let response = io.run(async move {
+        tokio::time::timeout(HTTP_STREAM_RESPONSE_TIMEOUT, request.send())
+            .await
+            .map_err(|_| SourceError::Http("HTTP stream response timed out".to_string()))?
+            .map_err(|error| SourceError::Http(error.without_url().to_string()))
+    })?;
+    let status = response.status().as_u16();
+    match status {
+        206 => {
+            validate_partial_response_etag(&response, identity.as_deref())?;
+            validate_partial_response_etag(&response, validator.as_deref())?;
+            // A stream that answers from anywhere but the requested offset
+            // would be spliced onto the cache as silent corruption, exactly
+            // like the synchronous path's resume check.
+            let content_range = response
+                .headers()
+                .get("content-range")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            if let Some(start) = content_range.as_deref().and_then(parse_content_range_start) {
+                if start != offset {
+                    return Err(SourceError::HttpRangeVerification(format!(
+                        "stream served from {start}, expected {offset}"
+                    )));
+                }
+            } else if offset > 0 {
+                // Without Content-Range a resumed stream cannot prove it is
+                // answering from the requested offset.
+                return Err(SourceError::HttpRangeVerification(
+                    "stream served 206 without Content-Range; cannot verify the resumed offset"
+                        .to_string(),
+                ));
+            }
+            Ok(StreamOpened::Body {
+                response,
+                skip_bytes: 0,
+            })
+        }
+        status @ (429 | 503) => stream_retry_after(&response)
+            .map(|delay| StreamOpened::RetryAfter { delay, status })
+            .ok_or_else(|| {
+                SourceError::Http(format!(
+                    "unexpected HTTP status {status} for stream request"
+                ))
+            }),
+        416 => Ok(StreamOpened::Eof),
+        200 => {
+            validate_partial_response_etag(&response, identity.as_deref())?;
+            validate_full_response_entity(&response, validator.as_deref())?;
+            Ok(StreamOpened::Body {
+                response,
+                skip_bytes: offset,
+            })
+        }
+        other => Err(SourceError::Http(format!(
+            "unexpected HTTP status {other} for stream request"
+        ))),
+    }
+}
+
+/// Preserve lazy stripe growth, except when its next geometric allocation
+/// would exceed the bytes still allowed in this original logical stripe.
+fn append_stream_stripe(stripe: &mut Vec<u8>, bytes: &[u8], remaining: usize) {
+    if bytes.len() > stripe.capacity() - stripe.len() {
+        let limit = stripe.len() + remaining;
+        if stripe.capacity().saturating_mul(2).max(8) > limit {
+            stripe.reserve_exact(limit - stripe.len());
+        }
+    }
+    stripe.extend_from_slice(bytes);
+}
+
+/// Gate each stripe, including multiple stripes received in one body chunk.
+fn wait_for_stream_window(
+    shared: &StreamShared,
+    io: &HttpIo,
+    epoch: u64,
+    offset: u64,
+    stripe_started: bool,
+) -> bool {
+    loop {
+        let inner = lock_stream(shared);
+        if inner.stopped || inner.epoch != epoch || io.is_cancelled() {
+            return false;
+        }
+        // Finish partial stripes so a small window cannot strand reader data.
+        if stripe_started || offset < inner.window_end {
+            return true;
+        }
+        let _ = shared
+            .signal
+            .wait_timeout(inner, Duration::from_millis(200));
+    }
+}
+
+async fn wait_for_idle_race_demand(shared: &StreamShared, epoch: u64, offset: u64) {
+    loop {
+        // Notifications retain a permit across registration. Only
+        // inspect shared demand after the foreground observes a stall.
+        let notified = shared.demand.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        notified.await;
+        let needed = {
+            let inner = lock_stream(&shared);
+            !inner.stopped
+                && inner.epoch == epoch
+                && inner.uncovered_read_end > offset
+                && inner.idle_race_read.is_some_and(|(position, began)| {
+                    position == offset && began.elapsed() >= HTTP_IDLE_RACE_GRACE
+                })
+        };
+        if needed {
+            break;
+        }
+    }
+}
+
+/// Cold path: request and strictly verify one foreground-demanded standby.
+/// The caller keeps polling the original body and owns its unchanged deadline.
+async fn open_idle_race_candidate(
+    request_context: &(reqwest::Client, String, Vec<(String, String)>),
+    validator: &str,
+    offset: u64,
+    total: u64,
+) -> Option<reqwest::Response> {
+    let (client, uri, headers) = request_context;
+    let mut request = client.get(uri).header(
+        "Range",
+        http_range_header(ByteRange {
+            start: offset,
+            length: None,
+        }),
+    );
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.header("If-Range", validator).send().await.ok()?;
+    let range = response.headers().get("content-range")?.to_str().ok()?;
+    if response.status().as_u16() != 206
+        || parse_content_range_start(range) != Some(offset)
+        || parse_content_range_total(range) != Some(total)
+        || response
+            .headers()
+            .get("etag")
+            .and_then(|v| strong_etag(v.as_bytes()))
+            != strong_etag(validator.as_bytes())
+    {
+        return None;
+    }
+    Some(response)
+}
+
+#[derive(Clone, Copy)]
+enum StreamPartialRelease {
+    FastReconnect,
+    AfterHonoredRetryAfter,
+}
+
+/// One persistent open-ended GET, delivering fixed-size stripes. Seeks,
+/// cancellation and backpressure are checked before starting each stripe.
+/// Body errors reconnect at the reached offset with the entity validator.
+fn stream_worker_main(
+    shared: Arc<StreamShared>,
+    io: HttpIo,
+    uri: String,
+    http_headers: Vec<(String, String)>,
+    epoch: u64,
+    start: u64,
+    total: u64,
+    initial_validator: Option<String>,
+) {
+    let mut offset = start;
+    let mut stripe_index = 0;
+    let mut stripe_start = start;
+    let mut stripe: Vec<u8> = Vec::new();
+    // Includes any prefix handed off early; reset only at the original boundary.
+    let mut stripe_received = 0usize;
+    let mut stripe_opened: Option<Instant> = None;
+    let mut validator: Option<String> = None;
+    let mut retained_validator = initial_validator.as_deref().map(Arc::<str>::from);
+    let mut live: Option<reqwest::Response> = None;
+    let mut skip_remaining = 0;
+    let mut response_start = start;
+    let mut response_has_bound_strong_etag = false;
+    let mut response_validator = None;
+    let mut response_strong_etag: Option<Arc<str>> = None;
+    // Once unbound response bytes enter this worker history, never use them
+    // for an early idle-prefix handoff, even if a later response adds a tag.
+    let mut stream_history_verified = true;
+    // Enabled only after the reader actually takes an idle slot; expires at
+    // this logical stripe's original 4 MiB end, never a healthy first stripe.
+    let mut idle_partial_delivered = false;
+    let mut resumes_since_progress: u32 = 0;
+    let mut fast_body_retry_used = false;
+    // Caller-supplied range headers keep their original request semantics.
+    let idle_race_allowed = !http_headers.iter().any(|(name, _)| {
+        name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+    });
+    let mut idle_race_available = idle_race_allowed;
+    let race_request = Arc::new((io.client().clone(), uri.clone(), http_headers.clone()));
+    // A winning standby can earn one new opportunity from its own body bytes.
+    let mut idle_race_earning = false;
+    let mut response_total_verified = false;
+    let mut release_partial_on_reconnect: Option<StreamPartialRelease> = None;
+
+    loop {
+        // Account before an ordinary reconnect can replace response_start. Only
+        // normal bounded byte acceptance advances offset and earns this credit.
+        let mut response_supplied_stripe =
+            offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES;
+        if idle_race_earning && response_supplied_stripe {
+            idle_race_available = true;
+            idle_race_earning = false;
+        }
+        // Finish a partial final stripe without needing another socket read or
+        // waiting for the read-ahead window to move beyond the known file end.
+        if offset >= total {
+            hand_off_stripe(
+                &shared,
+                epoch,
+                stripe_index,
+                stripe_start,
+                stripe,
+                retained_validator.clone(),
+            );
+            mark_worker_done(&shared, false);
+            return;
+        }
+        if !wait_for_stream_window(&shared, &io, epoch, offset, stripe_received != 0) {
+            return;
+        }
+        if live.is_none() {
+            // Keep earned credit, but never pool an unfinished winner's bytes
+            // with an ordinary response opened below.
+            idle_race_earning = false;
+            // Headers from an empty/failed response have not identified any
+            // retained stream bytes; bind the validator to the next body instead.
+            if offset == start {
+                validator = None;
+            }
+            // Consume on every open. Only FastReconnect may cross one honored
+            // Retry-After hint below; the deferred permission cannot extend again.
+            let release_partial = std::mem::take(&mut release_partial_on_reconnect);
+            match open_stream_response_with_identity(
+                &io,
+                &uri,
+                &http_headers,
+                offset,
+                validator.clone(),
+                retained_validator.clone(),
+            ) {
+                Ok(StreamOpened::Body {
+                    response,
+                    skip_bytes,
+                }) => {
+                    response_validator = response_entity_validator(&response);
+                    response_strong_etag = response_validator
+                        .as_deref()
+                        .filter(|value| strong_etag(value.as_bytes()).is_some())
+                        .map(Arc::<str>::from);
+                    response_has_bound_strong_etag =
+                        response_strong_etag.as_deref().is_some_and(|actual| {
+                            retained_validator
+                                .as_deref()
+                                .is_none_or(|expected| actual == expected)
+                        });
+                    response_total_verified = response
+                        .headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_range_total)
+                        == Some(total);
+                    // open_stream_response has already checked the 206 start.
+                    // Both the interrupted response and this response must have
+                    // explicitly supplied the same bound strong ETag. A 200 or
+                    // weak/missing tag keeps the original buffering path.
+                    if release_partial.is_some()
+                        && response.status().as_u16() == 206
+                        && response_has_bound_strong_etag
+                        && (!matches!(
+                            release_partial,
+                            Some(StreamPartialRelease::AfterHonoredRetryAfter)
+                        ) || response_total_verified)
+                    {
+                        if io.is_cancelled() {
+                            return;
+                        }
+                        let mut inner = lock_stream(&shared);
+                        if !inner.stopped
+                            && inner.epoch == epoch
+                            && stripe_start < inner.uncovered_read_end
+                            && inner.uncovered_read_end <= offset
+                        {
+                            inner.pending.insert(
+                                stripe_index,
+                                StripeHandoff {
+                                    start: stripe_start,
+                                    bytes: std::mem::take(&mut stripe),
+                                    validator: retained_validator.clone(),
+                                },
+                            );
+                            shared.signal.notify_all();
+                            stripe_index += 1;
+                            stripe_start = offset;
+                        }
+                    }
+                    response_start = offset;
+                    response_supplied_stripe = false;
+                    skip_remaining = skip_bytes;
+                    live = Some(response);
+                }
+                Ok(StreamOpened::RetryAfter {
+                    delay: requested_delay,
+                    status,
+                }) => {
+                    // A hinted response still spends one ordinary resume attempt. Do not
+                    // turn a server hint into progress or a new retry budget.
+                    resumes_since_progress += 1;
+                    if resumes_since_progress > HTTP_STREAM_MAX_RESUMES {
+                        mark_worker_done(&shared, true);
+                        return;
+                    }
+                    let (delay, honored) = {
+                        let inner = lock_stream(&shared);
+                        if inner.stopped || inner.epoch != epoch || io.is_cancelled() {
+                            return;
+                        }
+                        let established = idle_race_allowed
+                            && offset > start
+                            && stream_history_verified
+                            && response_has_bound_strong_etag;
+                        let fits_stall = HTTP_STREAM_STALL
+                            .checked_sub(inner.last_progress.elapsed())
+                            .is_some_and(|remaining| requested_delay < remaining);
+                        if established && fits_stall {
+                            (requested_delay, true)
+                        } else {
+                            (Duration::from_millis(300), false)
+                        }
+                    };
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_stream_retry_after\",\"status\":{},\"offset\":{},\"attempt\":{},\"requested_seconds\":{},\"wait_ms\":{}}}",
+                        status,
+                        offset,
+                        resumes_since_progress,
+                        requested_delay.as_secs(),
+                        delay.as_millis(),
+                    ));
+                    // No shared guard is held. Seek/drop cancel this same I/O;
+                    // the next loop rechecks epoch/window before another open.
+                    if io.wait_cancelled(delay) {
+                        return;
+                    }
+                    if honored
+                        && matches!(release_partial, Some(StreamPartialRelease::FastReconnect))
+                    {
+                        release_partial_on_reconnect =
+                            Some(StreamPartialRelease::AfterHonoredRetryAfter);
+                    }
+                    continue;
+                }
+                Ok(StreamOpened::Eof) => {
+                    // We still owe bytes below the known total. A premature
+                    // 416 is a failed prefetch, not the end of the media.
+                    mark_worker_done(&shared, true);
+                    return;
+                }
+                Err(SourceError::HttpEntityChanged) => {
+                    shared.entity_changed.store(true, Ordering::Release);
+                    mark_worker_done(&shared, true);
+                    return;
+                }
+                Err(error) => {
+                    resumes_since_progress += 1;
+                    http_trace_log(format!(
+                        "{{\"event\":\"http_stream_open_error\",\"worker\":0,\"offset\":{},\"attempt\":{},\"error\":\"{}\"}}",
+                        offset,
+                        resumes_since_progress,
+                        json_escape(&error.to_string()),
+                    ));
+                    if resumes_since_progress > HTTP_STREAM_MAX_RESUMES {
+                        mark_worker_done(&shared, true);
+                        return;
+                    }
+                    if io.wait_cancelled(Duration::from_millis(300)) {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
+        let mut response = live.take().expect("live response exists");
+        let offered_partial = !stripe.is_empty()
+            && stream_history_verified
+            && response.status().as_u16() == 206
+            && response_has_bound_strong_etag;
+        // Only an established, strongly bound 206 may speculate. Healthy reads
+        // create no timer or request; only a productive winner can rearm it.
+        let may_race = idle_race_allowed
+            && idle_race_available
+            && stream_history_verified
+            && response.status().as_u16() == 206
+            && response_has_bound_strong_etag
+            && response_supplied_stripe
+            && response_total_verified;
+        // The current response must itself have contributed bytes before the
+        // >=4 MiB gate. Header evidence stays provisional until that point.
+        let race_context = response_strong_etag
+            .as_ref()
+            .filter(|_| may_race)
+            .map(|validator| {
+                (
+                    Arc::clone(&shared),
+                    Arc::clone(&race_request),
+                    Arc::clone(validator),
+                )
+            });
+        if offered_partial || may_race {
+            let mut inner = lock_stream(&shared);
+            if inner.stopped || inner.epoch != epoch || io.is_cancelled() {
+                return;
+            }
+            let read_started = Instant::now();
+            inner.idle_race_read = may_race.then_some((offset, read_started));
+            if offered_partial {
+                debug_assert!(inner.reading_partial.is_none());
+                inner.reading_partial = Some(StreamReadPartial {
+                    epoch,
+                    index: stripe_index,
+                    end: offset,
+                    read_started,
+                    idle_recovery: idle_partial_delivered,
+                    handoff: Some(StripeHandoff {
+                        start: stripe_start,
+                        bytes: std::mem::take(&mut stripe),
+                        validator: retained_validator.clone(),
+                    }),
+                });
+            }
+        }
+        let body = io.run(async move {
+            let original = async move {
+                let chunk = tokio::time::timeout(HTTP_STREAM_BODY_TIMEOUT, response.chunk())
+                    .await
+                    .map_err(|_| SourceError::Http("HTTP stream body timed out".to_string()))?
+                    .map_err(|error| SourceError::Http(error.without_url().to_string()))?;
+                Ok((response, chunk))
+            };
+            tokio::pin!(original);
+            if let Some((shared, request_context, validator)) = race_context {
+                let mut attempted = false;
+                let result = {
+                    let replacement = async {
+                        wait_for_idle_race_demand(&shared, epoch, offset).await;
+                        attempted = true;
+                        let candidate = async {
+                            let mut response = open_idle_race_candidate(
+                                &request_context,
+                                validator.as_ref(),
+                                offset,
+                                total,
+                            )
+                            .await?;
+                            let first = response.chunk().await.ok()??;
+                            if first.is_empty() {
+                                return None;
+                            }
+                            Some((response, Some(first)))
+                        };
+                        if let Ok(Some(result)) =
+                            tokio::time::timeout(HTTP_STREAM_RESPONSE_TIMEOUT, candidate).await
+                        {
+                            return result;
+                        }
+                        // Failed speculation must neither poison identity nor end
+                        // or restart the original body read and its existing timeout.
+                        std::future::pending().await
+                    };
+                    tokio::pin!(replacement);
+                    tokio::select! {
+                        biased;
+                        result = &mut original => (result, false),
+                        result = &mut replacement => (Ok(result), true),
+                    }
+                }; // Drop the standby future before reading its local flag.
+                Ok((result.0, attempted, result.1))
+            } else {
+                Ok((original.await, false, false))
+            }
+        });
+        let body = match body {
+            Ok((result, attempted, switched)) => {
+                if attempted {
+                    idle_race_available = false;
+                    idle_race_earning = false;
+                }
+                if switched {
+                    response_start = offset;
+                    idle_race_earning = true;
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
+        {
+            // Reuse the existing per-chunk progress lock for reclamation. The
+            // socket future and its body timeout above are completely unchanged.
+            let mut inner = lock_stream(&shared);
+            inner.idle_race_read = None;
+            if offered_partial {
+                let partial = inner
+                    .reading_partial
+                    .take()
+                    .expect("in-flight partial slot");
+                if let Some(handoff) = partial.handoff {
+                    stripe = handoff.bytes;
+                } else {
+                    idle_partial_delivered = true;
+                    stripe_index += 1;
+                    stripe_start = offset;
+                }
+            }
+            if let Ok((_, Some(bytes))) = &body {
+                inner.progress_bytes += bytes.len() as u64;
+                inner.last_progress = Instant::now();
+            }
+        }
+        match body {
+            Ok((_response, None)) => {
+                // A valid 206 can cover less than the requested tail. Keep its
+                // bytes in this stripe and continue from the reached offset,
+                // replaying the entity validator just as on a transport error.
+                // Empty responses must still exhaust the no-progress allowance.
+                live = None;
+                resumes_since_progress += 1;
+                if resumes_since_progress > HTTP_STREAM_MAX_RESUMES {
+                    mark_worker_done(&shared, true);
+                    return;
+                }
+                if offset == response_start {
+                    if io.wait_cancelled(Duration::from_millis(300)) {
+                        return;
+                    }
+                }
+            }
+            Ok((response, Some(bytes))) => {
+                let response_verified =
+                    response.status().as_u16() == 206 && response_has_bound_strong_etag;
+                live = Some(response);
+                // A 200 starts at byte zero even after a reconnect. Discard
+                // the prefix in chunks without changing the cache offset.
+                let skip = skip_remaining.min(bytes.len() as u64) as usize;
+                skip_remaining -= skip as u64;
+                let bytes = &bytes[skip..];
+                if bytes.is_empty() {
+                    continue;
+                }
+                if stripe_opened.is_none() {
+                    stripe_opened = Some(Instant::now());
+                }
+                let received = bytes.len().min((total - offset) as usize);
+                if received != 0 {
+                    stream_history_verified &= response_verified;
+                    if validator.is_none() {
+                        validator = response_validator.take();
+                    }
+                    if retained_validator.is_none() {
+                        retained_validator = response_strong_etag.clone();
+                    }
+                }
+                resumes_since_progress = 0;
+                let mut consumed = 0usize;
+                while consumed < received {
+                    // A single HTTP body chunk can contain several stripes.
+                    // Apply backpressure at every stripe boundary, including
+                    // boundaries inside that chunk, before publishing more.
+                    if !wait_for_stream_window(&shared, &io, epoch, offset, stripe_received != 0) {
+                        return;
+                    }
+                    let available = HTTP_STREAM_STRIPE_BYTES as usize - stripe_received;
+                    let take = available.min(received - consumed);
+                    append_stream_stripe(&mut stripe, &bytes[consumed..consumed + take], available);
+                    consumed += take;
+                    offset += take as u64;
+                    stripe_received += take;
+                    if stripe_received as u64 == HTTP_STREAM_STRIPE_BYTES {
+                        let elapsed = stripe_opened
+                            .take()
+                            .map_or(0.0, |opened| opened.elapsed().as_secs_f64() * 1000.0);
+                        http_trace_log(format!(
+                            "{{\"event\":\"http_stream_stripe\",\"worker\":0,\"index\":{stripe_index},\"start\":{},\"bytes\":{},\"elapsed_ms\":{elapsed:.3}}}",
+                            stripe_start,
+                            stripe.len(),
+                        ));
+                        hand_off_stripe(
+                            &shared,
+                            epoch,
+                            stripe_index,
+                            stripe_start,
+                            std::mem::take(&mut stripe),
+                            retained_validator.clone(),
+                        );
+                        stripe_index += 1;
+                        stripe_start = offset;
+                        stripe_received = 0;
+                        idle_partial_delivered = false;
+                        if consumed < received {
+                            stripe_opened = Some(Instant::now());
+                        }
+                    } else if idle_partial_delivered
+                        && stream_history_verified
+                        && response_has_bound_strong_etag
+                        && !stripe.is_empty()
+                    {
+                        if io.is_cancelled() {
+                            return;
+                        }
+                        let mut inner = lock_stream(&shared);
+                        if !inner.stopped
+                            && inner.epoch == epoch
+                            && stripe_start < inner.uncovered_read_end
+                            && inner.uncovered_read_end <= offset
+                        {
+                            inner.pending.insert(
+                                stripe_index,
+                                StripeHandoff {
+                                    start: stripe_start,
+                                    bytes: std::mem::take(&mut stripe),
+                                    validator: retained_validator.clone(),
+                                },
+                            );
+                            shared.signal.notify_all();
+                            stripe_index += 1;
+                            stripe_start = offset;
+                        }
+                    }
+                }
+            }
+            Err(SourceError::Cancelled) => return,
+            Err(error) => {
+                resumes_since_progress += 1;
+                http_trace_log(format!(
+                    "{{\"event\":\"http_stream_body_error\",\"worker\":0,\"offset\":{},\"attempt\":{},\"error\":\"{}\"}}",
+                    offset,
+                    resumes_since_progress,
+                    json_escape(&error.to_string()),
+                ));
+                if resumes_since_progress > HTTP_STREAM_MAX_RESUMES {
+                    mark_worker_done(&shared, true);
+                    return;
+                }
+                // Once per worker, resume immediately after this response has
+                // delivered a full stripe. The loop rechecks cancellation and
+                // the stream epoch before opening the replacement response.
+                if !fast_body_retry_used
+                    && offset.saturating_sub(response_start) >= HTTP_STREAM_STRIPE_BYTES
+                {
+                    fast_body_retry_used = true;
+                    release_partial_on_reconnect = (!stripe.is_empty()
+                        && response_has_bound_strong_etag)
+                        .then_some(StreamPartialRelease::FastReconnect);
+                    continue;
+                }
+                if io.wait_cancelled(Duration::from_millis(300)) {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 const HTTP_FETCH_MAX_ATTEMPTS: u32 = 3;
+/// Total attempts allowed for one logical fetch once attempts start making
+/// progress (see `HttpRetryGate`).
+const HTTP_FETCH_MAX_RESUME_ATTEMPTS: u32 = 8;
 const HTTP_FETCH_RETRY_BACKOFF: [Duration; 2] =
     [Duration::from_millis(200), Duration::from_secs(1)];
 /// Wall-clock ceiling on one logical fetch, retries and backoff included.
 ///
-/// `read_range` runs on the demuxer thread, so every retry freezes playback.
-/// The per-request timeouts already allow 10 s to connect and 15 s for response
-/// headers, which three attempts would stretch past a minute; this bounds the
-/// stall instead, at the cost of giving up on origins that are merely very slow.
-const HTTP_FETCH_TOTAL_BUDGET: Duration = Duration::from_secs(20);
+/// `read_range` runs on the demuxer thread, so every retry freezes playback;
+/// this bounds the stall. It leaves room for multiple response/body attempts
+/// on a slow origin: giving up ends playback (EIO is terminal) rather than
+/// merely stalling it. Attempts without any progress still stop after
+/// `HTTP_FETCH_MAX_ATTEMPTS`, so a broken origin fails fast.
+///
+/// Every request receives only the remaining budget, so connect, headers,
+/// response bodies, retry delays, and retries all share this one ceiling.
+const HTTP_FETCH_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy)]
+struct HttpFetchTimeouts {
+    response: Duration,
+    body: Duration,
+    total: Duration,
+}
+
+impl Default for HttpFetchTimeouts {
+    fn default() -> Self {
+        Self {
+            response: Duration::from_secs(15),
+            body: Duration::from_secs(60),
+            total: HTTP_FETCH_TOTAL_BUDGET,
+        }
+    }
+}
+
+/// Hard ceiling on the body of one HTTP request.
+///
+/// Deliberately *not* the read-ahead window. Capping each exchange bounds its
+/// transient body allocation and makes retries resume in small pieces. The
+/// cache window is still filled to its configured depth by successive capped
+/// requests or by the persistent stream worker.
+const HTTP_REQUEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How close to the end of the resource an empty read may fall and still
+/// count as reaching the end instead of a fetch failure (issue #163).
+///
+/// Players skip into the closing moments of a file and read to its natural
+/// end, so short reads at the resource boundary are normal traffic; origins
+/// answer the final range with a 206 that promises the tail and delivers
+/// nothing. A fetch whose request window was truncated by the resource total
+/// starts at most `HTTP_REQUEST_MAX_BYTES` short of it, so mirroring that
+/// ceiling here keeps this guard in agreement with the fetch-side
+/// `window_ends_at_total` rule. Beyond the slack, an uncovered read is still
+/// an error: bytes that exist must never look like EOF.
+const HTTP_TAIL_EOF_SLACK_BYTES: u64 = HTTP_REQUEST_MAX_BYTES;
+
+/// How much already-played data stays in the cache. A rewind inside this tail is
+/// served locally instead of re-downloaded: mpv keeps 50 MiB of back buffer by
+/// default (`--demuxer-max-back-bytes`), VLC reuses a 3x4 MiB ring set. 16 MiB
+/// sits between them and covers a 10 s step at up to ~13 Mbps. This is the
+/// DEFAULT budget -- `http_back_buffer_bytes` on the open options overrides it,
+/// which is how hosts size the tail from media bitrate (a -10 s step at
+/// 71 Mbps covers ~89 MB).
+const HTTP_CACHE_RETAIN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The retained tail is only cut once it is this much over budget, so the O(n)
+/// buffer move happens per few MiB of playback instead of once per read.
+const HTTP_CACHE_TRIM_SLACK: u64 = 8 * 1024 * 1024;
+
+/// Hard stop for open-ended reads (`read_uri_to_end`: danmaku/subtitle sidecars).
+/// Matches the kernel's other sidecar ceilings; it only exists so an origin that
+/// answers full pieces forever cannot grow the cache without bound. Hitting it is
+/// reported as an error, never a silent short read.
+const HTTP_STREAM_TO_EOF_BYTE_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Ceiling for the configured read-ahead window. The window is a memory buffer,
+/// so an untrusted or extreme value (e.g. `u64::MAX` from a caller) must not be
+/// allowed to make the cache grow toward the whole media file. Default is 2 MiB;
+/// the App's picker tops out at 32 MiB, well under this.
+const HTTP_READ_AHEAD_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Most pieces one read may pull. An origin that answers short bodies needs
+/// several pieces per read (that is normal); this only stops a pathological one,
+/// and hitting it is reported as an error rather than a silent short read.
+const HTTP_FETCH_MAX_PIECES_PER_READ: u32 = 64;
+
+/// Consecutive background-prefetch failures before the chain is parked until a
+/// synchronous fetch succeeds.
+const HTTP_PREFETCH_MAX_FAILURES: u32 = 3;
+
+/// Stripe size: the unit a worker buffers before handing bytes to the reader.
+/// Purely bookkeeping -- the request itself is open-ended and never re-issued
+/// except on resume -- so it bounds transient memory, not request count.
+const HTTP_STREAM_STRIPE_BYTES: u64 = 4 * 1024 * 1024;
+/// A stream that delivers nothing for this long while the reader waits is
+/// considered dead; the read falls back to the synchronous capped path.
+const HTTP_STREAM_STALL: Duration = Duration::from_secs(20);
+/// Overall ceiling on one read's wait for stream coverage; past it the sync
+/// path (with its own retry budget) takes over.
+const HTTP_STREAM_WAIT_BUDGET: Duration = Duration::from_secs(60);
+/// Reconnects a worker may make without delivering a single byte. Any
+/// progress resets the counter, so a truncating origin that still moves the
+/// offset never trips it.
+const HTTP_STREAM_MAX_RESUMES: u32 = 3;
+/// Per-worker response/body timeouts. Generous on purpose: the stream is
+/// background traffic, and a healthy long-lived body must not be killed by
+/// the 15 s response deadline that shapes the synchronous request cap.
+const HTTP_STREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
+const HTTP_STREAM_BODY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Retry policy for one logical fetch (every attempt at the same range).
+///
+/// Two-tier: without progress the old behaviour stands (three attempts, so a
+/// broken origin fails fast instead of freezing the demuxer thread); with
+/// progress the fetch may keep resuming, because on a slow link a capped 4 MiB
+/// request may need several attempts. Resuming is bounded by the
+/// attempt count and `HTTP_FETCH_TOTAL_BUDGET` so a foreground stall stays
+/// finite.
+struct HttpRetryGate {
+    started: Instant,
+    budget: Duration,
+    attempts: u32,
+    attempts_without_progress: u32,
+    last_bytes: u64,
+}
+
+impl HttpRetryGate {
+    fn new(budget: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            budget,
+            attempts: 0,
+            attempts_without_progress: 0,
+            last_bytes: 0,
+        }
+    }
+
+    /// Note that an attempt is starting; returns its 1-based number.
+    fn begin_attempt(&mut self) -> u32 {
+        self.attempts = self.attempts.saturating_add(1);
+        self.attempts
+    }
+
+    /// Whether the wall-clock ceiling is already spent. Requests additionally
+    /// receive the remaining budget so their header/body waits cannot exceed it.
+    fn expired(&self) -> bool {
+        self.started.elapsed() >= self.budget
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Record a failed attempt (`received` = bytes of this logical fetch so
+    /// far): `Some(backoff)` to wait and try again, `None` to give up.
+    fn fail(&mut self, received: u64) -> Option<Duration> {
+        if received > self.last_bytes {
+            self.last_bytes = received;
+            self.attempts_without_progress = 0;
+        } else {
+            self.attempts_without_progress = self.attempts_without_progress.saturating_add(1);
+        }
+        if self.attempts_without_progress >= HTTP_FETCH_MAX_ATTEMPTS
+            || self.attempts >= HTTP_FETCH_MAX_RESUME_ATTEMPTS
+        {
+            return None;
+        }
+        let backoff = http_retry_backoff(self.attempts);
+        if self.started.elapsed().saturating_add(backoff) >= self.budget {
+            return None;
+        }
+        Some(backoff)
+    }
+}
 
 fn http_retry_backoff(attempt: u32) -> Duration {
     let index = usize::try_from(attempt.saturating_sub(1)).unwrap_or(0);
@@ -589,22 +2137,58 @@ fn http_retry_backoff(attempt: u32) -> Duration {
         .unwrap_or(Duration::from_secs(1))
 }
 
-/// Whether another attempt (plus its backoff) still fits inside the budget.
-/// Checked before sleeping so a retry is never armed only to blow the deadline.
-fn http_retry_fits_budget(deadline_started: Instant, backoff: Duration) -> bool {
-    deadline_started
-        .elapsed()
-        .saturating_add(backoff)
-        .lt(&HTTP_FETCH_TOTAL_BUDGET)
+#[derive(Debug, Error)]
+enum HttpRequestError {
+    #[error("{0}")]
+    Request(#[from] reqwest::Error),
+    #[error("{error}; Retry-After: {retry_after_seconds}s")]
+    RetryAfter {
+        error: reqwest::Error,
+        retry_after_seconds: u64,
+        retry_after: Duration,
+    },
+    #[error("HTTP phase timed out")]
+    Timeout(#[from] tokio::time::error::Elapsed),
 }
 
-/// Whether a failed HTTP exchange is worth retrying: transport errors and 5xx
-/// responses are transient; 4xx responses are deterministic client errors.
-fn http_error_is_retryable(error: &ureq::Error) -> bool {
+/// Phase timeouts, transport errors and 5xx are transient; 4xx are not.
+fn http_error_is_retryable(error: &HttpRequestError) -> bool {
     match error {
-        ureq::Error::StatusCode(status) => *status >= 500,
-        _ => true,
+        HttpRequestError::Timeout(_) => true,
+        HttpRequestError::RetryAfter { error, .. } | HttpRequestError::Request(error) => {
+            error.status().is_none_or(|status| status.is_server_error())
+        }
     }
+}
+
+// The request's own timeout remains active through the body and caps the
+// entire exchange at the remaining fetch budget. This shorter response timer
+// leaves time to retry when an origin accepts a connection but sends no head.
+async fn send_http_request(
+    request: reqwest::RequestBuilder,
+    remaining: Duration,
+    response_timeout: Duration,
+) -> std::result::Result<reqwest::Response, HttpRequestError> {
+    let response = tokio::time::timeout(response_timeout, request.timeout(remaining).send())
+        .await?
+        .map_err(reqwest::Error::without_url)?;
+    // Preserve only a parsed hint; never read the body or report raw headers.
+    let retry_after = matches!(response.status().as_u16(), 429 | 503)
+        .then(|| stream_retry_after(&response))
+        .flatten();
+    response.error_for_status().map_err(|error| {
+        let error = error.without_url();
+        match retry_after {
+            Some(delay) => HttpRequestError::RetryAfter {
+                error,
+                retry_after: delay,
+                retry_after_seconds: delay
+                    .as_secs()
+                    .saturating_add(u64::from(delay.subsec_nanos() != 0)),
+            },
+            None => HttpRequestError::Request(error),
+        }
+    })
 }
 
 /// Parses the `total` out of a `Content-Range: bytes start-end/total` header.
@@ -628,7 +2212,7 @@ fn parse_content_range_start(value: &str) -> Option<u64> {
 
 /// The strongest entity validator the response offers, preferred in the order
 /// RFC 9110 recommends for `If-Range`.
-fn response_entity_validator<T>(response: &ureq::http::Response<T>) -> Option<String> {
+fn response_entity_validator(response: &reqwest::Response) -> Option<String> {
     ["etag", "last-modified"].into_iter().find_map(|name| {
         response
             .headers()
@@ -640,6 +2224,59 @@ fn response_entity_validator<T>(response: &ureq::http::Response<T>) -> Option<St
     })
 }
 
+/// Weak ETags describe semantic equivalence, not byte identity. They cannot
+/// authorize a range splice or be sent in If-Range (RFC 9110 section 13.1.5).
+fn validate_resume_validator(validator: Option<&str>) -> Result<()> {
+    if validator.is_some_and(|value| value.starts_with("W/")) {
+        return Err(SourceError::HttpEntityChanged);
+    }
+    Ok(())
+}
+
+/// A strong ETag is a quoted opaque byte identifier, never a date or W/ tag.
+fn strong_etag(value: &[u8]) -> Option<&[u8]> {
+    let value = value.trim_ascii();
+    let opaque = value.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    opaque
+        .iter()
+        .all(|&byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
+        .then_some(value)
+}
+
+/// An origin can ignore If-Range while explicitly returning a different entity
+/// in a 206. Missing ETag is legal, so only contradictory strong tags reject it.
+fn validate_partial_response_etag(
+    response: &reqwest::Response,
+    validator: Option<&str>,
+) -> Result<()> {
+    if let Some(expected) = validator.map(str::as_bytes).and_then(strong_etag)
+        && let Some(actual) = response
+            .headers()
+            .get("etag")
+            .and_then(|value| strong_etag(value.as_bytes()))
+        && actual != expected
+    {
+        return Err(SourceError::HttpEntityChanged);
+    }
+    Ok(())
+}
+
+/// A 200 may mean that If-Range detected a changed resource. Only splice its
+/// tail onto previously received bytes when the original validator still
+/// matches; missing validators cannot prove that the replay is the same file.
+fn validate_full_response_entity(
+    response: &reqwest::Response,
+    validator: Option<&str>,
+) -> Result<()> {
+    validate_resume_validator(validator)?;
+    if let Some(expected) = validator
+        && response_entity_validator(response).as_deref() != Some(expected)
+    {
+        return Err(SourceError::HttpEntityChanged);
+    }
+    Ok(())
+}
+
 /// Learns the total length from a one-byte GET, for origins that reject HEAD.
 ///
 /// The body is deliberately never read. An origin that rejects HEAD *and*
@@ -647,24 +2284,50 @@ fn response_entity_validator<T>(response: &ureq::http::Response<T>) -> Option<St
 /// would turn a `len()` call into a full download of the media -- gigabytes
 /// into memory before playback, just to learn a number the headers already
 /// carry.
+#[cfg(test)]
 fn probe_http_total_length(
-    agent: &ureq::Agent,
+    agent: &HttpIo,
     uri: &str,
     http_headers: &[(String, String)],
+) -> Result<Option<u64>> {
+    let client = agent.client.clone();
+    let uri = uri.to_owned();
+    let http_headers = http_headers.to_vec();
+    agent.run(async move {
+        probe_http_total_length_async(
+            &client,
+            &uri,
+            &http_headers,
+            HttpFetchTimeouts::default().response,
+        )
+        .await
+    })
+}
+
+async fn probe_http_total_length_async(
+    client: &reqwest::Client,
+    uri: &str,
+    http_headers: &[(String, String)],
+    timeout: Duration,
 ) -> Result<Option<u64>> {
     let probe = ByteRange {
         start: 0,
         length: Some(1),
     };
-    let mut request = agent.get(uri).header("Range", &http_range_header(probe));
+    let mut request = client.get(uri).header("Range", http_range_header(probe));
     for (name, value) in http_headers {
         request = request.header(name, value);
     }
+    if timeout.is_zero() {
+        return Err(SourceError::Http(
+            "http metadata deadline exceeded".to_string(),
+        ));
+    }
     let response = request
-        .config()
-        .http_status_as_error(false)
-        .build()
-        .call()
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
         .map_err(|error| {
             http_trace_log(format!(
                 "{{\"event\":\"http_length_probe_error\",\"phase\":\"request\",\"error\":\"{}\"}}",
@@ -714,35 +2377,264 @@ fn http_range_header(range: ByteRange) -> String {
     }
 }
 
+#[cfg(test)]
 fn fetch_http_range(
-    agent: &ureq::Agent,
+    agent: &HttpIo,
     uri: &str,
     http_headers: &[(String, String)],
     range: ByteRange,
     event: &str,
 ) -> Result<HttpRangeResponse> {
+    fetch_http_range_with_validator(agent, uri, http_headers, range, event, None)
+}
+
+fn fetch_http_range_with_validator(
+    agent: &HttpIo,
+    uri: &str,
+    http_headers: &[(String, String)],
+    range: ByteRange,
+    event: &str,
+    validator: Option<String>,
+) -> Result<HttpRangeResponse> {
+    let client = agent.client.clone();
+    let cold_open = agent.cold_open.clone();
+    let uri = uri.to_owned();
+    let http_headers = http_headers.to_vec();
+    let event = event.to_owned();
+    agent.run(async move {
+        fetch_http_range_with_history_async(
+            &client,
+            &uri,
+            &http_headers,
+            range,
+            &event,
+            HttpFetchTimeouts::default(),
+            cold_open,
+            validator.as_deref().map(|validator| HttpRangeHistory {
+                start: range.start,
+                prefix: &[],
+                validator: None,
+                strong_etag: Some(validator),
+                total_length: None,
+            }),
+        )
+        .await
+    })
+}
+
+fn fetch_http_to_end(
+    agent: &HttpIo,
+    uri: &str,
+    http_headers: &[(String, String)],
+    start: u64,
+    mut total_length: Option<u64>,
+    mut strong_etag: Option<String>,
+) -> Result<HttpRangeResponse> {
+    let client = agent.client.clone();
+    let mut cold_open = agent.cold_open.clone();
+    let uri = uri.to_owned();
+    let http_headers = http_headers.to_vec();
+    agent.run(async move {
+        let mut bytes = Vec::new();
+        let mut validator = None;
+        let mut pieces = 0;
+        let mut progress_start = 0;
+        loop {
+            let end = start.saturating_add(bytes.len() as u64);
+            // Preserve known EOF before the byte ceiling (including the final
+            // full piece just past it) and before the small-progress bound.
+            if total_length.is_some_and(|total| end >= total) {
+                break;
+            }
+            if bytes.len() as u64 > HTTP_STREAM_TO_EOF_BYTE_LIMIT {
+                return Err(SourceError::Http(format!(
+                    "open-ended read exceeded the {HTTP_STREAM_TO_EOF_BYTE_LIMIT}-byte limit at {end}",
+                )));
+            }
+            if bytes.len().saturating_sub(progress_start) as u64 >= HTTP_REQUEST_MAX_BYTES {
+                progress_start = bytes.len();
+                pieces = 0;
+            }
+            if pieces >= HTTP_FETCH_MAX_PIECES_PER_READ {
+                return Err(SourceError::Http(format!(
+                    "open-ended read made less than {HTTP_REQUEST_MAX_BYTES} bytes of progress in {pieces} short responses",
+                )));
+            }
+            let response = fetch_http_range_with_history_async(
+                &client,
+                &uri,
+                &http_headers,
+                ByteRange {
+                    start: end,
+                    length: Some(HTTP_REQUEST_MAX_BYTES),
+                },
+                "http_range",
+                HttpFetchTimeouts::default(),
+                cold_open.take(),
+                Some(HttpRangeHistory {
+                    start,
+                    prefix: &bytes,
+                    validator: validator.as_deref(),
+                    strong_etag: strong_etag.as_deref(),
+                    total_length,
+                }),
+            )
+            .await?;
+            total_length = response.total_length;
+            if response.bytes.is_empty() {
+                if total_length.is_some_and(|total| end < total) {
+                    return Err(SourceError::Http(
+                        "origin returned an empty sidecar body before the known end".to_string(),
+                    ));
+                }
+                break;
+            }
+            if bytes.is_empty() {
+                validator = response.validator;
+            }
+            strong_etag = response.strong_etag;
+            let short = (response.bytes.len() as u64) < HTTP_REQUEST_MAX_BYTES;
+            bytes.extend_from_slice(&response.bytes);
+            pieces += 1;
+            if short && total_length.is_none() {
+                break;
+            }
+        }
+        Ok(HttpRangeResponse {
+            bytes,
+            total_length,
+            validator,
+            strong_etag,
+        })
+    })
+}
+
+struct HttpRangeHistory<'a> {
+    start: u64,
+    prefix: &'a [u8],
+    validator: Option<&'a str>,
+    // Separate from the original replay validator: later tagged pieces must
+    // not retroactively validate an unbound prefix.
+    strong_etag: Option<&'a str>,
+    total_length: Option<u64>,
+}
+
+// A validator-free 200 replay must agree with every retained byte before its
+// new tail can be appended. Compare the already-discarded prefix in place.
+fn http_replay_prefix_matches(
+    chunk: &[u8],
+    offset: u64,
+    history: &HttpRangeHistory<'_>,
+    current: &[u8],
+) -> bool {
+    let mut start = history.start;
+    for expected in [history.prefix, current] {
+        let end = start.saturating_add(expected.len() as u64);
+        let overlap_start = offset.max(start);
+        let overlap_end = offset.saturating_add(chunk.len() as u64).min(end);
+        if overlap_start < overlap_end {
+            let count = (overlap_end - overlap_start) as usize;
+            let actual_offset = (overlap_start - offset) as usize;
+            let expected_offset = (overlap_start - start) as usize;
+            if chunk[actual_offset..actual_offset + count]
+                != expected[expected_offset..expected_offset + count]
+            {
+                return false;
+            }
+        }
+        start = end;
+    }
+    true
+}
+
+#[cfg(test)]
+async fn fetch_http_range_async(
+    client: &reqwest::Client,
+    uri: &str,
+    http_headers: &[(String, String)],
+    range: ByteRange,
+    event: &str,
+    timeouts: HttpFetchTimeouts,
+) -> Result<HttpRangeResponse> {
+    fetch_http_range_with_history_async(
+        client,
+        uri,
+        http_headers,
+        range,
+        event,
+        timeouts,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn fetch_http_range_with_history_async(
+    client: &reqwest::Client,
+    uri: &str,
+    http_headers: &[(String, String)],
+    range: ByteRange,
+    event: &str,
+    timeouts: HttpFetchTimeouts,
+    cold_open: Option<ColdOpenCancellation>,
+    history: Option<HttpRangeHistory<'_>>,
+) -> Result<HttpRangeResponse> {
     let mut bytes = Vec::new();
-    let mut total_length = None;
-    // Entity validator from the first response. A resumed request replays it as
-    // `If-Range` so an origin that re-encoded or load-balanced to a different
-    // variant answers 200 (which the status check below rejects for a non-zero
-    // start) instead of handing back bytes from a different object to be spliced
-    // onto the prefix we already hold.
-    let mut validator: Option<String> = None;
-    let mut attempt = 0u32;
-    let deadline_started = Instant::now();
+    let initial_length = history.as_ref().and_then(|history| history.total_length);
+    let prior_bytes = history
+        .as_ref()
+        .is_some_and(|history| !history.prefix.is_empty());
+    let mut total_length = initial_length;
+    let mut validator = history
+        .as_ref()
+        .and_then(|history| history.validator.map(str::to_owned));
+    let mut strong_etag = history
+        .as_ref()
+        .and_then(|history| history.strong_etag.map(str::to_owned));
+    let mut gate = HttpRetryGate::new(timeouts.total);
+    let mut honored_cold_hint = false;
     loop {
-        attempt += 1;
-        // Resume from what already arrived: earlier attempts keep their bytes
-        // and the Range start advances past them.
+        let attempt = gate.begin_attempt();
+        if gate.expired() {
+            http_trace_log(format!(
+                "{{\"event\":\"{}_error\",\"phase\":\"budget\",\"attempt\":{},\"start\":{},\"elapsed_ms\":{:.3}}}",
+                event,
+                attempt,
+                range.start,
+                gate.elapsed().as_secs_f64() * 1000.0,
+            ));
+            return Err(SourceError::Http(format!(
+                "fetch budget of {:?} exhausted for bytes {}..",
+                timeouts.total, range.start,
+            )));
+        }
         let received = bytes.len() as u64;
+        if received == 0 {
+            // No bytes from this fetch bind us to a failed response. Restore
+            // only the history retained before this fetch, if any.
+            total_length = initial_length;
+            validator = history
+                .as_ref()
+                .and_then(|history| history.validator.map(str::to_owned));
+        }
         if range.length.is_some_and(|length| received >= length) {
-            // A body error surfaced after every requested byte arrived; the
-            // payload is complete, so do not re-request an open-ended tail.
             return Ok(HttpRangeResponse {
                 bytes,
                 total_length,
+                validator,
+                strong_etag,
             });
+        }
+        let resuming = received > 0 || prior_bytes;
+        // A complete weak-tagged piece may be followed by a verified 200
+        // replay, but a body failure inside this fetch keeps the old rejection.
+        let weak_prior_only = received == 0
+            && prior_bytes
+            && validator
+                .as_deref()
+                .is_some_and(|value| value.starts_with("W/"));
+        if resuming && !weak_prior_only {
+            validate_resume_validator(validator.as_deref())?;
         }
         let resume_range = ByteRange {
             start: range.start.saturating_add(received),
@@ -750,18 +2642,43 @@ fn fetch_http_range(
         };
         let header = http_range_header(resume_range);
         let started = Instant::now();
-        let mut request = agent.get(uri).header("Range", &header);
+        let mut request = client.get(uri).header("Range", &header);
         for (name, value) in http_headers {
             request = request.header(name, value);
         }
-        if received > 0
-            && let Some(validator) = validator.as_deref()
-        {
+        let inherited_identity = strong_etag.as_deref().filter(|_| {
+            !http_headers.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+            })
+        });
+        if let Some(validator) = inherited_identity.or_else(|| {
+            (resuming && !weak_prior_only)
+                .then_some(validator.as_deref())
+                .flatten()
+        }) {
             request = request.header("If-Range", validator);
         }
-        let mut response = match request.call() {
+        let remaining = timeouts.total.saturating_sub(gate.elapsed());
+        let mut response = match send_http_request(request, remaining, timeouts.response).await {
             Ok(response) => response,
             Err(error) => {
+                if let (Some(ticket), HttpRequestError::RetryAfter { retry_after, .. }) =
+                    (cold_open.as_ref(), &error)
+                    && attempt == 1
+                    && !honored_cold_hint
+                    && received == 0
+                    && !prior_bytes
+                    && !http_headers.iter().any(|(name, _)| {
+                        name.eq_ignore_ascii_case("Range") || name.eq_ignore_ascii_case("If-Range")
+                    })
+                    && gate.elapsed().saturating_add(*retry_after) < timeouts.total
+                    && gate.fail(0).is_some()
+                {
+                    honored_cold_hint = true;
+                    ticket.wait(*retry_after).await?;
+                    continue;
+                }
+
                 http_trace_log(format!(
                     "{{\"event\":\"{}_error\",\"phase\":\"request\",\"attempt\":{},\"start\":{},\"length\":{},\"elapsed_ms\":{:.3},\"error\":\"{}\"}}",
                     event,
@@ -773,10 +2690,11 @@ fn fetch_http_range(
                     started.elapsed().as_secs_f64() * 1000.0,
                     json_escape(&error.to_string()),
                 ));
-                let backoff = http_retry_backoff(attempt);
-                if attempt < HTTP_FETCH_MAX_ATTEMPTS
+                // A second explicit hint after the one permitted cold-open wait
+                // must not fall through to an earlier generic retry.
+                if !(honored_cold_hint && matches!(&error, HttpRequestError::RetryAfter { .. }))
                     && http_error_is_retryable(&error)
-                    && http_retry_fits_budget(deadline_started, backoff)
+                    && let Some(backoff) = gate.fail(received)
                 {
                     http_trace_log(format!(
                         "{{\"event\":\"{}_retry\",\"phase\":\"request\",\"attempt\":{},\"start\":{},\"received\":{},\"backoff_ms\":{}}}",
@@ -786,70 +2704,72 @@ fn fetch_http_range(
                         received,
                         backoff.as_millis(),
                     ));
-                    thread::sleep(backoff);
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
                 return Err(SourceError::Http(error.to_string()));
             }
         };
         let status = response.status().as_u16();
-        match status {
+        if matches!(status, 200 | 206) {
+            validate_partial_response_etag(&response, strong_etag.as_deref())?;
+        }
+        // A tag bound within this fetch cannot validate an older, unbound
+        // sidecar prefix, even when a retry correctly repeats that local tag.
+        let replay_history = history.as_ref().filter(|history| {
+            status == 200
+                && resuming
+                && (validator.is_none()
+                    || weak_prior_only
+                    || (!history.prefix.is_empty() && history.validator.is_none()))
+        });
+        let reported_total = match status {
             206 => {
+                if resuming {
+                    validate_partial_response_etag(&response, validator.as_deref())?;
+                }
                 let content_range = response
                     .headers()
                     .get("content-range")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
-                // A resumed request must continue exactly where the prefix
-                // ends. A server that answers 206 from a different offset --
-                // or a changed entity that ignored If-Range -- would otherwise
-                // be spliced onto the bytes already held and returned as
-                // silently corrupt media.
-                if let Some(start) = content_range.as_deref().and_then(parse_content_range_start)
-                    && start != resume_range.start
-                {
+                if let Some(start) = content_range.as_deref().and_then(parse_content_range_start) {
+                    if start != resume_range.start {
+                        http_trace_log(format!(
+                            "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":{}}}",
+                            event, attempt, resume_range.start, start,
+                        ));
+                        return Err(SourceError::HttpRangeVerification(format!(
+                            "server served range from {start}, expected {}",
+                            resume_range.start
+                        )));
+                    }
+                } else if resume_range.start > 0 {
+                    // A 206 without Content-Range cannot be position-verified,
+                    // and a spliced answer would be silent cache corruption;
+                    // only offset 0 is unambiguous, so lenient servers keep
+                    // working for whole-file requests.
                     http_trace_log(format!(
-                        "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":{}}}",
-                        event, attempt, resume_range.start, start,
-                    ));
-                    return Err(SourceError::Http(format!(
-                        "server served range from {start}, expected {}",
-                        resume_range.start
-                    )));
-                }
-                if total_length.is_none() {
-                    total_length = content_range.as_deref().and_then(parse_content_range_total);
-                }
-                if validator.is_none() {
-                    validator = response_entity_validator(&response);
-                }
-            }
-            200 => {
-                if resume_range.start > 0 {
-                    // The server sent the file from byte zero: treating that
-                    // payload as `resume_range.start` data would silently
-                    // corrupt the cache, so fail instead of retrying.
-                    http_trace_log(format!(
-                        "{{\"event\":\"{}_error\",\"phase\":\"status\",\"attempt\":{},\"start\":{},\"status\":200}}",
+                        "{{\"event\":\"{}_error\",\"phase\":\"content_range\",\"attempt\":{},\"start\":{},\"served_start\":null}}",
                         event, attempt, resume_range.start,
                     ));
-                    return Err(SourceError::Http(
-                        "server ignored Range request (status 200)".to_string(),
+                    return Err(SourceError::HttpRangeVerification(
+                        "server served 206 without Content-Range; cannot verify the resumed offset"
+                            .to_string(),
                     ));
                 }
-                if total_length.is_none() {
-                    total_length = response
-                        .headers()
-                        .get("content-length")
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<u64>().ok());
-                }
-                if validator.is_none() {
-                    validator = response_entity_validator(&response);
-                }
+                content_range.as_deref().and_then(parse_content_range_total)
             }
-            // ureq maps 4xx/5xx to Error::StatusCode before this point; any
-            // other status (204, 304, ...) carries no usable range payload.
+            200 => {
+                if resuming && !weak_prior_only {
+                    validate_full_response_entity(&response, validator.as_deref())?;
+                }
+                response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+            }
             _ => {
                 http_trace_log(format!(
                     "{{\"event\":\"{}_error\",\"phase\":\"status\",\"attempt\":{},\"start\":{},\"status\":{}}}",
@@ -859,8 +2779,81 @@ fn fetch_http_range(
                     "unexpected HTTP status {status} for Range request"
                 )));
             }
+        };
+        if history.is_some()
+            && total_length
+                .zip(reported_total)
+                .is_some_and(|(expected, actual)| expected != actual)
+        {
+            return Err(SourceError::HttpEntityChanged);
         }
-        if let Err(error) = response.body_mut().as_reader().read_to_end(&mut bytes) {
+        if total_length.is_none() {
+            total_length = reported_total;
+        }
+        let response_validator = response_entity_validator(&response);
+        let response_strong_etag = response_validator
+            .as_deref()
+            .filter(|value| self::strong_etag(value.as_bytes()).is_some())
+            .map(str::to_owned);
+        let mut entity_mismatch = false;
+        let mut skip_remaining = if status == 200 { resume_range.start } else { 0 };
+        let mut response_bytes = 0u64;
+        let mut reached_eof = false;
+        let body_result: std::result::Result<(), HttpRequestError> = async {
+            while let Some(chunk) = tokio::time::timeout(timeouts.body, response.chunk())
+                .await?
+                .map_err(reqwest::Error::without_url)?
+            {
+                if let Some(history) = replay_history
+                    && !http_replay_prefix_matches(
+                        &chunk,
+                        response_bytes,
+                        history,
+                        &bytes[..received as usize],
+                    )
+                {
+                    entity_mismatch = true;
+                    return Ok(());
+                }
+                response_bytes = response_bytes.saturating_add(chunk.len() as u64);
+                let skip = skip_remaining.min(chunk.len() as u64) as usize;
+                skip_remaining -= skip as u64;
+                let chunk = &chunk[skip..];
+                let take = range.length.map_or(chunk.len(), |length| {
+                    length
+                        .saturating_sub(bytes.len() as u64)
+                        .min(chunk.len() as u64) as usize
+                });
+                if take != 0 {
+                    // Keep the original replay proof's scope: a tag learned
+                    // after unbound bytes cannot validate those earlier bytes.
+                    if validator.is_none() && (history.is_none() || received == 0) {
+                        validator = response_validator.clone();
+                    }
+                    if strong_etag.is_none() {
+                        strong_etag = response_strong_etag.clone();
+                    }
+                }
+                bytes.extend_from_slice(&chunk[..take]);
+                // Drop the remaining whole-file body once the requested range
+                // is covered; never buffer it just because Range was ignored.
+                if range
+                    .length
+                    .is_some_and(|length| bytes.len() as u64 >= length)
+                {
+                    return Ok(());
+                }
+            }
+            reached_eof = true;
+            Ok(())
+        }
+        .await;
+        if entity_mismatch || (replay_history.is_some() && reached_eof && skip_remaining > 0) {
+            return Err(SourceError::HttpEntityChanged);
+        }
+        if let Err(error) = body_result {
+            // Release the stalled socket before sleeping or opening its resume.
+            drop(response);
             http_trace_log(format!(
                 "{{\"event\":\"{}_error\",\"phase\":\"body\",\"attempt\":{},\"start\":{},\"length\":{},\"status\":{},\"bytes\":{},\"elapsed_ms\":{:.3},\"error\":\"{}\"}}",
                 event,
@@ -874,10 +2867,7 @@ fn fetch_http_range(
                 started.elapsed().as_secs_f64() * 1000.0,
                 json_escape(&error.to_string()),
             ));
-            let backoff = http_retry_backoff(attempt);
-            if attempt < HTTP_FETCH_MAX_ATTEMPTS
-                && http_retry_fits_budget(deadline_started, backoff)
-            {
+            if let Some(backoff) = gate.fail(bytes.len() as u64) {
                 http_trace_log(format!(
                     "{{\"event\":\"{}_retry\",\"phase\":\"body\",\"attempt\":{},\"start\":{},\"received\":{},\"backoff_ms\":{}}}",
                     event,
@@ -886,10 +2876,22 @@ fn fetch_http_range(
                     bytes.len(),
                     backoff.as_millis(),
                 ));
-                thread::sleep(backoff);
+                tokio::time::sleep(backoff).await;
                 continue;
             }
             return Err(SourceError::Http(error.to_string()));
+        }
+        if history.is_some()
+            && status == 200
+            && reached_eof
+            && total_length.is_some_and(|total| total != response_bytes)
+        {
+            return Err(SourceError::HttpEntityChanged);
+        }
+        if status == 200 && reached_eof && total_length.is_none() {
+            // Count the discarded prefix too. This also discovers EOF when
+            // the requested offset is beyond a lengthless response's body.
+            total_length = Some(response_bytes);
         }
         http_trace_log(format!(
             "{{\"event\":\"{}\",\"attempt\":{},\"start\":{},\"length\":{},\"status\":{},\"bytes\":{},\"elapsed_ms\":{:.3}}}",
@@ -906,7 +2908,121 @@ fn fetch_http_range(
         return Ok(HttpRangeResponse {
             bytes,
             total_length,
+            validator,
+            strong_etag,
         });
+    }
+}
+
+async fn fetch_http_length(
+    client: &reqwest::Client,
+    uri: &str,
+    http_headers: &[(String, String)],
+    started: Instant,
+    timeouts: HttpFetchTimeouts,
+    cold_open: Option<&ColdOpenCancellation>,
+) -> Result<Option<u64>> {
+    let mut gate = HttpRetryGate::new(timeouts.total);
+    let head_error = loop {
+        let attempt = gate.begin_attempt();
+        if gate.expired() {
+            return Err(SourceError::Http(
+                "http metadata deadline exceeded".to_string(),
+            ));
+        }
+        let mut request = client.head(uri);
+        for (name, value) in http_headers {
+            request = request.header(name, value);
+        }
+        let remaining = timeouts.total.saturating_sub(gate.elapsed());
+        match send_http_request(request, remaining, timeouts.response).await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let length = response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                if length == Some(0) {
+                    http_trace_log(format!(
+                        "[erika-http-trace] stage=head_zero_length_fallback status={} elapsed_ms={:.3}",
+                        status,
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    ));
+                    return match probe_http_total_length_async(
+                        client,
+                        uri,
+                        http_headers,
+                        timeouts
+                            .response
+                            .min(timeouts.total.saturating_sub(gate.elapsed())),
+                    )
+                    .await
+                    {
+                        Ok(total_length) => Ok(total_length),
+                        Err(error) => Err(SourceError::Http(format!(
+                            "HEAD reported Content-Length: 0 and range probe failed: {error}"
+                        ))),
+                    };
+                }
+                http_trace_log(format!(
+                    "[erika-http-trace] stage=head_response status={} length={} elapsed_ms={:.3}",
+                    status,
+                    length.map_or_else(|| "null".to_string(), |length| length.to_string()),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                ));
+                return Ok(length);
+            }
+            Err(error) => {
+                http_trace_log(format!(
+                    "[erika-http-trace] stage=head_error attempt={} elapsed_ms={:.3} error={}",
+                    attempt,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    json_escape(&error.to_string()),
+                ));
+                if http_error_is_retryable(&error)
+                    && let Some(backoff) = gate.fail(0)
+                {
+                    http_trace_log(format!(
+                        "[erika-http-trace] stage=head_retry attempt={} backoff_ms={}",
+                        attempt,
+                        backoff.as_millis(),
+                    ));
+                    if let (
+                        Some(ticket),
+                        HttpRequestError::RetryAfter {
+                            error, retry_after, ..
+                        },
+                    ) = (cold_open, &error)
+                        && error.status().is_some_and(|status| status.as_u16() == 503)
+                        && gate.elapsed().saturating_add(*retry_after) < timeouts.total
+                    {
+                        ticket.metadata_backoff(backoff).await?;
+                    } else {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    continue;
+                }
+                break error;
+            }
+        }
+    };
+    http_trace_log(format!(
+        "[erika-http-trace] stage=head_fallback_range error={}",
+        json_escape(&head_error.to_string()),
+    ));
+    match probe_http_total_length_async(
+        client,
+        uri,
+        http_headers,
+        timeouts
+            .response
+            .min(timeouts.total.saturating_sub(gate.elapsed())),
+    )
+    .await
+    {
+        Ok(total_length) => Ok(total_length),
+        Err(_) => Err(SourceError::Http(head_error.to_string())),
     }
 }
 
@@ -918,18 +3034,50 @@ impl std::fmt::Debug for HttpRangeSource {
             .field("cache_start", &self.cache_start)
             .field("cache_bytes", &self.cache_bytes.len())
             .field("read_ahead_bytes", &self.read_ahead_bytes)
+            .field("request_bytes", &self.request_bytes)
             .finish()
     }
 }
 
+impl Drop for HttpRangeSource {
+    fn drop(&mut self) {
+        self.agent.cancel();
+        self.kill_streams();
+    }
+}
+
 impl MediaSource for HttpRangeSource {
+    fn set_cold_open_cancellation(&mut self, cancellation: Option<ColdOpenCancellation>) {
+        if let Some(ticket) = &cancellation {
+            ticket.bind_source(self.agent.cancellation.clone());
+        }
+        self.agent.cold_open = cancellation;
+    }
     fn uri(&self) -> &str {
         &self.uri
+    }
+
+    fn cancellation(&self) -> Option<SourceCancellation> {
+        Some(self.agent.cancellation.clone())
+    }
+
+    fn release_buffer(&mut self) {
+        self.kill_streams();
+        self.cache_bytes = Vec::new();
+        self.cache_start = 0;
+        self.stream_reader_end = 0;
+        self.prefetch_failures = 0;
     }
 
     fn len(&mut self) -> Result<Option<u64>> {
         if self.content_length.is_some() {
             return Ok(self.content_length);
+        }
+        if self.length_probed {
+            // A finished probe already established that the origin reports no
+            // length (chunked / connection-close). Only transient probe errors
+            // stay retryable.
+            return Ok(None);
         }
         let started = Instant::now();
         http_trace_log(format!(
@@ -939,105 +3087,47 @@ impl MediaSource for HttpRangeSource {
             self.cache_end(),
             self.read_ahead_bytes,
         ));
-        // Keep metadata probing off the range-request pool. Some HTTP/1.0
-        // servers close a HEAD connection without an explicit Connection
-        // header; reusing that stale socket for the first GET otherwise
-        // surfaces as `Peer disconnected`.
-        // TODO(perf): cache a dedicated metadata agent on `HttpRangeSource` so
-        // repeated `len()` probes without Content-Length do not rebuild the TLS
-        // client, while still keeping HEAD sockets out of the range-request pool.
-        let head_agent = http_agent();
-        let mut attempt = 0u32;
-        let head_error = loop {
-            attempt += 1;
-            let mut request = head_agent.head(&self.uri);
-            for (name, value) in &self.http_headers {
-                request = request.header(name, value);
-            }
-            match request.call() {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let length = response
-                        .headers()
-                        .get("content-length")
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<u64>().ok());
-                    // Some streaming servers synthesize an empty HEAD body and
-                    // incorrectly report that body length as the media length.
-                    // A zero-byte media resource is not useful to the demuxer,
-                    // so verify it with a one-byte range request before caching
-                    // the value. Content-Range carries the actual object size.
-                    if length == Some(0) {
-                        http_trace_log(format!(
-                            "[erika-http-trace] stage=head_zero_length_fallback status={} elapsed_ms={:.3}",
-                            status,
-                            started.elapsed().as_secs_f64() * 1000.0,
-                        ));
-                        return match probe_http_total_length(
-                            &self.agent,
-                            &self.uri,
-                            &self.http_headers,
-                        ) {
-                            Ok(total_length) => {
-                                self.content_length = total_length;
-                                Ok(self.content_length)
-                            }
-                            Err(error) => Err(SourceError::Http(format!(
-                                "HEAD reported Content-Length: 0 and range probe failed: {error}"
-                            ))),
-                        };
-                    }
-                    self.content_length = length;
-                    http_trace_log(format!(
-                        "[erika-http-trace] stage=head_response status={} length={} elapsed_ms={:.3}",
-                        status,
-                        length.map_or_else(|| "null".to_string(), |length| length.to_string()),
-                        started.elapsed().as_secs_f64() * 1000.0,
-                    ));
-                    return Ok(length);
-                }
-                Err(error) => {
-                    http_trace_log(format!(
-                        "[erika-http-trace] stage=head_error attempt={} elapsed_ms={:.3} error={}",
-                        attempt,
-                        started.elapsed().as_secs_f64() * 1000.0,
-                        json_escape(&error.to_string()),
-                    ));
-                    let backoff = http_retry_backoff(attempt);
-                    if attempt < HTTP_FETCH_MAX_ATTEMPTS
-                        && http_error_is_retryable(&error)
-                        && http_retry_fits_budget(started, backoff)
-                    {
-                        http_trace_log(format!(
-                            "[erika-http-trace] stage=head_retry attempt={} backoff_ms={}",
-                            attempt,
-                            backoff.as_millis(),
-                        ));
-                        thread::sleep(backoff);
-                        continue;
-                    }
-                    break error;
-                }
-            }
-        };
-        // Some servers reject HEAD (e.g. 405) yet still serve ranges. Probe
-        // with a one-byte GET and take the total from Content-Range.
-        http_trace_log(format!(
-            "[erika-http-trace] stage=head_fallback_range error={}",
-            json_escape(&head_error.to_string()),
-        ));
-        match probe_http_total_length(&self.agent, &self.uri, &self.http_headers) {
-            Ok(total_length) => {
-                self.content_length = total_length;
-                Ok(self.content_length)
-            }
-            Err(_) => Err(SourceError::Http(head_error.to_string())),
-        }
+        let cold_open = self.agent.cold_open.clone();
+        let client = self.agent.client.clone();
+        let uri = self.uri.clone();
+        let http_headers = self.http_headers.clone();
+        self.content_length = self.agent.run(async move {
+            fetch_http_length(
+                &client,
+                &uri,
+                &http_headers,
+                started,
+                HttpFetchTimeouts::default(),
+                cold_open.as_ref(),
+            )
+            .await
+        })?;
+        self.length_probed = true;
+        Ok(self.content_length)
     }
 
     fn read_range(&mut self, range: ByteRange) -> Result<Vec<u8>> {
+        if self.agent.cancellation.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
+        self.check_entity()?;
+        if self
+            .streams
+            .as_ref()
+            .is_some_and(|session| session.io.is_cancelled())
+        {
+            self.kill_streams();
+        }
+        // Fold in stripes the workers completed since the last read: the hit
+        // checks below only see what is already in `cache_bytes`.
+        self.drain_stripes();
+        self.trim_cache(range);
+        self.stream_reader_end = range.start.saturating_add(range.length.unwrap_or(0));
+        self.update_stream_backpressure();
+
         if let Some(bytes) = self.cached_slice(range) {
-            self.maybe_start_prefetch(range);
+            self.ensure_streams();
+            self.check_entity()?;
             http_trace_log(format!(
                 "{{\"event\":\"http_cache_hit\",\"start\":{},\"length\":{},\"bytes\":{}}}",
                 range.start,
@@ -1047,91 +3137,77 @@ impl MediaSource for HttpRangeSource {
             return Ok(bytes);
         }
 
-        let requested_length = range.length.unwrap_or(0);
-        if let Some(prefix) = self.cached_prefix(range) {
-            let prefix_length = prefix.len() as u64;
-            let suffix_range = ByteRange {
-                start: range.start.saturating_add(prefix_length),
-                length: Some(requested_length.saturating_sub(prefix_length)),
-            };
-            if let Some(prefetch) = self.take_prefetch(suffix_range) {
-                let (prefetch_start, prefetch_bytes) = prefetch?;
-                let prefetch_range = ByteRange {
-                    start: prefetch_start,
-                    length: Some(prefetch_bytes.len() as u64),
-                };
-                if range_contains(prefetch_range, suffix_range) {
-                    let mut cache_bytes = prefix;
-                    cache_bytes.extend_from_slice(&prefetch_bytes);
-                    self.cache_start = range.start;
-                    self.cache_bytes = cache_bytes;
-                    self.maybe_start_prefetch(range);
-                    let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
-                    return Ok(self.cache_bytes[..copy_len].to_vec());
-                }
-            }
-
-            let _ = self.prefetch.take();
-            let fetch_length = self.fetch_length(suffix_range)?;
-            if fetch_length == Some(0) {
-                return Ok(prefix);
-            }
-            let suffix = self.fetch_range(ByteRange {
-                start: suffix_range.start,
-                length: fetch_length,
-            })?;
-            let mut cache_bytes = prefix;
-            cache_bytes.extend_from_slice(&suffix);
-            self.cache_start = range.start;
-            self.cache_bytes = cache_bytes;
-            self.maybe_start_prefetch(range);
-            let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
-            return Ok(self.cache_bytes[..copy_len].to_vec());
-        }
-        let fetch_length = self.fetch_length(range)?;
-        if fetch_length == Some(0) {
+        if let Some(total) = self.content_length
+            && range.start >= total
+        {
+            // Past EOF: an empty read, which the AVIO layer turns into EOF.
             return Ok(Vec::new());
         }
-        let fetched = match self.take_prefetch(range) {
-            Some(Ok((start, bytes))) => {
-                self.cache_start = start;
-                self.cache_bytes = bytes;
-                if let Some(bytes) = self.cached_slice(range) {
-                    self.maybe_start_prefetch(range);
-                    return Ok(bytes);
-                }
-                // The prefetch returned fewer bytes than requested (short
-                // read). An empty result here would be mistaken for EOF by
-                // the AVIO layer, so fall back to a synchronous fetch.
-                http_trace_log(format!(
-                    "{{\"event\":\"http_prefetch_short_read\",\"start\":{},\"length\":{},\"cache_start\":{},\"cache_bytes\":{}}}",
-                    range.start,
-                    range
-                        .length
-                        .map_or_else(|| "null".to_string(), |length| length.to_string()),
-                    self.cache_start,
-                    self.cache_bytes.len(),
-                ));
-                self.fetch_range(ByteRange {
-                    start: range.start,
-                    length: fetch_length,
-                })?
-            }
-            Some(Err(error)) => return Err(error),
-            None => self.fetch_range(ByteRange {
-                start: range.start,
-                length: fetch_length,
-            })?,
-        };
-        if range.length.is_none() {
-            return Ok(fetched);
+
+        // The read is not covered yet. The streams are already delivering
+        // bytes from `cache_end` onward -- wait for them instead of issuing a
+        // duplicate download. A read behind the cache (a rewind) skips the
+        // wait: re-anchoring in the fetch below handles it. Dead or stalled
+        // streams hand the wait back to the synchronous path.
+        //
+        // The skip is keyed off the read's *start*, matching the boundary
+        // `fetch_missing` re-anchors at: the wait is skipped exactly when the
+        // fetch will re-anchor, so there is no band where the wait is skipped
+        // *and* the fetch fills from `cache_end` -- which would re-download the
+        // range the workers are already delivering (and `drain_stripes` would
+        // then discard their copy as overlap). Keying it off the read's *end*
+        // opened that band for any read longer than one request cap. A read
+        // that jumps farther ahead than the fetch could cover re-anchors at the
+        // read instead, so waiting for it could only burn the stall clock.
+        let waiting_end = range.start.saturating_add(range.length.unwrap_or(0));
+        if waiting_end > self.cache_end()
+            && range.start <= self.cache_end().saturating_add(HTTP_REQUEST_MAX_BYTES)
+            && self.wait_for_stream_coverage(waiting_end)
+            && let Some(bytes) = self.cached_slice(range)
+        {
+            self.ensure_streams();
+            self.check_entity()?;
+            return Ok(bytes);
         }
 
-        self.cache_start = range.start;
-        self.cache_bytes = fetched;
-        self.maybe_start_prefetch(range);
-        let copy_len = requested_length.min(self.cache_bytes.len() as u64) as usize;
-        Ok(self.cache_bytes[..copy_len].to_vec())
+        self.check_entity()?;
+        self.fetch_missing(range)?;
+        self.drain_stripes();
+        self.ensure_streams();
+        self.check_entity()?;
+
+        // Serve whatever the cache now holds from the read position. A short
+        // read is legitimate (EOF, or an origin that answered short); an empty
+        // result becomes EOF in the AVIO layer, so it is only allowed when the
+        // resource really ends before the read.
+        let offset = usize::try_from(range.start.saturating_sub(self.cache_start)).unwrap_or(0);
+        let Some(tail) = self.cache_bytes.get(offset..) else {
+            if let Some(total) = self.uncovered_read(range.start) {
+                return Err(SourceError::Http(format!(
+                    "no data for bytes {}.. (origin total {total})",
+                    range.start,
+                )));
+            }
+            // Within the tail slack an empty result is the resource's end: a
+            // fetch window truncated by the total answered with nothing
+            // (issue #163) rather than a failure mid-read.
+            return Ok(Vec::new());
+        };
+        if tail.is_empty() && self.uncovered_read(range.start).is_some() {
+            // A whole-file 200 may have just discovered EOF before this read's
+            // offset. Empty data below the total still means the fetch failed
+            // (e.g. an empty 206), which must not look like EOF.
+            return Err(SourceError::Http(format!(
+                "cache holds no bytes at {}.. although the resource is larger",
+                range.start,
+            )));
+        }
+        let copy_len = range.length.map_or(tail.len(), |length| {
+            usize::try_from(length)
+                .unwrap_or(usize::MAX)
+                .min(tail.len())
+        });
+        Ok(tail[..copy_len].to_vec())
     }
 }
 
@@ -1161,27 +3237,35 @@ pub fn source_from_uri_with_hint_and_headers(
     source_hint: MediaSourceHint,
     http_headers: Vec<(String, String)>,
 ) -> Result<Box<dyn MediaSource>> {
-    source_from_uri_with_options(uri, source_hint, http_headers, None)
+    source_from_uri_with_options(uri, source_hint, http_headers, None, None)
 }
 
 /// `http_read_ahead_bytes` only applies to HTTP(S) sources and overrides the
 /// per-request read-ahead window; `None` keeps the default resolution
-/// (env override, then the 2 MiB engine default).
+/// (env override, then the 2 MiB engine default). `http_back_buffer_bytes`
+/// likewise overrides the rewind budget; `None` keeps the 16 MiB default.
 pub fn source_from_uri_with_options(
     uri: &str,
     source_hint: MediaSourceHint,
     http_headers: Vec<(String, String)>,
     http_read_ahead_bytes: Option<u64>,
+    http_back_buffer_bytes: Option<u64>,
 ) -> Result<Box<dyn MediaSource>> {
     match source_hint {
-        MediaSourceHint::Auto => source_from_auto_uri(uri, http_headers, http_read_ahead_bytes),
+        MediaSourceHint::Auto => source_from_auto_uri(
+            uri,
+            http_headers,
+            http_read_ahead_bytes,
+            http_back_buffer_bytes,
+        ),
         MediaSourceHint::LocalFile => source_from_local_uri(uri),
         MediaSourceHint::Http => {
             if uri.starts_with("http://") || uri.starts_with("https://") {
-                Ok(Box::new(HttpRangeSource::with_http_headers_and_read_ahead(
+                Ok(Box::new(HttpRangeSource::with_http_headers_and_window(
                     uri,
                     http_headers,
                     http_read_ahead_bytes,
+                    http_back_buffer_bytes,
                 )))
             } else {
                 Err(SourceError::Unsupported(uri.to_string()))
@@ -1194,18 +3278,20 @@ fn source_from_auto_uri(
     uri: &str,
     http_headers: Vec<(String, String)>,
     http_read_ahead_bytes: Option<u64>,
+    http_back_buffer_bytes: Option<u64>,
 ) -> Result<Box<dyn MediaSource>> {
     if uri.starts_with("fd://") {
         return source_from_local_uri(uri);
     }
     if let Some(path) = uri.strip_prefix("file://") {
-        return Ok(Box::new(LocalFileSource::open(path)?));
+        return Ok(Box::new(LocalFileSource::open(file_uri_path(path))?));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        return Ok(Box::new(HttpRangeSource::with_http_headers_and_read_ahead(
+        return Ok(Box::new(HttpRangeSource::with_http_headers_and_window(
             uri,
             http_headers,
             http_read_ahead_bytes,
+            http_back_buffer_bytes,
         )));
     }
     let path = Path::new(uri);
@@ -1232,21 +3318,87 @@ fn source_from_local_uri(uri: &str) -> Result<Box<dyn MediaSource>> {
     Ok(Box::new(LocalFileSource::open(local_path_from_uri(uri))?))
 }
 
-fn local_path_from_uri(uri: &str) -> &str {
-    uri.strip_prefix("file://").unwrap_or(uri)
+fn local_path_from_uri(uri: &str) -> PathBuf {
+    match uri.strip_prefix("file://") {
+        Some(path) => file_uri_path(path),
+        None => PathBuf::from(uri),
+    }
 }
 
-fn range_contains(container: ByteRange, range: ByteRange) -> bool {
-    let (Some(container_length), Some(range_length)) = (container.length, range.length) else {
-        return false;
+/// The local path of a `file:` URI, given what follows `file://`. RFC 8089
+/// URIs are percent-encoded (`file:///Videos/%E5%BD%B1.mkv`), as hosts such
+/// as Bern and the system file pickers hand them over. liberika itself
+/// writes URIs around raw paths (`LocalFileSource::uri`), so a raw path that
+/// exists wins when its decoding does not.
+fn file_uri_path(path: &str) -> PathBuf {
+    let path = path
+        .strip_prefix("localhost")
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(path);
+    let raw = PathBuf::from(system_path(path));
+    let decoded = percent_decoded_path(path);
+    let decoded = match decoded.to_str() {
+        Some(text) if cfg!(windows) => PathBuf::from(system_path(text)),
+        _ => decoded,
     };
-    let Some(container_end) = container.start.checked_add(container_length) else {
-        return false;
-    };
-    let Some(range_end) = range.start.checked_add(range_length) else {
-        return false;
-    };
-    range.start >= container.start && range_end <= container_end
+    if decoded != raw && !decoded.exists() && raw.exists() {
+        raw
+    } else {
+        decoded
+    }
+}
+
+/// The path a `file:` URI's path names on this system. On Windows a drive
+/// path comes after a slash (`file:///C:/Videos/a.mkv`, RFC 8089), which
+/// the drive path itself does not have.
+fn system_path(path: &str) -> &str {
+    if cfg!(windows) {
+        without_slash_before_drive(path)
+    } else {
+        path
+    }
+}
+
+fn without_slash_before_drive(path: &str) -> &str {
+    match path.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &path[1..],
+        _ => path,
+    }
+}
+
+/// `text` with each valid `%XX` escape replaced by its byte; anything else
+/// is kept as written.
+fn percent_decoded_path(text: &str) -> PathBuf {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(decoded))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+    }
 }
 
 fn http_read_ahead_bytes() -> u64 {
@@ -1295,29 +3447,73 @@ fn json_escape(value: &str) -> String {
 mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     use super::*;
 
     #[test]
-    fn http_retry_budget_stops_retrying_once_the_stall_ceiling_is_reached() {
-        let fresh = Instant::now();
-        assert!(http_retry_fits_budget(fresh, Duration::from_millis(200)));
-        assert!(http_retry_fits_budget(fresh, Duration::from_secs(1)));
+    fn http_retry_gate_fails_fast_when_no_bytes_arrive() {
+        let mut gate = HttpRetryGate::new(HTTP_FETCH_TOTAL_BUDGET);
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(0).is_some());
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(0).is_some());
+        // A fetch that never moved must fail fast: read_range blocks the
+        // demuxer thread.
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(0).is_none(), "three stalls must stop the fetch");
+    }
 
-        // A fetch that already burned the budget must fail fast rather than
-        // arm another attempt: read_range blocks the demuxer thread.
-        let exhausted = Instant::now() - HTTP_FETCH_TOTAL_BUDGET;
-        assert!(!http_retry_fits_budget(exhausted, Duration::ZERO));
+    #[test]
+    fn http_retry_gate_keeps_resuming_while_bytes_arrive() {
+        let mut gate = HttpRetryGate::new(HTTP_FETCH_TOTAL_BUDGET);
+        let mut allowed = 0;
+        for received in 1..=u64::from(HTTP_FETCH_MAX_RESUME_ATTEMPTS) {
+            let _ = gate.begin_attempt();
+            match gate.fail(received) {
+                Some(_) => allowed += 1,
+                None => break,
+            }
+        }
+        // The whole resume allowance is available once every attempt moves the
+        // resume point: a capped 4 MiB request on a slow origin legitimately
+        // spans several 15 s attempts, and stopping after three would end
+        // playback instead of merely slowing it down.
+        assert_eq!(allowed, HTTP_FETCH_MAX_RESUME_ATTEMPTS - 1);
+    }
 
-        // The backoff counts against the budget, so a retry is refused when
-        // only the sleep would still fit.
-        let nearly_done = Instant::now() - (HTTP_FETCH_TOTAL_BUDGET - Duration::from_millis(500));
-        assert!(http_retry_fits_budget(
-            nearly_done,
-            Duration::from_millis(200)
-        ));
-        assert!(!http_retry_fits_budget(nearly_done, Duration::from_secs(1)));
+    #[test]
+    fn http_retry_gate_forgets_stalls_once_bytes_arrive() {
+        let mut gate = HttpRetryGate::new(HTTP_FETCH_TOTAL_BUDGET);
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(0).is_some());
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(0).is_some());
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(64).is_some(), "progress resets the stall count");
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(64).is_some());
+        let _ = gate.begin_attempt();
+        assert!(gate.fail(64).is_some());
+        let _ = gate.begin_attempt();
+        assert!(
+            gate.fail(64).is_none(),
+            "progress does not license endless stalls"
+        );
+    }
+
+    #[test]
+    fn http_retry_gate_respects_the_wall_clock_ceiling() {
+        let mut gate = HttpRetryGate::new(HTTP_FETCH_TOTAL_BUDGET);
+        gate.started = Instant::now() - HTTP_FETCH_TOTAL_BUDGET;
+        let _ = gate.begin_attempt();
+        assert!(
+            gate.fail(1).is_none(),
+            "the ceiling stops even a progressing fetch"
+        );
     }
 
     struct MockResponse {
@@ -1331,10 +3527,6 @@ mod tests {
                 delay: Duration::ZERO,
                 raw,
             }
-        }
-
-        fn delayed(delay: Duration, raw: Vec<u8>) -> Self {
-            Self { delay, raw }
         }
     }
 
@@ -1414,6 +3606,247 @@ mod tests {
             .to_lowercase()
     }
 
+    /// Serves up to `connections` Range requests, trickling each body at
+    /// `bytes_per_sec` so the client spends real time inside the body phase --
+    /// the way a slow origin does, and the only way to exercise the client's own
+    /// body deadline. `piece_limit` caps each answer the way a CDN that ignores
+    /// the requested length does; `bytes_per_sec == 0` means no throttling.
+    fn spawn_drip_http_server(
+        total: u64,
+        bytes_per_sec: u64,
+        piece_limit: Option<u64>,
+        connections: usize,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let _ = sender.send(head.clone());
+                let (start, mut end) = parse_range_head(&head, total);
+                if let Some(limit) = piece_limit {
+                    end = end.min(start.saturating_add(limit).saturating_sub(1));
+                }
+                let length = end.saturating_sub(start) + 1;
+                let response_head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(response_head.as_bytes()).is_err() {
+                    continue;
+                }
+                let slice = 32 * 1024u64;
+                let mut sent = 0u64;
+                while sent < length {
+                    let count = slice.min(length - sent) as usize;
+                    let chunk: Vec<u8> = (0..count)
+                        .map(|index| ((start + sent + index as u64) % 251) as u8)
+                        .collect();
+                    if stream.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    sent += count as u64;
+                    if bytes_per_sec > 0 {
+                        thread::sleep(Duration::from_secs_f64(count as f64 / bytes_per_sec as f64));
+                    }
+                }
+                let _ = stream.flush();
+            }
+        });
+        (uri, receiver)
+    }
+
+    /// `Range: bytes=start-end` from a raw request head, clamped to the file.
+    fn parse_range_head(head: &str, total: u64) -> (u64, u64) {
+        let value = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default();
+        let spec = value.strip_prefix("bytes=").unwrap_or_default();
+        let mut parts = spec.split('-');
+        let start = parts
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
+        let end = parts
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .parse::<u64>()
+            .unwrap_or_else(|_| total.saturating_sub(1));
+        (start, end.min(total.saturating_sub(1)))
+    }
+
+    /// Serves every connection on its own thread, so concurrent range requests
+    /// genuinely overlap, reports the high-water mark of simultaneously
+    /// in-flight requests, and records every request head. Each answer serves
+    /// the exact requested range (open-ended included) with position-dependent
+    /// bytes: `body[offset] == (offset % 251)`.
+    fn spawn_concurrent_mock_http_server(
+        total: u64,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let (uri, in_flight, max_in_flight, heads, _) = spawn_counted_http_server(total);
+        (uri, in_flight, max_in_flight, heads)
+    }
+
+    fn spawn_counted_http_server(
+        total: u64,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let sent_bytes = Arc::new(AtomicUsize::new(0));
+        let sent_seen = Arc::clone(&sent_bytes);
+        let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (in_flight_seen, max_seen, heads_seen) = (
+            Arc::clone(&in_flight),
+            Arc::clone(&max_in_flight),
+            Arc::clone(&heads),
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let in_flight = Arc::clone(&in_flight_seen);
+                let max_in_flight = Arc::clone(&max_seen);
+                let heads = Arc::clone(&heads_seen);
+                let sent_bytes = Arc::clone(&sent_seen);
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                    }
+                    heads.lock().unwrap().push(head.clone());
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    // Hold the request open so the stream workers really do
+                    // connect while this one is still on the wire.
+                    thread::sleep(Duration::from_millis(150));
+                    let (start, end) = parse_range_head(&head, total);
+                    let length = end.saturating_sub(start) + 1;
+                    let response = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(response.as_bytes()).is_ok() {
+                        let mut sent = 0u64;
+                        while sent < length {
+                            let count = (32 * 1024u64).min(length - sent) as usize;
+                            let chunk = (0..count)
+                                .map(|index| ((start + sent + index as u64) % 251) as u8)
+                                .collect::<Vec<u8>>();
+                            if stream.write_all(&chunk).is_err() {
+                                break;
+                            }
+                            sent += count as u64;
+                            sent_bytes.fetch_add(count, Ordering::SeqCst);
+                        }
+                    }
+                    let _ = stream.flush();
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (uri, in_flight, max_in_flight, heads, sent_bytes)
+    }
+
+    /// Origin that serves bounded ranges fully but closes every open-ended
+    /// stream right after the headers, leaving the declared body unmet: the
+    /// workers hit a body-phase transport error and must fail, exercising the
+    /// synchronous fallback.
+    fn spawn_flaky_stream_server(total: u64) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let heads_seen = Arc::clone(&heads);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                heads_seen.lock().unwrap().push(head.clone());
+                let (start, end) = parse_range_head(&head, total);
+                let range_line = head
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                if range_line.ends_with('-') {
+                    // Declare the full tail, deliver nothing, close.
+                    let length = total.saturating_sub(start);
+                    let response = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n",
+                        total - 1
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    continue;
+                }
+                let length = end.saturating_sub(start) + 1;
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    let mut sent = 0u64;
+                    while sent < length {
+                        let count = (32 * 1024u64).min(length - sent) as usize;
+                        let chunk = (0..count)
+                            .map(|index| ((start + sent + index as u64) % 251) as u8)
+                            .collect::<Vec<u8>>();
+                        if stream.write_all(&chunk).is_err() {
+                            break;
+                        }
+                        sent += count as u64;
+                    }
+                }
+                let _ = stream.flush();
+            }
+        });
+        (uri, heads)
+    }
+
     #[test]
     fn local_file_source_reads_ranges() {
         let path = std::env::temp_dir().join(format!("erika-source-{}.bin", std::process::id()));
@@ -1439,6 +3872,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_uris_are_percent_decoded_unless_the_raw_path_exists() {
+        let dir = std::env::temp_dir().join(format!("erika-file-uri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = dir.join("影 #1 100%.mkv");
+        std::fs::write(&named, b"named").unwrap();
+        let encoded = format!("file://{}/%E5%BD%B1%20%231%20100%25.mkv", dir.display());
+        assert_eq!(read_uri_to_end(&encoded).unwrap(), b"named");
+        let local = format!(
+            "file://localhost{}/%E5%BD%B1%20%231%20100%25.mkv",
+            dir.display()
+        );
+        assert_eq!(read_uri_to_end(&local).unwrap(), b"named");
+        // A raw path written into a URI keeps working, also when it
+        // contains what looks like an escape.
+        let literal = dir.join("a%20b.mkv");
+        std::fs::write(&literal, b"literal").unwrap();
+        assert_eq!(
+            read_uri_to_end(&format!("file://{}", literal.display())).unwrap(),
+            b"literal"
+        );
+        assert_eq!(
+            without_slash_before_drive("/C:/Videos/a.mkv"),
+            "C:/Videos/a.mkv"
+        );
+        assert_eq!(without_slash_before_drive("/d:"), "d:");
+        assert_eq!(without_slash_before_drive("C:\\Videos"), "C:\\Videos");
+        assert_eq!(without_slash_before_drive("/Videos/a.mkv"), "/Videos/a.mkv");
+        assert_eq!(percent_decoded_path("%zz%4"), PathBuf::from("%zz%4"));
+        assert_eq!(percent_decoded_path("%+1"), PathBuf::from("%+1"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1569,30 +4035,6 @@ mod tests {
     }
 
     #[test]
-    fn range_contains_accepts_inner_byte_ranges() {
-        assert!(range_contains(
-            ByteRange {
-                start: 100,
-                length: Some(200),
-            },
-            ByteRange {
-                start: 128,
-                length: Some(64),
-            },
-        ));
-        assert!(!range_contains(
-            ByteRange {
-                start: 100,
-                length: Some(200),
-            },
-            ByteRange {
-                start: 280,
-                length: Some(64),
-            },
-        ));
-    }
-
-    #[test]
     fn content_range_total_parses_totals_and_rejects_unknown() {
         assert_eq!(parse_content_range_total("bytes 0-99/1234"), Some(1234));
         assert_eq!(parse_content_range_total("bytes 100-199/200"), Some(200));
@@ -1607,29 +4049,499 @@ mod tests {
         let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         )]);
-        let error = probe_http_total_length(&http_agent(), &uri, &[]).unwrap_err();
+        let error = probe_http_total_length(&HttpIo::new(), &uri, &[]).unwrap_err();
         assert!(error.to_string().contains("404"));
     }
 
     #[test]
-    fn http_range_rejects_status_200_for_nonzero_offset() {
-        let body = vec![b'a'; 100];
+    fn http_range_accepts_status_200_for_nonzero_offset() {
+        let body: Vec<u8> = (0..100).collect();
         let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
             http_simple_response("200 OK", &body),
         )]);
         let mut source = HttpRangeSource::new(uri);
         source.content_length = Some(100);
-        let error = source
+        let bytes = source
             .read_range(ByteRange {
                 start: 10,
                 length: Some(10),
             })
-            .expect_err("a 200 answer to a mid-file Range request must fail");
-        assert!(matches!(
-            error,
-            SourceError::Http(message) if message.contains("ignored Range")
-        ));
+            .unwrap();
+        assert_eq!(bytes, body[10..20]);
+        assert_eq!(source.cache_bytes, body[10..]);
         assert!(recv_request_head(&requests).contains("range: bytes=10-99"));
+    }
+
+    fn http_200_without_length(body: &[u8], chunked: bool) -> Vec<u8> {
+        let mut raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n".to_vec();
+        if chunked {
+            raw.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+            for chunk in body.chunks(7) {
+                raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                raw.extend_from_slice(chunk);
+                raw.extend_from_slice(b"\r\n");
+            }
+            raw.extend_from_slice(b"0\r\n\r\n");
+        } else {
+            raw.extend_from_slice(b"\r\n");
+            raw.extend_from_slice(body);
+        }
+        raw
+    }
+
+    #[test]
+    fn http_range_200_without_length_skips_prefix_and_learns_eof() {
+        let body: Vec<u8> = (0..100).collect();
+        for chunked in [false, true] {
+            for start in [0, 10, 100, 120] {
+                let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+                    http_200_without_length(&body, chunked),
+                )]);
+                let response = fetch_http_range(
+                    &HttpIo::new(),
+                    &uri,
+                    &[],
+                    ByteRange {
+                        start,
+                        length: Some(256),
+                    },
+                    "test_range",
+                )
+                .unwrap();
+                assert_eq!(response.bytes, body[(start as usize).min(body.len())..]);
+                assert_eq!(response.total_length, Some(body.len() as u64));
+                assert!(recv_request_head(&requests).contains(&format!("range: bytes={start}-")));
+            }
+        }
+    }
+
+    #[test]
+    fn http_range_200_buffers_only_the_requested_bytes() {
+        let body: Vec<u8> = (0..192 * 1024).map(|index| (index % 251) as u8).collect();
+        for raw in [
+            http_simple_response("200 OK", &body),
+            http_200_without_length(&body, false),
+        ] {
+            let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(raw)]);
+            let response = fetch_http_range(
+                &HttpIo::new(),
+                &uri,
+                &[],
+                ByteRange {
+                    start: 100 * 1024 + 3,
+                    length: Some(17),
+                },
+                "test_range",
+            )
+            .unwrap();
+            assert_eq!(response.bytes, body[100 * 1024 + 3..100 * 1024 + 20]);
+        }
+    }
+
+    #[test]
+    fn http_source_200_without_length_handles_reads_at_and_past_eof() {
+        for start in [0, 10, 100, 120] {
+            let body: Vec<u8> = (0..100).collect();
+            let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+                http_200_without_length(&body, true),
+            )]);
+            let mut source = HttpRangeSource::new(uri);
+            assert_eq!(
+                source.read_range(ByteRange::suffix_from(start)).unwrap(),
+                body[(start as usize).min(body.len())..],
+            );
+            assert_eq!(source.len().unwrap(), Some(100));
+            assert!(
+                source
+                    .read_range(ByteRange {
+                        start: 100,
+                        length: Some(64)
+                    })
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    fn http_200_with_validator(body: &[u8], validator: &str, declared_length: usize) -> Vec<u8> {
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nETag: {validator}\r\nConnection: close\r\n\r\n"
+        ).into_bytes();
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    #[test]
+    fn http_range_weak_etag_allows_reads_but_rejects_resuming_partial_bytes() {
+        for start in [0, 10] {
+            let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+                http_200_with_validator(&[b'a'; 100], "W/\"v1\"", 100),
+            )]);
+            let response = fetch_http_range(
+                &HttpIo::new(),
+                &uri,
+                &[],
+                ByteRange {
+                    start,
+                    length: Some(40),
+                },
+                "test_range",
+            )
+            .unwrap();
+            assert_eq!(response.bytes, vec![b'a'; 40]);
+            assert!(!recv_request_head(&requests).contains("if-range:"));
+
+            let (uri, requests) = spawn_mock_http_server(vec![
+                MockResponse::immediate(http_200_with_validator(&[b'a'; 20], "W/\"v1\"", 100)),
+                MockResponse::immediate(http_200_with_validator(&[b'b'; 100], "W/\"v1\"", 100)),
+            ]);
+            let result = fetch_http_range(
+                &HttpIo::new(),
+                &uri,
+                &[],
+                ByteRange {
+                    start,
+                    length: Some(40),
+                },
+                "test_range",
+            );
+            assert!(matches!(result, Err(SourceError::HttpEntityChanged)));
+            let _ = recv_request_head(&requests);
+            assert!(
+                requests.try_recv().is_err(),
+                "weak ETags must not be sent in If-Range"
+            );
+        }
+    }
+
+    #[test]
+    fn http_stream_entity_failure_blocks_fallback_and_survives_buffer_release() {
+        for (validator, resumed) in [
+            (
+                "\"v1\"",
+                http_200_with_validator(&[b'b'; 1024], "\"v2\"", 1024),
+            ),
+            ("\"v1\"", http_simple_response("200 OK", &[b'b'; 1024])),
+            (
+                "W/\"v1\"",
+                http_200_with_validator(&[b'b'; 1024], "W/\"v1\"", 1024),
+            ),
+        ] {
+            let mut responses = vec![MockResponse::immediate(http_200_with_validator(
+                &[b'a'; 512],
+                validator,
+                1024,
+            ))];
+            responses.extend((0..8).map(|_| MockResponse::immediate(resumed.clone())));
+            let (uri, requests) = spawn_mock_http_server(responses);
+            let mut source = HttpRangeSource::new(uri);
+            source.content_length = Some(1024);
+            source.cache_bytes = vec![b'a'; 64];
+            source.ensure_streams();
+
+            let result = source.read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            });
+            assert!(
+                matches!(result, Err(SourceError::HttpEntityChanged)),
+                "{result:?}"
+            );
+            assert!(recv_request_head(&requests).contains("range: bytes=64-"));
+            if !validator.starts_with("W/") {
+                let resumed = recv_request_head(&requests);
+                assert!(resumed.contains("range: bytes=512-"));
+                assert!(resumed.contains("if-range: \"v1\""));
+            }
+            // A cached read and a seek after releasing/replacing the worker
+            // must retain the failure, without fetching the changed entity.
+            assert!(matches!(
+                source.read_range(ByteRange {
+                    start: 0,
+                    length: Some(1)
+                }),
+                Err(SourceError::HttpEntityChanged)
+            ));
+            source.release_buffer();
+            assert!(matches!(
+                source.read_range(ByteRange {
+                    start: 700,
+                    length: Some(1)
+                }),
+                Err(SourceError::HttpEntityChanged)
+            ));
+            assert!(
+                requests.try_recv().is_err(),
+                "entity failures must not retry or fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn http_range_200_retry_skips_prefix_and_preserves_received_bytes() {
+        let body: Vec<u8> = (0..100).collect();
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_200_with_validator(&body[..20], "\"v1\"", 100)),
+            MockResponse::immediate(http_200_with_validator(&body, "\"v1\"", 100)),
+        ]);
+        let response = fetch_http_range(
+            &HttpIo::new(),
+            &uri,
+            &[],
+            ByteRange {
+                start: 10,
+                length: Some(40),
+            },
+            "test_range",
+        )
+        .unwrap();
+        assert_eq!(response.bytes, body[10..50]);
+        assert_eq!(response.total_length, Some(100));
+        assert!(recv_request_head(&requests).contains("range: bytes=10-49"));
+        let resumed = recv_request_head(&requests);
+        assert!(resumed.contains("range: bytes=20-49"));
+        assert!(resumed.contains("if-range: \"v1\""));
+    }
+
+    #[test]
+    fn http_range_200_retry_rejects_a_changed_or_missing_validator() {
+        let body: Vec<u8> = (0..100).collect();
+        for raw in [
+            http_200_with_validator(&body, "\"v2\"", 100),
+            http_simple_response("200 OK", &body),
+        ] {
+            let (uri, _requests) = spawn_mock_http_server(vec![
+                MockResponse::immediate(http_200_with_validator(&body[..20], "\"v1\"", 100)),
+                MockResponse::immediate(raw),
+            ]);
+            let error = fetch_http_range(
+                &HttpIo::new(),
+                &uri,
+                &[],
+                ByteRange {
+                    start: 10,
+                    length: Some(40),
+                },
+                "test_range",
+            )
+            .err()
+            .expect("changed entities must not be spliced");
+            assert!(error.to_string().contains("resource changed"));
+        }
+    }
+
+    #[test]
+    fn http_stream_200_skips_prefix_across_chunks_and_stripes() {
+        let total = HTTP_STREAM_STRIPE_BYTES + 1024;
+        let body: Vec<u8> = (0..total).map(|index| (index % 251) as u8).collect();
+        let initial = 100 * 1024 + 3;
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(0, total, &body[..initial])),
+            MockResponse::immediate(http_200_without_length(&body, false)),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        source.request_bytes = initial as u64;
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(initial as u64)
+                })
+                .unwrap(),
+            body[..initial]
+        );
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: initial as u64,
+                    length: Some(total - initial as u64)
+                })
+                .unwrap(),
+            body[initial..]
+        );
+        assert!(recv_request_head(&requests).contains(&format!("range: bytes=0-{}", initial - 1)));
+        assert!(recv_request_head(&requests).contains(&format!("range: bytes={initial}-\r\n")));
+        assert!(
+            requests.try_recv().is_err(),
+            "the persistent stream should cover the tail"
+        );
+    }
+
+    #[test]
+    fn http_stream_200_retry_preserves_a_partial_stripe() {
+        let body: Vec<u8> = (0..1024).map(|index| (index % 251) as u8).collect();
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(0, 1024, &body[..64])),
+            MockResponse::immediate(http_200_with_validator(&body[..512], "\"v1\"", 1024)),
+            MockResponse::immediate(http_200_with_validator(&body, "\"v1\"", 1024)),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(1024);
+        source.request_bytes = 64;
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(64)
+                })
+                .unwrap(),
+            body[..64]
+        );
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 64,
+                    length: Some(960)
+                })
+                .unwrap(),
+            body[64..]
+        );
+        let _ = recv_request_head(&requests);
+        assert!(recv_request_head(&requests).contains("range: bytes=64-\r\n"));
+        let resumed = recv_request_head(&requests);
+        assert!(resumed.contains("range: bytes=512-\r\n"));
+        assert!(resumed.contains("if-range: \"v1\""));
+    }
+
+    #[test]
+    fn http_stream_200_retry_rejects_a_changed_entity() {
+        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_200_with_validator(b"new body", "\"v2\"", 8),
+        )]);
+        let result = open_stream_response(&HttpIo::new(), &uri, &[], 4, Some("\"v1\"".to_string()));
+        assert!(matches!(result, Err(SourceError::HttpEntityChanged)));
+    }
+
+    #[test]
+    fn http_lengthless_200_supports_ffmpeg_custom_avio_reads_and_seek() {
+        let body = include_bytes!("../testdata/playback/playback-fixture.mkv");
+        let (uri, requests) = spawn_mock_http_server(
+            (0..32)
+                .map(|_| MockResponse::immediate(http_200_without_length(body, false)))
+                .collect(),
+        );
+        let source =
+            HttpRangeSource::with_http_headers_and_read_ahead(uri, Vec::new(), Some(64 * 1024));
+        let mut demuxer = crate::ffmpeg::Demuxer::open_source(Box::new(source)).unwrap();
+        assert_eq!(demuxer.probe().video.len(), 1);
+        let mut packets = 0;
+        while demuxer.read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(packets >= 240);
+        demuxer.seek(Duration::from_secs(2)).unwrap();
+        assert!(demuxer.read_packet().unwrap().is_some());
+        assert!(
+            requests
+                .try_iter()
+                .any(|head| { head.to_lowercase().contains("range: bytes=65536-") }),
+            "FFmpeg must read past the first capped whole-file response"
+        );
+    }
+
+    /// Serves `body` by Range (bounded and open-ended), clamping every answer
+    /// that would reach past `empty_from`, and answering any request that
+    /// starts at or beyond it the way the origin in issue #163 did: a 206
+    /// with a correct Content-Range and Content-Length but zero body bytes
+    /// before the connection closes.
+    fn spawn_fixture_range_server(
+        body: Arc<Vec<u8>>,
+        empty_from: u64,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let heads_seen = Arc::clone(&heads);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                heads_seen.lock().unwrap().push(head.clone());
+                let total = body.len() as u64;
+                if head.starts_with("HEAD") {
+                    // Metadata answers report the real resource size; only the
+                    // body serving is broken near the tail.
+                    let _ = stream.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n").as_bytes(),
+                    );
+                    continue;
+                }
+                let (start, requested_end) = parse_range_head(&head, total);
+                // An injected answer promises exactly the requested range and
+                // delivers nothing; every other answer is clamped so the tail
+                // stays reachable only through an injected request.
+                let injected = start >= empty_from;
+                let end = if injected {
+                    requested_end
+                } else {
+                    requested_end.min(empty_from - 1)
+                };
+                let length = end.saturating_sub(start) + 1;
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(response.as_bytes()).is_err() {
+                    continue;
+                }
+                if injected {
+                    // Declared but never delivered: the injected failure.
+                    continue;
+                }
+                let slice = &body[start as usize..=end as usize];
+                let _ = stream.write_all(slice);
+                let _ = stream.flush();
+            }
+        });
+        (uri, heads)
+    }
+
+    #[test]
+    fn http_tail_empty_range_injection_ends_playback_cleanly() {
+        // End-to-end shape of issue #163: an origin that cannot deliver the
+        // final bytes of the resource. Before the tail rule the demuxer
+        // turned those answers into a fatal av_read_frame EIO; the read must
+        // end the stream at EOF instead, after playing to its natural end.
+        let body = Arc::new(include_bytes!("../testdata/playback/playback-fixture.mkv").to_vec());
+        let total = body.len() as u64;
+        let empty_from = total - 4096;
+        let (uri, heads) = spawn_fixture_range_server(Arc::clone(&body), empty_from);
+        let source =
+            HttpRangeSource::with_http_headers_and_read_ahead(uri, Vec::new(), Some(64 * 1024));
+        let mut demuxer = crate::ffmpeg::Demuxer::open_source(Box::new(source)).unwrap();
+        assert_eq!(demuxer.probe().video.len(), 1);
+        let mut packets = 0;
+        while demuxer.read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        assert!(
+            packets >= 240,
+            "playback must reach its natural end, got {packets} packets"
+        );
+        let heads_snapshot = heads.lock().unwrap().clone();
+        let saw_injected_request = heads_snapshot.iter().any(|head| {
+            head.to_lowercase()
+                .lines()
+                .find(|line| line.starts_with("range:"))
+                .and_then(|line| line.split_once("bytes="))
+                .and_then(|(_, spec)| spec.split('-').next())
+                .and_then(|start| start.trim().parse::<u64>().ok())
+                .is_some_and(|start| start >= empty_from)
+        });
+        assert!(
+            saw_injected_request,
+            "the reproduction must actually exercise the injected empty tail; requests: {heads_snapshot:?}"
+        );
     }
 
     #[test]
@@ -1649,14 +4561,82 @@ mod tests {
 
     #[test]
     fn http_range_backfills_total_from_206_content_range() {
-        let body = vec![b'x'; 16];
-        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
-            http_206_response(0, 4096, &body),
-        )]);
+        let mut body = vec![b'y'; 4096];
+        body[..16].fill(b'x');
+        let (uri, _requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_response(0, 4096, &body[..16])),
+            MockResponse::immediate(http_206_response(16, 4096, &body[16..])),
+        ]);
         let mut source = HttpRangeSource::new(uri);
         assert_eq!(source.read_range(ByteRange::suffix_from(0)).unwrap(), body);
         // The 206 Content-Range total satisfies len() without a HEAD request.
         assert_eq!(source.len().unwrap(), Some(4096));
+    }
+
+    #[test]
+    fn http_range_caps_bodies_that_overrun_the_requested_length() {
+        // Answers bytes 0-63/4096 to a bytes=0-7 request: the excess must be
+        // discarded instead of buffered, or a Range-ignoring origin (which
+        // sends the whole file for offset 0) would balloon the cache. The
+        // 8-byte read-ahead window keeps the wire request exactly the 8 bytes
+        // the read asked for (fetch_length would otherwise widen it).
+        let mut raw =
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-63/4096\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        raw.extend_from_slice(&[b'x'; 64]);
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(raw)]);
+        let mut source =
+            HttpRangeSource::with_http_headers_and_window(uri, Vec::new(), Some(8), None);
+        source.content_length = Some(4096);
+        let fetched = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(8),
+            })
+            .unwrap();
+        assert_eq!(fetched, vec![b'x'; 8]);
+        assert!(recv_request_head(&requests).contains("range: bytes=0-7"));
+    }
+
+    #[test]
+    fn http_range_rejects_206_without_content_range_on_a_resumed_offset() {
+        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nConnection: close\r\n\r\n01234567"
+                .to_vec(),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(4096);
+        let error = source
+            .read_range(ByteRange {
+                start: 32,
+                length: Some(8),
+            })
+            .expect_err("a 206 without Content-Range cannot prove the served offset");
+        assert!(
+            matches!(
+                &error,
+                SourceError::HttpRangeVerification(message) if message.contains("Content-Range")
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn length_probe_caches_an_absent_content_length() {
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        assert_eq!(source.len().unwrap(), None);
+        assert_eq!(source.len().unwrap(), None);
+        assert!(
+            requests.try_recv().is_ok(),
+            "the first len() probes the origin"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "a finished probe must not re-issue HEAD for every piece"
+        );
     }
 
     #[test]
@@ -1705,46 +4685,1506 @@ mod tests {
         assert!(recv_request_head(&requests).contains("range: bytes=32-63"));
     }
 
-    #[test]
-    fn take_prefetch_joins_inflight_thread_instead_of_refetching() {
-        let body: Vec<u8> = (0..100u8).collect();
-        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::delayed(
-            Duration::from_millis(250),
-            http_206_response(0, 100, &body),
-        )]);
-        let mut source = HttpRangeSource::new(uri.clone());
-        source.content_length = Some(100);
-        let range = ByteRange {
-            start: 0,
-            length: Some(100),
-        };
-        source.prefetch = Some(PendingHttpFetch::spawn(uri, Vec::new(), range));
-        assert_eq!(source.read_range(range).unwrap(), body);
-        let _ = recv_request_head(&requests);
-        // Joining the pending prefetch must not issue a duplicate download.
-        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    /// A 206 whose Content-Length frames an empty body cleanly (unlike
+    /// `http_206_truncated_response`, which promises bytes and closes).
+    fn http_206_clean_empty_response(start: u64, end: u64, total: u64) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
     }
 
     #[test]
-    fn short_prefetch_read_falls_back_to_synchronous_fetch() {
-        let body: Vec<u8> = (0..100u8).collect();
-        let (uri, requests) = spawn_mock_http_server(vec![
-            // Prefetch answer is complete HTTP but shorter than the request.
-            MockResponse::immediate(http_206_response(0, 100, &body[..50])),
-            MockResponse::immediate(http_206_response(0, 100, &body)),
+    fn http_tail_flush_empty_206_body_reads_as_eof() {
+        // Issue #163: a window that runs to the resource total is boundary
+        // traffic. An origin answering it with a clean empty 206 marks the
+        // resource's end, and the read must surface EOF, not a fatal fetch
+        // failure.
+        let total = 8 * 1024 * 1024u64;
+        let start = total - 4096;
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_clean_empty_response(start, total - 1, total),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(4096),
+            })
+            .unwrap();
+        assert!(bytes.is_empty(), "a tail-flush empty answer is EOF");
+        assert!(recv_request_head(&requests).contains(&format!("range: bytes={start}-")));
+    }
+
+    #[test]
+    fn http_tail_flush_empty_206_body_reads_as_eof_when_the_response_reveals_the_total() {
+        // An origin whose length probe finds nothing: the empty tail response
+        // is the first and only source of the total, and the boundary rule
+        // must still hold -- the window's reach is judged after the fetch,
+        // once the response has named the resource size.
+        let total = 8 * 1024 * 1024u64;
+        let start = total - 4096;
+        let (uri, _requests) = spawn_mock_http_server(vec![
+            // HEAD: no usable length (Content-Length: 0 triggers the probe).
+            MockResponse::immediate(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ),
+            // Probe: Range ignored, and no Content-Length either.
+            MockResponse::immediate(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec()),
+            MockResponse::immediate(http_206_clean_empty_response(start, total - 1, total)),
         ]);
-        let mut source = HttpRangeSource::new(uri.clone());
-        source.content_length = Some(100);
-        let range = ByteRange {
+        let mut source = HttpRangeSource::new(uri);
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(4096),
+            })
+            .unwrap();
+        assert!(bytes.is_empty(), "a tail-flush empty answer is EOF");
+        assert_eq!(
+            source.len().unwrap(),
+            Some(total),
+            "the response supplies the total"
+        );
+    }
+
+    #[test]
+    fn http_midfile_empty_206_body_is_still_an_error() {
+        // 576c388's rule stands outside the tail: an empty answer for a
+        // window that ends short of the resource total is a fetch failure,
+        // and bytes that exist must never look like EOF.
+        let total = 8 * 1024 * 1024u64;
+        let (uri, _requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_clean_empty_response(0, 2 * 1024 * 1024 - 1, total),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let error = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            })
+            .expect_err("an empty mid-file answer must not look like EOF");
+        assert!(
+            matches!(&error, SourceError::Http(message) if message.contains("empty body")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn http_tail_flush_zero_byte_truncated_body_reads_as_eof() {
+        // The injection from issue #163's reproduction: a 206 that declares
+        // the tail's Content-Length but delivers zero bytes and closes. The
+        // fetch exhausts its retries; the tail-flush window then ends the
+        // read as EOF instead of failing the session.
+        let total = 8 * 1024 * 1024u64;
+        let start = total - 2048;
+        let responses = (0..HTTP_FETCH_MAX_ATTEMPTS)
+            .map(|_| {
+                MockResponse::immediate(http_206_truncated_response(
+                    start,
+                    total,
+                    (total - start) as usize,
+                    &[],
+                ))
+            })
+            .collect();
+        let (uri, requests) = spawn_mock_http_server(responses);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(2048),
+            })
+            .unwrap();
+        assert!(bytes.is_empty(), "a tail-flush undelivered range is EOF");
+        for _ in 0..HTTP_FETCH_MAX_ATTEMPTS {
+            assert!(recv_request_head(&requests).contains(&format!("range: bytes={start}-")));
+        }
+    }
+
+    #[test]
+    fn http_midfile_truncated_body_exhausting_retries_is_still_an_error() {
+        // The transport-failure downgrade is tail-only: exhausted retries on
+        // a mid-file window still surface their error.
+        let total = 8 * 1024 * 1024u64;
+        let responses = (0..HTTP_FETCH_MAX_ATTEMPTS)
+            .map(|_| {
+                MockResponse::immediate(http_206_truncated_response(0, total, 2 * 1024 * 1024, &[]))
+            })
+            .collect();
+        let (uri, _requests) = spawn_mock_http_server(responses);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let error = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            })
+            .expect_err("mid-file transport failures must stay errors");
+        assert!(
+            matches!(&error, SourceError::Http(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn http_stream_read_at_the_frontier_waits_without_a_duplicate_request() {
+        // The reader catches up to the delivery frontier: it waits for the
+        // streams instead of re-requesting bytes that are already on the
+        // wire, and the server never sees a second, overlapping GET.
+        let total = 64 * 1024 * 1024u64;
+        let (uri, _in_flight, _max, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 1024 * 1024];
+        source.ensure_streams();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && heads.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let bytes = source
+            .read_range(ByteRange {
+                start: 1024 * 1024 - 1024,
+                length: Some(2048),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 2048);
+        assert!(bytes[..1024].iter().all(|byte| *byte == b'c'));
+        assert!(
+            bytes[1024..]
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == ((1024 * 1024 + index) % 251) as u8)
+        );
+        // The only GET is the open-ended worker stream; the straddling
+        // read produced no request at all.
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 1, "heads: {heads:?}");
+        for head in heads.iter() {
+            let lower = head.to_lowercase();
+            let range_line = lower
+                .lines()
+                .find(|line| line.starts_with("range:"))
+                .unwrap_or_default();
+            assert!(
+                range_line.trim_end().ends_with('-'),
+                "worker GETs must be open-ended: {range_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_read_past_the_request_cap_is_still_covered_by_the_streams() {
+        // A read that starts inside the window but ends past `cache_end +
+        // HTTP_REQUEST_MAX_BYTES` must be served by the streaming workers too.
+        // The wait was keyed off the read's *end* while the re-anchor was keyed
+        // off its *start*, so this read skipped the wait and `fetch_missing`
+        // re-downloaded the gap from `cache_end` -- the very range the workers
+        // were delivering, which `drain_stripes` then discarded as overlap.
+        // The origin saw the bytes twice and the demuxer thread blocked for the
+        // whole synchronous fill.
+        let total = 64 * 1024 * 1024u64;
+        let (uri, _in_flight, _max, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 1024 * 1024];
+        source.ensure_streams();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && heads.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Starts at the cache end and runs 8 MiB: two request caps past it.
+        let read_start = 1024 * 1024u64;
+        let read_length = 8 * 1024 * 1024u64;
+        let bytes = source
+            .read_range(ByteRange {
+                start: read_start,
+                length: Some(read_length),
+            })
+            .expect("the streams must cover a read that starts inside the window");
+        assert_eq!(bytes.len() as u64, read_length);
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, ((read_start + index as u64) % 251) as u8);
+        }
+
+        // Only the open-ended worker GET: a closed-range request here
+        // means the read was re-downloaded instead of waited for.
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 1, "heads: {heads:?}");
+        for head in heads.iter() {
+            let lower = head.to_lowercase();
+            let range_line = lower
+                .lines()
+                .find(|line| line.starts_with("range:"))
+                .unwrap_or_default();
+            assert!(
+                range_line.trim_end().ends_with('-'),
+                "a closed-range request means the read was re-downloaded: {range_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_stream_worker_failure_falls_back_to_synchronous_fetch() {
+        let total = 64 * 1024 * 1024u64;
+        let (uri, heads) = spawn_flaky_stream_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_start = 0;
+        source.cache_bytes = (0..1024 * 1024u64)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        source.ensure_streams();
+
+        // The workers fail (no body byte ever arrives), but the read must
+        // not: the synchronous capped path serves the gap, position-exact.
+        let read_start = 1024 * 1024u64;
+        let bytes = source
+            .read_range(ByteRange {
+                start: read_start,
+                length: Some(1024),
+            })
+            .expect("a failed stream must degrade to the synchronous path");
+        assert_eq!(bytes.len(), 1024);
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, ((read_start + index as u64) % 251) as u8);
+        }
+        assert!(
+            source.prefetch_failures >= 1,
+            "the worker failure must be counted"
+        );
+        let heads = heads.lock().unwrap();
+        assert!(
+            heads
+                .iter()
+                .any(|head| head.to_lowercase().contains("range: bytes=1048576-")),
+            "the sync fallback must be a bounded GET: {heads:?}"
+        );
+    }
+
+    #[test]
+    fn http_short_stream_response_resumes_with_entity_validator() {
+        let start = 1024 * 1024;
+        let split = start + 256 * 1024;
+        let total = 2 * 1024 * 1024 + 123;
+        let expected: Vec<u8> = (start..total).map(|offset| (offset % 251) as u8).collect();
+        let mut first = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nETag: \"version-1\"\r\nConnection: close\r\n\r\n",
+            split - 1, split - start,
+        ).into_bytes();
+        first.extend_from_slice(&expected[..(split - start) as usize]);
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(first),
+            MockResponse::immediate(http_206_response(
+                split,
+                total,
+                &expected[(split - start) as usize..],
+            )),
+        ]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        source.cache_bytes = vec![0; start as usize];
+        source.ensure_streams();
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(total - start + 1024),
+            })
+            .unwrap();
+        assert_eq!(bytes, expected);
+        let first = recv_request_head(&requests).to_lowercase();
+        assert!(first.contains(&format!("range: bytes={start}-\r\n")));
+        let resumed = recv_request_head(&requests).to_lowercase();
+        assert!(resumed.contains(&format!("range: bytes={split}-\r\n")));
+        assert!(resumed.contains("if-range: \"version-1\""));
+    }
+
+    #[test]
+    fn http_empty_stream_responses_exhaust_retries_and_fall_back() {
+        let start = 1024 * 1024;
+        let total = 8 * 1024 * 1024;
+        let expected: Vec<u8> = (start..start + 2 * 1024 * 1024)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        let mut responses: Vec<_> = (0..=HTTP_STREAM_MAX_RESUMES)
+            .map(|_| MockResponse::immediate(http_simple_response("206 Partial Content", b"")))
+            .collect();
+        responses.push(MockResponse::immediate(http_206_response(
+            start, total, &expected,
+        )));
+        let (uri, requests) = spawn_mock_http_server(responses);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        source.cache_bytes = vec![0; start as usize];
+        source.ensure_streams();
+        let began = Instant::now();
+        let bytes = source
+            .read_range(ByteRange {
+                start,
+                length: Some(1024),
+            })
+            .unwrap();
+        assert_eq!(bytes, expected[..1024]);
+        assert!(began.elapsed() < Duration::from_secs(5));
+        for _ in 0..=HTTP_STREAM_MAX_RESUMES {
+            assert!(recv_request_head(&requests).contains(&format!("range: bytes={start}-\r\n")));
+        }
+        assert!(recv_request_head(&requests).contains("range: bytes=1048576-3145727\r\n"));
+    }
+
+    #[test]
+    fn http_stream_to_eof_reads_past_eight_pieces() {
+        // An open-ended read (danmaku/subtitle sidecar) larger than one read's
+        // fetch allowance must still reach EOF. The first rewrite of this path
+        // capped the loop at 8 x 4 MiB = 32 MiB and truncated silently.
+        let chunks = 9u64;
+        let total = chunks * HTTP_REQUEST_MAX_BYTES;
+        let responses = (0..chunks)
+            .map(|index| {
+                MockResponse::immediate(http_206_response(
+                    index * HTTP_REQUEST_MAX_BYTES,
+                    total,
+                    &vec![b'x'; HTTP_REQUEST_MAX_BYTES as usize],
+                ))
+            })
+            .collect();
+        let (uri, requests) = spawn_mock_http_server(responses);
+        let mut source = HttpRangeSource::new(uri);
+
+        let bytes = source.read_range(ByteRange::suffix_from(0)).unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            total,
+            "an open-ended read must reach EOF, not stop at the attempt cap"
+        );
+        for index in 0..chunks {
+            let head = recv_request_head(&requests);
+            assert!(
+                head.contains(&format!("range: bytes={}-", index * HTTP_REQUEST_MAX_BYTES)),
+                "request {index}: {head}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_short_pieces_still_cover_the_read() {
+        // An origin that caps every body at 256 KiB needs many pieces to cover a
+        // gap. Walking away would hand the caller an empty read, which the AVIO
+        // layer turns into EOF: bytes that exist must never look like the end of
+        // the resource.
+        let total = 8 * 1024 * 1024u64;
+        let piece = 256 * 1024u64;
+        // A range-aware origin that caps every answer at 256 KiB.
+        let (uri, _requests) = spawn_drip_http_server(total, 0, Some(piece), 40);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+
+        // Warm the cache with the first short piece, then read just inside the
+        // 4 MiB forward-gap guard: covering it takes ~15 more pieces.
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(1024)
+                })
+                .unwrap()
+                .len(),
+            1024
+        );
+        // A later worker used to append its far-away short response here,
+        // disguising a hole as contiguous bytes. Check the first gap itself.
+        let gap_start = 2 * piece;
+        let gap = source
+            .read_range(ByteRange {
+                start: gap_start,
+                length: Some(1024),
+            })
+            .unwrap();
+        assert!(
+            gap.iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == ((gap_start + index as u64) % 251) as u8)
+        );
+        let target = HTTP_REQUEST_MAX_BYTES;
+        let bytes = source
+            .read_range(ByteRange {
+                start: target,
+                length: Some(1024),
+            })
+            .expect("short pieces must still cover the read");
+        assert_eq!(bytes.len(), 1024, "a covered read must not look like EOF");
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == ((target + index as u64) % 251) as u8)
+        );
+    }
+
+    #[test]
+    fn http_caller_requests_are_capped_too() {
+        let total = 64 * 1024 * 1024u64;
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(0, total, &vec![b'a'; 4096]),
+        )]);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        // No cache yet, so the window is anchored at the read -- and a 32 MiB
+        // caller request must not become a 32 MiB body (that is the issue #1
+        // shape). The caller sees a short read and asks again.
+        let bytes = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(32 * 1024 * 1024),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 4096);
+        let head = recv_request_head(&requests);
+        assert!(
+            head.contains("range: bytes=0-4194303"),
+            "request head: {head}"
+        );
+    }
+
+    #[test]
+    fn http_trim_never_drops_the_current_read_position() {
+        let mut source = HttpRangeSource::new("https://example.invalid/video.mp4");
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 25 * 1024 * 1024];
+
+        // A read starting at 0 may not have its own start trimmed away, however
+        // large it is.
+        source.trim_cache(ByteRange {
             start: 0,
-            length: Some(100),
+            length: Some(20 * 1024 * 1024),
+        });
+        assert_eq!(source.cache_start, 0);
+
+        // A read near the cache end trims the head down to the retention budget.
+        source.trim_cache(ByteRange {
+            start: 25 * 1024 * 1024,
+            length: Some(1024),
+        });
+        assert_eq!(
+            source.cache_start,
+            25 * 1024 * 1024 - HTTP_CACHE_RETAIN_BYTES
+        );
+    }
+
+    #[test]
+    fn http_back_buffer_budget_is_honored_by_trim() {
+        // The rewind budget is host-tunable: a host sizing it from media
+        // bitrate (a -10 s skip at 71 Mbps covers ~89 MB) must see the trim
+        // honor the larger tail instead of the 16 MiB default.
+        let mut source = HttpRangeSource::with_http_headers_and_window(
+            "https://example.invalid/video.mp4",
+            Vec::new(),
+            None,
+            Some(96 * 1024 * 1024),
+        );
+        source.cache_start = 0;
+        source.cache_bytes = vec![b'c'; 128 * 1024 * 1024];
+
+        source.trim_cache(ByteRange {
+            start: 128 * 1024 * 1024,
+            length: Some(1024),
+        });
+        assert_eq!(
+            source.cache_start,
+            128 * 1024 * 1024 - 96 * 1024 * 1024,
+            "the tail must be trimmed to the configured back-buffer budget"
+        );
+    }
+
+    #[test]
+    fn http_stream_spawns_one_open_ended_worker() {
+        let total = 64 * 1024 * 1024;
+        let (uri, _in_flight, _max, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_bytes = vec![b'c'; 20 * 1024 * 1024];
+        source.ensure_streams();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && heads.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 1, "heads: {heads:?}");
+        assert!(
+            heads[0]
+                .to_lowercase()
+                .contains("range: bytes=20971520-\r\n")
+        );
+    }
+
+    #[test]
+    fn dropping_http_source_interrupts_blocked_stream_worker() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (closed_sender, closed_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-8388607/8388608\r\nContent-Length: 8388607\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            request_sender.send(()).unwrap();
+
+            let mut byte = [0u8; 1];
+            let closed = reader.read(&mut byte).unwrap_or(0) == 0;
+            closed_sender.send(closed).unwrap();
+        });
+
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(8 * 1024 * 1024);
+        source.cache_bytes = vec![0];
+        source.ensure_streams();
+        request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream worker should reach the blocked response body");
+
+        let started = Instant::now();
+        drop(source);
+        assert!(
+            closed_receiver
+                .recv_timeout(Duration::from_millis(500))
+                .expect("dropping the source must close the worker socket"),
+            "worker socket should close cleanly"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "source drop took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn cancelling_http_source_interrupts_foreground_body_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (closed_sender, closed_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-8388607/8388608\r\nContent-Length: 8388608\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            request_sender.send(()).unwrap();
+            let mut byte = [0u8; 1];
+            closed_sender
+                .send(reader.read(&mut byte).unwrap_or(0) == 0)
+                .unwrap();
+        });
+
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(8 * 1024 * 1024);
+        let cancellation = source.cancellation().unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = source.read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            });
+            result_sender.send(result).unwrap();
+        });
+        request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("foreground request should reach the blocked response body");
+
+        let started = Instant::now();
+        cancellation.cancel();
+        assert!(matches!(
+            result_receiver.recv_timeout(Duration::from_millis(500)),
+            Ok(Err(SourceError::Cancelled))
+        ));
+        assert!(
+            closed_receiver
+                .recv_timeout(Duration::from_millis(500))
+                .expect("cancellation must close the foreground socket")
+        );
+        worker.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn cancellation_wakes_a_reader_waiting_for_prefetch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/media", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-999/1000\r\nContent-Length: 999\r\nConnection: close\r\n\r\n").unwrap();
+            started_tx.send(()).unwrap();
+            assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+        });
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(1000);
+        source.cache_bytes = vec![0];
+        source.ensure_streams();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let cancellation = source.cancellation().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let result = source.read_range(ByteRange {
+                start: 1,
+                length: Some(10),
+            });
+            let _ = done_tx.send(result);
+        });
+        // Let the foreground reader enter the prefetch condition-variable wait.
+        thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(500)),
+                Ok(Err(SourceError::Cancelled))
+            ),
+            "cancel must wake the prefetch consumer as well as its socket"
+        );
+        reader.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_deep_window_against_a_slow_origin_still_serves_the_read() {
+        // The issue #1 shape: a 32 MiB window against an origin that can only
+        // deliver ~900 KB/s. Before the request cap this asked for all 32 MiB in
+        // one body, which the client's 15 s body deadline killed
+        // (`timeout: receive response` -> EIO -> playback ended). A capped 4 MiB
+        // request finishes in about five seconds.
+        let total = 64 * 1024 * 1024u64;
+        let (uri, requests) = spawn_drip_http_server(total, 900 * 1024, None, 2);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        let started = Instant::now();
+        let bytes = source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(1024),
+            })
+            .expect("a deep window must not turn a slow origin into a failed read");
+        assert_eq!(bytes.len(), 1024);
+        // The discriminating failure is the `expect` above (the old shape errors
+        // out at the 15 s body deadline); this bound only catches a fetch that
+        // silently stopped making progress, so it is sized for a loaded machine.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "first read took {:?}",
+            started.elapsed()
+        );
+        let head = recv_request_head(&requests);
+        assert!(
+            head.contains("range: bytes=0-4194303"),
+            "request head: {head}"
+        );
+    }
+
+    #[test]
+    fn http_resumes_more_than_three_times_while_bytes_arrive() {
+        // Four pieces, each on its own connection: three truncated bodies, then
+        // the rest. Every attempt moves the resume point, so the fetch has to
+        // keep going -- the flat three-attempt rule used to end playback here
+        // (a capped request on a slow origin legitimately spans several
+        // attempts, each cut short by the 15 s body deadline).
+        let total = 4 * 1024 * 1024u64;
+        let piece = 1024 * 1024usize;
+        let held = vec![b'a'; piece];
+        let (uri, requests) = spawn_mock_http_server(vec![
+            MockResponse::immediate(http_206_truncated_response(
+                0,
+                total,
+                4 * 1024 * 1024,
+                &held,
+            )),
+            MockResponse::immediate(http_206_truncated_response(
+                1024 * 1024,
+                total,
+                3 * 1024 * 1024,
+                &held,
+            )),
+            MockResponse::immediate(http_206_truncated_response(
+                2 * 1024 * 1024,
+                total,
+                2 * 1024 * 1024,
+                &held,
+            )),
+            MockResponse::immediate(http_206_response(3 * 1024 * 1024, total, &held)),
+        ]);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(8 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(1024)
+                })
+                .unwrap()
+                .len(),
+            1024
+        );
+        let first = recv_request_head(&requests);
+        assert!(first.contains("range: bytes=0-4194303"), "{first}");
+        let second = recv_request_head(&requests);
+        assert!(second.contains("range: bytes=1048576-4194303"), "{second}");
+        let third = recv_request_head(&requests);
+        assert!(third.contains("range: bytes=2097152-4194303"), "{third}");
+        // A fourth attempt: the old gate stopped at three, no matter how much
+        // each attempt had already delivered.
+        let fourth = recv_request_head(&requests);
+        assert!(fourth.contains("range: bytes=3145728-4194303"), "{fourth}");
+    }
+
+    #[test]
+    fn http_request_body_is_capped_regardless_of_the_read_ahead_window() {
+        let total = 64 * 1024 * 1024u64;
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(0, total, &vec![b'a'; 4096]),
+        )]);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        assert_eq!(source.read_ahead_bytes, 32 * 1024 * 1024);
+        assert_eq!(source.request_bytes, HTTP_REQUEST_MAX_BYTES);
+
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(1024)
+                })
+                .unwrap()
+                .len(),
+            1024
+        );
+        // A 32 MiB window used to go out as one 32 MiB request (~18 Mbps at the
+        // 15 s body deadline, i.e. an issue #1 failure on anything slower). It
+        // must now be a capped request.
+        let head = recv_request_head(&requests);
+        assert!(
+            head.contains("range: bytes=0-4194303"),
+            "request head: {head}"
+        );
+    }
+
+    #[test]
+    fn http_stream_downloads_each_byte_once() {
+        let total = 32 * 1024 * 1024;
+        let (uri, in_flight, _max, heads, sent) = spawn_counted_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        let mut offset = 0;
+        while offset < total {
+            let bytes = source
+                .read_range(ByteRange {
+                    start: offset,
+                    length: Some(64 * 1024),
+                })
+                .unwrap();
+            assert!(!bytes.is_empty());
+            assert!(
+                bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| *byte == ((offset + index as u64) % 251) as u8)
+            );
+            offset += bytes.len() as u64;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(sent.load(Ordering::SeqCst) as u64, total);
+        let heads = heads.lock().unwrap();
+        assert_eq!(
+            heads.len(),
+            2,
+            "one initial fetch and one persistent stream: {heads:?}"
+        );
+    }
+
+    #[test]
+    fn http_final_partial_read_does_not_wait_past_eof() {
+        let total = 3 * 1024 * 1024 + 123;
+        let (uri, _in_flight, _max, _heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        let started = Instant::now();
+        let bytes = source
+            .read_range(ByteRange {
+                start: total - 123,
+                length: Some(64 * 1024),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 123);
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == ((total - 123 + index as u64) % 251) as u8)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "tail read stalled {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn http_stream_gap_falls_back_without_splicing_wrong_bytes() {
+        let total = 8 * 1024 * 1024;
+        let (uri, _in_flight, _max, _heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        source.cache_bytes = (0..64 * 1024).map(|offset| (offset % 251) as u8).collect();
+        source.streams = Some(StreamSession {
+            shared: Arc::new(StreamShared {
+                inner: Mutex::new(StreamInner {
+                    epoch: 1,
+                    pending: BTreeMap::from([(
+                        0,
+                        StripeHandoff {
+                            start: 128 * 1024,
+                            bytes: vec![255; 64 * 1024],
+                            validator: None,
+                        },
+                    )]),
+                    worker_done: true,
+                    worker_failed: false,
+                    failure_acked: false,
+                    progress_bytes: 64 * 1024,
+                    last_progress: Instant::now(),
+                    window_end: total,
+                    uncovered_read_end: 0,
+                    reading_partial: None,
+                    idle_race_read: None,
+                    stopped: false,
+                }),
+                signal: Condvar::new(),
+                demand: tokio::sync::Notify::new(),
+                entity_changed: Arc::clone(&source.entity_changed),
+            }),
+            io: HttpIo::new(),
+            worker: None,
+        });
+        let started = Instant::now();
+        let bytes = source
+            .read_range(ByteRange {
+                start: 64 * 1024,
+                length: Some(1024),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 1024);
+        assert!(
+            bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == ((64 * 1024 + index) % 251) as u8)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn http_stream_delivers_contiguous_bytes_across_stripes() {
+        // One read crossing two delivered stripes: the appends must land in
+        // stripe order (frontier semantics) and hand back exactly the
+        // position-dependent bytes.
+        let total = 64 * 1024 * 1024u64;
+        let (uri, _in_flight, _max, _heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(32 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+        source.cache_start = 0;
+        source.cache_bytes = (0..1024 * 1024u64)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+
+        let read_start = 1024 * 1024u64;
+        let read_len = 8 * 1024 * 1024u64;
+        let bytes = source
+            .read_range(ByteRange {
+                start: read_start,
+                length: Some(read_len),
+            })
+            .expect("a read across stream stripes must be served");
+        assert_eq!(bytes.len() as u64, read_len);
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                ((read_start + index as u64) % 251) as u8,
+                "byte {} of the read",
+                read_start + index as u64
+            );
+        }
+    }
+
+    #[test]
+    fn http_stream_far_forward_read_reanchors_without_the_stall_wait() {
+        // A read far beyond the window (a demuxer probing the tail, a large
+        // forward seek) can never be covered by the streams: the workers stop
+        // at the read-ahead boundary. It must skip the coverage wait and
+        // re-anchor immediately, not burn the full HTTP_STREAM_STALL clock on
+        // a wait that cannot succeed. The window is 8 MiB (two stripe budgets
+        // in flight), so any far-forward read sees the workers paused.
+        let total = 128 * 1024 * 1024u64;
+        let (uri, _in_flight, _max_in_flight, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(8 * 1024 * 1024),
+        );
+        source.content_length = Some(total);
+
+        // The first read anchors the window and spawns the workers; the far
+        // read follows immediately, before the workers could have drained the
+        // whole file into the cache.
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: 0,
+                    length: Some(64 * 1024)
+                })
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+
+        let far_start = total - 4096;
+        let started = Instant::now();
+        let bytes = source
+            .read_range(ByteRange {
+                start: far_start,
+                length: Some(4096),
+            })
+            .expect("a far-forward read must re-anchor instead of stalling");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "far-forward read took {:?} (the stall wait is 20s)",
+            started.elapsed()
+        );
+        assert_eq!(bytes.len(), 4096);
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, ((far_start + index as u64) % 251) as u8);
+        }
+        // The read was served by a synchronous re-anchor at the far position,
+        // not by draining a window the workers could never cover.
+        let expected = format!("range: bytes={far_start}-{}", far_start + 4095);
+        let heads = heads.lock().unwrap();
+        assert!(
+            heads
+                .iter()
+                .any(|head| head.to_lowercase().contains(&expected)),
+            "a re-anchor request must be issued for the far position: {heads:?}"
+        );
+    }
+
+    #[test]
+    fn http_default_window_keeps_the_streams_delivering() {
+        // A 2 MiB window must allow the worker to finish a 4 MiB stripe;
+        // otherwise bytes needed by the reader stay in its private buffer and
+        // every frontier read burns the 20 s stall clock.
+        let total = 32 * 1024 * 1024u64;
+        let (uri, _in_flight, _max, heads) = spawn_concurrent_mock_http_server(total);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+
+        let started = Instant::now();
+        let mut offset = 0u64;
+        while offset < 8 * 1024 * 1024 {
+            let bytes = source
+                .read_range(ByteRange {
+                    start: offset,
+                    length: Some(64 * 1024),
+                })
+                .unwrap();
+            assert_eq!(bytes.len(), 64 * 1024);
+            offset += 64 * 1024;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "default-window sequential reads took {:?}: the 20 s stall clock means the streams never delivered",
+            started.elapsed()
+        );
+        // The run must be served by the open-ended stream GETs, not only by the
+        // capped synchronous fallback (which requests a closed range).
+        let heads = heads.lock().unwrap();
+        assert!(
+            heads.iter().any(|head| head
+                .to_lowercase()
+                .lines()
+                .any(|line| line.starts_with("range:") && line.trim_end().ends_with('-'))),
+            "the default window must keep the streaming workers delivering: {heads:?}"
+        );
+    }
+
+    #[test]
+    fn http_stream_window_stays_bounded_against_a_fast_origin() {
+        // A fast origin and a reader that only ever consumes a small prefix: the
+        // workers must not run away with the rest of the resource. The bytes
+        // buffered ahead of the reader must stay inside the configured window
+        // plus the workers' in-flight stripe budget, never grow with the file.
+        let total = 256 * 1024 * 1024u64;
+        let window = 8 * 1024 * 1024u64;
+        let (uri, _in_flight, _max, _heads) = spawn_concurrent_mock_http_server(total);
+        let mut source =
+            HttpRangeSource::with_http_headers_and_read_ahead(uri, Vec::new(), Some(window));
+        source.content_length = Some(total);
+
+        let mut offset = 0u64;
+        while offset < 4 * 1024 * 1024 {
+            let bytes = source
+                .read_range(ByteRange {
+                    start: offset,
+                    length: Some(64 * 1024),
+                })
+                .unwrap();
+            assert_eq!(bytes.len(), 64 * 1024);
+            offset += 64 * 1024;
+        }
+        // Let an unthrottled worker flood the cache if the window does not bind.
+        thread::sleep(Duration::from_millis(500));
+        source.drain_stripes();
+        let pending: u64 = source
+            .streams
+            .as_ref()
+            .map(|session| {
+                lock_stream(&session.shared)
+                    .pending
+                    .values()
+                    .map(|stripe| stripe.bytes.len() as u64)
+                    .sum()
+            })
+            .unwrap_or(0);
+        let buffered = source
+            .cache_end()
+            .saturating_sub(source.stream_reader_end)
+            .saturating_add(pending);
+        let slack = HTTP_STREAM_STRIPE_BYTES;
+        assert!(
+            buffered <= window + slack,
+            "prefetch ran away: {buffered} bytes buffered ahead of the reader \
+             with a {window}-byte window (slack {slack})"
+        );
+    }
+
+    #[test]
+    fn http_rewind_inside_the_retained_tail_is_served_from_cache() {
+        let total = 40 * 1024 * 1024u64;
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(0, total, b"unused"),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        // Pretend a 40 MiB window has been buffered from byte zero.
+        source.cache_start = 0;
+        source.cache_bytes = (0..total).map(|offset| (offset % 251) as u8).collect();
+
+        // Reading near the tail trims the head down to the retention budget...
+        let tail_start = total - 1024;
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: tail_start,
+                    length: Some(1024)
+                })
+                .unwrap()
+                .len(),
+            1024
+        );
+        assert_eq!(
+            source.cache_start,
+            (tail_start) - HTTP_CACHE_RETAIN_BYTES,
+            "the head must be trimmed to the retention budget, measured from the read"
+        );
+
+        // ...and a small rewind lands inside what is left: served locally.
+        let rewind_start = source.cache_end() - 4 * 1024 * 1024;
+        let bytes = source
+            .read_range(ByteRange {
+                start: rewind_start,
+                length: Some(64),
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(bytes[0], (rewind_start % 251) as u8);
+        assert!(
+            requests.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a rewind inside the retained tail must not hit the network"
+        );
+    }
+
+    #[test]
+    fn http_rewind_past_the_retained_tail_reanchors_the_window() {
+        let target = 2 * 1024 * 1024u64;
+        let total = target + 128;
+        let (uri, requests) = spawn_mock_http_server(vec![MockResponse::immediate(
+            http_206_response(target, total, &[b'r'; 128]),
+        )]);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        // The cache only holds the tail; everything before it was trimmed.
+        source.cache_start = 24 * 1024 * 1024;
+        source.cache_bytes = vec![b'c'; 1024];
+
+        // Far behind the retained tail: re-anchor at the read position, the
+        // same thing every player does once a seek lands past its back buffer.
+        assert_eq!(
+            source
+                .read_range(ByteRange {
+                    start: target,
+                    length: Some(64)
+                })
+                .unwrap()
+                .len(),
+            64
+        );
+        let head = recv_request_head(&requests);
+        assert!(
+            head.contains(&format!("range: bytes={target}-")),
+            "request head: {head}"
+        );
+        assert_eq!(source.cache_start, target);
+    }
+
+    // Real sockets, with short private deadlines so timeout regressions do not
+    // add minutes to the test suite. A stalled response lasts until disconnect.
+    fn spawn_timeout_http_server(
+        responses: Vec<(Vec<u8>, bool)>,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let uri = format!("http://{}/media", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for (raw, stall) in responses {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept timeout test connection: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let _ = sender.send(head);
+                if stream.write_all(&raw).is_err() {
+                    return;
+                }
+                if stall {
+                    // EOF/reset/abort all mean the client stopped the exchange.
+                    // The socket timeout also bounds cleanup on test failure.
+                    let _ = reader.read(&mut [0]);
+                }
+            }
+        });
+        (uri, receiver)
+    }
+
+    fn short_http_timeouts() -> HttpFetchTimeouts {
+        HttpFetchTimeouts {
+            // Real socket scheduling on loaded CI runners needs more than
+            // millisecond-scale margins. These remain below production limits.
+            response: Duration::from_secs(1),
+            body: Duration::from_secs(1),
+            total: Duration::from_secs(10),
+        }
+    }
+
+    fn assert_length_probe_shares_budget(head_status: &str) {
+        let (uri, requests) = spawn_timeout_http_server(vec![
+            (
+                http_simple_response("500 Internal Server Error", b""),
+                false,
+            ),
+            (
+                http_simple_response("500 Internal Server Error", b""),
+                false,
+            ),
+            (http_simple_response(head_status, b""), false),
+            (Vec::new(), true),
+        ]);
+        let io = HttpIo::new();
+        let client = io.client.clone();
+        let timeouts = HttpFetchTimeouts {
+            response: Duration::from_secs(3),
+            total: Duration::from_secs(2),
+            ..short_http_timeouts()
         };
-        source.prefetch = Some(PendingHttpFetch::spawn(uri, Vec::new(), range));
-        // A short prefetch must trigger the synchronous fallback, not an
-        // empty (fake-EOF) read.
-        assert_eq!(source.read_range(range).unwrap(), body);
-        let _ = recv_request_head(&requests);
-        assert!(recv_request_head(&requests).contains("range: bytes=0-99"));
+        let result = io
+            .run(async move {
+                // Two HEAD retries spend at least 1.2 s of the 2 s budget.
+                // Allow 1 s of scheduler slack: a fresh 2 s probe deadline
+                // would still exceed this watchdog (1.2 + 2 > 3).
+                Ok(tokio::time::timeout(
+                    Duration::from_secs(3),
+                    fetch_http_length(&client, &uri, &[], Instant::now(), timeouts, None),
+                )
+                .await)
+            })
+            .unwrap()
+            .expect("fallback GET escaped the metadata budget");
+        assert!(result.is_err());
+        assert!(recv_request_head(&requests).starts_with("head"));
+        assert!(recv_request_head(&requests).starts_with("head"));
+        assert!(recv_request_head(&requests).starts_with("head"));
+        let probe = recv_request_head(&requests);
+        assert!(probe.starts_with("get"));
+        assert!(probe.contains("range: bytes=0-0"));
+    }
+
+    #[test]
+    fn http_timeout_rejected_head_probe_shares_budget() {
+        assert_length_probe_shares_budget("405 Method Not Allowed");
+    }
+
+    #[test]
+    fn http_timeout_zero_length_head_probe_shares_budget() {
+        assert_length_probe_shares_budget("200 OK");
+    }
+
+    #[test]
+    fn http_timeout_head_retries_stalled_headers() {
+        let (uri, requests) = spawn_timeout_http_server(vec![
+            (Vec::new(), true),
+            (http_simple_response("200 OK", b"abcd"), false),
+        ]);
+        let io = HttpIo::new();
+        let client = io.client.clone();
+        let length = io
+            .run(async move {
+                fetch_http_length(
+                    &client,
+                    &uri,
+                    &[],
+                    Instant::now(),
+                    short_http_timeouts(),
+                    None,
+                )
+                .await
+            })
+            .unwrap();
+        assert_eq!(length, Some(4));
+        assert!(recv_request_head(&requests).starts_with("head"));
+        assert!(recv_request_head(&requests).starts_with("head"));
+    }
+
+    #[test]
+    fn http_timeout_range_retries_stalled_headers() {
+        let (uri, requests) = spawn_timeout_http_server(vec![
+            (Vec::new(), true),
+            (http_206_response(0, 4, b"abcd"), false),
+        ]);
+        let io = HttpIo::new();
+        let client = io.client.clone();
+        let response = io
+            .run(async move {
+                fetch_http_range_async(
+                    &client,
+                    &uri,
+                    &[],
+                    ByteRange {
+                        start: 0,
+                        length: Some(4),
+                    },
+                    "test_range",
+                    short_http_timeouts(),
+                )
+                .await
+            })
+            .unwrap();
+        assert_eq!(response.bytes, b"abcd");
+        assert!(recv_request_head(&requests).contains("range: bytes=0-3"));
+        assert!(recv_request_head(&requests).contains("range: bytes=0-3"));
+    }
+
+    #[test]
+    fn http_timeout_range_resumes_stalled_body() {
+        let partial = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\nContent-Length: 4\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nab";
+        let (uri, requests) = spawn_timeout_http_server(vec![
+            (partial.to_vec(), true),
+            (http_206_response(2, 4, b"cd"), false),
+        ]);
+        let io = HttpIo::new();
+        let client = io.client.clone();
+        let response = io
+            .run(async move {
+                fetch_http_range_async(
+                    &client,
+                    &uri,
+                    &[],
+                    ByteRange {
+                        start: 0,
+                        length: Some(4),
+                    },
+                    "test_range",
+                    short_http_timeouts(),
+                )
+                .await
+            })
+            .unwrap();
+        assert_eq!(response.bytes, b"abcd");
+        assert!(recv_request_head(&requests).contains("range: bytes=0-3"));
+        let resumed = recv_request_head(&requests);
+        assert!(resumed.contains("range: bytes=2-3"));
+        assert!(resumed.contains("if-range: \"v1\""));
+    }
+
+    #[test]
+    fn http_timeout_progressing_body_keeps_reading_until_total_budget() {
+        for total in [Duration::from_secs(10), Duration::from_millis(500)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let uri = format!("http://{}/media", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/8\r\nContent-Length: 8\r\nConnection: close\r\n\r\n").unwrap();
+                for byte in b"abcdefgh" {
+                    if socket.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+            });
+            let io = HttpIo::new();
+            let client = io.client.clone();
+            let result = io.run(async move {
+                fetch_http_range_async(
+                    &client,
+                    &uri,
+                    &[],
+                    ByteRange {
+                        start: 0,
+                        length: Some(8),
+                    },
+                    "test_range",
+                    HttpFetchTimeouts {
+                        total,
+                        ..short_http_timeouts()
+                    },
+                )
+                .await
+            });
+            if total == Duration::from_secs(10) {
+                // The 1.4 s body outlives the 1 s header/idle deadlines, while
+                // each 200 ms chunk interval leaves ample scheduling margin.
+                assert_eq!(result.unwrap().bytes, b"abcdefgh");
+            } else {
+                assert!(result.is_err());
+                // Without the total deadline the server delivers the full
+                // body successfully. Check that result, not scheduler latency.
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]
@@ -1909,6 +6349,211 @@ mod tests {
         assert_eq!(
             redacted_uri("https://example.invalid/video.mkv?AccessToken=secret"),
             "https://example.invalid/video.mkv?AccessToken=REDACTED"
+        );
+    }
+    #[test]
+    fn http_range_caps_the_buffered_response_body() {
+        let (uri, _) = spawn_mock_http_server(vec![MockResponse::immediate(http_206_response(
+            0,
+            64,
+            &[b'x'; 64],
+        ))]);
+        let response = fetch_http_range(
+            &HttpIo::new(),
+            &uri,
+            &[],
+            ByteRange {
+                start: 0,
+                length: Some(8),
+            },
+            "review_body_cap",
+        )
+        .unwrap();
+        assert_eq!(
+            response.bytes.len(),
+            8,
+            "bound the downloaded buffer, not just the returned read slice"
+        );
+    }
+
+    #[test]
+    fn http_range_stops_at_the_exact_limit_before_an_idle_body() {
+        let (uri, requests) = spawn_timeout_http_server(vec![(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-63/64\r\nContent-Length: 64\r\nConnection: close\r\n\r\nabcdefgh".to_vec(),
+            true,
+        )]);
+        let io = HttpIo::new();
+        let client = io.client.clone();
+        let response = io
+            .run(async move {
+                fetch_http_range_async(
+                    &client,
+                    &uri,
+                    &[],
+                    ByteRange {
+                        start: 0,
+                        length: Some(8),
+                    },
+                    "review_exact_limit",
+                    HttpFetchTimeouts {
+                        total: Duration::from_millis(500),
+                        ..short_http_timeouts()
+                    },
+                )
+                .await
+            })
+            .expect("the requested bytes are complete; do not wait for an unwanted body tail");
+        assert_eq!(response.bytes, b"abcdefgh");
+        assert!(recv_request_head(&requests).contains("range: bytes=0-7"));
+        assert!(
+            requests.try_recv().is_err(),
+            "a complete bounded range needs no resume"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Origin that always answers full `piece`-sized 206 bodies for the
+    /// requested range, no matter how big the request was.
+    fn spawn_capping_origin(
+        total: u64,
+        piece: u64,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/video.bin", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let maxlen = Arc::new(AtomicUsize::new(0));
+        let (c, m) = (count.clone(), maxlen.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                c.fetch_add(1, Ordering::SeqCst);
+                let lower = head.to_lowercase();
+                if lower.starts_with("head") {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    continue;
+                }
+                // parse "range: bytes=N-M"
+                let start: u64 = lower
+                    .lines()
+                    .find(|l| l.starts_with("range:"))
+                    .and_then(|l| l.split_once("bytes="))
+                    .and_then(|(_, v)| v.split('-').next())
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let end = (start + piece - 1).min(total.saturating_sub(1));
+                let len = end.saturating_sub(start) + 1;
+                m.fetch_max(len as usize, Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                if stream.write_all(resp.as_bytes()).is_err() {
+                    continue;
+                }
+                let mut sent = 0u64;
+                while sent < len {
+                    let n = (32 * 1024u64).min(len - sent) as usize;
+                    if stream.write_all(&vec![b'z'; n]).is_err() {
+                        break;
+                    }
+                    sent += n as u64;
+                }
+                let _ = stream.flush();
+            }
+        });
+        (uri, count, maxlen)
+    }
+
+    #[test]
+    fn probe_stream_to_eof_known_total_just_past_the_limit_ends_cleanly() {
+        // The old ordering checked the hard limit before the declared-total
+        // EOF, so a resource whose total is the limit plus one full piece
+        // (260 MiB with the current constants) was misreported as a limit
+        // violation after the final piece landed exactly on the total. The EOF
+        // check must win over the limit check.
+        let total = HTTP_STREAM_TO_EOF_BYTE_LIMIT + HTTP_REQUEST_MAX_BYTES;
+        let (uri, _, _) = spawn_capping_origin(total, HTTP_REQUEST_MAX_BYTES);
+        let mut source = HttpRangeSource::new(uri);
+        source.content_length = Some(total);
+        let bytes = source
+            .read_range(ByteRange::suffix_from(0))
+            .expect("a declared total just past the limit is still a clean EOF");
+        assert_eq!(bytes.len() as u64, total);
+    }
+
+    #[test]
+    fn probe_stream_to_eof_beyond_the_hard_limit() {
+        let total = HTTP_STREAM_TO_EOF_BYTE_LIMIT + 16 * 1024 * 1024;
+        let (uri, _, _) = spawn_capping_origin(total, HTTP_REQUEST_MAX_BYTES);
+        let mut source = HttpRangeSource::new(uri);
+        match source.read_range(ByteRange::suffix_from(0)) {
+            Err(error) => assert!(
+                error.to_string().contains("limit"),
+                "expected a limit error, got: {error}"
+            ),
+            Ok(bytes) => panic!(
+                "an open-ended read past the hard limit must fail, got {} bytes",
+                bytes.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn read_that_needs_more_than_the_piece_cap_must_fail_loudly() {
+        // An origin that caps every body at 64 KiB: covering a forward gap much
+        // larger than `HTTP_FETCH_MAX_PIECES_PER_READ` pieces needs more fetches
+        // than one read may pull, and must error rather than hand the caller a
+        // short read that looks like EOF on bytes that exist. The gap is sized
+        // far past the cap so the answer is the same whether or not a prefetch
+        // piece lands before the read.
+        let total = 64 * 1024 * 1024u64;
+        let piece = 64 * 1024u64;
+        let (uri, _, _) = spawn_capping_origin(total, piece);
+        let mut source = HttpRangeSource::with_http_headers_and_read_ahead(
+            uri,
+            Vec::new(),
+            Some(8 * 1024 * 1024),
+        );
+        // Warm the cache so fetch_missing takes its multi-piece loop instead of
+        // re-anchoring a fresh window at the read. The streams are then killed
+        // and the total hidden: this pins the synchronous fallback's own piece
+        // cap, which is what bounds the read when streaming cannot serve.
+        source
+            .read_range(ByteRange {
+                start: 0,
+                length: Some(piece),
+            })
+            .expect("the first piece must serve");
+        source.kill_streams();
+        source.content_length = None;
+        let error = source
+            .read_range(ByteRange {
+                start: piece,
+                length: Some(200 * piece),
+            })
+            .expect_err("a gap past the piece cap must error");
+        assert!(
+            error.to_string().contains("short pieces"),
+            "expected a piece-cap error, got: {error}"
         );
     }
 }

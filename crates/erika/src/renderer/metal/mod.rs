@@ -11,7 +11,8 @@ use crate::ffmpeg::{Frame, PlanarFrame};
 use crate::overlay::OverlayFrame;
 pub use crate::renderer::pipeline::LumaUpscalerMode;
 use crate::renderer::pipeline::{
-    ColorRange, HdrMetadata, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
+    ColorRange, DoviSourceMetadata, HdrMetadata, MatrixCoefficients, SourceColorState,
+    VideoRenderPipeline,
 };
 use crate::trace;
 
@@ -22,11 +23,20 @@ use crate::renderer::output::{
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 mod apple;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+mod post_process;
 // Public for integration tests (numeric verification against ONNX
 // references); not part of the stable API surface.
 #[doc(hidden)]
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub mod upscaler;
+
+/// Probes upscaler and post-processing capabilities for the default Metal GPU
+/// when no renderer instance has been created yet.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub fn probe_default_upscalers() -> crate::renderer::pipeline::UpscalerCapabilities {
+    apple::probe_default_upscalers()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClearColor {
@@ -79,6 +89,13 @@ pub struct MetalRendererConfig {
     pub output_mode: MetalOutputMode,
     pub luma_upscaler: LumaUpscalerMode,
     pub video_alpha_mode: VideoAlphaMode,
+    /// How long the Direct3D 11 renderer waits for the GPU to finish with a
+    /// decoded frame before handing it back to the decoder, when it draws
+    /// into a compositor-owned surface. A hardware decoder's work shares
+    /// the wait, which after a seek can take hundreds of milliseconds: a
+    /// host rendering on its UI thread keeps it short, one rendering on a
+    /// thread of its own can wait that out.
+    pub compositor_handoff_timeout: Duration,
 }
 
 /// Describes how a decoded video frame carries transparency.
@@ -121,6 +138,7 @@ impl Default for MetalRendererConfig {
             output_mode: MetalOutputMode::default(),
             luma_upscaler: LumaUpscalerMode::default(),
             video_alpha_mode: VideoAlphaMode::default(),
+            compositor_handoff_timeout: Duration::from_millis(100),
         }
     }
 }
@@ -142,7 +160,13 @@ pub(crate) fn metal_target_color(
 ) -> crate::renderer::pipeline::TargetColorState {
     match mode {
         MetalOutputMode::Sdr | MetalOutputMode::Auto { .. } => {
-            crate::renderer::pipeline::TargetColorState::sdr(ColorPrimaries::Bt709)
+            if source.is_hdr() {
+                crate::renderer::pipeline::TargetColorState::sdr_tone_map_target(
+                    ColorPrimaries::Bt709,
+                )
+            } else {
+                crate::renderer::pipeline::TargetColorState::sdr(ColorPrimaries::Bt709)
+            }
         }
         MetalOutputMode::AppleEdr { headroom } | MetalOutputMode::ExtendedLinear { headroom } => {
             #[cfg(any(target_os = "ios", target_os = "tvos"))]
@@ -214,6 +238,8 @@ pub struct MetalRendererStats {
     pub edr_rendered_frames: u64,
     pub sdr_tonemap_frames: u64,
     pub output_mode_switches: u64,
+    /// Host headroom reports accepted by `set_output_headroom`.
+    pub headroom_updates: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,13 +332,27 @@ impl ImportedVideoFrame {
         range: ColorRange,
         matrix: MatrixCoefficients,
         hdr_metadata: Option<HdrMetadata>,
+        dovi_metadata: Option<DoviSourceMetadata>,
     ) {
         self.set_source_color(
             SourceColorState::new(primaries, transfer)
                 .range(range)
                 .matrix(matrix)
-                .hdr_metadata(hdr_metadata),
+                .hdr_metadata(hdr_metadata)
+                .dovi(dovi_metadata),
         );
+    }
+
+    /// Attach a presenter-measured scene-average luminance so the tone map's
+    /// pivot follows the content like Dolby Vision L1 would. Only meaningful
+    /// when the source carries no dynamic L1 metadata of its own.
+    pub fn set_measured_scene_avg(&mut self, scene_avg_nits: Option<f32>) {
+        if scene_avg_nits.is_none() {
+            return;
+        }
+        let mut source = self.source_color();
+        source = source.measured_scene_avg_nits(scene_avg_nits);
+        self.set_source_color(source);
     }
 }
 
@@ -587,6 +627,14 @@ impl MetalRenderer {
     }
 
     fn import_player_frame(&mut self, frame: &Frame) -> Result<ImportedVideoFrame> {
+        let unsupported = || {
+            PlayerError::Renderer(format!(
+                "unsupported software video frame format {}",
+                frame
+                    .pixel_format()
+                    .unwrap_or_else(|| "unknown".to_string())
+            ))
+        };
         let mut imported = if let Some(pixel_buffer) = frame.videotoolbox_pixel_buffer() {
             unsafe {
                 self.import_video_frame_textures(VideoFrameTextureSource::new(
@@ -596,15 +644,7 @@ impl MetalRenderer {
                 ))
             }?
         } else {
-            let planar = frame.to_planar_frame().ok_or_else(|| {
-                PlayerError::Renderer(format!(
-                    "unsupported software video frame format {}",
-                    frame
-                        .pixel_format()
-                        .unwrap_or_else(|| "unknown".to_string())
-                ))
-            })?;
-            self.import_planar_frame(&planar, frame.color_range())?
+            self.import_software_frame(frame, unsupported)?
         };
         imported.set_source_color_metadata(
             frame.color_primaries(),
@@ -612,8 +652,66 @@ impl MetalRenderer {
             frame.color_range(),
             frame.matrix_coefficients(),
             frame.hdr_metadata(),
+            frame.dovi_metadata(),
         );
         Ok(imported)
+    }
+
+    fn import_software_frame(
+        &mut self,
+        frame: &Frame,
+        unsupported: impl FnOnce() -> PlayerError,
+    ) -> Result<ImportedVideoFrame> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if frame.raw_pixel_format() == erika_ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+            let Some(planes) = frame.software_yuv420p_upload() else {
+                return Err(unsupported());
+            };
+            if let Some(result) = self
+                .inner
+                .upload_linear_yuv420p8_uv(&planes, frame.color_range() == ColorRange::Full)?
+            {
+                return Ok(ImportedVideoFrame {
+                    info: result.info,
+                    source_color: SourceColorState::default(),
+                    inner: Some(result.textures),
+                });
+            }
+            // Candidate creation failed or is unsupported: its local resources
+            // are gone before the original 8-bit upload path runs below.
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        if frame.is_8bit_420_software() {
+            let planes = frame.software_nv12_upload().ok_or_else(unsupported)?;
+            let result = self
+                .inner
+                .upload_software_nv12(&planes, frame.color_range() == ColorRange::Full)?;
+            return Ok(ImportedVideoFrame {
+                info: result.info,
+                source_color: SourceColorState::default(),
+                inner: Some(result.textures),
+            });
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if frame.raw_pixel_format() == erika_ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+            let Some(planes) = frame.software_p010_upload() else {
+                return Err(unsupported());
+            };
+            if let Some(result) = self
+                .inner
+                .upload_linear_p010(&planes, frame.color_range() == ColorRange::Full)
+            {
+                return Ok(ImportedVideoFrame {
+                    info: result.info,
+                    source_color: SourceColorState::default(),
+                    inner: Some(result.textures),
+                });
+            }
+            // Unsupported devices/layouts or failed candidate creation release
+            // their local resources and use the unchanged packed upload below.
+        }
+        let planar = frame.to_planar_frame().ok_or_else(unsupported)?;
+        self.import_planar_frame(&planar, frame.color_range())
     }
 
     fn import_planar_frame(
@@ -649,6 +747,22 @@ impl MetalRenderer {
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
             MetalRendererStats::default()
+        }
+    }
+
+    /// Diagnostics detail for the luma upscaler: the reason it is
+    /// `Inactive` (or why it runs on a simpler kernel family) and the engine
+    /// executing it (`metal4_tensor_ops`, `simdgroup_matrix`, `scalar`,
+    /// `legacy_*`, `fsr1`, `metalfx_spatial`,
+    /// `vt_low_latency_super_resolution`).
+    pub fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.upscaler_status_detail()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            (None, None)
         }
     }
 }
@@ -740,6 +854,10 @@ pub fn fourcc_string(value: u32) -> String {
 }
 
 impl RendererBackend for MetalRenderer {
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        MetalRenderer::upscaler_status_detail(self)
+    }
+
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
         match surface {
             PlatformSurface::Metal(handle) => unsafe {
@@ -853,7 +971,8 @@ impl RendererBackend for MetalRenderer {
                 "Metal renderer received a non-VideoToolbox hardware payload".to_string(),
             )
         })?;
-        let imported = self.import_player_frame(decoded)?;
+        let mut imported = self.import_player_frame(decoded)?;
+        imported.set_measured_scene_avg(frame.scene_avg_nits);
         if !decoded.is_videotoolbox() {
             self.software_upload_counter = self.software_upload_counter.wrapping_add(1);
         }
@@ -1079,9 +1198,15 @@ impl RendererBackend for MetalRenderer {
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let active_output_mode = self.output_mode.resolve_for_source(false);
         let extended = attached && active_output_mode.is_edr();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        let is_hdr10_pq = attached && self.inner.is_hdr10_pq();
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        let is_hdr10_pq = false;
         OutputRuntimeStatus {
             requested_mode: self.output_mode,
-            active_encoding: if extended {
+            active_encoding: if is_hdr10_pq {
+                ActiveOutputEncoding::Hdr10Pq
+            } else if extended {
                 ActiveOutputEncoding::AppleEdr
             } else {
                 ActiveOutputEncoding::SdrSrgb
@@ -1093,17 +1218,19 @@ impl RendererBackend for MetalRenderer {
             },
             native_data_space: -1,
             requested_headroom: self.output_mode.headroom(),
-            active_headroom: if extended {
+            active_headroom: if is_hdr10_pq {
+                10_000.0 / 203.0
+            } else if extended {
                 active_output_mode.headroom()
             } else {
                 1.0
             },
             active_headroom_known: attached,
-            extended_linear_active: extended,
+            extended_linear_active: extended && !is_hdr10_pq,
             fallback_reason: OutputFallbackReason::None,
             fallback_count: 0,
             data_space_failures: 0,
-            headroom_updates: 0,
+            headroom_updates: stats.headroom_updates,
             extended_linear_frames: stats.edr_rendered_frames,
         }
     }
@@ -1116,6 +1243,72 @@ impl RendererBackend for MetalRenderer {
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
             let _ = mode;
+        }
+    }
+
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.set_custom_upscaler_model(model);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let _ = model;
+        }
+    }
+
+    fn supported_upscalers(&self) -> crate::renderer::pipeline::UpscalerCapabilities {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.supported_upscalers()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            crate::renderer::pipeline::UpscalerCapabilities::default()
+        }
+    }
+
+    fn set_post_process_shader(
+        &mut self,
+        shader: Option<std::sync::Arc<crate::renderer::post_process::PostProcessShader>>,
+    ) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.set_post_process_shader(shader);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let _ = shader;
+        }
+    }
+
+    fn post_process_status(&self) -> crate::renderer::post_process::PostProcessRuntimeInfo {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.post_process_status()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            crate::renderer::post_process::PostProcessRuntimeInfo::default()
+        }
+    }
+
+    /// Caches the display headroom the host resolved on the main thread.
+    ///
+    /// `MetalRendererImpl::select_output_mode_for_source` runs on the render
+    /// thread and must not query AppKit, so the host owns the `NSView` /
+    /// `NSScreen` lookup and pushes the result here.
+    fn set_output_headroom(&mut self, headroom: f32, known: bool) {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            self.inner.set_output_headroom(headroom, known);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let _ = (headroom, known);
         }
     }
 }
@@ -1346,6 +1539,7 @@ mod tests {
             ColorRange::Limited,
             MatrixCoefficients::Bt709,
             None,
+            None,
         );
 
         assert_eq!(frame.source_color().range, ColorRange::Full);
@@ -1372,6 +1566,7 @@ mod tests {
             ColorRange::Limited,
             MatrixCoefficients::Bt2020NonConstantLuminance,
             Some(metadata),
+            None,
         );
 
         assert_eq!(frame.source_color().hdr_metadata, Some(metadata));

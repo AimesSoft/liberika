@@ -1,8 +1,8 @@
-# Erika Danmaku Perf Lab
+# liberika Danmaku Perf Lab
 
 [中文](README.zh.md) | [English](README.md) | [日本語](README.ja.md)
 
-Erika の制御された弾幕パフォーマンス計測ハーネスです。NipaPlay から意図的に独立させてあり、弾幕密度、viewport size、media time、video decode、trace output を Flutter/UI のノイズなしで変えられます。
+liberika の制御された弾幕パフォーマンス計測ハーネスです。NipaPlay から意図的に独立させてあり、弾幕密度、viewport size、media time、video decode、trace output を Flutter/UI のノイズなしで変えられます。
 
 ## Synthetic danmaku load
 

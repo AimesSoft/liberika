@@ -9,7 +9,31 @@ use erika::renderer::wgpu_artcnn::{
 const WIDTH: u32 = 128;
 const HEIGHT: u32 = 72;
 
+fn retain_test_graphics_runtime() {
+    // These tests construct wgpu directly and bypass liberika's renderer setup.
+    // WSL D3D12 registers TLS destructors that outlive Vulkan/EGL teardown.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if std::path::Path::new("/dev/dxg").exists() {
+        static RETAIN: std::sync::Once = std::sync::Once::new();
+        RETAIN.call_once(|| {
+            for library in [
+                c"/usr/lib/wsl/lib/libd3d12core.so",
+                c"/usr/lib/wsl/lib/libdxcore.so",
+            ] {
+                // SAFETY: known WSL runtime libraries, retained until exit.
+                unsafe {
+                    libc::dlopen(
+                        library.as_ptr(),
+                        libc::RTLD_LAZY | libc::RTLD_LOCAL | libc::RTLD_NODELETE,
+                    );
+                }
+            }
+        });
+    }
+}
+
 fn request_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    retain_test_graphics_runtime();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         // The emulator's ranchu Vulkan debug-utils implementation dereferences
@@ -40,6 +64,7 @@ fn request_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
 }
 
 fn request_gles_webgl2_device() -> Option<(wgpu::Adapter, wgpu::Device)> {
+    retain_test_graphics_runtime();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::GL,
         flags: wgpu::InstanceFlags::from_build_config() | wgpu::InstanceFlags::DISCARD_HAL_LABELS,
@@ -309,7 +334,10 @@ fn check_model(mode: LumaUpscalerMode, input_bytes: &[u8], expected_bytes: &[u8]
         &mut upscaler,
         &device,
         &queue,
-        WgpuArtCnnInput::PlanarLuma { view: &luma_view },
+        WgpuArtCnnInput::PlanarLuma {
+            view: &luma_view,
+            p010_le_bytes: false,
+        },
         1,
     );
 
@@ -326,7 +354,10 @@ fn check_model(mode: LumaUpscalerMode, input_bytes: &[u8], expected_bytes: &[u8]
         &mut upscaler,
         &device,
         &queue,
-        WgpuArtCnnInput::PlanarLuma { view: &luma_view },
+        WgpuArtCnnInput::PlanarLuma {
+            view: &luma_view,
+            p010_le_bytes: false,
+        },
         1,
     );
     assert!(cached.cache_hit);
@@ -395,7 +426,10 @@ fn nonlinear_rgb_conv0_matches_planar_luma_and_deferred_failure_invalidates_cach
         &mut upscaler,
         &device,
         &queue,
-        WgpuArtCnnInput::PlanarLuma { view: &luma_view },
+        WgpuArtCnnInput::PlanarLuma {
+            view: &luma_view,
+            p010_le_bytes: false,
+        },
         10,
     );
     let planar = readback_packed(&device, &queue, &planar.texture);
@@ -499,6 +533,92 @@ fn nonlinear_rgb_conv0_matches_planar_luma_and_deferred_failure_invalidates_cach
         12,
     );
     assert!(!rebuilt.cache_hit, "invalidated token must be recomputed");
+}
+
+#[test]
+fn p010_byte_pair_luma_matches_float_input() {
+    let Some((adapter, device, queue)) = request_device() else {
+        return;
+    };
+    let mut upscaler = WgpuArtCnn::new(&adapter, &device);
+    if !upscaler.capability().supported {
+        return;
+    }
+    upscaler
+        .set_mode(&device, LumaUpscalerMode::ArtCnnC4F16)
+        .unwrap();
+    let words: Vec<u16> = (0..WIDTH * HEIGHT)
+        .map(|i| ((64 + i * 13 % 877) as u16) << 6)
+        .collect();
+    let packed: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let reference: Vec<u8> = words
+        .iter()
+        .flat_map(|word| (*word as f32 / 65535.0).to_le_bytes())
+        .collect();
+    let make = |format, data: &[u8], stride| {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("P010 ArtCNN regression input"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(HEIGHT),
+            },
+            texture.size(),
+        );
+        texture
+    };
+    let float_texture = make(wgpu::TextureFormat::R32Float, &reference, WIDTH * 4);
+    let bytes_texture = make(wgpu::TextureFormat::Rg8Unorm, &packed, WIDTH * 2);
+    let float_view = float_texture.create_view(&Default::default());
+    let bytes_view = bytes_texture.create_view(&Default::default());
+    let expected = encode_once(
+        &mut upscaler,
+        &device,
+        &queue,
+        WgpuArtCnnInput::PlanarLuma {
+            view: &float_view,
+            p010_le_bytes: false,
+        },
+        90,
+    );
+    let expected = readback_packed(&device, &queue, &expected.texture);
+    let actual = encode_once(
+        &mut upscaler,
+        &device,
+        &queue,
+        WgpuArtCnnInput::PlanarLuma {
+            view: &bytes_view,
+            p010_le_bytes: true,
+        },
+        91,
+    );
+    let actual = readback_packed(&device, &queue, &actual.texture);
+    let error = compare(&actual, &expected);
+    assert!(
+        error.max < 0.002,
+        "P010 byte reconstruction changed ArtCNN output: {}",
+        error.max
+    );
 }
 
 #[test]
