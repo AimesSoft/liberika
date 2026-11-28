@@ -6032,6 +6032,36 @@ mod tests {
     }
 
     #[test]
+    fn dxgi_hdr10_metadata_preserves_decoded_subnit_mastering_peak() {
+        use crate::ffmpeg::{DecoderBackend, DecoderOutputFrame, Demuxer};
+        use crate::renderer::VideoFramePayload;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/software/av1-subnit.ivf");
+        let mut demuxer = Demuxer::open_path(path).unwrap();
+        let mut decoder = demuxer.open_decoder(0).unwrap();
+        let packet = demuxer.read_packet().unwrap().unwrap();
+        decoder.send_packet(&packet).unwrap();
+        decoder.send_eof().unwrap();
+        let DecoderOutputFrame::Frame(frame) = decoder.receive_frame().unwrap() else {
+            panic!("expected the PQ fixture's frame");
+        };
+        let player_frame = PlayerVideoFrame {
+            frame: VideoFramePayload::from_decoded(frame).unwrap(),
+            decode_backend: DecoderBackend::Software,
+            pts: None,
+            media_time: Duration::ZERO,
+            late_by: None,
+            generation: 0,
+            scene_avg_nits: None,
+        };
+
+        let metadata = dxgi_hdr10_metadata(source_color_for_frame(&player_frame));
+        // DXGI encodes the fixture's 0.5 nit mastering peak in whole nits.
+        assert_eq!(metadata.MaxMasteringLuminance, 1);
+    }
+
+    #[test]
     fn dxgi_hdr10_metadata_uses_source_mastering_values() {
         let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
             .hdr_metadata(Some(crate::renderer::pipeline::HdrMetadata::new(

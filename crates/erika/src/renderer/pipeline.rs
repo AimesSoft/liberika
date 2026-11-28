@@ -22,8 +22,16 @@ impl HdrMetadata {
         }
     }
 
+    // A sub-nit mastering peak can disable PQ tone mapping on SDR output.
+    // Keep the decoded value available for metadata queries and HDR10 passthrough.
+    fn mastering_peak_for_tone_mapping(self) -> Option<f32> {
+        self.mastering_display?
+            .max_luminance_nits
+            .filter(|peak| peak.is_finite() && *peak >= 1.0)
+    }
+
     pub fn nominal_peak_nits(self) -> Option<f32> {
-        let mastering = self.mastering_display.and_then(|m| m.max_luminance_nits());
+        let mastering = self.mastering_peak_for_tone_mapping();
         let cll = self
             .content_light
             .and_then(|c| c.max_content_light_level_nits());
@@ -1628,9 +1636,14 @@ fn build_graph(
 fn static_source_peak_nits(source: &SourceColorState) -> f32 {
     source
         .hdr_metadata
-        .and_then(|hdr| hdr.mastering_display)
-        .and_then(|mastering| mastering.max_luminance_nits)
-        .filter(|peak| peak.is_finite() && *peak > 0.0)
+        .and_then(|hdr| {
+            if source.dovi.is_some_and(|rpu| rpu.source_max_pq != 0) {
+                // dovi() already stored the converted static L0 peak here.
+                hdr.mastering_display?.max_luminance_nits()
+            } else {
+                hdr.mastering_peak_for_tone_mapping()
+            }
+        })
         .unwrap_or(source.nominal_peak_nits)
 }
 
@@ -2826,25 +2839,28 @@ mod tests {
     }
 
     #[test]
-    fn hdr_metadata_falls_back_to_max_cll_when_mastering_peak_is_missing() {
-        let metadata = HdrMetadata::new(
-            Some(MasteringDisplayMetadata {
-                display_primaries: None,
-                white_point: None,
-                min_luminance_nits: Some(0.005),
-                max_luminance_nits: None,
-            }),
-            Some(ContentLightMetadata {
-                max_content_light_level_nits: 4000,
-                max_frame_average_light_level_nits: 450,
-            }),
-        );
+    fn hdr_metadata_falls_back_to_max_cll_when_mastering_peak_is_unusable() {
+        for peak in [None, Some(0.5)] {
+            let metadata = HdrMetadata::new(
+                Some(MasteringDisplayMetadata {
+                    display_primaries: None,
+                    white_point: None,
+                    min_luminance_nits: Some(0.005),
+                    max_luminance_nits: peak,
+                }),
+                Some(ContentLightMetadata {
+                    max_content_light_level_nits: 4000,
+                    max_frame_average_light_level_nits: 450,
+                }),
+            );
 
-        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
-            .hdr_metadata(Some(metadata));
+            let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+                .hdr_metadata(Some(metadata));
 
-        assert_eq!(metadata.nominal_peak_nits(), Some(4000.0));
-        assert_eq!(source.nominal_peak_nits, 4000.0);
+            assert_eq!(metadata.nominal_peak_nits(), Some(4000.0));
+            assert_eq!(source.nominal_peak_nits, 4000.0);
+            assert_eq!(static_source_peak_nits(&source), 4000.0);
+        }
     }
 
     #[test]
