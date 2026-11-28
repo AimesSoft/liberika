@@ -70,6 +70,8 @@ coreaudio-rs.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ash = "0.38.0"
+windows-core = "0.62.2"
+windows-version = "0.1.7"
 windows = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Direct3D",
@@ -111,6 +113,3 @@ objc2-quartz-core.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dev-dependencies]
 objc2.workspace = true
 objc2-metal.workspace = true
-
-[target.'cfg(target_os = "windows")'.dev-dependencies]
-windows-core = "0.62.2"
