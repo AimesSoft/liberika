@@ -60,7 +60,7 @@ if(NOT "$ENV{ERIKA_FORCE_SOURCE_BUILD}" STREQUAL "1")
     "${ERIKA_PREBUILT_DIR}/erika-capi-openharmony-arm64/lib/liberika_capi.so"
   )
   set(ERIKA_PREBUILT_URL
-    "https://github.com/AimesSoft/Erika/releases/download/${ERIKA_PREBUILT_TAG}/erika-capi-openharmony-arm64.zip"
+    "https://github.com/AimesSoft/liberika/releases/download/${ERIKA_PREBUILT_TAG}/erika-capi-openharmony-arm64.zip"
   )
 
   if(EXISTS "${ERIKA_PREBUILT_ZIP}")
@@ -162,7 +162,7 @@ if(NOT ERIKA_USE_PREBUILT)
       "${CMAKE_COMMAND}" -E env
         "OHOS_NDK_HOME=${OHOS_SDK_NATIVE}"
         "${CARGO_EXECUTABLE}" run -q -p xtask --
-        deps build --profile lgpl --target "${ERIKA_TARGET}"
+        deps build --all --profile lgpl --target "${ERIKA_TARGET}"
     COMMAND
       "${CMAKE_COMMAND}" -E env
         "ERIKA_NATIVE_PROFILE=lgpl"
@@ -176,7 +176,7 @@ if(NOT ERIKA_USE_PREBUILT)
         "AR_aarch64_unknown_linux_ohos=${OHOS_LLVM_BIN}/llvm-ar"
         "${CARGO_EXECUTABLE}" build -p erika_capi
         --target "${ERIKA_TARGET}" --release
-        --no-default-features --features wgpu
+        --no-default-features --features libass,wgpu
     WORKING_DIRECTORY "${ERIKA_ROOT}"
     DEPENDS ${ERIKA_RUST_SOURCES}
     COMMENT "Building Erika OpenHarmony runtime"

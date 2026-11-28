@@ -1,4 +1,4 @@
-# Erika Danmaku Perf Lab
+# liberika Danmaku Perf Lab
 
 Controlled danmaku performance harness for Erika. This is intentionally outside
 NipaPlay so danmaku density, viewport size, media time, video decode, and trace

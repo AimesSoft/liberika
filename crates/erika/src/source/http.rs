@@ -14,6 +14,124 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Result, SourceError};
 
+/// One open's optional retry capability. It never cancels healthy network I/O.
+/// Commit and cancellation are serialized; sealed handles cannot affect playback.
+#[derive(Clone, Debug, Default)]
+pub struct ColdOpenCancellation(Arc<Mutex<ColdOpenState>>);
+
+/// An already reserved open capability. This deliberately has no Clone
+/// implementation and cannot be constructed outside the cancellation factory.
+#[derive(Debug)]
+pub struct ClaimedColdOpenCancellation(ColdOpenCancellation);
+
+impl ClaimedColdOpenCancellation {
+    pub(crate) fn into_inner(self) -> ColdOpenCancellation {
+        self.0
+    }
+}
+
+#[derive(Debug, Default)]
+struct ColdOpenState {
+    used: bool,
+    cancelled: bool,
+    sealed: bool,
+    claimed: bool,
+    metadata_backoff: bool,
+    source: Option<SourceCancellation>,
+}
+
+impl ColdOpenCancellation {
+    /// Reserve this one-shot capability before touching a presenter. Two opens
+    /// must never bind the same capability to different sources.
+    pub fn claim(&self) -> Option<ClaimedColdOpenCancellation> {
+        let mut state = self.0.lock().unwrap();
+        if state.used || state.sealed {
+            return None;
+        }
+        state.used = true;
+        Some(ClaimedColdOpenCancellation(self.clone()))
+    }
+
+    pub fn cancel(&self) {
+        let mut state = self.0.lock().unwrap();
+        if !state.sealed {
+            state.cancelled = true;
+            if state.claimed || state.metadata_backoff {
+                state.claimed = true;
+                if let Some(source) = &state.source {
+                    source.cancel();
+                }
+            }
+        }
+    }
+
+    /// Seal success or failure before publication. Later cancellation is harmless.
+    pub fn finish(&self) -> bool {
+        let mut state = self.0.lock().unwrap();
+        state.sealed = true;
+        state.source = None;
+        !state.cancelled || !state.claimed
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        let state = self.0.lock().unwrap();
+        state.cancelled && state.claimed
+    }
+
+    pub(super) fn bind_source(&self, source: SourceCancellation) {
+        self.0.lock().unwrap().source = Some(source);
+    }
+
+    /// Expose only the existing metadata sleep to cancellation, without
+    /// consuming the later media GET's one-shot retry capability.
+    pub(super) async fn metadata_backoff(&self, duration: Duration) -> Result<()> {
+        struct Window<'a> {
+            state: &'a Mutex<ColdOpenState>,
+        }
+        impl Drop for Window<'_> {
+            fn drop(&mut self) {
+                self.state.lock().unwrap().metadata_backoff = false;
+            }
+        }
+        let window = {
+            let mut state = self.0.lock().unwrap();
+            if state.sealed || state.claimed {
+                None
+            } else if state.cancelled {
+                state.claimed = true;
+                if let Some(source) = &state.source {
+                    source.cancel();
+                }
+                return Err(SourceError::Cancelled);
+            } else {
+                state.metadata_backoff = true;
+                Some(Window { state: &self.0 })
+            }
+        };
+        tokio::time::sleep(duration).await;
+        drop(window);
+        Ok(())
+    }
+
+    pub(super) async fn wait(&self, duration: Duration) -> Result<()> {
+        {
+            let mut state = self.0.lock().unwrap();
+            if state.sealed || state.claimed {
+                return Err(SourceError::Http("cold-open retry unavailable".into()));
+            }
+            state.claimed = true;
+            if state.cancelled {
+                if let Some(source) = &state.source {
+                    source.cancel();
+                }
+                return Err(SourceError::Cancelled);
+            }
+        }
+        tokio::time::sleep(duration).await;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SourceCancellation(Arc<Mutex<CancellationState>>);
 
@@ -80,6 +198,7 @@ impl SourceCancellation {
 pub(super) struct HttpIo {
     pub(super) client: reqwest::Client,
     pub(super) cancellation: SourceCancellation,
+    pub(super) cold_open: Option<ColdOpenCancellation>,
 }
 
 impl HttpIo {
@@ -87,6 +206,7 @@ impl HttpIo {
         Self {
             client: shared_client().clone(),
             cancellation: SourceCancellation::default(),
+            cold_open: None,
         }
     }
 
@@ -94,6 +214,7 @@ impl HttpIo {
         Self {
             client: self.client.clone(),
             cancellation: self.cancellation.child(),
+            cold_open: None,
         }
     }
 

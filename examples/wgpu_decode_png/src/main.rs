@@ -1,4 +1,4 @@
-//! Decodes a video frame with Erika (software path) and renders it through the
+//! Decodes a video frame with liberika (software path) and renders it through the
 //! wgpu backend's `upload_player_frame` -> `render_current_offscreen` path, writing
 //! the result to a PNG. End-to-end proof that wgpu renders real decoded frames.
 //!

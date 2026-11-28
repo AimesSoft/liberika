@@ -1,0 +1,16 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=256) in;
+void main() {
+    uint i=gl_GlobalInvocationID.x+gl_GlobalInvocationID.y*gl_NumWorkGroups.x*256;
+    if(p.core.z==0) {
+        if(i>=2*p.core.x) return;
+        uint v=i*747796405u+2891336453u;
+        v=((v>>((v>>28)+4))^v)*277803737u;
+        features[i]=float16_t(unpackHalf2x16(v^(v>>22)).x);
+    } else {
+        if(i>=p.core.x) return;
+        features[i]=features[i+p.core.x];
+    }
+}

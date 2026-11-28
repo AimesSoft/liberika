@@ -1,4 +1,4 @@
-//! Erika danmaku outline profiles and raster quantization.
+//! liberika danmaku outline profiles and raster quantization.
 //!
 //! Layout and rendering must use the same resolved width so collision bounds
 //! match the glyphs drawn on screen. Keep every profile tuning constant here.
@@ -15,7 +15,7 @@ const MAX_RASTER_RADIUS_PX: f32 = 16.0;
 /// Resolves the public outline profile to a physical-pixel width.
 ///
 /// Profiles are 0 = off, 1 = fine, 2 = normal, and 3 = thick; values above 3
-/// clamp to thick. Normal and thick reproduce the widths Erika's former
+/// clamp to thick. Normal and thick reproduce the widths liberika's former
 /// continuous multiplier produced at 1.0 and 2.0, so a host that used to send
 /// `outline_width: 1.0` must now send `2.0` to keep the same stroke.
 pub(super) fn resolve_width_px(font_size: f32, profile: f32) -> f32 {

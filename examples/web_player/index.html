@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  /><link rel="icon" href="data:," /><title>liberika Web 播放器</title>
+  <style>
+    body {
+      margin: 0;
+      background: #12151b;
+      color: #e9edf5;
+      font: 15px system-ui;
+    }
+    main {
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 20px;
+    }
+    h1 {
+      font-size: 24px;
+    }
+    canvas {
+      width: 100%;
+      height: 62vh;
+      display: block;
+      background: #000;
+      border-radius: 12px;
+    }
+    section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin: 16px 0;
+    }
+    button,
+    label.file {
+      background: #283349;
+      border: 0;
+      border-radius: 7px;
+      color: inherit;
+      padding: 9px 13px;
+      cursor: pointer;
+    }
+    input[type="file"] {
+      display: none;
+    }
+    input[type="range"] {
+      accent-color: #9caaff;
+    }
+    #seek {
+      flex: 1;
+      min-width: 200px;
+    }
+    #status {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: #adb9ce;
+      font: 13px ui-monospace;
+    }
+    select {
+      background: #283349;
+      color: white;
+      border: 0;
+      padding: 8px;
+      max-width: 220px;
+    }
+  </style>
+  <main>
+    <h1>liberika Web 播放器</h1>
+    <section>
+      <label class="file"
+        >打开视频<input
+          id="file"
+          type="file"
+          accept="video/*,.mkv,.mp4,.webm" /></label
+      ><label class="file"
+        >载入弹幕<input id="comments" type="file" accept=".xml,.json" /></label
+      ><label class="file"
+        >载入字幕<input
+          id="subs"
+          type="file"
+          accept=".ass,.ssa,.srt,.vtt" /></label
+      ><label class="file"
+        >超分模型<input
+          id="srmodel"
+          type="file"
+          accept=".esr,.glsl,.hook" /></label
+      ><span id="filename"></span>
+    </section>
+    <canvas id="video"></canvas>
+    <section>
+      <button id="play">播放</button
+      ><input
+        id="seek"
+        type="range"
+        min="0"
+        max="100"
+        value="0"
+        step="0.01"
+      /><span id="time">0:00</span
+      ><label
+        >音量
+        <input id="volume" type="range" min="0" max="1" value="1" step="0.01"
+      /></label>
+    </section>
+    <section>
+      <label
+        >弹幕不透明度
+        <input
+          id="opacity"
+          type="range"
+          min="0"
+          max="1"
+          value="1"
+          step="0.01" /></label
+      ><label
+        >字号
+        <input id="size" type="range" min="12" max="70" value="30" /></label
+      ><label><input id="hd" type="checkbox" checked />高清弹幕</label
+      ><label><input id="subhd" type="checkbox" checked />高清字幕</label
+      ><select id="tracks">
+        <option value="-1">关闭字幕</option>
+      </select
+      ><select id="upscaler">
+        <option value="off">超分：关闭</option>
+        <option value="fsr1">超分：FSR 1.0</option>
+        <option value="anime4k_s">超分：Anime4K S</option>
+        <option value="anime4k_m">超分：Anime4K M</option>
+        <option value="anime4k_l">超分：Anime4K L</option>
+        <option value="anime4k_vl">超分：Anime4K VL</option>
+        <option value="anime4k_ul">超分：Anime4K UL</option>
+        <option value="anime4k_denoise_m">超分：Anime4K Denoise M</option>
+        <option value="artcnn_c4f16">超分：ArtCNN C4F16</option>
+        <option value="artcnn_c4f16_ds">超分：ArtCNN C4F16 DS</option>
+        <option value="artcnn_c4f16_dn">超分：ArtCNN C4F16 DN</option>
+        <option value="artcnn_c4f32">超分：ArtCNN C4F32</option>
+        <option value="custom">超分：自定义模型</option>
+      </select>
+    </section>
+    <p id="status">正在初始化…</p>
+  </main>
+  <script type="module">
+    import { Player } from "./index.js";
+    const $ = (id) => document.getElementById(id),
+      status = $("status");
+    let summary = "";
+    try {
+      const player = (window.player = await Player.create({
+        canvas: $("video"),
+      }));
+      $("upscaler").disabled = player.renderer !== "webgpu";
+      status.textContent =
+        `渲染后端：${player.renderer} · 请选择本地视频；也可以使用 ?src=URL 打开支持 Range 的远程文件。`;
+      player.addEventListener(
+        "error",
+        (e) => (status.textContent = String(e.detail)),
+      );
+      player.addEventListener("loaded", (e) => {
+        const i = e.detail;
+        summary = `${i.backend} (${i.renderer}) · ${i.decoder} · ${Math.round(i.duration)} 秒`;
+        $("seek").max = i.duration;
+        $("tracks").replaceChildren(new Option("关闭字幕", "-1"));
+        for (const t of i.tracks.filter(
+          (t) => t.type === "subtitle" && ["ass", "ssa"].includes(t.codec),
+        ))
+          $("tracks").add(
+            new Option(t.name || `${t.language} ${t.codec}`, t.id),
+          );
+        $("tracks").value = i.subtitleTrack ?? -1;
+        status.textContent = summary;
+      });
+      player.addEventListener("stats", (e) => {
+        const s = e.detail;
+        const sr =
+          s.upscaler && s.upscaler.mode !== "off"
+            ? ` · 超分 ${s.upscaler.mode} (${s.upscaler.backend}${s.upscaler.halfFloat ? "/f16" : "/f32"}, ${s.upscaler.upscaledFrames} 帧)`
+            : "";
+        status.textContent = `${summary}\n视频解码 ${s.decodedVideo} 帧 · 绘制 ${s.rendered} 帧 · 弹幕字形 ${s.glyphs} · 图集上传 ${s.atlasUploads} 次${sr}`;
+      });
+      player.addEventListener("timeupdate", (e) => {
+        if (document.activeElement !== $("seek")) $("seek").value = e.detail;
+        $("time").textContent =
+          `${Math.floor(e.detail / 60)}:${String(Math.floor(e.detail) % 60).padStart(2, "0")}`;
+      });
+      player.addEventListener("play", () => ($("play").textContent = "暂停"));
+      player.addEventListener("pause", () => ($("play").textContent = "播放"));
+      const safe = (fn) => async (e) => {
+        try {
+          await fn(e);
+        } catch (error) {
+          status.textContent = String(error);
+        }
+      };
+      $("file").onchange = safe(async () => {
+        const f = $("file").files[0];
+        if (f) {
+          $("filename").textContent = f.name;
+          await player.open(f);
+        }
+      });
+      $("play").onclick = safe(() =>
+        player.playing ? player.pause() : player.play(),
+      );
+      $("seek").onchange = safe(() => player.seek(Number($("seek").value)));
+      $("volume").oninput = () => player.setVolume(Number($("volume").value));
+      $("comments").onchange = safe(async () =>
+        player.addDanmaku(await $("comments").files[0].text()),
+      );
+      $("subs").onchange = safe(async () =>
+        player.addSubtitle(await $("subs").files[0].text()),
+      );
+      $("opacity").oninput = safe(() =>
+        player.configureDanmaku({ opacity: Number($("opacity").value) }),
+      );
+      $("size").oninput = safe(() =>
+        player.configureDanmaku({ fontSize: Number($("size").value) }),
+      );
+      $("hd").onchange = safe(() =>
+        player.configureDanmaku({ supersampling: $("hd").checked }),
+      );
+      $("subhd").onchange = safe(() =>
+        player.configureSubtitles({ supersampling: $("subhd").checked }),
+      );
+      $("tracks").onchange = safe(() =>
+        player.selectSubtitle(Number($("tracks").value)),
+      );
+      $("upscaler").onchange = safe(() =>
+        player.setUpscaler($("upscaler").value),
+      );
+      $("srmodel").onchange = safe(async () => {
+        const f = $("srmodel").files[0];
+        if (!f) return;
+        await player.loadUpscalerModel(f.name, await f.arrayBuffer());
+        $("upscaler").value = "custom";
+        await player.setUpscaler("custom");
+      });
+      const src = new URL(location.href).searchParams.get("src");
+      if (src) await player.open(new URL(src, location.href).href);
+      window.addEventListener("pagehide", () => player.destroy());
+    } catch (e) {
+      status.textContent = String(e);
+    }
+  </script>
+</html>

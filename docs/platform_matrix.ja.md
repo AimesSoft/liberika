@@ -1,0 +1,74 @@
+# liberika プラットフォーム機能一覧
+
+> [中文](platform_matrix.zh.md) · [English](platform_matrix.md) · [日本語](platform_matrix.ja.md)
+
+以下は 0.3.8 を基準としたプラットフォームです。ブラウザバックエンドは Erika Web に組み込まれ、npm パッケージと Release の独立した Web アーカイブで配布しており、[オンラインデモ](https://liberika.aimes-soft.com/demo/)もあります。Linux の機能は実験的ですが、0.3.7 以降の Release は Ubuntu 22.04 で構築した x64 / ARM64 × bundled / system の 4 種類を提供します。
+
+| プラットフォーム | 最低バージョン | デコード / 描画 | 音声 | 配布とビルド |
+|---|---|---|---|---|
+| macOS | 11 | VideoToolbox / ソフトウェア + Metal | CoreAudio | arm64、x64、universal；Flutter / SwiftPM |
+| iOS | 13 | VideoToolbox / ソフトウェア + Metal | AudioQueue | 実機とシミュレータの XCFramework；Flutter / SwiftPM |
+| tvOS | 13 | VideoToolbox / ソフトウェア + Metal | AudioQueue | 実機とシミュレータの XCFramework；Flutter / SwiftPM |
+| Windows | 10 | D3D11VA / ソフトウェア + D3D11 | WASAPI | x64 / ARM64；Flutter |
+| Android | 8 / API 26 | MediaCodec / ソフトウェア + wgpu | AAudio | 4 ABI；Flutter |
+| OpenHarmony | API 18 | AVCodec / ソフトウェア + wgpu | OHAudio | arm64；Flutter / ArkTS OHPM |
+| Linux（実験的） | glibc 2.35；system は FFmpeg 8 共有ライブラリも必要 | NVDEC / VA-API / ソフトウェア + wgpu | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system；Rust / C ABI / Flutter |
+| ブラウザ | HTTPS / localhost、WebCodecs 動画・音声、OffscreenCanvas、WebGL2、Web Audio | WebCodecs + WebGL2 / Canvas | Web Audio | npm `@aimessoft/liberika-web`、Release アーカイブ、または JS / WASM ソースビルド |
+
+ネイティブプラットフォームは C ABI Presenter を提供し、ブラウザは JavaScript / TypeScript の `Player` を使用します。ハードウェアデコードの可否はコーデック、デバイス、ドライバに依存し、ブラウザのコーデック設定は実行時に対応を確認します。
+
+## ブラウザ再生
+
+FFmpeg WASM がコンテナを分離し、libass が MKV 内の ASS/SSA と添付フォントを使って字幕を描画し、Rust DFM エンジンが弾幕を描画します。字幕と弾幕は再生クロックと WebGL2 コンポジタを共有し、それぞれ 2 倍のスーパーサンプリングを使用できます。外部 ASS/SSA、SRT、WebVTT 字幕に対応します。サーバーは元ファイルを HTTP Range で提供します。
+
+出力は SDR で、音声と動画は WebCodecs がデコードします。HDR/EDR、Dolby Vision、ArtCNN、ビットマップ字幕、内蔵非 ASS 字幕の変換は未移植です。要件、制限、ビルドとデプロイの詳細は [ブラウザガイド](web.md) を参照してください。
+
+## 動画サーフェスと HDR
+
+| プラットフォーム | ネイティブ表示 | Flutter テクスチャと合成 |
+|---|---|---|
+| Apple | EDR 対応 CAMetalLayer | macOS の IOSurface / Metal テクスチャで Flutter のクリッピングとフィルタを利用可能 |
+| Windows | HDR10 対応 HWND / D3D11。透過動画には DirectComposition を利用可能 | 共有 D3D11 SDR テクスチャ。overlay ブレンドはネイティブレイヤーに切り替わる |
+| Android | SDR は TextureView。scRGB は SurfaceView、Vulkan、FP16 / data space のネゴシエーションを使用 | TextureView 互換パスは SDR |
+| OpenHarmony | OHNativeWindow、wgpu / AVCodec、OHNativeBuffer インポート | Flutter 外部テクスチャ |
+| Linux | X11 / Wayland。Wayland ではネイティブ動画レイヤーを利用可能 | RGBA SDR テクスチャは読み戻しが必要。ネイティブレイヤーは透明な Flutter UI の下に配置 |
+
+Android scRGB と Linux HDR には、それぞれのエンコーディングをサポートするサーフェスが必要です。`erika_presenter_get_output_status` で現在の出力、ヘッドルーム、フォールバック理由を確認できます。
+
+Linux VA-API → Vulkan の直接インポートと WSL GPU コピーパスは実験的です。テクスチャ合成、ハードウェアデコード、デコードフレームのゼロコピーは別のパスです。選択方法は [Linux ガイド](linux.ja.md) を参照してください。
+
+## フォールバックフォント
+
+字幕と弾幕は足りない文字にまずシステムフォントを使い、読めないときに内蔵の Droid Sans
+Fallback を使います。
+
+| プラットフォーム | システムフォント |
+|---|---|
+| macOS、Windows、Linux | そのまま読みます |
+| Android | `fonts.xml` の言語一覧から選びます |
+| OpenHarmony | そのまま読みます |
+| iOS、tvOS | 内蔵フォントを使います。iOS 18 以降と tvOS の中国語フォント `PingFangUI.ttc` のアウトラインは `hvgl` テーブルにあり、FreeType では読めません |
+| ブラウザ | 読めません。wasm の内蔵フォントか、`fallbackFont` で渡したものを使います |
+
+`embedded-fallback-font` を無効にすると内蔵フォントはなくなります。iOS と tvOS では中国語が
+表示されず、ブラウザのページにはフォントを渡す必要があります。
+
+## カラー絵文字
+
+弾幕の絵文字はフォント自身の色で描きます。字幕は単色です（libass はアルファビットマップ
+しか出力しません）。
+
+| プラットフォーム | 絵文字フォント |
+|---|---|
+| macOS、iOS、tvOS | Apple Color Emoji |
+| Windows | Segoe UI Emoji |
+| Linux | Noto Color Emoji などシステムのカラーフォント。なければ単色 |
+| Android | Noto Color Emoji。国旗は `NotoColorEmojiFlags` |
+| OpenHarmony | システムのカラーフォント |
+| ブラウザ | ブラウザ自身のフォント |
+
+## CI と検証
+
+ネイティブビルドは 7 プラットフォームを対象とします。Linux workflow は両 CPU・両モードをネイティブビルドし、Xvfb・Mesa・PulseAudio でソースと展開済み Release の再生を確認し、クリーンな Ubuntu 22.04 で実行依存と ABI 基準を検証します。Flutter consumer workflow は従来の 6 プラットフォームを確認し、Linux は `ERIKA_LIBRARY_DIR` による手動組み込みです。HDR 出力とプラットフォームのライフサイクルに関する実機検証は [検証記録](investigations/README.md) にあります。
+
+Web workflow は完全な WASM パッケージをビルドし、独立プレーヤーの回帰テストを実行します。Erika Web は macOS の Chrome 155.0.8059.85 で H.264/AAC/ASS・添付フォント付き MKV、VP9/Opus WebM、2,000 件の弾幕、リアルタイム設定、チャプター、スクリーンショット、プレーヤーのライフサイクルを検証しました。Safari 27.0.1 の HEVC Main 10 / Opus / ASS 再生と seek も手動検証済みです。[ブラウザーガイド](web.ja.md)を参照してください。Firefox は未検証です。

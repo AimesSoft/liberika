@@ -1,5 +1,5 @@
 {
-  description = "Erika Rust-first media player development shell";
+  description = "liberika Rust-first media player development shell";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

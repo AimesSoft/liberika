@@ -1,7 +1,7 @@
 # Issue #125：资源生命周期修复与验证
 
 验证环境：2026-09-28，macOS / Apple Silicon，分支基于提交 `ca40a95`。
-问题链接：https://github.com/AimesSoft/Erika/issues/125
+问题链接：https://github.com/AimesSoft/liberika/issues/125
 
 ## 结论
 
@@ -104,7 +104,7 @@ cargo test -p erika --test media_lifecycle -- --nocapture --test-threads=1
 cargo test -p erika --test media_lifecycle memory_probe -- --ignored --nocapture --test-threads=1
 ```
 
-当前结果：Erika 681 项库测试、C API 41 项测试全部通过；生命周期集成测试 4 项通过、
+当前结果：liberika 681 项库测试、C API 41 项测试全部通过；生命周期集成测试 4 项通过、
 1 项手动内存实验通过。
 
 ## 边界

@@ -1,0 +1,12 @@
+[package]
+name = "playback_rate_check"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+erika = { path = "../../crates/erika", default-features = false }
+crossbeam-channel.workspace = true
+serde_json.workspace = true

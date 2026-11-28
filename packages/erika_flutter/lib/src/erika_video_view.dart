@@ -35,7 +35,7 @@ bool get _supportsFlutterTextureVideoView =>
 /// that needs Flutter clipping or color filters.
 ///
 /// This is the compatibility surface. Full-player Apple hosts should usually
-/// prefer [ErikaWindowOverlayVideoView] so Erika owns the native Metal video
+/// prefer [ErikaWindowOverlayVideoView] so liberika owns the native Metal video
 /// plane outside Flutter's platform-view compositor.
 /// Linux uses an SDR texture here. On Wayland, explicitly use
 /// [ErikaWindowOverlayVideoView] for a native plane below transparent Flutter UI.

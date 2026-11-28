@@ -1,11 +1,18 @@
-# Erika Architecture
+# liberika Architecture
 
 [中文](architecture.zh.md) | [English](architecture.md) | [日本語](architecture.ja.md)
 
-Erika is an embeddable Rust media playback library. Host applications call into
+liberika is an embeddable Rust media playback library. Host applications call into
 the engine through the Rust API, a C ABI (`erika_capi`), or Flutter bindings
 (`erika_flutter`). Video frames, subtitles, and danmaku stay inside the engine
 and are composited in the renderer — they do not flow through the host.
+
+The [browser backend](web.md) exposes a JavaScript/TypeScript `Player`. It
+reuses Rust danmaku and patched libass in WASM, with FFmpeg container demuxing
+and MKV font attachments; WebCodecs, Web Audio and WebGL2 provide decoding,
+the media clock and final composition. Erika Web uses this path. The overview
+below describes the native runtime; the browser guide documents its Worker
+pipeline and lifecycle.
 
 ## System Overview
 
@@ -154,10 +161,10 @@ clock recovery does not replace independent audio delivery.
 - **Parsing**: SRT, WebVTT, ASS timeline parsing. Embedded and external subtitle
   tracks. External tracks can be added/removed at runtime.
 - **libass renderer**: Statically linked, enabled by default. Accepts ASS
-  scripts, calls `ass_render_frame`, imports alpha planes into Erika's overlay
+  scripts, calls `ass_render_frame`, imports alpha planes into liberika's overlay
   system. macOS uses the CoreText font provider and Windows DirectWrite; every
   other target runs without a system font provider (the vendored libass build
-  disables fontconfig), so Erika's bundled Droid Sans Fallback — registered as
+  disables fontconfig), so liberika's bundled Droid Sans Fallback — registered as
   an in-memory font on all platforms — is the family libass resolves by default.
 - **Subtitle style**: A custom font family and font file, colours, metrics
   (size, outline, shadow, blur, spacing, scale), attributes, border style,
@@ -200,20 +207,14 @@ The primary renderer for Apple platforms:
   over absolute nits.
 - SDR output (`BGRA8Unorm`) and Apple EDR output (`RGBA16Float` with EDR
   headroom).
-- Neural luma upscaler (`LumaUpscalerMode`): ArtCNN C4F16/C4F16 DS/C4F32 2x doublers
-  as Metal compute passes on the decoded Y plane, encoded on the same command
-  buffer ahead of the render pass (`renderer/metal/upscaler.rs`). Chroma keeps
-  its source resolution. Engages only when the video is displayed above source
-  resolution; the network output is cached per decoded frame so repeated vsync
-  ticks of the same frame skip the compute. Weights are converted from the
-  upstream ONNX releases (`assets/artcnn/`) and verified against onnxruntime
-  references (`tests/artcnn_upscaler.rs`). Two kernel backends: a
-  `simdgroup_matrix` matmul implementation (default on Apple Silicon) and a
-  scalar texture fallback; both are compiled on a background thread, so
-  playback continues unscaled until the pipelines are ready.
-  Blob validation, model layout, execution policy, and frame-token caching live
-  in the backend-neutral `renderer/artcnn.rs` module and are also consumed by
-  the wgpu implementation.
+- Luma upscaler (`LumaUpscalerMode`): network modes (ArtCNN, Anime4K, `Custom`)
+  run as Metal compute on the decoded Y plane, encoded on the same command
+  buffer ahead of the render pass. Chroma keeps its source resolution. The
+  network output is cached per decoded frame so repeated vsync ticks of the
+  same frame skip the compute. Kernels compile on a background thread, so
+  playback continues unscaled until they are ready. Engine families (generic
+  network engine, FSR1, MetalFX spatial, VideoToolbox) are listed under
+  [Super resolution](#super-resolution).
 - Subtitle overlay: RGBA plane upload and alpha blending.
 - Danmaku: Instanced glyph quad drawing from atlas (shadow → outline → fill passes).
 - Presentation layout preserves source aspect ratio.
@@ -226,11 +227,12 @@ The native renderer for Windows (`renderer/d3d11.rs`):
   are shared into the render device, no CPU round-trip.
 - YCbCr sampling and color space conversion (HLSL shaders), same pipeline model
   as Metal.
-- Tiled ArtCNN C4F16/C4F16 DS/C4F32 compute on the zero-copy D3D11VA luma plane, using
-  bounded RGBA16F feature arrays, a source-sized packed DepthToSpace output,
-  and decoded-frame caching. It runs only when the presented video is larger
-  than its source and reports an explicit `Inactive` fallback below feature
-  level 11.0 or after an optional compute failure.
+- Neural and platform super resolution on the zero-copy D3D11VA luma plane
+  through generated compute kernels, with measured backend selection, RTX/Intel
+  VSR and optional Vulkan / D3D12 accelerator sidecars (see
+  [Super resolution](#super-resolution)). The upscaled luma is a plain 2x
+  `R16_FLOAT` texture, cached per decoded frame. A mode that cannot run reports
+  an explicit `Inactive` fallback with the reason.
 - HDR10 output via an `R10G10B10A2_UNORM` swapchain with `DXGI_HDR_METADATA_HDR10`,
   with SDR (`BGRA8`) fallback.
 - Subtitle overlay alpha-atlas upload and blending; instanced danmaku glyph
@@ -253,11 +255,15 @@ Second renderer backend for portability:
   decoder callback context is still alive; presenter and GPU recovery never
   retain the decoder-owned AVFrame.
 - Color space conversion, tone mapping (same pipeline model as Metal).
-- Tiled ArtCNN C4F16/C4F16 DS/C4F32 compute (`renderer/wgpu_artcnn.rs`) with bounded
-  feature textures and a source-sized packed DepthToSpace output. It accepts
-  both native luma planes and Android's converted nonlinear RGB texture while
-  preserving chroma as `rgb + (Y_sr - Y)`. GLES 3.0 reports `Inactive` with a
-  structured `native_luma_sampling` fallback instead of attempting compute.
+- Super resolution (`renderer/wgpu_sr.rs` with `renderer/sr/wgsl.rs`): every
+  network mode (ArtCNN 1-7, Anime4K 16-25, `Custom`) plus `Fsr1`, from the same
+  `SrModel` IR as D3D11 and Metal. Network output is a source-sized
+  `Rgba16Float` texture holding the packed 2x2 depth-to-space quad; FSR1 writes
+  a presented-size luma texture. It accepts both native luma planes and
+  Android's converted nonlinear RGB texture while preserving chroma as
+  `rgb + (Y_sr - Y)`. `PlatformVideo` and `MetalFxSpatial` are `Inactive`.
+  GLES 3.0 reports `Inactive` with a structured `native_luma_sampling`
+  fallback instead of attempting compute.
 - Subtitle/danmaku compositing, frame capture, and offscreen headless tests.
   Capture always renders to an SDR RGBA8 target, including when the display
   surface is extended-linear, so screenshots never expose unclamped scRGB
@@ -292,10 +298,68 @@ Second renderer backend for portability:
 - A Flutter extended-linear player with no explicit `edrHeadroom` uses a 4x
   content ceiling while passing `0` to the `SurfaceView` as system-auto desired
   headroom. An explicit value becomes the content ceiling and, on API 35, the
-  per-`SurfaceView` desired headroom; Erika never changes the global window.
+  per-`SurfaceView` desired headroom; liberika never changes the global window.
 - Emulator/non-HDR coverage verifies the explicit SDR fallback path. Active
   `Rgba16Float + SCRGB_LINEAR` presentation still requires acceptance on an
   API 35 HDR device before it is described as device-validated.
+
+### Super resolution
+
+Network modes share a backend-neutral network IR in `crates/erika/src/renderer/sr/`:
+
+- `model.rs`: the network graph (convolutions on a 1-channel luma input with
+  per-input kernels, CReLU transforms, residuals, ReLU/SiLU/PReLU, and a 2x
+  depth-to-space head) and its `.esr` serialization.
+- `catalog.rs` maps a mode to its bundled model; `mpv.rs` imports Anime4K /
+  FSRCNNX mpv hook shaders (weights only, shader code is never executed);
+  `artcnn.rs` lowers the legacy ArtCNN blobs; `fsr1.rs` is FSR 1.0.
+- `fold.rs` applies exact optimizations: merging sibling passes and
+  algebraically folding linear layers into their neighbours (ArtCNN conv0 into
+  conv1 and conv5 into conv6) with nine border-class weight sets so the image
+  border stays exact. ArtCNN needs 26-33% fewer MACs.
+- `reference.rs` is the CPU oracle every GPU backend is tested against.
+- `hlsl.rs` is the D3D11 kernel generator; `wgsl.rs` is the wgpu one.
+
+Direct3D 11 (`renderer/d3d11_sr.rs` and neighbours):
+
+- `d3d11_sr.rs` is the executor: per-layer kernels with constant-buffer weights
+  at literal indices, groupshared input staging, a fused epilogue/head, one ring
+  dispatch for the border, tiling within a 192 MB budget, background FXC
+  compilation with a disk cache, and timestamp queries for GPU time.
+- `d3d11_sr_select.rs` measures scalar against the accelerators per network and
+  chooses the fastest; it emits the `luma_upscaler_backend_selection` diagnostic
+  event with the measured candidates.
+- `d3d11_vsr.rs` drives NVIDIA RTX Video / Intel VSR through the video
+  processor vendor extension.
+- Sidecars: `d3d11_vk_coopmat.rs` with `vk_coopmat/` (Vulkan cooperative
+  matrix) and `d3d11_d3d12_linalg.rs` with `d3d12_linalg/` (opt-in D3D12 SM 6.10
+  preview).
+
+The Windows Vulkan sidecar loads `vulkan-1.dll` by its absolute system-directory
+path, independent of DLLs bundled by the host application. A missing runtime or
+unsupported device uses the existing scalar D3D11 compute path. The
+`luma_upscaler_vulkan_init` diagnostics identify the loader path and adapter/driver;
+`luma_upscaler_backend_selection` includes unavailable-accelerator reasons alongside
+the measured candidates. Acceleration remains capability-based across GPU vendors.
+
+Metal (`renderer/metal/`): `upscaler_network.rs` is the generic network engine
+(Metal 4 tensor ops on M5/A19, `simdgroup_matrix`, or scalar), with
+`upscaler_fsr.rs`, `upscaler_metalfx.rs` and `upscaler_vt.rs` for FSR1, MetalFX
+spatial and VideoToolbox; `upscaler.rs` handles selection and status. The
+hand-written ArtCNN kernels remain selectable with `ERIKA_SR_BACKEND=legacy`.
+
+wgpu (`renderer/wgpu_sr.rs`, `renderer/sr/wgsl.rs`): `wgsl.rs` generates WGSL
+from the `SrModel` IR and is validated against `reference.rs`; `wgpu_sr.rs` is
+the executor, with background compilation (`Building` status), tiling within a
+scratch budget and a model cache. Generated kernels use workgroup-memory input
+staging, a fused bias/residual/activation epilogue and depth-to-space head, one
+perimeter dispatch for the border classes of folded layers, fp16 where the
+adapter has `SHADER_F16`, and 16x16 cooperative matrices on Vulkan adapters that
+advertise them (NVIDIA). Per-adapter defaults are refined by timing a few kernel
+variants on the first frames (cached in-process; `ERIKA_WGPU_SR_AUTOTUNE=0`
+disables). FSR1 is a fused EASU+RCAS kernel. `wgpu_artcnn.rs` (the legacy
+ArtCNN executor) remains only for regression comparisons.
+
 
 ### Render Pipeline
 
@@ -332,7 +396,7 @@ The canonical header is `crates/erika_capi/include/erika.h`; package copies must
 `erika_capi` exposes two handle families:
 
 - **`ErikaHandle`** — player control and event polling. The host owns rendering.
-- **`ErikaPresenterHandle`** — Erika owns the full stack. The host provides a
+- **`ErikaPresenterHandle`** — liberika owns the full stack. The host provides a
   surface and calls `render_tick`.
 
 Covers: create/destroy, open/play/pause/stop/seek, track selection, subtitle

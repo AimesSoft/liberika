@@ -1,4 +1,4 @@
-//! Headless media export jobs.
+//! Headless media export jobs: animated GIFs and single frames.
 //!
 //! This module deliberately does not construct a [`crate::Player`] or attach a
 //! presentation surface. It owns a separate demuxer, software decoder and
@@ -17,7 +17,8 @@ use libc::EAGAIN;
 use thiserror::Error;
 
 use crate::core::{MediaRequest, TrackKind};
-use crate::ffmpeg::{DecoderOutputFrame, Demuxer, Frame, StreamSelection};
+use crate::export_color::SdrRendition;
+use crate::ffmpeg::{Decoder, DecoderOutputFrame, Demuxer, Frame, StreamSelection};
 use crate::source::source_from_uri_with_options;
 
 const AVERROR_EOF: i32 = -541_478_725;
@@ -102,6 +103,17 @@ pub enum ExportError {
     Ffmpeg(String),
     #[error("I/O error for {path}: {message}")]
     Io { path: PathBuf, message: String },
+    #[error("invalid frame export options: {0}")]
+    InvalidFrameOptions(String),
+    #[error("position {position:?} is not before the end of the media ({duration:?})")]
+    PastEnd {
+        position: Duration,
+        duration: Duration,
+    },
+    #[error("the video has no picture at or after the start")]
+    NoPicture,
+    #[error("PNG encoding failed: {0}")]
+    Png(String),
 }
 
 pub type Result<T> = std::result::Result<T, ExportError>;
@@ -256,6 +268,600 @@ pub fn export_gif(options: &GifExportOptions) -> Result<GifExportResult> {
         frame_count,
         file_size,
     })
+}
+
+/// What [`export_frame`] returns the picture as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameExportFormat {
+    /// RGBA8 rows of exactly `width * 4` bytes, top row first; alpha is 255.
+    Rgba,
+    /// A PNG file (8-bit RGB).
+    Png,
+}
+
+impl FrameExportFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rgba => "rgba",
+            Self::Png => "png",
+        }
+    }
+}
+
+/// Largest side [`export_frame`] accepts as a bound.
+pub const FRAME_EXPORT_MAX_DIMENSION: u32 = 16_384;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameExportOptions {
+    pub input: MediaRequest,
+    /// The picture shown at this media time is exported.
+    pub position: Duration,
+    /// Largest output width in pixels; zero leaves the width unbounded.
+    pub max_width: u32,
+    /// Largest output height in pixels; zero leaves the height unbounded.
+    /// The picture keeps the video's display aspect ratio and is never larger
+    /// than the video, so two zeros give the video's own size.
+    pub max_height: u32,
+    pub format: FrameExportFormat,
+}
+
+impl FrameExportOptions {
+    pub fn new(input_uri: impl Into<String>, position: Duration) -> Self {
+        Self {
+            input: MediaRequest::new(input_uri),
+            position,
+            max_width: 0,
+            max_height: 0,
+            format: FrameExportFormat::Png,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub format: FrameExportFormat,
+    /// RGBA rows or a PNG file, as `format` says.
+    pub data: Vec<u8>,
+    /// Presentation time of the picture: the last frame at or before the
+    /// requested position (the first frame when the position precedes it).
+    pub timestamp: Duration,
+    /// The video's decoded size.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// The media's duration when the container reports one.
+    pub duration: Option<Duration>,
+    /// The source is HDR (PQ, HLG or Dolby Vision) and the picture was tone
+    /// mapped to SDR the way Erika renders it on an SDR display.
+    pub tone_mapped: bool,
+}
+
+/// Decodes the picture shown at `options.position` and returns it scaled to
+/// the requested bounds as RGBA or PNG.
+///
+/// A one-picture [`FrameExportSession`]: it opens its own demuxer and a
+/// (multi-threaded) software decoder, seeks to the keyframe before the
+/// position and decodes forward, so it never touches a player. The operation
+/// is synchronous; UI integrations must call it on a worker thread or isolate.
+pub fn export_frame(options: &FrameExportOptions) -> Result<ExportedFrame> {
+    validate_frame_options(options)?;
+    let mut session = FrameExportSession::open(&options.input)?;
+    session.frame_at(&FrameRequest {
+        position: options.position,
+        max_width: options.max_width,
+        max_height: options.max_height,
+        format: options.format,
+    })
+}
+
+/// One picture asked of a [`FrameExportSession`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRequest {
+    /// The picture shown at this media time is exported.
+    pub position: Duration,
+    /// Bounds as in [`FrameExportOptions`]: zero leaves a side unbounded; the
+    /// display aspect ratio is kept and the picture is never enlarged.
+    pub max_width: u32,
+    pub max_height: u32,
+    pub format: FrameExportFormat,
+}
+
+impl FrameRequest {
+    pub fn new(position: Duration) -> Self {
+        Self {
+            position,
+            max_width: 0,
+            max_height: 0,
+            format: FrameExportFormat::Png,
+        }
+    }
+}
+
+/// Counters of a [`FrameExportSession`] since it opened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameExportStats {
+    /// Pictures returned.
+    pub pictures: u64,
+    /// Seeks to a keyframe, the first picture's included.
+    pub seeks: u64,
+    /// Video frames the decoder produced.
+    pub decoded_frames: u64,
+}
+
+/// Without a seek index, a request at most this far past the decoded
+/// position is reached by decoding forward. The keyframe interval seen in the
+/// stream raises it.
+const FORWARD_DECODE_WITHOUT_INDEX: f64 = 2.0;
+
+/// A keyframe at most this far (seconds) past the decoded position is
+/// decoded through rather than sought to.
+const KEYFRAME_SEEK_MARGIN: f64 = 0.5;
+
+/// Pictures of one media taken one after another with one demuxer and one
+/// decoder.
+///
+/// [`export_frame`] opens the media, seeks to the keyframe before the
+/// position and decodes up to it for every picture. A session keeps both
+/// open: a request after the previous one continues decoding from where the
+/// decoder is when no keyframe lies between that point and the request (the
+/// demuxer's seek index tells; without one, when it is close), and seeks
+/// otherwise, backwards included. Requests in ascending time order are the
+/// cheapest. A session is used by one thread at a time; it is `Send`.
+pub struct FrameExportSession {
+    demuxer: Demuxer,
+    decoder: Decoder,
+    duration: Option<Duration>,
+    source_width: u32,
+    source_height: u32,
+    /// The newest decoded frame at or before the previous request.
+    shown: Option<Frame>,
+    /// The decoded frame after `shown`, when the decoder produced it.
+    ahead: Option<Frame>,
+    /// The decoder continues from a seek (false when opened or after an
+    /// error, so the next request seeks).
+    positioned: bool,
+    eof_sent: bool,
+    finished: bool,
+    /// Presentation time of the last keyframe packet read, and the longest
+    /// interval between two keyframes seen.
+    last_keyframe: Option<f64>,
+    keyframe_interval: f64,
+    stats: FrameExportStats,
+}
+
+impl FrameExportSession {
+    /// Opens the media's first video stream with a multi-threaded software
+    /// decoder.
+    pub fn open(input: &MediaRequest) -> Result<Self> {
+        if input.uri.is_empty() {
+            return Err(ExportError::InvalidFrameOptions(
+                "input URI must not be empty".to_string(),
+            ));
+        }
+        let source = source_from_uri_with_options(
+            &input.uri,
+            input.source_hint,
+            input.http_headers.clone(),
+            input.http_read_ahead_bytes,
+            None,
+        )
+        .map_err(|error| ExportError::Source(error.to_string()))?;
+        let mut demuxer = Demuxer::open_source(source).map_err(ffmpeg_error)?;
+        let duration = demuxer.probe().duration;
+        let video = demuxer
+            .probe()
+            .video
+            .first()
+            .cloned()
+            .ok_or(ExportError::NoVideoTrack)?;
+        let stream_index = i32::try_from(video.track_id)
+            .map_err(|_| ExportError::Ffmpeg("video stream index exceeds i32".to_string()))?;
+        demuxer
+            .set_stream_selection(StreamSelection::only([stream_index]))
+            .map_err(ffmpeg_error)?;
+        let decoder = Decoder::open_software_threaded(
+            demuxer
+                .codec_parameters(stream_index)
+                .map_err(ffmpeg_error)?,
+        )
+        .map_err(ffmpeg_error)?;
+        Ok(Self {
+            demuxer,
+            decoder,
+            duration,
+            source_width: video.params.width,
+            source_height: video.params.height,
+            shown: None,
+            ahead: None,
+            positioned: false,
+            eof_sent: false,
+            finished: false,
+            last_keyframe: None,
+            keyframe_interval: 0.0,
+            stats: FrameExportStats::default(),
+        })
+    }
+
+    /// The media's duration when the container reports one.
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration
+    }
+
+    /// The video stream's coded size as the container reports it.
+    pub fn video_size(&self) -> (u32, u32) {
+        (self.source_width, self.source_height)
+    }
+
+    pub fn stats(&self) -> FrameExportStats {
+        self.stats
+    }
+
+    /// The picture shown at `request.position`, scaled and encoded as asked.
+    pub fn frame_at(&mut self, request: &FrameRequest) -> Result<ExportedFrame> {
+        if request.max_width > FRAME_EXPORT_MAX_DIMENSION
+            || request.max_height > FRAME_EXPORT_MAX_DIMENSION
+        {
+            return Err(ExportError::InvalidFrameOptions(format!(
+                "width and height must not exceed {FRAME_EXPORT_MAX_DIMENSION}"
+            )));
+        }
+        if let Some(duration) = self.duration
+            && request.position >= duration
+        {
+            return Err(ExportError::PastEnd {
+                position: request.position,
+                duration,
+            });
+        }
+        // Half a millisecond absorbs time-base rounding of a frame exactly at
+        // the position.
+        let target = request.position.as_secs_f64() + 0.000_5;
+        let result = (|| {
+            if !self.continues_to(request.position, target) {
+                self.seek(request.position)?;
+            }
+            self.advance_to(target)?;
+            let picture = self.shown.as_ref().ok_or(ExportError::NoPicture)?;
+            render_picture(picture, request, self.duration)
+        })();
+        match result {
+            Ok(frame) => {
+                self.stats.pictures += 1;
+                Ok(frame)
+            }
+            Err(error) => {
+                // Start over from a seek next time.
+                self.positioned = false;
+                self.shown = None;
+                self.ahead = None;
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether decoding on from the current state reaches `target` at least
+    /// as cheaply as a seek.
+    fn continues_to(&self, position: Duration, target: f64) -> bool {
+        if !self.positioned {
+            return false;
+        }
+        let seconds = |frame: &Frame| frame.pts().map(|pts| pts.seconds());
+        if self
+            .shown
+            .as_ref()
+            .and_then(seconds)
+            .is_some_and(|shown| target < shown)
+        {
+            // Behind the picture already passed.
+            return false;
+        }
+        let Some(newest) = self
+            .ahead
+            .as_ref()
+            .or(self.shown.as_ref())
+            .and_then(seconds)
+        else {
+            return false;
+        };
+        if self.finished || target <= newest {
+            return true;
+        }
+        match self.demuxer.keyframe_at_or_before(position) {
+            // A keyframe well after the decoded position: seeking to it skips
+            // decoding everything before it. Just ahead, decoding the few
+            // frames up to it costs less than restarting the decoder.
+            Some(keyframe) => keyframe.as_secs_f64() <= newest + KEYFRAME_SEEK_MARGIN,
+            None => {
+                target - newest <= FORWARD_DECODE_WITHOUT_INDEX.max(self.keyframe_interval / 2.0)
+            }
+        }
+    }
+
+    fn seek(&mut self, position: Duration) -> Result<()> {
+        self.positioned = false;
+        self.shown = None;
+        self.ahead = None;
+        self.demuxer.seek(position).map_err(ffmpeg_error)?;
+        self.decoder.flush();
+        self.eof_sent = false;
+        self.finished = false;
+        self.last_keyframe = None;
+        self.positioned = true;
+        self.stats.seeks += 1;
+        Ok(())
+    }
+
+    /// Decodes until `shown` is the last frame at or before `target` (or the
+    /// first frame, when `target` precedes it).
+    fn advance_to(&mut self, target: f64) -> Result<()> {
+        let seconds = |frame: &Frame| frame.pts().map(|pts| pts.seconds());
+        loop {
+            if let Some(ahead_seconds) = self.ahead.as_ref().and_then(seconds) {
+                if ahead_seconds <= target {
+                    self.shown = self.ahead.take();
+                    continue;
+                }
+                if self.shown.is_none() {
+                    // The position precedes the first picture.
+                    self.shown = self.ahead.take();
+                }
+                return Ok(());
+            }
+            if self.finished {
+                return if self.shown.is_some() {
+                    Ok(())
+                } else {
+                    Err(ExportError::NoPicture)
+                };
+            }
+            match self.decoder.receive_frame().map_err(ffmpeg_error)? {
+                DecoderOutputFrame::Frame(frame) => {
+                    self.stats.decoded_frames += 1;
+                    if frame.pts().is_some() {
+                        self.ahead = Some(frame);
+                    }
+                }
+                DecoderOutputFrame::NeedMoreInput if self.eof_sent => self.finished = true,
+                DecoderOutputFrame::NeedMoreInput => {
+                    match self.demuxer.read_packet().map_err(ffmpeg_error)? {
+                        Some(packet) => {
+                            if packet.is_key()
+                                && let Some(pts) = packet.pts().map(|pts| pts.seconds())
+                            {
+                                if let Some(previous) = self.last_keyframe
+                                    && pts > previous
+                                {
+                                    self.keyframe_interval =
+                                        self.keyframe_interval.max(pts - previous);
+                                }
+                                self.last_keyframe = Some(pts);
+                            }
+                            self.decoder.send_packet(&packet).map_err(ffmpeg_error)?;
+                        }
+                        None => {
+                            self.decoder.send_eof().map_err(ffmpeg_error)?;
+                            self.eof_sent = true;
+                        }
+                    }
+                }
+                DecoderOutputFrame::EndOfStream => self.finished = true,
+            }
+        }
+    }
+}
+
+/// Scales (and for HDR sources tone maps) a decoded picture and encodes it.
+fn render_picture(
+    picture: &Frame,
+    request: &FrameRequest,
+    duration: Option<Duration>,
+) -> Result<ExportedFrame> {
+    let (width, height) = frame_output_size(picture, request.max_width, request.max_height)?;
+    let rendition = SdrRendition::for_frame(picture);
+    let rgba = match &rendition {
+        Some(rendition) => rendition
+            .render(picture, width, height)
+            .map_err(ExportError::Ffmpeg)?,
+        None => scale_frame_to_rgba(picture, width, height)?,
+    };
+    let data = match request.format {
+        FrameExportFormat::Rgba => rgba,
+        FrameExportFormat::Png => encode_png_rgb(&rgba, width, height)?,
+    };
+    Ok(ExportedFrame {
+        width,
+        height,
+        format: request.format,
+        data,
+        timestamp: picture
+            .pts()
+            .and_then(|pts| pts.as_duration())
+            .unwrap_or_default(),
+        source_width: picture.width(),
+        source_height: picture.height(),
+        duration,
+        tone_mapped: rendition.is_some(),
+    })
+}
+
+fn validate_frame_options(options: &FrameExportOptions) -> Result<()> {
+    if options.input.uri.is_empty() {
+        return Err(ExportError::InvalidFrameOptions(
+            "input URI must not be empty".to_string(),
+        ));
+    }
+    if options.max_width > FRAME_EXPORT_MAX_DIMENSION
+        || options.max_height > FRAME_EXPORT_MAX_DIMENSION
+    {
+        return Err(ExportError::InvalidFrameOptions(format!(
+            "width and height must not exceed {FRAME_EXPORT_MAX_DIMENSION}"
+        )));
+    }
+    Ok(())
+}
+
+/// The output size: the frame's display size (sample aspect ratio applied)
+/// fitted into the bounds, never enlarged.
+fn frame_output_size(frame: &Frame, max_width: u32, max_height: u32) -> Result<(u32, u32)> {
+    let (coded_width, coded_height) = (frame.width(), frame.height());
+    if coded_width == 0 || coded_height == 0 {
+        return Err(ExportError::Ffmpeg(
+            "decoded frame reported zero dimensions".to_string(),
+        ));
+    }
+    let aspect = unsafe { (*frame.as_ptr()).sample_aspect_ratio };
+    let display_width = if aspect.num > 0 && aspect.den > 0 && aspect.num != aspect.den {
+        (coded_width as f64 * aspect.num as f64 / aspect.den as f64).round()
+    } else {
+        coded_width as f64
+    };
+    Ok(fit_within(
+        display_width,
+        coded_height as f64,
+        max_width,
+        max_height,
+    ))
+}
+
+fn fit_within(width: f64, height: f64, max_width: u32, max_height: u32) -> (u32, u32) {
+    let mut scale = 1.0_f64;
+    if max_width > 0 {
+        scale = scale.min(max_width as f64 / width);
+    }
+    if max_height > 0 {
+        scale = scale.min(max_height as f64 / height);
+    }
+    (
+        ((width * scale).round() as u32).max(1),
+        ((height * scale).round() as u32).max(1),
+    )
+}
+
+/// Converts with swscale's frame API, which reads the source's colour space
+/// and range from the frame. An unlabelled YUV source is taken as BT.709
+/// when it is HD or larger and BT.601 otherwise, as players do.
+fn scale_frame_to_rgba(frame: &Frame, width: u32, height: u32) -> Result<Vec<u8>> {
+    let source = OwnedAvFrame::alloc()?;
+    let output = OwnedAvFrame::alloc()?;
+    let scaler = OwnedSwsContext::alloc()?;
+    unsafe {
+        check(
+            sys::av_frame_ref(source.0, frame.as_ptr()),
+            "av_frame_ref(frame export)",
+        )?;
+        let descriptor = sys::av_pix_fmt_desc_get((*source.0).format);
+        let rgb_source =
+            !descriptor.is_null() && (*descriptor).flags & sys::AV_PIX_FMT_FLAG_RGB as u64 != 0;
+        if !rgb_source {
+            if (*source.0).colorspace == sys::AVColorSpace_AVCOL_SPC_UNSPECIFIED {
+                (*source.0).colorspace = if (*source.0).width >= 1280 || (*source.0).height > 576 {
+                    sys::AVColorSpace_AVCOL_SPC_BT709
+                } else {
+                    sys::AVColorSpace_AVCOL_SPC_SMPTE170M
+                };
+            }
+            if (*source.0).color_range == sys::AVColorRange_AVCOL_RANGE_UNSPECIFIED {
+                (*source.0).color_range = sys::AVColorRange_AVCOL_RANGE_MPEG;
+            }
+        }
+        (*output.0).format = sys::AVPixelFormat_AV_PIX_FMT_RGBA;
+        (*output.0).width = width as i32;
+        (*output.0).height = height as i32;
+        (*output.0).color_range = sys::AVColorRange_AVCOL_RANGE_JPEG;
+        check(
+            sys::av_frame_get_buffer(output.0, 0),
+            "av_frame_get_buffer(frame export)",
+        )?;
+        (*scaler.0).flags = (sys::SwsFlags_SWS_BICUBIC
+            | sys::SwsFlags_SWS_ACCURATE_RND
+            | sys::SwsFlags_SWS_FULL_CHR_H_INT) as _;
+        // 0: one thread per core.
+        (*scaler.0).threads = 0;
+        check(
+            sys::sws_scale_frame(scaler.0, output.0, source.0),
+            "sws_scale_frame(frame export)",
+        )?;
+        let row_bytes = width as usize * 4;
+        let stride = (*output.0).linesize[0];
+        if stride < row_bytes as i32 {
+            return Err(ExportError::Ffmpeg(format!(
+                "RGBA output stride {stride} is shorter than a row of {row_bytes} bytes"
+            )));
+        }
+        let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+        let base = (*output.0).data[0];
+        for row in 0..height as usize {
+            rgba.extend_from_slice(std::slice::from_raw_parts(
+                base.add(row * stride as usize),
+                row_bytes,
+            ));
+        }
+        Ok(rgba)
+    }
+}
+
+fn encode_png_rgb(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let rgb: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect();
+    let mut encoded = Vec::new();
+    let mut encoder = png::Encoder::new(&mut encoded, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| ExportError::Png(error.to_string()))?;
+    writer
+        .write_image_data(&rgb)
+        .map_err(|error| ExportError::Png(error.to_string()))?;
+    writer
+        .finish()
+        .map_err(|error| ExportError::Png(error.to_string()))?;
+    Ok(encoded)
+}
+
+struct OwnedAvFrame(*mut sys::AVFrame);
+
+impl OwnedAvFrame {
+    fn alloc() -> Result<Self> {
+        let frame = unsafe { sys::av_frame_alloc() };
+        if frame.is_null() {
+            return Err(ExportError::Ffmpeg(
+                "av_frame_alloc returned null".to_string(),
+            ));
+        }
+        Ok(Self(frame))
+    }
+}
+
+impl Drop for OwnedAvFrame {
+    fn drop(&mut self) {
+        unsafe { sys::av_frame_free(&mut self.0) };
+    }
+}
+
+struct OwnedSwsContext(*mut sys::SwsContext);
+
+impl OwnedSwsContext {
+    fn alloc() -> Result<Self> {
+        let context = unsafe { sys::sws_alloc_context() };
+        if context.is_null() {
+            return Err(ExportError::Ffmpeg(
+                "sws_alloc_context returned null".to_string(),
+            ));
+        }
+        Ok(Self(context))
+    }
+}
+
+impl Drop for OwnedSwsContext {
+    fn drop(&mut self) {
+        unsafe { sys::sws_free_context(&mut self.0) };
+    }
 }
 
 fn validate_options(options: &GifExportOptions) -> Result<()> {
@@ -780,6 +1386,172 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("test directory should be created");
         directory
+    }
+
+    fn playback_fixture() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/playback/playback-fixture.mkv")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn frame_bounds_keep_the_aspect_ratio_and_never_enlarge() {
+        assert_eq!(fit_within(4096.0, 1744.0, 640, 640), (640, 273));
+        assert_eq!(fit_within(4096.0, 1744.0, 0, 360), (846, 360));
+        assert_eq!(fit_within(4096.0, 1744.0, 0, 0), (4096, 1744));
+        assert_eq!(fit_within(160.0, 90.0, 3840, 0), (160, 90));
+        assert_eq!(fit_within(90.0, 160.0, 64, 64), (36, 64));
+    }
+
+    #[test]
+    fn exports_the_frame_shown_at_a_position_as_png() {
+        let mut options = FrameExportOptions::new(playback_fixture(), Duration::from_millis(2_500));
+        options.max_width = 80;
+        let frame = export_frame(&options).unwrap();
+        assert_eq!((frame.width, frame.height), (80, 45));
+        assert_eq!((frame.source_width, frame.source_height), (160, 90));
+        assert_eq!(frame.format, FrameExportFormat::Png);
+        assert_eq!(frame.duration, Some(Duration::from_secs(8)));
+        // The last frame at or before 2.5 s (30 fps).
+        assert!(
+            frame.timestamp <= Duration::from_millis(2_500),
+            "{:?}",
+            frame.timestamp
+        );
+        assert!(
+            frame.timestamp > Duration::from_millis(2_450),
+            "{:?}",
+            frame.timestamp
+        );
+        let decoder = png::Decoder::new(std::io::Cursor::new(&frame.data));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (80, 45));
+        assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+    }
+
+    #[test]
+    fn exports_rgba_at_the_video_size_and_differs_between_times() {
+        let start = export_frame(&FrameExportOptions {
+            format: FrameExportFormat::Rgba,
+            ..FrameExportOptions::new(playback_fixture(), Duration::ZERO)
+        })
+        .unwrap();
+        assert_eq!((start.width, start.height), (160, 90));
+        assert_eq!(start.data.len(), 160 * 90 * 4);
+        assert!(start.data.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        let later = export_frame(&FrameExportOptions {
+            format: FrameExportFormat::Rgba,
+            ..FrameExportOptions::new(playback_fixture(), Duration::from_secs(6))
+        })
+        .unwrap();
+        assert!(later.timestamp > start.timestamp);
+        assert_ne!(start.data, later.data);
+    }
+
+    #[test]
+    fn frame_export_refuses_positions_past_the_end_and_oversized_bounds() {
+        let error = export_frame(&FrameExportOptions::new(
+            playback_fixture(),
+            Duration::from_secs(8),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, ExportError::PastEnd { .. }), "{error}");
+        let mut options = FrameExportOptions::new(playback_fixture(), Duration::ZERO);
+        options.max_width = FRAME_EXPORT_MAX_DIMENSION + 1;
+        assert!(matches!(
+            export_frame(&options).unwrap_err(),
+            ExportError::InvalidFrameOptions(_)
+        ));
+    }
+
+    fn single(position: Duration, format: FrameExportFormat) -> ExportedFrame {
+        export_frame(&FrameExportOptions {
+            format,
+            max_width: 64,
+            ..FrameExportOptions::new(playback_fixture(), position)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_session_decodes_forward_inside_a_keyframe_interval() {
+        // The fixture has a keyframe every second at 30 fps.
+        let mut session = FrameExportSession::open(&MediaRequest::new(playback_fixture())).unwrap();
+        assert_eq!(session.duration(), Some(Duration::from_secs(8)));
+        assert_eq!(session.video_size(), (160, 90));
+        for millis in (100..=900).step_by(100) {
+            let position = Duration::from_millis(millis);
+            let frame = session
+                .frame_at(&FrameRequest {
+                    max_width: 64,
+                    format: FrameExportFormat::Rgba,
+                    ..FrameRequest::new(position)
+                })
+                .unwrap();
+            let expected = single(position, FrameExportFormat::Rgba);
+            assert_eq!(frame.timestamp, expected.timestamp, "{millis} ms");
+            assert_eq!(frame.data, expected.data, "{millis} ms");
+            assert!(!frame.tone_mapped);
+        }
+        let stats = session.stats();
+        assert_eq!(stats.pictures, 9);
+        assert_eq!(stats.seeks, 1, "{stats:?}");
+        assert!(stats.decoded_frames < 9 * 10, "{stats:?}");
+    }
+
+    #[test]
+    fn a_session_seeks_past_keyframes_and_backwards_and_survives_errors() {
+        let mut session = FrameExportSession::open(&MediaRequest::new(playback_fixture())).unwrap();
+        let mut take = |millis: u64| {
+            session
+                .frame_at(&FrameRequest {
+                    max_width: 64,
+                    format: FrameExportFormat::Rgba,
+                    ..FrameRequest::new(Duration::from_millis(millis))
+                })
+                .map(|frame| (frame.timestamp, frame.data))
+        };
+        for millis in [500, 3_500, 3_600, 1_200, 1_200, 0] {
+            let expected = single(Duration::from_millis(millis), FrameExportFormat::Rgba);
+            assert_eq!(
+                take(millis).unwrap(),
+                (expected.timestamp, expected.data),
+                "{millis} ms"
+            );
+        }
+        assert!(matches!(take(9_000), Err(ExportError::PastEnd { .. })));
+        let expected = single(Duration::from_millis(7_990), FrameExportFormat::Rgba);
+        assert_eq!(take(7_990).unwrap(), (expected.timestamp, expected.data));
+        // 0.5 s; 3.5 s (keyframe at 3 s); 3.6 s forward; 1.2 s backwards;
+        // 1.2 s again; 0 backwards; 7.99 s (keyframe at 7 s).
+        assert_eq!(session.stats().seeks, 5, "{:?}", session.stats());
+        assert_eq!(session.stats().pictures, 7);
+    }
+
+    #[test]
+    fn decode_thread_override_parses_counts_and_auto() {
+        assert_eq!(crate::ffmpeg::software_video_decode_threads_from(None), 0);
+        assert_eq!(
+            crate::ffmpeg::software_video_decode_threads_from(Some("auto")),
+            0
+        );
+        assert_eq!(
+            crate::ffmpeg::software_video_decode_threads_from(Some(" 1 ")),
+            1
+        );
+        assert_eq!(
+            crate::ffmpeg::software_video_decode_threads_from(Some("8")),
+            8
+        );
+        assert_eq!(
+            crate::ffmpeg::software_video_decode_threads_from(Some("-3")),
+            0
+        );
+        assert_eq!(
+            crate::ffmpeg::software_video_decode_threads_from(Some("lots")),
+            0
+        );
     }
 
     #[test]

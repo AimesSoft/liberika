@@ -1,8 +1,8 @@
 [中文](../README.md) | [English](README.en.md) | [日本語](README.ja.md)
 
-# Erika
+# liberika
 
-> 「GOOD！私はErika、NipaPlayにおいてmdk、video player、libmpv、media kitに次ぐ5番目のプレイヤーカーネルです。」
+> 「GOOD！私はliberika、NipaPlayにおいてmdk、video player、libmpv、media kitに次ぐ5番目のプレイヤーカーネルです。」
 > 「あなたを数えても、プレイヤーカーネルは4つだけ！」
 
 **NipaPlay の自社開発再生コア。** Rust 実装、組み込み可能、デコードからレンダリングまで一手に引き受けます。
@@ -11,31 +11,76 @@
 > そして [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) は『ひぐらしのなく頃に』の古手梨花の口癖「にぱー☆」から——コミュニティではみんな「梨花」と呼んでいます。
 > 一方は表舞台のプレイヤー、もう一方は舞台裏のエンジン。同じ世界から生まれた、表裏一体の存在です。
 
-ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて Erika 内部で完結します。
+ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて liberika 内部で完結します。
 
-現在のリリースは **0.2.1** です。[ドキュメント一覧](../docs/README.md) からガイドを選べます。
+現在のリリースは **0.3.8** です。[ドキュメント一覧](../docs/README.ja.md) からガイドを選べます。
+
+**MKV 内の ASS 字幕と添付フォントを使って、ブラウザーで直接再生できます。**
+[オンラインデモを開く](https://liberika.aimes-soft.com/demo/)か、`npm install @aimessoft/liberika-web` を実行してください。
+現在のソースには [Web / WASM バックエンド](../docs/web.md) が含まれ、Erika Web に
+組み込み済みです。WebCodecs が映像・音声をデコードし、WASM の libass が字幕の
+フォント・配置・縁取り・エフェクトを描画します。Rust 弾幕と字幕は同じ再生クロックに
+従い、WebGL2 で合成されます。サイト独自の UI を維持したまま、サーバーは元ファイルを
+HTTP Range で配信でき、字幕の事前抽出や映像への焼き付けは不要です。
+
+0.3.8 では Windows D3D11 のスクリーンショット、HTTP ソースの応答検証と停滞からの復帰、
+キャンセル可能なオープン、ソフトウェアデコードのアップロードと字幕アトラスの高速化を追加しました。
+0.3.5–0.3.7 ではカラー Emoji 弾幕、組み込みフォントの選択、Bilibili mode 7 弾幕、Linux の線形
+dma-buf 出力、Linux x64 / ARM64 の各 bundled / system 計 4 種のビルド済みアーカイブを追加しています。変更と移行手順は
+[更新履歴](../CHANGELOG.ja.md)を参照してください。
 
 ## 機能
 
 - VideoToolbox、D3D11VA、MediaCodec、AVCodec によるハードウェアデコードとソフトウェアフォールバック。Linux は実験的に NVDEC / VA-API に対応。
-- Metal、D3D11、wgpu による映像・字幕・弾幕の合成、HDR/EDR、Dolby Vision マッピング、ArtCNN 輝度アップスケーリング。
+- Metal、D3D11、wgpu による映像・字幕・弾幕の合成、HDR/EDR、Dolby Vision マッピング、ArtCNN・Anime4K・FSR1 とプラットフォームの超解像（対応状況はデバイスと backend に依存）。
 - ローカルファイルと HTTP(S)、カスタムヘッダー、先読みとリワインドキャッシュ。
 - 音声マスタークロック、再生・一時停止・シーク・倍速、トラック切替と外部字幕。
 - Rust、C ABI、Flutter、SwiftPM、OpenHarmony ArkTS から組み込み可能。
+- ブラウザーの JavaScript / TypeScript 組み込み：MKV の分離、ASS 添付フォント、字幕・弾幕の統合合成と独立したスーパーサンプリング。
 
 ## 組み込み
 
 | ホスト | インストール / 入口 | ガイド |
 |---|---|---|
-| Flutter | `flutter pub add erika_flutter`（0.2.1） | [プラグイン](../packages/erika_flutter/README.ja.md) |
-| Swift / Apple | Xcode に `https://github.com/AimesSoft/ErikaSwift` を追加、0.2.1 以降 | [ErikaSwift](https://github.com/AimesSoft/ErikaSwift) |
-| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.md) |
+| ブラウザー / JavaScript / TypeScript | `npm install @aimessoft/liberika-web`、または `liberika-web-0.3.8.zip` | [Web 組み込み・配信](../docs/web.ja.md) |
+| Flutter | `flutter pub add erika_flutter`（0.3.8） | [プラグイン](../packages/erika_flutter/README.ja.md) |
+| Swift / Apple | Xcode に `https://github.com/AimesSoft/liberika-swift` を追加。公開済み SDK 最新版は 2026-11-26 時点で 0.3.8 | [liberika-swift](https://github.com/AimesSoft/liberika-swift) |
+| OpenHarmony / ArkTS | `ohpm install erika` | [ArkTS SDK](../packages/erika_ohos/README.ja.md) |
 | C / C++ | 同じバージョンの C ABI バンドルと `erika.h` | [ネイティブ組み込み](../docs/integration.ja.md) |
-| Rust | Git 依存を `v0.2.1` に固定 | [ビルド](../docs/building.ja.md) |
-| Linux | システム FFmpeg 8 とパッチ済み libass、ソースビルド | [Linux](../docs/linux.md) |
+| Rust | Git 依存を `v0.3.8` に固定 | [ビルド](../docs/building.ja.md) |
+| Linux | x64 / ARM64、bundled / system、glibc 2.35 基準 | [Linux](../docs/linux.md) |
 
-2026-10-02 時点の OHPM 公開版は 0.1.9、0.2.1 は審査に提出済みです。
-ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/Erika/releases/tag/v0.2.1) にあります。
+2026-11-26 時点の OHPM 公開最新バージョンは 0.3.8 です。
+ネイティブバンドルは [GitHub Releases](https://github.com/AimesSoft/liberika/releases/tag/v0.3.8) にあります。
+
+### ブラウザー
+
+```sh
+npm install @aimessoft/liberika-web
+```
+
+```js
+import { Player } from '@aimessoft/liberika-web';
+
+const player = await Player.create({ canvas });
+await player.open(fileOrURL);
+await player.play();
+```
+
+まず[オンラインデモ](https://liberika.aimes-soft.com/demo/)で試せます。デモは同じパッケージを npm CDN から読み込みます。
+Vite などのバンドラーは設定不要です。`@aimessoft/liberika-web-nofont` は約 6 MB の
+フォールバックフォントを含まず、ホストがフォントを提供します。
+Release の `liberika-web-0.3.8.zip` を展開して自分で配信するか、ソースからビルドすることもできます。
+
+```sh
+# 先に Emscripten、wasm-bindgen などのビルド依存を準備します。
+cargo run -p xtask -- web build
+python3 scripts/serve_web.py
+```
+
+音声・映像コーデックは
+ブラウザーの WebCodecs 対応範囲に依存します。依存、サンプル、Erika への組み込みは
+[ブラウザーガイド（英語）](../docs/web.md) を参照してください。
 
 ### Flutter
 
@@ -58,7 +103,7 @@ Windows HDR10 にはネイティブ映像サーフェスを使います。選択
 
 ```toml
 [dependencies]
-erika = { git = "https://github.com/AimesSoft/Erika", tag = "v0.2.1" }
+erika = { git = "https://github.com/AimesSoft/liberika", tag = "v0.3.8" }
 ```
 
 ```rust
@@ -73,6 +118,9 @@ player.play()?;
 はレンダリングと音声を担当します。C の入口は `ErikaHandle` と `ErikaPresenterHandle`、
 宣言は [erika.h](../crates/erika_capi/include/erika.h) にあります。
 
+Linux の Rust ホストでは `wgpu` と利用側 workspace のルート manifest の HAL パッチが
+必要です。ネイティブ依存、フォントライブラリ、構築設定は [Linux ガイド](../docs/linux.ja.md)を参照してください。
+
 ## プラットフォーム
 
 | プラットフォーム | デコード | レンダリング | 音声 | 配布 |
@@ -83,10 +131,12 @@ player.play()?;
 | Windows 10+ | D3D11VA / software | D3D11 | WASAPI | x64 / ARM64 バンドル、Flutter |
 | Android 8+ | MediaCodec / software | wgpu Vulkan / GLES | AAudio | 4 ABI バンドル、Flutter |
 | OpenHarmony API 18+ | AVCodec / software | wgpu | OHAudio | arm64 バンドル、Flutter、OHPM |
-| Linux（実験的） | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | Rust、C ABI、Flutter ソースビルド |
+| Linux（実験的） | NVDEC / VA-API / software | wgpu X11 / Wayland | PulseAudio / pipewire-pulse | x64 / ARM64 × bundled / system リリースビルド；Rust、C ABI、Flutter |
+| ブラウザー | WebCodecs | WebGL2 / Canvas | Web Audio | Release の Web archive または JS / WASM ソースビルド |
 
 サーフェスと HDR の対応は [プラットフォーム表](../docs/platform_matrix.zh.md) にまとめています。
-Web の再生バックエンドは未実装です。
+ブラウザー版は現在 SDR 出力で、Chrome で検証済みです。HTTPS または localhost、
+WebCodecs の映像・音声デコード、OffscreenCanvas、WebGL2、Web Audio が必要です。
 
 ## 開発
 
@@ -96,7 +146,7 @@ cargo run -p xtask -- deps build --all --profile lgpl
 cargo build -p erika_capi
 ```
 
-クロスビルドでは target triple を指定します。Linux はシステムライブラリを使います。
+クロスビルドでは target triple を指定します。Linux は `scripts/build_linux_release.sh` で両モードを Ubuntu 22.04 上で構築し、system は自分で導入した ABI 互換の FFmpeg 8 共有ライブラリも利用できます。
 [ビルド](../docs/building.ja.md)、[リリース](../docs/releasing.ja.md)、
 [開発者ガイド](../CONTRIBUTING.ja.md) に手順をまとめています。
 
@@ -109,8 +159,9 @@ cargo build -p erika_capi
 | `crates/erika_ffmpeg_sys` | FFmpeg bindings |
 | `packages/erika_flutter` | Flutter プラグイン |
 | `packages/erika_ohos` | OpenHarmony ArkTS SDK |
-| `examples` | ネイティブ、Flutter、ArkTS サンプル |
-| `xtask` | ネイティブ依存のビルド |
+| `packages/erika_web` | ブラウザー Player、Worker、WebGL2 合成と TypeScript 型 |
+| `examples` | ネイティブ、Flutter、ArkTS、ブラウザープレイヤーのサンプル |
+| `xtask` | ネイティブ依存と Web パッケージのビルド |
 | `docs` | ガイドと設計。過去の調査・検証記録は `investigations/` |
 
 変更履歴は [CHANGELOG](../CHANGELOG.md) にあります。

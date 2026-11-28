@@ -1,0 +1,52 @@
+{
+  "name": "@aimessoft/liberika-web",
+  "version": "0.0.0",
+  "description": "Play MKV in the browser with ASS subtitles, attached fonts and danmaku: WebCodecs, libass and a Rust danmaku engine in WASM",
+  "keywords": [
+    "video",
+    "player",
+    "mkv",
+    "matroska",
+    "ass",
+    "ssa",
+    "subtitles",
+    "libass",
+    "danmaku",
+    "webcodecs",
+    "wasm",
+    "webgl"
+  ],
+  "homepage": "https://github.com/AimesSoft/liberika/blob/main/docs/web.md",
+  "bugs": "https://github.com/AimesSoft/liberika/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AimesSoft/liberika.git",
+    "directory": "packages/erika_web"
+  },
+  "license": "MPL-2.0 AND LGPL-2.1-or-later",
+  "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    },
+    "./worker.js": "./worker.js",
+    "./erika_core_bg.wasm": "./erika_core_bg.wasm",
+    "./media.wasm": "./media.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "*.js",
+    "*.d.ts",
+    "*.wasm",
+    "WEB-GUIDE*.md",
+    "licenses/"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

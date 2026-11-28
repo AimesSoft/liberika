@@ -18,6 +18,9 @@ use std::{
 };
 use wgpu::util::DeviceExt;
 
+mod danmaku;
+use danmaku::{DanmakuDraws, DanmakuPipeline, DanmakuResources};
+
 #[cfg(target_os = "android")]
 use crate::android::{AndroidDataSpaceErrorKind, AndroidNativeWindow};
 use crate::core::ColorPrimaries;
@@ -34,9 +37,7 @@ use crate::core::{
     LumaUpscalerBackendStatus, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
     RendererBackend, RendererRuntimeStats, Result, SurfaceOutputCapabilities, WgpuSurfaceHandle,
 };
-use crate::danmaku::{
-    DanmakuAtlasUpdate, DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan,
-};
+use crate::danmaku::{DanmakuAtlasUpdate, DanmakuColorAtlas, DanmakuGlyphAtlas, DanmakuRenderPlan};
 use crate::ffmpeg::{DecoderBackend, PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 #[cfg(target_os = "android")]
@@ -57,10 +58,29 @@ use crate::renderer::output::{
     ActiveOutputEncoding, OutputDescription, OutputFallbackReason, OutputMode, OutputRuntimeStatus,
     OutputSurfaceFormat,
 };
-use crate::renderer::pipeline::{LumaUpscalerMode, SourceColorState, VideoRenderPipeline};
+use crate::renderer::pipeline::{
+    LumaUpscalerMode, SourceColorState, UpscalerCapabilities, VideoRenderPipeline,
+};
+use crate::renderer::post_process::{
+    PostProcessRuntimeInfo, PostProcessShader, PostProcessStage, PostProcessUniforms,
+};
+use crate::renderer::wgpu_post_process::WgpuPostProcess;
+
+/// Lightweight default capabilities reported on wgpu platforms before a
+/// `WgpuRenderer` adapter has been initialized. Once a renderer exists,
+/// [`RendererBackend::supported_upscalers`] reflects the probed adapter
+/// capabilities.
+pub fn probe_default_upscalers() -> UpscalerCapabilities {
+    UpscalerCapabilities {
+        modes: UpscalerCapabilities::bundled_portable_modes(),
+        supports_custom_network: true,
+        supports_post_process: true,
+    }
+}
 use crate::renderer::presentation::{PresentationLayout, PresentationRect};
-use crate::renderer::wgpu_artcnn::{
-    WgpuArtCnn, WgpuArtCnnInput, WgpuArtCnnInputKind, WgpuArtCnnStatus,
+use crate::renderer::wgpu_sr::{
+    Input as WgpuArtCnnInput, InputKind as WgpuArtCnnInputKind, Status as WgpuArtCnnStatus,
+    WgpuSr as WgpuArtCnn,
 };
 use crate::subtitle::AssColor;
 
@@ -261,8 +281,9 @@ impl OverlayUniforms {
         }
     }
 
-    fn alpha_atlas_rect(
-        color: [f32; 4],
+    /// An emoji from the premultiplied picture atlas, at `opacity`.
+    fn picture_rect(
+        opacity: f32,
         rect: [f32; 4],
         tex_rect: [f32; 4],
         viewport_w: u32,
@@ -272,9 +293,9 @@ impl OverlayUniforms {
             rect,
             tex_rect,
             viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
-            overlay_mode: 1,
+            overlay_mode: 2,
             output_encoding: 0,
-            color,
+            color: [1.0, 1.0, 1.0, opacity],
         }
     }
 
@@ -341,12 +362,6 @@ struct OverlayDraw {
     dynamic_offset: u32,
     _texture: wgpu::Texture,
     _uniform: wgpu::Buffer,
-}
-
-#[derive(Clone, Copy)]
-enum DanmakuAtlasTexture {
-    Fill,
-    Outline,
 }
 
 struct WgpuDanmakuAtlasCache {
@@ -549,6 +564,13 @@ pub struct WgpuRenderer {
         Option<std::result::Result<crate::renderer::linux_vulkan::LinuxVulkanInterop, String>>,
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     linux_import_failure: Option<(u64, String)>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    linux_vulkan_export:
+        Option<std::result::Result<crate::renderer::vulkan_export::VulkanExportContext, String>>,
+    /// Ring of linear dma-buf export targets (`export_frame_dmabuf`), reused
+    /// across frames and rebuilt when the export size changes.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    linux_dmabuf_pool: Option<crate::renderer::vulkan_dmabuf_export::DmabufExportPool>,
     adapter: wgpu::Adapter,
     #[cfg(target_os = "android")]
     android_vulkan: Option<AndroidVulkanInterop>,
@@ -567,6 +589,8 @@ pub struct WgpuRenderer {
     surface: Option<AttachedSurface>,
     video_pipeline: Option<VideoPipeline>,
     overlay_pipeline: Option<OverlayPipeline>,
+    danmaku_pipeline: Option<DanmakuPipeline>,
+    danmaku_resources: Option<DanmakuResources>,
     /// Perceptual gamut-mapping 3D LUT cache, keyed by the source/target
     /// primaries plus the target black/peak (PQ codes) that parametrize the
     /// LUT's I axis.
@@ -584,13 +608,16 @@ pub struct WgpuRenderer {
     current_video_visible: bool,
     upload_serial: u64,
     danmaku_atlas_cache: Option<WgpuDanmakuAtlasCache>,
+    danmaku_picture_cache: Option<(u64, wgpu::Texture)>,
     supports_16bit_norm: bool,
     output_mode: OutputMode,
     video_alpha_mode: VideoAlphaMode,
     output_status: OutputRuntimeStatus,
     output_headroom: OutputHeadroomState,
     upscaler_mode: LumaUpscalerMode,
+    custom_upscaler_model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
     upscaler: WgpuArtCnn,
+    post_process: WgpuPostProcess,
     upscaler_failed_frame_token: Option<u64>,
     upscaler_active_frame_reported: bool,
     cpu_video_frame_fallback_reported: bool,
@@ -764,7 +791,7 @@ fn select_linux_surface_output(
 }
 
 fn requested_device_limits(adapter_limits: wgpu::Limits, backend: wgpu::Backend) -> wgpu::Limits {
-    // Erika only needs the portable binding-count and buffer-size baseline, but
+    // liberika only needs the portable binding-count and buffer-size baseline, but
     // video and swapchain textures must retain the adapter's real resolution.
     // This also keeps Android software Vulkan implementations usable: SwiftShader
     // exposes the Vulkan minimum 16 KiB uniform-buffer binding limit, while
@@ -772,14 +799,37 @@ fn requested_device_limits(adapter_limits: wgpu::Limits, backend: wgpu::Backend)
     // GLES 3.0 adapters legitimately expose no compute workgroups. Request the
     // WebGL2/GLES baseline there instead of accidentally asking for the GLES 3.1
     // compute minima and rejecting an otherwise valid presentation backend.
-    let baseline = if backend == wgpu::Backend::Gl {
+    let has_compute = adapter_limits.max_compute_workgroups_per_dimension > 0
+        && adapter_limits.max_storage_buffers_per_shader_stage >= 4;
+    let baseline = if backend == wgpu::Backend::Gl && !has_compute {
         wgpu::Limits::downlevel_webgl2_defaults()
     } else {
         wgpu::Limits::downlevel_defaults()
     };
-    baseline
+    let mut limits = baseline
         .using_resolution(adapter_limits.clone())
-        .using_alignment(adapter_limits)
+        .using_alignment(adapter_limits.clone());
+    if has_compute {
+        limits.max_uniform_buffer_binding_size =
+            adapter_limits.max_uniform_buffer_binding_size.min(65536);
+        limits.max_compute_workgroup_storage_size = adapter_limits
+            .max_compute_workgroup_storage_size
+            .min(28 * 1024);
+    }
+    if backend == wgpu::Backend::Gl {
+        // GLES emulators may report a nonzero dispatch limit below the portable
+        // baseline. Retain compute support without rejecting device creation.
+        limits.max_compute_workgroups_per_dimension = limits
+            .max_compute_workgroups_per_dimension
+            .min(adapter_limits.max_compute_workgroups_per_dimension);
+        // Some phone emulators expose fewer varyings than the WebGL2 baseline.
+        // Our presentation shaders use only a few; asking for all 15 prevents
+        // device creation even when these shaders fit the adapter.
+        limits.max_inter_stage_shader_variables = limits
+            .max_inter_stage_shader_variables
+            .min(adapter_limits.max_inter_stage_shader_variables);
+    }
+    limits
 }
 
 fn wgpu_instance_flags() -> wgpu::InstanceFlags {
@@ -845,7 +895,10 @@ struct WgpuBackendCandidate {
     force_fallback_adapter: bool,
     #[cfg(target_os = "android")]
     android_ahb_interop: bool,
-    #[cfg(target_os = "android")]
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     allow_cpu_adapter: bool,
     #[cfg(target_env = "ohos")]
     ohos_native_buffer_interop: bool,
@@ -914,6 +967,49 @@ fn fit_extent_without_upscale(
     }
 }
 
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn linux_wgpu_backend_candidates(
+    env_backends: Option<wgpu::Backends>,
+) -> Vec<WgpuBackendCandidate> {
+    if let Some(backends) = env_backends {
+        return vec![WgpuBackendCandidate {
+            label: "linux-env",
+            backends,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        }];
+    }
+    // Probe Vulkan and GL in separate instances so Vulkan hosts do not pay to
+    // initialize Mesa's EGL/DRI stack, while preserving hardware GL over
+    // software Vulkan when no hardware Vulkan driver is available.
+    vec![
+        WgpuBackendCandidate {
+            label: "linux-vulkan",
+            backends: wgpu::Backends::VULKAN,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: false,
+        },
+        WgpuBackendCandidate {
+            label: "linux-gl",
+            backends: wgpu::Backends::GL,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: false,
+        },
+        WgpuBackendCandidate {
+            label: "linux-vulkan-software",
+            backends: wgpu::Backends::VULKAN,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        },
+        WgpuBackendCandidate {
+            label: "linux-gl-software",
+            backends: wgpu::Backends::GL,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        },
+    ]
+}
+
 fn wgpu_backend_candidates() -> Vec<WgpuBackendCandidate> {
     #[cfg(target_os = "android")]
     {
@@ -980,17 +1076,13 @@ fn wgpu_backend_candidates() -> Vec<WgpuBackendCandidate> {
     }
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
-        vec![WgpuBackendCandidate {
-            label: "linux",
-            backends: wgpu::Backends::all().with_env(),
-            force_fallback_adapter: false,
-        }]
+        linux_wgpu_backend_candidates(wgpu::Backends::from_env())
     }
     #[cfg(not(any(target_os = "android", target_os = "linux", target_env = "ohos")))]
     {
         vec![WgpuBackendCandidate {
             label: "platform-default",
-            backends: wgpu::Backends::all(),
+            backends: wgpu::Backends::all().with_env(),
             force_fallback_adapter: false,
         }]
     }
@@ -1265,6 +1357,32 @@ fn request_wgpu_device(
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         let hardware = linux_adapter_is_hardware(adapter_info.device_type, &adapter_info.name);
+        if !hardware && std::env::var("ERIKA_REQUIRE_HARDWARE_GPU").as_deref() == Ok("1") {
+            crate::trace::diagnostic(
+                serde_json::json!({
+                    "event": "wgpu_renderer",
+                    "stage": "adapter_selected",
+                    "backend": format!("{:?}", adapter_info.backend),
+                    "deviceType": format!("{:?}", adapter_info.device_type),
+                    "name": adapter_info.name,
+                    "driver": adapter_info.driver,
+                    "driverInfo": adapter_info.driver_info,
+                    "hardware": hardware,
+                    "displayBound": linux_surface.is_some(),
+                })
+                .to_string(),
+            );
+            return Err(format!(
+                "hardware GPU required, but selected CPU adapter {}",
+                adapter_info.name
+            ));
+        }
+        if !hardware && !candidate.allow_cpu_adapter {
+            return Err(format!(
+                "software adapter {} is deferred while probing hardware backends",
+                adapter_info.name
+            ));
+        }
         crate::trace::diagnostic(
             serde_json::json!({
                 "event": "wgpu_renderer",
@@ -1279,12 +1397,6 @@ fn request_wgpu_device(
             })
             .to_string(),
         );
-        if !hardware && std::env::var("ERIKA_REQUIRE_HARDWARE_GPU").as_deref() == Ok("1") {
-            return Err(format!(
-                "hardware GPU required, but selected CPU adapter {}",
-                adapter_info.name
-            ));
-        }
     }
     #[cfg(target_os = "android")]
     if candidate.backends == wgpu::Backends::VULKAN
@@ -1325,6 +1437,24 @@ fn request_wgpu_device(
     } else {
         wgpu::Features::empty()
     };
+    let required_features = required_features
+        | (adapter.features()
+            & (wgpu::Features::SHADER_F16
+                | wgpu::Features::SUBGROUP
+                | wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES));
+    let required_features = required_features
+        | if matches!(
+            adapter_info.backend,
+            wgpu::Backend::Metal | wgpu::Backend::Vulkan
+        ) && (std::env::var("ERIKA_WGPU_SR_COOPERATIVE").as_deref() == Ok("1")
+            || (std::env::var_os("ERIKA_WGPU_SR_COOPERATIVE").is_none()
+                && crate::renderer::wgpu_sr::Config::vulkan_matrix_supported(&adapter)))
+        {
+            adapter.features() & wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
+        } else {
+            wgpu::Features::empty()
+        };
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     let required_features = required_features
         | if adapter_info.backend == wgpu::Backend::Vulkan {
@@ -1369,7 +1499,14 @@ fn request_wgpu_device(
         required_features,
         required_limits,
         memory_hints: wgpu::MemoryHints::default(),
-        experimental_features: wgpu::ExperimentalFeatures::default(),
+        experimental_features: if required_features
+            .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        {
+            // SR matrices are gated by adapter properties or an explicit override.
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::default()
+        },
         trace: wgpu::Trace::Off,
     };
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -1451,6 +1588,19 @@ fn request_wgpu_device(
         #[cfg(target_env = "ohos")]
         ohos_vulkan: None,
     })
+}
+
+/// Device constants for Vulkan export, queried on first use (and kept on failure).
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn linux_vulkan_export_context<'a>(
+    slot: &'a mut Option<
+        std::result::Result<crate::renderer::vulkan_export::VulkanExportContext, String>,
+    >,
+    device: &wgpu::Device,
+) -> Result<&'a crate::renderer::vulkan_export::VulkanExportContext> {
+    slot.get_or_insert_with(|| crate::renderer::vulkan_export::VulkanExportContext::new(device))
+        .as_ref()
+        .map_err(|reason| PlayerError::Renderer(reason.clone()))
 }
 
 impl WgpuRenderer {
@@ -1658,6 +1808,10 @@ impl WgpuRenderer {
             linux_vulkan: None,
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             linux_import_failure: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_vulkan_export: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_dmabuf_pool: None,
             flutter_metrics: None,
             flutter_frame: None,
             adapter: context.adapter,
@@ -1678,20 +1832,25 @@ impl WgpuRenderer {
             surface: None,
             video_pipeline: None,
             overlay_pipeline: None,
+            danmaku_pipeline: None,
+            danmaku_resources: None,
             current_video: None,
             current_video_visible: false,
             upload_serial: 0,
             danmaku_atlas_cache: None,
+            danmaku_picture_cache: None,
             supports_16bit_norm: context.supports_16bit_norm,
             output_mode,
             video_alpha_mode,
             output_status: OutputRuntimeStatus::requested(output_mode),
             output_headroom: OutputHeadroomState::default(),
             upscaler_mode: LumaUpscalerMode::Off,
+            custom_upscaler_model: None,
             gamut_lut: None,
             gamut_lut_job: None,
             dummy_lut: None,
             upscaler,
+            post_process: WgpuPostProcess::default(),
             upscaler_failed_frame_token: None,
             upscaler_active_frame_reported: false,
             cpu_video_frame_fallback_reported: false,
@@ -1720,7 +1879,9 @@ impl WgpuRenderer {
             self.video_alpha_mode,
             surface,
         )?;
+        replacement.set_custom_upscaler_model(self.custom_upscaler_model.clone());
         replacement.set_luma_upscaler(self.upscaler_mode);
+        replacement.set_post_process_shader(self.post_process.shader());
         replacement.upload_serial = self.upload_serial;
         if let Some((frame, uniforms, color)) = self.linux_frame.as_ref() {
             replacement.upload_planar_with_context(frame.clone(), *uniforms, *color)?;
@@ -2720,6 +2881,12 @@ impl WgpuRenderer {
                 PlayerError::Renderer(format!("stage=ohos_native_image_conversion reason={error}"))
             })?;
         let Some(texture) = texture else {
+            // The NativeImage could not produce a texture this tick. Keeping
+            // the previous frame on screen is correct, but the drop must stay
+            // observable instead of silently mimicking a successful import.
+            crate::trace::log(
+                "[erika-wgpu-trace] stage=ohos_native_image_conversion result=texture_not_ready",
+            );
             return Ok(());
         };
         let uniforms = self
@@ -2988,7 +3155,7 @@ impl WgpuRenderer {
         };
         let danmaku_draws = match danmaku {
             Some(plan) if !plan.is_empty() => self.prepare_danmaku_draws(plan, output)?,
-            _ => Vec::new(),
+            _ => DanmakuDraws::default(),
         };
         let (
             native_luma_view,
@@ -3032,6 +3199,7 @@ impl WgpuRenderer {
             target_width,
             target_height,
         );
+        self.upscaler.poll_build();
         let upscale_requested = !self.video_alpha_mode.has_alpha()
             && self.upscaler_mode.is_enabled()
             && self.upscaler.status() == WgpuArtCnnStatus::Scalar
@@ -3070,6 +3238,15 @@ impl WgpuRenderer {
                 input,
                 video_width,
                 video_height,
+                [
+                    viewport.width.round().max(1.0) as u32,
+                    viewport.height.round().max(1.0) as u32,
+                ],
+                if source_is_rgb || video_uniforms.full_range != 0 {
+                    crate::renderer::sr::reference::LumaRange::Full
+                } else {
+                    crate::renderer::sr::reference::LumaRange::Limited
+                },
                 Some(frame_token),
             );
             let compute_commands = compute_encoder.finish();
@@ -3111,6 +3288,11 @@ impl WgpuRenderer {
                                     video_uniforms.packed_d2s_rgb_detail_input()
                                 }
                             };
+                            if !output.packed {
+                                // 4: ordinary luma, 5: nonlinear RGB detail.
+                                video_uniforms.input_mode = (video_uniforms.input_mode & !255)
+                                    | if source_is_rgb { 5 } else { 4 };
+                            }
                             self.upscaler_failed_frame_token = None;
                             if !self.upscaler_active_frame_reported {
                                 self.upscaler_active_frame_reported = true;
@@ -3162,6 +3344,23 @@ impl WgpuRenderer {
             Some(view) => wgpu::BindingResource::TextureView(view),
             None => wgpu::BindingResource::TextureView(&dummy_lut_view.expect("dummy LUT view")),
         };
+        let video_format = self
+            .video_pipeline
+            .as_ref()
+            .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?
+            .format;
+        let post_stage = self.post_process.stage();
+        let (post_w, post_h) = if post_stage == PostProcessStage::Output {
+            (target_width.max(1), target_height.max(1))
+        } else {
+            (
+                viewport.width.round().max(1.0) as u32,
+                viewport.height.round().max(1.0) as u32,
+            )
+        };
+        let post_active = self
+            .post_process
+            .prepare(&self.device, post_w, post_h, video_format);
         let pipeline = self
             .video_pipeline
             .as_ref()
@@ -3205,7 +3404,126 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("erika-wgpu-video-encoder"),
             });
-        {
+        let clear_color = if self.video_alpha_mode.has_alpha() {
+            wgpu::Color::TRANSPARENT
+        } else {
+            wgpu::Color::BLACK
+        };
+        let mut overlays_composited = false;
+        if post_active && let Some(post_src_view) = self.post_process.source_view() {
+            if post_stage == PostProcessStage::Output {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("erika-wgpu-output-post-src-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_src_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear_color),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.set_viewport(
+                        viewport.x,
+                        viewport.y,
+                        viewport.width,
+                        viewport.height,
+                        0.0,
+                        1.0,
+                    );
+                    pass.draw(0..3, 0..1);
+                    if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
+                        let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
+                            PlayerError::Renderer("overlay pipeline not initialized".to_string())
+                        })?;
+                        pass.set_pipeline(&overlay_pipeline.pipeline);
+                        pass.set_viewport(
+                            viewport.x,
+                            viewport.y,
+                            viewport.width,
+                            viewport.height,
+                            0.0,
+                            1.0,
+                        );
+                        for draw in &overlay_draws {
+                            pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
+                            pass.draw(0..4, 0..1);
+                        }
+                        pass.set_viewport(
+                            0.0,
+                            0.0,
+                            target_width as f32,
+                            target_height as f32,
+                            0.0,
+                            1.0,
+                        );
+                        self.encode_danmaku_draws(&mut pass, &danmaku_draws);
+                    }
+                }
+                overlays_composited = true;
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [0.0, 0.0, target_width as f32, target_height as f32],
+                    (target_width, target_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                self.post_process.encode_pass(
+                    &self.device,
+                    &mut encoder,
+                    target_view,
+                    clear_color,
+                    (0.0, 0.0, target_width as f32, target_height as f32),
+                    &post_uniforms,
+                );
+            } else {
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("erika-wgpu-video-post-src-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: post_src_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(clear_color),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.set_viewport(0.0, 0.0, post_w as f32, post_h as f32, 0.0, 1.0);
+                    pass.draw(0..3, 0..1);
+                }
+                let post_uniforms = PostProcessUniforms::new(
+                    (post_w, post_h),
+                    [viewport.x, viewport.y, viewport.width, viewport.height],
+                    (target_width, target_height),
+                    self.stats.rendered_frames as f64 / 60.0,
+                    self.stats.rendered_frames,
+                );
+                self.post_process.encode_pass(
+                    &self.device,
+                    &mut encoder,
+                    target_view,
+                    clear_color,
+                    (viewport.x, viewport.y, viewport.width, viewport.height),
+                    &post_uniforms,
+                );
+            }
+        } else {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("erika-wgpu-video-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3213,11 +3531,7 @@ impl WgpuRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(if self.video_alpha_mode.has_alpha() {
-                            wgpu::Color::TRANSPARENT
-                        } else {
-                            wgpu::Color::BLACK
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3239,7 +3553,7 @@ impl WgpuRenderer {
             pass.draw(0..3, 0..1);
         }
 
-        if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
+        if !overlays_composited && (!overlay_draws.is_empty() || !danmaku_draws.is_empty()) {
             let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
                 PlayerError::Renderer("overlay pipeline not initialized".to_string())
             })?;
@@ -3261,14 +3575,30 @@ impl WgpuRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&overlay_pipeline.pipeline);
+            // Subtitle coordinates are produced in the video-frame viewport.
+            // Composite them through the same aspect-fit viewport as the video
+            // so they stay inside the picture; only danmaku use the letterbox.
+            pass.set_viewport(
+                viewport.x,
+                viewport.y,
+                viewport.width,
+                viewport.height,
+                0.0,
+                1.0,
+            );
             for draw in &overlay_draws {
                 pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
                 pass.draw(0..4, 0..1);
             }
-            for draw in &danmaku_draws {
-                pass.set_bind_group(0, &draw.bind_group, &[draw.dynamic_offset]);
-                pass.draw(0..4, 0..1);
-            }
+            pass.set_viewport(
+                0.0,
+                0.0,
+                target_width as f32,
+                target_height as f32,
+                0.0,
+                1.0,
+            );
+            self.encode_danmaku_draws(&mut pass, &danmaku_draws);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -3322,38 +3652,22 @@ impl WgpuRenderer {
         Ok(draws)
     }
 
-    fn prepare_danmaku_draws(
-        &mut self,
-        plan: &DanmakuRenderPlan,
-        output: OutputDescription,
-    ) -> Result<Vec<OverlayDraw>> {
-        if self.overlay_pipeline.is_none() {
-            return Err(PlayerError::Renderer(
-                "overlay pipeline not initialized".to_string(),
-            ));
+    fn prepare_danmaku_picture_texture(&mut self, atlas: &DanmakuColorAtlas) -> wgpu::Texture {
+        if let Some((version, texture)) = &self.danmaku_picture_cache
+            && *version == atlas.version
+        {
+            return texture.clone();
         }
-        let Some(atlas) = plan.atlas.as_ref() else {
-            return Ok(Vec::new());
-        };
-        if !atlas.is_valid() {
-            return Err(PlayerError::Renderer(format!(
-                "danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
-                atlas.fill_alpha.len(),
-                atlas.outline_alpha.len(),
-                atlas.required_len(),
-                atlas.width,
-                atlas.height,
-                atlas.stride
-            )));
-        }
-        let viewport_w = plan.viewport.width;
-        let viewport_h = plan.viewport.height;
-        let mut uniforms = Vec::with_capacity(plan.items.len() * 3);
-        let (fill_texture, outline_texture) = self.prepare_danmaku_atlas_textures(atlas);
-        for item in &plan.items {
-            self.append_danmaku_glyph_uniforms(item, viewport_w, viewport_h, output, &mut uniforms);
-        }
-        self.make_batched_danmaku_draws(&fill_texture, &outline_texture, &uniforms)
+        let texture = self.create_plane_texture(
+            "erika-wgpu-danmaku-picture-atlas",
+            atlas.width,
+            atlas.height,
+            wgpu::TextureFormat::Rgba8Unorm,
+            &atlas.rgba,
+            atlas.width * 4,
+        );
+        self.danmaku_picture_cache = Some((atlas.version, texture.clone()));
+        texture
     }
 
     fn prepare_danmaku_atlas_textures(
@@ -3447,144 +3761,6 @@ impl WgpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
-    }
-
-    fn append_danmaku_glyph_uniforms(
-        &self,
-        item: &DanmakuGlyphInstance,
-        viewport_w: u32,
-        viewport_h: u32,
-        output: OutputDescription,
-        draws: &mut Vec<(DanmakuAtlasTexture, OverlayUniforms)>,
-    ) {
-        if item.shadow_rgba[3] > 0.0 {
-            let mut rect = item.rect;
-            rect[0] += item.shadow_offset[0];
-            rect[1] += item.shadow_offset[1];
-            let uniform = OverlayUniforms::alpha_atlas_rect(
-                item.shadow_rgba,
-                rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-            )
-            .for_output(output);
-            draws.push((DanmakuAtlasTexture::Outline, uniform));
-        }
-        if item.outline_rgba[3] > 0.0 {
-            let uniform = OverlayUniforms::alpha_atlas_rect(
-                item.outline_rgba,
-                item.rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-            )
-            .for_output(output);
-            draws.push((DanmakuAtlasTexture::Outline, uniform));
-        }
-        let uniform = OverlayUniforms::alpha_atlas_rect(
-            item.color_rgba,
-            item.rect,
-            item.tex_rect,
-            viewport_w,
-            viewport_h,
-        )
-        .for_output(output);
-        draws.push((DanmakuAtlasTexture::Fill, uniform));
-    }
-
-    fn make_batched_danmaku_draws(
-        &self,
-        fill_texture: &wgpu::Texture,
-        outline_texture: &wgpu::Texture,
-        uniforms: &[(DanmakuAtlasTexture, OverlayUniforms)],
-    ) -> Result<Vec<OverlayDraw>> {
-        if uniforms.is_empty() {
-            return Ok(Vec::new());
-        }
-        let uniform_size = std::mem::size_of::<OverlayUniforms>();
-        let alignment = self
-            .device
-            .limits()
-            .min_uniform_buffer_offset_alignment
-            .max(1) as usize;
-        let stride = uniform_size.div_ceil(alignment) * alignment;
-        let buffer_size = stride.checked_mul(uniforms.len()).ok_or_else(|| {
-            PlayerError::Renderer("danmaku dynamic uniform buffer size overflow".to_string())
-        })?;
-        let mut bytes = vec![0u8; buffer_size];
-        for (index, (_, uniform)) in uniforms.iter().enumerate() {
-            let start = index * stride;
-            bytes[start..start + uniform_size].copy_from_slice(bytemuck::bytes_of(uniform));
-        }
-        // TODO(perf): retain a growable per-frame uniform buffer and update it via
-        // `Queue::write_buffer` (or a small ring) instead of allocating a new GPU
-        // buffer for every danmaku frame. Keep `stride` device-aligned when reusing it.
-        let uniform_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("erika-wgpu-danmaku-dynamic-uniforms"),
-                contents: &bytes,
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let make_bind_group = |label: &'static str, texture: &wgpu::Texture| {
-            let pipeline = self
-                .overlay_pipeline
-                .as_ref()
-                .expect("overlay pipeline initialized");
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &pipeline.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &uniform_buffer,
-                            offset: 0,
-                            size: std::num::NonZeroU64::new(uniform_size as u64),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
-                    },
-                ],
-            })
-        };
-        let fill_bind_group = make_bind_group("erika-wgpu-danmaku-fill-bind-group", fill_texture);
-        let outline_bind_group =
-            make_bind_group("erika-wgpu-danmaku-outline-bind-group", outline_texture);
-        uniforms
-            .iter()
-            .enumerate()
-            .map(|(index, (texture, _))| {
-                let offset = index.checked_mul(stride).ok_or_else(|| {
-                    PlayerError::Renderer("danmaku dynamic uniform offset overflow".to_string())
-                })?;
-                let dynamic_offset = u32::try_from(offset).map_err(|_| {
-                    PlayerError::Renderer(format!(
-                        "danmaku dynamic uniform offset exceeds u32: {offset}"
-                    ))
-                })?;
-                let (bind_group, texture) = match texture {
-                    DanmakuAtlasTexture::Fill => (fill_bind_group.clone(), fill_texture.clone()),
-                    DanmakuAtlasTexture::Outline => {
-                        (outline_bind_group.clone(), outline_texture.clone())
-                    }
-                };
-                Ok(OverlayDraw {
-                    bind_group,
-                    dynamic_offset,
-                    _texture: texture,
-                    _uniform: uniform_buffer.clone(),
-                })
-            })
-            .collect()
     }
 
     /// Pack libass alpha coverage bitmaps horizontally into one R8 atlas and add a
@@ -3880,6 +4056,7 @@ impl WgpuRenderer {
     }
 
     fn ensure_overlay_pipeline(&mut self, format: wgpu::TextureFormat) {
+        self.ensure_danmaku_pipeline(format);
         if self
             .overlay_pipeline
             .as_ref()
@@ -4938,6 +5115,252 @@ impl RendererBackend for WgpuRenderer {
         self.flutter_frame.take()
     }
 
+    fn validate_export_texture_size(&mut self, width: u32, height: u32) -> Result<()> {
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
+        {
+            let _ = (width, height);
+            Err(PlayerError::Renderer(
+                "native texture export requires Linux/Vulkan or Apple/Metal".into(),
+            ))
+        }
+
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        ))]
+        {
+            let max = self.device.limits().max_texture_dimension_2d;
+            if width == 0 || height == 0 || width > max || height > max {
+                return Err(PlayerError::Renderer(format!(
+                    "invalid external texture dimensions {width}x{height} (limit {max})"
+                )));
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?
+                .check_size(width, height)
+                .map_err(PlayerError::Renderer)?;
+            Ok(())
+        }
+    }
+
+    fn export_current_frame_texture(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<crate::core::ExternalTextureFrame>> {
+        self.validate_export_texture_size(width, height)?;
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )))]
+        {
+            let _ = context;
+            Err(PlayerError::Renderer(
+                "native texture export requires Linux/Vulkan or Apple/Metal".into(),
+            ))
+        }
+
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        ))]
+        {
+            if !self.current_video_visible || self.current_video.is_none() {
+                return Ok(None);
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            let target = crate::renderer::vulkan_export::VulkanExportTarget::new(
+                linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?,
+                &self.device,
+                width,
+                height,
+            )
+            .map_err(PlayerError::Renderer)?;
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            let texture = &target.texture;
+
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("erika-external-metal-frame"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: OFFSCREEN_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            let info = {
+                use crate::core::{
+                    ExternalTextureFormat, ExternalTextureInfo, ExternalTextureKind,
+                };
+                use objc2_metal::{MTLDevice, MTLResource};
+                let hal =
+                    unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }.ok_or_else(|| {
+                        PlayerError::Renderer("native texture export requires Metal".into())
+                    })?;
+                let native = hal.raw_handle();
+                ExternalTextureInfo {
+                    kind: ExternalTextureKind::Metal,
+                    format: ExternalTextureFormat::Rgba8Unorm,
+                    width,
+                    height,
+                    native_handle: std::ptr::from_ref(native) as u64,
+                    device_id: native.device().registryID(),
+                    allocation_size: 0,
+                    memory_type_index: 0,
+                    vulkan_format: 0,
+                    vulkan_usage: 0,
+                    vulkan_tiling: 0,
+                    device_uuid: [0; 16],
+                    driver_uuid: [0; 16],
+                }
+            };
+            self.ensure_video_pipeline(OFFSCREEN_FORMAT);
+            if context.overlay.is_some_and(overlay_has_planes)
+                || context.danmaku.is_some_and(|plan| !plan.is_empty())
+            {
+                self.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
+            }
+            let danmaku = context.danmaku.filter(|plan| {
+                plan.generation == context.generation
+                    && plan.viewport.width == width
+                    && plan.viewport.height == height
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let draws = self.draw_current_video(
+                &view,
+                width,
+                height,
+                context.overlay,
+                danmaku,
+                OutputDescription::sdr(),
+            )?;
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            {
+                target
+                    .release_to_consumer(&self.queue)
+                    .map_err(PlayerError::Renderer)?;
+            }
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(5)),
+                })
+                .map_err(|error| {
+                    PlayerError::Renderer(format!(
+                        "external texture GPU completion failed: {error}"
+                    ))
+                })?;
+            self.stats.rendered_frames += 1;
+            self.stats.offscreen_frames += 1;
+            if draws > 0 {
+                self.stats.danmaku_passes += 1;
+                self.stats.danmaku_items += draws as u64;
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            return Ok(Some(crate::core::ExternalTextureFrame::new(
+                target.info,
+                target,
+            )));
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            Ok(Some(crate::core::ExternalTextureFrame::new(info, texture)))
+        }
+    }
+
+    /// The same composite, delivered as a linear dma-buf the host imports
+    /// without a Vulkan device of its own: renders into a fast offscreen
+    /// target, then copies it into a `DMA_BUF`-backed linear image.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn export_current_frame_dmabuf(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<crate::core::DmabufFrame>> {
+        self.validate_export_texture_size(width, height)?;
+        if !self.current_video_visible || self.current_video.is_none() {
+            return Ok(None);
+        }
+        // Ring of export targets, made once per size: allocating a linear
+        // dma-buf image, its memory and its descriptor per frame costs more
+        // than the copy itself (and shows up as engine-thread CPU time).
+        let stale = self
+            .linux_dmabuf_pool
+            .as_ref()
+            .is_none_or(|pool| pool.size() != (width, height));
+        if stale {
+            self.linux_dmabuf_pool = None;
+            let pool = crate::renderer::vulkan_dmabuf_export::DmabufExportPool::new(
+                linux_vulkan_export_context(&mut self.linux_vulkan_export, &self.device)?,
+                &self.device,
+                width,
+                height,
+            )
+            .map_err(PlayerError::Renderer)?;
+            self.linux_dmabuf_pool = Some(pool);
+        }
+        let source = self
+            .linux_dmabuf_pool
+            .as_ref()
+            .expect("pool was just made")
+            .source();
+
+        self.ensure_video_pipeline(OFFSCREEN_FORMAT);
+        if context.overlay.is_some_and(overlay_has_planes)
+            || context.danmaku.is_some_and(|plan| !plan.is_empty())
+        {
+            self.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
+        }
+        let danmaku = context.danmaku.filter(|plan| {
+            plan.generation == context.generation
+                && plan.viewport.width == width
+                && plan.viewport.height == height
+        });
+        let view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let draws = self.draw_current_video(
+            &view,
+            width,
+            height,
+            context.overlay,
+            danmaku,
+            OutputDescription::sdr(),
+        )?;
+        // No wait here: the slot's own fence is waited on when it comes round
+        // again, so the CPU prepares the next frame while the GPU copies this one.
+        let frame = self
+            .linux_dmabuf_pool
+            .as_mut()
+            .expect("pool was just made")
+            .present(&self.device, &self.queue, &source)
+            .map_err(PlayerError::Renderer)?;
+        self.stats.rendered_frames += 1;
+        self.stats.offscreen_frames += 1;
+        if draws > 0 {
+            self.stats.danmaku_passes += 1;
+            self.stats.danmaku_items += draws as u64;
+        }
+        Ok(Some(frame))
+    }
+
     fn capture_current_frame(
         &mut self,
         context: RenderFrameContext<'_>,
@@ -5016,6 +5439,9 @@ impl RendererBackend for WgpuRenderer {
             last_danmaku_vertex_count: 0,
             upscaler_mode: self.upscaler_mode,
             upscaler_backend: match self.upscaler.status() {
+                WgpuArtCnnStatus::Scalar if self.upscaler.is_tuning() => {
+                    LumaUpscalerBackendStatus::Building
+                }
                 WgpuArtCnnStatus::Off => LumaUpscalerBackendStatus::Off,
                 WgpuArtCnnStatus::Building => LumaUpscalerBackendStatus::Building,
                 WgpuArtCnnStatus::Inactive => LumaUpscalerBackendStatus::Inactive,
@@ -5050,7 +5476,11 @@ impl RendererBackend for WgpuRenderer {
         if mode == self.upscaler_mode
             && self.upscaler.mode() == mode
             && ((mode == LumaUpscalerMode::Off && self.upscaler.status() == WgpuArtCnnStatus::Off)
-                || (mode.is_enabled() && self.upscaler.status() == WgpuArtCnnStatus::Scalar))
+                || (mode.is_enabled()
+                    && matches!(
+                        self.upscaler.status(),
+                        WgpuArtCnnStatus::Scalar | WgpuArtCnnStatus::Building
+                    )))
         {
             return;
         }
@@ -5065,7 +5495,12 @@ impl RendererBackend for WgpuRenderer {
                 crate::trace::diagnostic(
                     serde_json::json!({
                         "event": "luma_upscaler",
-                        "stage": if mode.is_enabled() { "active" } else { "disabled" },
+                        "stage": match self.upscaler.status() {
+                            WgpuArtCnnStatus::Building => "building",
+                            WgpuArtCnnStatus::Scalar => "active",
+                            WgpuArtCnnStatus::Off => "disabled",
+                            WgpuArtCnnStatus::Inactive => "inactive",
+                        },
                         "renderer": "wgpu",
                         "requestedMode": format!("{mode:?}"),
                         "activeBackend": format!("{:?}", self.upscaler.status()),
@@ -5078,6 +5513,52 @@ impl RendererBackend for WgpuRenderer {
                 crate::trace::diagnostic(failure.diagnostic_json().to_string());
             }
         }
+    }
+
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        self.custom_upscaler_model = model.clone();
+        self.upscaler.set_custom_model(&self.device, model);
+        self.upscaler_failed_frame_token = None;
+        self.upscaler_active_frame_reported = false;
+    }
+
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        (
+            self.upscaler.last_failure().map(|f| f.reason.clone()),
+            (self.upscaler.status() == WgpuArtCnnStatus::Scalar).then_some(
+                if self.upscaler_mode == LumaUpscalerMode::Fsr1 {
+                    "wgpu_fsr1_fused"
+                } else if self.upscaler.half() {
+                    "wgpu_f16"
+                } else {
+                    "wgpu_f32"
+                },
+            ),
+        )
+    }
+
+    fn supported_upscalers(&self) -> UpscalerCapabilities {
+        let supported = self.upscaler.capability().supported;
+        UpscalerCapabilities {
+            modes: if supported {
+                UpscalerCapabilities::bundled_portable_modes()
+            } else {
+                Vec::new()
+            },
+            supports_custom_network: supported,
+            supports_post_process: true,
+        }
+    }
+
+    fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.post_process.set_shader(shader);
+    }
+
+    fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.post_process.status_info()
     }
 
     fn set_output_headroom(&mut self, headroom: f32, known: bool) {
@@ -5155,6 +5636,8 @@ pub struct AndroidRecoveringWgpuRenderer {
     output_headroom: OutputHeadroomState,
     upscaler_mode: LumaUpscalerMode,
     retired_stats: RendererRuntimeStats,
+    custom_upscaler_model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    post_process_shader: Option<std::sync::Arc<PostProcessShader>>,
     retired_output_status: OutputRuntimeStatus,
     terminal_failure: Option<String>,
     recovery_sequence: u64,
@@ -5184,6 +5667,8 @@ impl AndroidRecoveringWgpuRenderer {
             output_headroom: OutputHeadroomState::default(),
             upscaler_mode: LumaUpscalerMode::Off,
             retired_stats: RendererRuntimeStats::default(),
+            custom_upscaler_model: None,
+            post_process_shader: None,
             retired_output_status: OutputRuntimeStatus::requested(config.output_mode),
             terminal_failure: None,
             recovery_sequence: 0,
@@ -5381,7 +5866,11 @@ impl AndroidRecoveringWgpuRenderer {
             self.active.output_status(),
         );
         self.active = replacement;
+        self.active
+            .set_custom_upscaler_model(self.custom_upscaler_model.clone());
         self.active.set_luma_upscaler(self.upscaler_mode);
+        self.active
+            .set_post_process_shader(self.post_process_shader.clone());
         self.active
             .update_output_headroom_state(self.output_headroom, false);
 
@@ -5685,6 +6174,31 @@ impl RendererBackend for AndroidRecoveringWgpuRenderer {
         self.active.set_luma_upscaler(mode);
     }
 
+    fn set_custom_upscaler_model(
+        &mut self,
+        model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+        self.custom_upscaler_model = model.clone();
+        self.active.set_custom_upscaler_model(model);
+    }
+
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        self.active.upscaler_status_detail()
+    }
+
+    fn supported_upscalers(&self) -> UpscalerCapabilities {
+        self.active.supported_upscalers()
+    }
+
+    fn set_post_process_shader(&mut self, shader: Option<std::sync::Arc<PostProcessShader>>) {
+        self.post_process_shader = shader.clone();
+        self.active.set_post_process_shader(shader);
+    }
+
+    fn post_process_status(&self) -> PostProcessRuntimeInfo {
+        self.active.post_process_status()
+    }
+
     fn set_output_headroom(&mut self, headroom: f32, known: bool) {
         self.output_headroom = OutputHeadroomState::reported(headroom, known);
         self.active
@@ -5908,6 +6422,60 @@ mod tests {
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     #[test]
+    fn linux_backend_candidates_prefer_hardware_before_software() {
+        let default = linux_wgpu_backend_candidates(None);
+        let summary: Vec<_> = default
+            .iter()
+            .map(|c| (c.label, c.backends, c.allow_cpu_adapter))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("linux-vulkan", wgpu::Backends::VULKAN, false),
+                ("linux-gl", wgpu::Backends::GL, false),
+                ("linux-vulkan-software", wgpu::Backends::VULKAN, true),
+                ("linux-gl-software", wgpu::Backends::GL, true),
+            ]
+        );
+        let overridden = linux_wgpu_backend_candidates(Some(wgpu::Backends::GL));
+        assert_eq!(overridden.len(), 1);
+        assert_eq!(overridden[0].backends, wgpu::Backends::GL);
+        assert!(overridden[0].allow_cpu_adapter);
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn linux_gl_repeated_instance_create_and_drop_is_safe() {
+        if std::env::var("ERIKA_REQUIRE_HARDWARE_GPU").as_deref() == Ok("1") {
+            return;
+        }
+        let candidate = WgpuBackendCandidate {
+            label: "linux-gl-reinit",
+            backends: wgpu::Backends::GL,
+            force_fallback_adapter: false,
+            allow_cpu_adapter: true,
+        };
+        let mut had_gl = false;
+        for iteration in 0..6 {
+            match request_wgpu_device(candidate, 0, 0, 1, None) {
+                Ok(context) => {
+                    had_gl = true;
+                    drop(context);
+                }
+                Err(error) if !had_gl && iteration == 0 => {
+                    eprintln!("skipping GL re-init check without EGL/GL adapter: {error}");
+                    return;
+                }
+                Err(error) => {
+                    panic!("GL re-initialization failed on iteration {iteration}: {error}");
+                }
+            }
+        }
+        assert!(had_gl);
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
     fn linux_surfaces_require_both_handles_and_keep_their_native_types() {
         for kind in [WgpuSurfaceKind::XlibWindow, WgpuSurfaceKind::WaylandSurface] {
             for (window, display) in [(0, 1), (1, 0), (0, 0)] {
@@ -6092,10 +6660,25 @@ mod tests {
     }
 
     #[test]
+    fn requested_limits_accept_reduced_gles_compute_dispatch_count() {
+        let adapter_limits = wgpu::Limits {
+            max_compute_workgroups_per_dimension: 33_778,
+            ..wgpu::Limits::downlevel_defaults()
+        };
+
+        let requested = requested_device_limits(adapter_limits.clone(), wgpu::Backend::Gl);
+
+        assert_eq!(requested.max_compute_workgroups_per_dimension, 33_778);
+        assert!(requested.max_compute_invocations_per_workgroup > 0);
+        assert!(requested.check_limits(&adapter_limits));
+    }
+
+    #[test]
     fn requested_limits_accept_gles_without_compute_support() {
         let adapter_limits = wgpu::Limits {
             max_texture_dimension_2d: 8192,
             max_uniform_buffer_binding_size: 16 * 1024,
+            max_inter_stage_shader_variables: 7,
             max_compute_workgroup_storage_size: 0,
             max_compute_invocations_per_workgroup: 0,
             max_compute_workgroup_size_x: 0,
@@ -6105,11 +6688,12 @@ mod tests {
             ..wgpu::Limits::downlevel_webgl2_defaults()
         };
 
-        let requested = requested_device_limits(adapter_limits, wgpu::Backend::Gl);
+        let requested = requested_device_limits(adapter_limits.clone(), wgpu::Backend::Gl);
 
         assert_eq!(requested.max_texture_dimension_2d, 8192);
         assert_eq!(requested.max_uniform_buffer_binding_size, 16 * 1024);
         assert_eq!(requested.max_compute_workgroups_per_dimension, 0);
+        assert!(requested.check_limits(&adapter_limits));
     }
 
     #[test]
@@ -6500,6 +7084,79 @@ mod tests {
     }
 
     #[test]
+    fn wgpu_renderer_keeps_subtitles_inside_the_picture_and_lets_danmaku_use_the_letterbox() {
+        use crate::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement};
+
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        // A 2:1 picture in a square target: rows 2..6 are the picture, rows
+        // 0..2 and 6..8 are the letterbox.
+        renderer
+            .upload_nv12(8, 4, &[16; 32], &[128; 16], uniforms)
+            .unwrap();
+        // libass draws on a canvas twice the video size; one line along its
+        // top edge and one along its bottom edge, in red.
+        let line = |y| {
+            SubtitleAlphaBitmap::new(
+                SubtitleBitmapPlacement::new(0, y, 16, 2),
+                16,
+                0xff00_0000,
+                vec![255; 32],
+            )
+        };
+        let overlay = OverlayFrame {
+            pts: Duration::ZERO,
+            viewport: crate::overlay::OverlayViewport::new(16, 8),
+            subtitle_planes: Vec::new(),
+            subtitle_alpha_planes: vec![line(0), line(6)],
+            subtitle_changed: true,
+        };
+        // Danmaku are laid out on the whole surface: green rows at its very
+        // top and bottom.
+        let mut plan = DanmakuRenderPlan::empty(Duration::ZERO, 1, DanmakuViewport::new(8, 8));
+        plan.atlas = Some(std::sync::Arc::new(DanmakuGlyphAtlas {
+            width: 1,
+            height: 1,
+            stride: 1,
+            fill_alpha: vec![255],
+            outline_alpha: vec![0],
+            version: 1,
+            update: None,
+        }));
+        for (item_id, y) in [(1, 0.0), (2, 7.0)] {
+            plan.items.push(DanmakuGlyphInstance {
+                item_id,
+                rect: [0.0, y, 8.0, 1.0],
+                tex_rect: [0.0, 0.0, 1.0, 1.0],
+                color_rgba: [0.0, 1.0, 0.0, 1.0],
+                outline_rgba: [0.0; 4],
+                shadow_rgba: [0.0; 4],
+                shadow_offset: [0.0; 2],
+            });
+        }
+
+        let capture = renderer
+            .render_current_offscreen_sized(8, 8, Some(&overlay), Some(&plan))
+            .unwrap()
+            .expect("current wgpu frame captured with overlays");
+
+        let row_color = |y: u32| match capture.pixel(4, y) {
+            [r, g, ..] if r > 200 && g < 40 => "subtitle",
+            [r, g, ..] if r < 40 && g > 200 => "danmaku",
+            [r, g, ..] if r < 40 && g < 40 => "black",
+            pixel => panic!("row {y} has an unexpected color {pixel:?}"),
+        };
+        let rows = (0..8).map(row_color).collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "danmaku", "black", "subtitle", "black", "black", "subtitle", "black", "danmaku",
+            ]
+        );
+    }
+
+    #[test]
     fn wgpu_renderer_prepares_danmaku_glyph_atlas_draws_and_reuses_cache() {
         let mut renderer = WgpuRenderer::new().unwrap();
         renderer.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
@@ -6526,13 +7183,15 @@ mod tests {
                 shadow_rgba: [0.0, 0.0, 0.0, 0.0],
                 shadow_offset: [1.0, 1.0],
             }],
+            color_atlas: None,
+            color_glyphs: Vec::new(),
             frame_stats: DanmakuFrameStats::default(),
         };
 
         let draws = renderer
             .prepare_danmaku_draws(&plan, OutputDescription::sdr())
             .unwrap();
-        assert_eq!(draws.len(), 2);
+        assert_eq!(draws.len(), 1);
         assert!(
             renderer
                 .danmaku_atlas_cache
@@ -6543,7 +7202,7 @@ mod tests {
         let cached_draws = renderer
             .prepare_danmaku_draws(&plan, OutputDescription::sdr())
             .unwrap();
-        assert_eq!(cached_draws.len(), 2);
+        assert_eq!(cached_draws.len(), 1);
         assert!(
             renderer
                 .danmaku_atlas_cache
@@ -6575,7 +7234,7 @@ mod tests {
         let updated_draws = renderer
             .prepare_danmaku_draws(&updated_plan, OutputDescription::sdr())
             .unwrap();
-        assert_eq!(updated_draws.len(), 2);
+        assert_eq!(updated_draws.len(), 1);
         let updated_cache = renderer
             .danmaku_atlas_cache
             .as_ref()
@@ -7047,6 +7706,104 @@ mod tests {
                 (got - want).abs() <= 2,
                 "y={y} tone_map={tone_map} ({nits} nits) = {got}, expected {want}"
             );
+        }
+    }
+
+    #[test]
+    fn wgpu_sr_presentation_preserves_planar_and_rgb_chroma() {
+        use crate::renderer::sr::model::*;
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let model = std::sync::Arc::new(SrModel {
+            name: "identity residual".into(),
+            padding: Padding::Clamp,
+            input_range: InputRange::Full,
+            tensors: vec![1, 4],
+            layers: vec![ConvLayer {
+                output: 1,
+                out_channels: 4,
+                inputs: vec![ConvInput {
+                    tensor: 0,
+                    transform: InputTransform::Identity,
+                    kernel: 1,
+                    weights: vec![0.0; 4],
+                }],
+                bias: vec![0.0; 4],
+                residual: None,
+                activation: Activation::None,
+                border: None,
+            }],
+            head: Head {
+                tensor: 1,
+                order: SubpixelOrder::RowMajor,
+                base: HeadBase::Bilinear,
+                clamp: true,
+            },
+        });
+        renderer.set_custom_upscaler_model(Some(model));
+        for rgb in [false, true] {
+            renderer.set_luma_upscaler(LumaUpscalerMode::Off);
+            let uniforms =
+                VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+            if rgb {
+                let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("SR RGB presentation test"),
+                    size: wgpu::Extent3d {
+                        width: 4,
+                        height: 4,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                renderer.queue.write_texture(
+                    texture.as_image_copy(),
+                    &[51, 102, 153, 255].repeat(16),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(16),
+                        rows_per_image: Some(4),
+                    },
+                    texture.size(),
+                );
+                renderer.current_video = Some(UploadedVideoFrame {
+                    textures: UploadedVideoTextures::Rgb { texture },
+                    width: 4,
+                    height: 4,
+                    uniforms: uniforms.rgb_texture_input(),
+                    source_color: None,
+                    frame_token: renderer.next_upload_serial(),
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                    _linux_direct: None,
+                });
+                renderer.current_video_visible = true;
+            } else {
+                let (y, uv) = build_solid_nv12(4, 4, 128, 80, 160);
+                renderer.upload_nv12(4, 4, &y, &uv, uniforms).unwrap();
+            }
+            let baseline = renderer
+                .render_current_offscreen_sized(8, 8, None, None)
+                .unwrap()
+                .unwrap();
+            for mode in [LumaUpscalerMode::Custom, LumaUpscalerMode::Fsr1] {
+                renderer.set_luma_upscaler(mode);
+                renderer.upscaler.wait_ready().unwrap();
+                let before = renderer.upscaler.stats().upscaled_frames;
+                let enhanced = renderer
+                    .render_current_offscreen_sized(8, 8, None, None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(renderer.upscaler.stats().upscaled_frames, before + 1);
+                for (&a, &b) in baseline.rgba.iter().zip(&enhanced.rgba) {
+                    assert!(
+                        (i16::from(a) - i16::from(b)).abs() <= 2,
+                        "{mode:?} rgb={rgb}: {a} vs {b}"
+                    );
+                }
+            }
         }
     }
 

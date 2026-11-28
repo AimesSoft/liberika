@@ -525,6 +525,38 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeRegist
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeLoadUpscalerModel(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    name: JString<'_>,
+    data: JByteArray<'_>,
+) -> jstring {
+    let response = catch_unwind(AssertUnwindSafe(|| {
+        let bytes = env
+            .convert_byte_array(&data)
+            .map_err(|error| format!("invalid upscaler model byte array: {error}"))?;
+        let name: String = env
+            .get_string(&name)
+            .map_err(|error| format!("invalid upscaler model name: {error}"))?
+            .into();
+        let name = CString::new(name)
+            .map_err(|_| "upscaler model name contains a NUL byte".to_string())?;
+        with_registered_presenter(handle, "loadUpscalerModel", |presenter| {
+            status_value(unsafe {
+                erika_presenter_load_upscaler_model(
+                    presenter.handle,
+                    name.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                )
+            })
+        })
+    }));
+    response_to_jstring(&mut env, response)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeAttachSurface(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -765,13 +797,12 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativePlayba
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptureFrame(
+fn capture_frame_jni(
     mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
     handle: jlong,
     width: jint,
     height: jint,
+    include_danmaku: bool,
 ) -> jbyteArray {
     let result = catch_unwind(AssertUnwindSafe(|| {
         with_registered_presenter(handle, "captureFrame", |presenter| {
@@ -786,7 +817,7 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptur
             }
             let handle = unsafe { presenter.handle.as_mut() }
                 .ok_or_else(|| "Android screenshot presenter handle is null".to_string())?;
-            capture_presenter_frame_rgba(handle, width, height)
+            capture_presenter_frame_rgba(handle, width, height, include_danmaku)
         })
     }));
 
@@ -810,6 +841,28 @@ pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptur
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptureFrame(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    width: jint,
+    height: jint,
+) -> jbyteArray {
+    capture_frame_jni(env, handle, width, height, false)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_aimesoft_erika_1flutter_ErikaNative_nativeCaptureFrameWithDanmaku(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    width: jint,
+    height: jint,
+) -> jbyteArray {
+    capture_frame_jni(env, handle, width, height, true)
+}
+
 unsafe fn invoke_presenter(
     presenter: &mut AndroidPresenter,
     method: &str,
@@ -831,7 +884,8 @@ unsafe fn invoke_presenter(
                 header_count: headers.len(),
                 http_read_ahead_bytes: optional_open_byte_count(args, "httpReadAheadBytes")?,
                 http_back_buffer_bytes: optional_open_byte_count(args, "httpBackBufferBytes")?,
-                reserved: [0; 2],
+                start_position_micros: optional_open_byte_count(args, "startPositionMicros")?,
+                reserved: [0; 1],
             };
             let status =
                 unsafe { erika_presenter_open_with_options(handle, uri_c.as_ptr(), &options) };
@@ -857,6 +911,9 @@ unsafe fn invoke_presenter(
         "setUpscaler" => {
             let mode = required_i64(args, "mode")? as i32;
             status_value(unsafe { erika_presenter_set_upscaler(handle, mode) })
+        }
+        "clearUpscalerModel" => {
+            status_value(unsafe { erika_presenter_clear_upscaler_model(handle) })
         }
         "setSubtitleScale" => {
             let scale = required_f64(args, "scale")?;
@@ -1035,6 +1092,11 @@ unsafe fn invoke_presenter(
             )
         }),
         "setDanmakuConfig" => unsafe { set_danmaku_config(handle, args) },
+        // Remaining names go to the shared pass-through table (diagnostics,
+        // logs, listMethods, invokeJson, …); unknown names still fail here.
+        method if crate::presenter_json::json_method_spec(method).is_some() => unsafe {
+            crate::presenter_json::invoke(handle, method, arguments)
+        },
         method => Err(format!("unsupported Erika Android method: {method}")),
     }
 }

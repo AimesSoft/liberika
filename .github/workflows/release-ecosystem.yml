@@ -170,6 +170,49 @@ jobs:
       publish: true
     secrets: inherit
 
+  # npm trusted publishing: the packages name this workflow file as their
+  # publisher on npmjs.com, so no token is stored. Set the repository variable
+  # NPM_PUBLISH to true once both packages exist there; see docs/releasing.md.
+  publish-npm:
+    name: Publish npm packages
+    needs: version
+    if: vars.NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@^11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: liberika-web-npm
+          path: npm
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Publish the packages this release has not published yet
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(find npm -name '*.tgz' | wc -l)" -eq 2
+          for tarball in npm/*.tgz; do
+            name="$(tar -xOf "$tarball" package/package.json | jq -r .name)"
+            version="$(tar -xOf "$tarball" package/package.json | jq -r .version)"
+            [[ "$version" == "$VERSION" ]]
+            if [[ "$(npm view "${name}@${version}" version 2>/dev/null)" == "$version" ]]; then
+              echo "${name}@${version} is already on npm."
+              continue
+            fi
+            npm publish "$tarball" --access public
+          done
+
   build-swift:
     name: Build and attach Swift binary
     needs: version
@@ -183,7 +226,7 @@ jobs:
     secrets: inherit
 
   update-swift-sdk:
-    name: Update ErikaSwift repository
+    name: Update liberika-swift repository
     needs: [version, build-swift]
     runs-on: ubuntu-latest
     permissions:
@@ -194,7 +237,7 @@ jobs:
       CHECKSUM: ${{ needs.build-swift.outputs.checksum }}
       SOURCE_TAG: ${{ needs.version.outputs.release_ref }}
     steps:
-      - name: Dispatch ErikaSwift release workflow
+      - name: Dispatch liberika-swift release workflow
         shell: bash
         run: |
           set -euo pipefail
@@ -205,4 +248,4 @@ jobs:
             --arg checksum "$CHECKSUM" \
             --arg source_tag "$SOURCE_TAG" \
             '{event_type:"erika-release", client_payload:{version:$version, checksum:$checksum, source_tag:$source_tag}}' \
-            | gh api --method POST repos/AimesSoft/ErikaSwift/dispatches --input -
+            | gh api --method POST repos/AimesSoft/liberika-swift/dispatches --input -

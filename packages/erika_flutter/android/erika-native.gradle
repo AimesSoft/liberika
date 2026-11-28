@@ -270,7 +270,7 @@ def hostTag = {
 
 tasks.register("buildErikaAndroidRuntime") {
     group = "build"
-    description = "Stage a prebuilt or source-built Erika runtime for the selected Android ABIs"
+    description = "Stage a prebuilt or source-built liberika runtime for the selected Android ABIs"
     outputs.dir(generatedJniLibs)
     // Cargo and xtask own their incremental caches. Always enter the native
     // build so Rust/source or ABI changes cannot leave stale packaged .so files.
@@ -297,7 +297,7 @@ tasks.register("buildErikaAndroidRuntime") {
                         "${prebuiltName}.zip",
                     )
                     def prebuiltUrl =
-                        "https://github.com/AimesSoft/Erika/releases/download/" +
+                        "https://github.com/AimesSoft/liberika/releases/download/" +
                         "$prebuiltTag/${prebuiltName}.zip"
                     if (prebuiltArchive.isFile()) {
                         def cachedSha256 = sha256(prebuiltArchive)

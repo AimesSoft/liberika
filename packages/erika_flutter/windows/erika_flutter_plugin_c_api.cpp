@@ -8,5 +8,6 @@ void ErikaFlutterPluginCApiRegisterWithRegistrar(
     FlutterDesktopPluginRegistrarRef registrar) {
   erika_flutter::ErikaFlutterPlugin::RegisterWithRegistrar(
       flutter::PluginRegistrarManager::GetInstance()
-          ->GetRegistrar<flutter::PluginRegistrarWindows>(registrar));
+          ->GetRegistrar<flutter::PluginRegistrarWindows>(registrar),
+      FlutterDesktopPluginRegistrarGetMessenger(registrar));
 }

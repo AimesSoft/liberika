@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing Erika release tag to verify
+        description: Existing liberika release tag to verify
         required: true
         type: string
 

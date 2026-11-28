@@ -4,10 +4,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(erika_shared_ffmpeg)");
+    // Browser C dependencies are built and packaged by `cargo run -p xtask -- web build`.
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        return;
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_PROFILE");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_TARGET");
     println!("cargo:rerun-if-env-changed=ERIKA_FFMPEG_DIR");
+    println!("cargo:rerun-if-env-changed=ERIKA_FFMPEG_SET");
     println!("cargo:rerun-if-env-changed=ERIKA_LIBASS_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_FREETYPE_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_HARFBUZZ_DIR");
@@ -28,6 +34,18 @@ fn main() {
 
     let ffmpeg_version_major = emit_ffmpeg_version_cfg();
     enforce_bundled_ffmpeg_version(ffmpeg_version_major);
+
+    // FFmpeg av_log bridge feeding the diagnostics log ring. A distro FFmpeg is
+    // a shared library other components of the host process may configure, so
+    // capture there is opt-in (see trace::FfmpegLogCapture::SharedLibrary).
+    if use_system_libraries("ERIKA_FFMPEG_DIR") {
+        println!("cargo:rustc-cfg=erika_shared_ffmpeg");
+    }
+    println!("cargo:rerun-if-changed=src/ffmpeg_log_bridge.c");
+    cc::Build::new()
+        .file("src/ffmpeg_log_bridge.c")
+        .warnings(true)
+        .compile("erika_ffmpeg_log_bridge");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").ok();
     if target_os.as_deref() == Some("linux")
@@ -74,9 +92,29 @@ fn main() {
                 .compile("erika_linux_vulkan");
             if env::var("ERIKA_LINUX_D3D12_INTEROP").as_deref() == Ok("1") {
                 let directx = pkg_config::Config::new()
+                    .cargo_metadata(false)
                     .probe("DirectX-Headers")
                     .expect("WSL interop requires DirectX-Headers development files");
+                let mut directx_includes = Vec::new();
+                let mut fallback_link_search = None;
+                for path in &directx.include_paths {
+                    for subdir in ["directx", "wsl/stubs"] {
+                        let candidate = path.join(subdir);
+                        if candidate.is_dir() {
+                            directx_includes.push(candidate);
+                        }
+                    }
+                    if fallback_link_search.is_none() {
+                        if let Some(lib_dir) = path.parent().map(|root| root.join("lib")) {
+                            if lib_dir.join("libDirectX-Headers.a").is_file() {
+                                fallback_link_search = Some(lib_dir);
+                            }
+                        }
+                    }
+                    directx_includes.push(path.clone());
+                }
                 let va = pkg_config::Config::new()
+                    .cargo_metadata(false)
                     .probe("libva")
                     .expect("WSL interop requires libva-dev");
                 println!("cargo:rerun-if-changed=src/renderer/linux_wsl_d3d12.cpp");
@@ -85,13 +123,18 @@ fn main() {
                     .std("c++17")
                     .file("src/renderer/linux_wsl_d3d12.cpp")
                     .includes(&avutil_includes)
-                    .includes(directx.include_paths)
+                    .includes(directx_includes)
                     .includes(va.include_paths)
                     .includes(&vulkan.include_paths)
                     .warnings(true)
                     .compile("erika_linux_wsl");
 
                 // Static objects refer to GUIDs/libva after the archive.
+                if directx.link_paths.is_empty() {
+                    if let Some(lib_dir) = fallback_link_search {
+                        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+                    }
+                }
                 pkg_config::Config::new().probe("DirectX-Headers").unwrap();
                 pkg_config::Config::new().probe("libva").unwrap();
             }
@@ -116,7 +159,7 @@ fn main() {
         ] {
             println!("cargo:rustc-link-lib={lib}");
         }
-        // Erika always includes C++ code through bundled SoundTouch, and the
+        // liberika always includes C++ code through bundled SoundTouch, and the
         // libass/HarfBuzz path adds more C++ when that feature is enabled.
         // Keep the Android runtime dependency independent of Cargo features.
         println!("cargo:rustc-link-lib=dylib=c++_shared");
@@ -139,7 +182,7 @@ fn main() {
         && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
         && env::var("ERIKA_USE_SYSTEM_LIBS").as_deref() != Ok("0")
     {
-        // Erika's ordered memory-font fallback is an in-tree libass patch.
+        // liberika's ordered memory-font fallback is an in-tree libass patch.
         // Keep it even when the distro supplies FFmpeg and the font libraries.
         let libass = env::var_os("ERIKA_LIBASS_DIR")
             .map(PathBuf::from)
@@ -219,12 +262,46 @@ fn main() {
         );
     }
 
-    println!("cargo:rustc-link-lib=static=ass");
-    println!("cargo:rustc-link-lib=static=fribidi");
-    println!("cargo:rustc-link-lib=static=harfbuzz");
-    println!("cargo:rustc-link-lib=static=freetype");
+    let linux = target_os.as_deref() == Some("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos");
+    for (prefix, library) in [
+        (&libass, "ass"),
+        (&fribidi, "fribidi"),
+        (&harfbuzz, "harfbuzz"),
+        (&freetype, "freetype"),
+    ] {
+        if linux {
+            // pkg-config (e.g. PulseAudio) can add /usr/lib before our prefixes.
+            // A distinct name prevents accidentally linking a distro archive.
+            let archive = prefix.join(format!("lib/lib{library}.a"));
+            println!("cargo:rerun-if-changed={}", archive.display());
+            let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+            fs::copy(&archive, out.join(format!("liberika_bundled_{library}.a")))
+                .unwrap_or_else(|error| panic!("copy bundled {}: {error}", archive.display()));
+            println!("cargo:rustc-link-search=native={}", out.display());
+            println!("cargo:rustc-link-lib=static=erika_bundled_{library}");
+        } else {
+            println!("cargo:rustc-link-lib=static={library}");
+        }
+    }
 
-    if target_os.as_deref() == Some("windows") {
+    if target_os.as_deref() == Some("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos")
+    {
+        // Fontconfig is the system font-discovery interface, not a bundled
+        // rasterizer. Do not emit its transitive -lfreetype: we already linked
+        // the bundled FreeType above, and must not select a distro archive.
+        let fontconfig = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .statik(false)
+            .probe("fontconfig")
+            .expect("Linux subtitles require libfontconfig-dev");
+        for path in fontconfig.link_paths {
+            println!("cargo:rustc-link-search=native={}", path.display());
+        }
+        println!("cargo:rustc-link-lib=dylib=fontconfig");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    } else if target_os.as_deref() == Some("windows") {
         println!("cargo:rustc-link-lib=dwrite");
     } else if matches!(target_os.as_deref(), Some("ios" | "tvos" | "macos")) {
         if target_os.as_deref() == Some("macos") {
@@ -368,6 +445,17 @@ fn enforce_bundled_ffmpeg_version(version_major: Option<u32>) {
     );
 }
 
+/// `ffmpeg`, or the folder of the smaller set `ERIKA_FFMPEG_SET` names, as
+/// `xtask deps build --ffmpeg` builds it.
+fn ffmpeg_dir_name() -> String {
+    match env::var("ERIKA_FFMPEG_SET") {
+        Ok(set) if !set.is_empty() && set != "full" => {
+            format!("ffmpeg-{}", set.replace(',', "-"))
+        }
+        _ => "ffmpeg".to_string(),
+    }
+}
+
 fn ffmpeg_dist_dir() -> PathBuf {
     if let Ok(path) = env::var("ERIKA_FFMPEG_DIR") {
         return PathBuf::from(path);
@@ -376,14 +464,12 @@ fn ffmpeg_dist_dir() -> PathBuf {
         return workspace_root()
             .join("third_party/dist")
             .join(target)
-            .join(native_profile())
-            .join("ffmpeg");
+            .join(native_profile_dir())
+            .join(ffmpeg_dir_name());
     }
-    let mut dist = workspace_root().join("third_party/dist");
-    if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
-    }
-    dist.join(native_profile()).join("ffmpeg")
+    native_dist_root()
+        .join(native_profile_dir())
+        .join(ffmpeg_dir_name())
 }
 
 fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
@@ -394,18 +480,49 @@ fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
         return workspace_root()
             .join("third_party/dist")
             .join(target)
-            .join(native_profile())
+            .join(native_profile_dir())
             .join(name);
     }
-    let mut dist = workspace_root().join("third_party/dist");
+    native_dist_root().join(native_profile_dir()).join(name)
+}
+
+/// The dist directory `xtask deps build` filled for this target: the one
+/// named after the target triple when it was built (`--target
+/// aarch64-apple-darwin`), else the host build's.
+fn native_dist_root() -> PathBuf {
+    let dist = workspace_root().join("third_party/dist");
     if let Some(target) = inferred_native_target() {
-        dist = dist.join(target);
+        return dist.join(target);
     }
-    dist.join(native_profile()).join(name)
+    if let Ok(target) = env::var("TARGET") {
+        let built = dist.join(target);
+        if built.join(native_profile_dir()).is_dir() {
+            return built;
+        }
+    }
+    dist
 }
 
 fn native_profile() -> String {
     env::var("ERIKA_NATIVE_PROFILE").unwrap_or_else(|_| "lgpl".to_string())
+}
+
+/// Rust links the MSVC C runtime statically (`-C target-feature=+crt-static`),
+/// so the native libraries must too: `xtask deps build --crt static`.
+fn static_crt() -> bool {
+    env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+        && env::var("CARGO_CFG_TARGET_FEATURE")
+            .is_ok_and(|features| features.split(',').any(|feature| feature == "crt-static"))
+}
+
+/// The dist directory of the profile, which a static C runtime build keeps
+/// apart.
+fn native_profile_dir() -> String {
+    if static_crt() {
+        format!("{}-crt-static", native_profile())
+    } else {
+        native_profile()
+    }
 }
 
 fn inferred_native_target() -> Option<String> {

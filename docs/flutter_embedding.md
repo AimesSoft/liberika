@@ -2,7 +2,7 @@
 
 [中文](flutter_embedding.zh.md) | [English](flutter_embedding.md) | [日本語](flutter_embedding.ja.md)
 
-Erika is not a Flutter video renderer. Flutter is an optional host UI.
+liberika is not a Flutter video renderer. Flutter is an optional host UI.
 The player owns decode, timing, native rendering, subtitles, danmaku, audio, and
 HDR presentation.
 
@@ -12,7 +12,7 @@ There are two C ABI entrypoint families:
 
 - `ErikaHandle`: control and event API. Use this when the host owns its own
   presenter loop or only wants to probe/control playback.
-- `ErikaPresenterHandle`: presenter-owned API. Use this when Erika should
+- `ErikaPresenterHandle`: presenter-owned API. Use this when liberika should
   own `Player + renderer + audio output` and the host only supplies a
   native surface plus a display-tick callback.
 
@@ -51,7 +51,7 @@ overlay that sits outside Flutter's platform-view compositor:
 5. Attach retry with exponential backoff handles window readiness timing.
 
 The overlay path is the recommended path for NipaPlay and other full-player
-UIs. It keeps video presentation owned by Erika/Metal while Flutter remains a
+UIs. It keeps video presentation owned by liberika/Metal while Flutter remains a
 control and layout layer. On iOS/tvOS the native side uses a window plus a
 sibling `UIView`/`CAMetalLayer`; on macOS it uses the host `NSWindow` plus a
 sibling `NSView`/`CAMetalLayer`.
@@ -131,7 +131,7 @@ device-side run verification.
 
 ## Transparent Video and Blend Modes
 
-Erika can present alpha-bearing video assets while keeping Flutter layout and
+liberika can present alpha-bearing video assets while keeping Flutter layout and
 composition. Transparency is requested per player:
 
 ```dart
@@ -177,14 +177,14 @@ rebound automatically if the decoder or output device rebuilds the swap chain.
 
 ## iOS Build Path
 
-The iOS plugin links the Erika C ABI static library into the app through a
+The iOS plugin links the liberika C ABI static library into the app through a
 CocoaPod script phase. By default it downloads the matching prebuilt archive;
 set `ERIKA_FORCE_SOURCE_BUILD=1` (with `ERIKA_REPO_ROOT`) to build the Rust
 `erika_capi` crate for the target iOS architecture instead.
 
 ## tvOS Build Path
 
-The tvOS plugin links the Erika C ABI static library through its CocoaPod script
+The tvOS plugin links the liberika C ABI static library through its CocoaPod script
 phase. Like iOS it downloads the prebuilt archive by default, with
 `ERIKA_FORCE_SOURCE_BUILD=1` falling back to building from source. It supports
 tvOS 13+, arm64 devices, and arm64/x86_64 simulators. See
@@ -250,6 +250,29 @@ extended-linear scRGB; GLES and failed capability negotiation explicitly fall
 back to SDR. Android SDR is verified, while the API 35 HDR-device active-path
 acceptance remains pending. Linux provides experimental X11/Wayland and Flutter integration.
 
+On Windows each presenter runs on its own native worker thread: create, commands, surface
+attach/resize/detach, render ticks, capture and destroy all execute there, and frame requests
+coalesce (at most one tick queued or running per presenter). Method results, `EventSink` events,
+SMTC updates, texture registration and HWND/DirectComposition operations stay on the platform
+thread, so a slow render tick no longer blocks the window message loop. Set
+`ERIKA_FLUTTER_FRAME_TRACE=1` to log `presenter_worker ... platform_thread=... render_thread=...
+off_platform=true` once per presenter and slow ticks (`frame_tick ... work_ms=`) measured on the worker.
+
+The other platforms use the same owner model. Linux shares the canonical
+`windows/erika_presenter_worker.h` and drives its own 16 ms monotonic clock; GTK, view and Flutter
+texture registration stay on the platform thread, and results and events reach it through an idle
+source. OpenHarmony (the Flutter plugin and the `erika_ohos` package) has one owner thread per
+presenter behind `presenter_bridge.h`; every N-API function also has an `...Async` variant that
+resolves a promise on the ArkTS thread, and the legacy C helper `ErikaOhosPlayerFromId` now returns
+null because native code must not reach into a presenter owned by another thread. Android keeps a
+dedicated `HandlerThread` per presenter. On macOS, iOS and tvOS each presenter owns a dedicated
+thread (`ErikaPresenterOwner.swift`) that performs create, every native command, rendering, event
+polling, capture and destroy in FIFO order with coalesced frame ticks; `CVDisplayLink` and
+`CADisplayLink` only wake it, while the main thread decodes arguments, delivers results and events in
+order, and does the AppKit/UIKit work (now-playing, remote commands, views). A slow `open`, `seek` or
+`dispose` therefore neither blocks the UI thread nor delays rendering, and `ERIKA_FLUTTER_FRAME_TRACE=1`
+logs the thread of each tick and command.
+
 ## Dart API
 
 Installation, player controls, HTTP cache options, events and view examples are
@@ -262,7 +285,7 @@ provides `codec`, `width`, `height`, `pixelFormat`, `profile`, `level`, `bitRate
 `frameRateNumerator`, and `frameRateDenominator`; audio tracks additionally provide
 `sampleRate`, `channels`, and `sampleFormat`.
 
-- `bitRate` is in bit/s. Erika prefers the video track's own codec parameters; only when there is
+- `bitRate` is in bit/s. liberika prefers the video track's own codec parameters; only when there is
   exactly one video track with no declared bitrate and the container bitrate plus every other
   media track's bitrate (audio, subtitle, other video) are known does it estimate video bitrate as
   container bitrate minus those. It is `null` when
@@ -290,7 +313,7 @@ player.events.listen((event) {
 
 ## Native Debug HUD
 
-`setDebugHudEnabled(true)` makes Erika draw a diagnostic HUD in the native video composition. It
+`setDebugHudEnabled(true)` makes liberika draw a diagnostic HUD in the native video composition. It
 does not render through Dart or alter the Flutter widget hierarchy. It is off by
 default and intended for development, performance analysis, and on-device diagnosis.
 
@@ -303,30 +326,101 @@ cumulative for the presenter lifetime. The HUD is excluded from `screenshot()` o
 For a custom UI, use `getPresenterStats()` to retrieve the latest native display-tick snapshot. It
 does not drive the HUD, and its freshness depends on an attached surface and active display loop.
 
+## Diagnostics for Hosts and Agents
+
+Three methods expose the engine's own view for automated troubleshooting
+(stutter, corruption, decode failures, A/V drift):
+
+- `getDiagnosticsSnapshot()` returns one JSON map (schema 1): decoder and
+  hardware path with fallbacks, presenter counters, output/HDR, resources,
+  upscaler, audio, buffer depths, and timing — scheduler late drops,
+  presentation cadence and jitter, clock drift and corrections. Unknown values
+  are `null`.
+- `getLogs({limit, minLevel, sinceSeq})` reads the process-wide, redacted log
+  ring: liberika's operational diagnostics plus FFmpeg warnings and errors.
+- `invokeJson(method, [arguments])` calls any entry of the native JSON method
+  table and returns its envelope (`{ok, status, value | error, code?}`);
+  `invokeJson('listMethods')` lists the table, so new engine capabilities need
+  no Dart change.
+
+Field reference: [capi_reference.md](capi_reference.md), "Agent diagnostics
+(JSON)" and "JSON bridge". When the platform plugin or the bundled native
+library lacks a method, the call throws `UnsupportedError`. Status in this
+release: macOS, iOS and tvOS resolve the new symbols optionally; Linux,
+HarmonyOS and Android route through the shared JSON table; Windows throws
+`UnsupportedError`.
+
+On macOS and iOS the plugin runs `invokeJson` and `getDiagnosticsSnapshot` on the
+presenter's owner thread and `getLogs` on a utility queue, and answers on the main
+thread, so a call that takes long (`addExternalSubtitle` of a large file,
+`exportFrame`) does not occupy it. A long presenter method delays that presenter's
+next frame (frames run between commands) but never the interface; methods whose
+`scope` is `global` (`exportFrame`, `exportFrames`, `getLogs`, `listMethods`) run
+without a presenter handle.
+`listMethods` marks each method `blocking` (returns when the work is done, and
+the work grows with its input) and `writesFiles` (creates files; the result
+lists their paths).
+
+## Pictures Without a Player
+
+`ErikaPlayer.exportFrame(uri, position: ...)` returns the picture shown at a
+media time as RGBA or PNG from its own demuxer and multi-threaded software
+decoder; no player is involved. HDR sources (PQ, HLG, Dolby Vision) are tone
+mapped to SDR with the arithmetic the player uses for an SDR display, and
+`ErikaExportedFrame.toneMapped` says so. For several pictures of one media open
+an `ErikaFrameExportSession` (or call `ErikaPlayer.exportFrames`): the media is
+opened once and requests in ascending time order continue decoding instead of
+seeking again. The work runs off the UI thread: a native worker queue on macOS,
+a background isolate per session on the FFI platforms (iOS, tvOS, Android,
+Windows, Linux, HarmonyOS). Close a session with `close()`. Set
+`ERIKA_FLUTTER_LIBRARY` to a library path to run the FFI exports against a
+build under test.
+
 ## Neural Upscaler Status
 
-`setUpscaler` requests a mode; the kernels are compiled on a background thread,
-so the host should poll `getUpscalerStatus` to drive its UI:
+`setUpscaler(ErikaUpscalerMode)` requests a mode (ArtCNN, Anime4K, `fsr1`,
+`platformVideo`, `metalFxSpatial`, `custom`; see
+[integration.md](integration.md#upscaler) for the modes and what runs on each
+platform). Kernels are compiled on a background thread, so the host should poll
+`getUpscalerStatus` to drive its UI:
 
 | `activeBackend` | Meaning |
 |-----------------|---------|
 | `off` | No mode requested. |
-| `building` | Kernels compiling (first use of a mode); frames render unscaled until ready. |
-| `inactive` | Mode requested but not applied — kernels not ready (and not compiling), or the backend recorded a fallback/failure. |
-| `scalar` | Running on the Metal scalar or wgpu compute backend. |
-| `simdgroupMatrix` | Running on the `simdgroup_matrix` backend (Apple Silicon default). |
+| `inactive` | Mode requested but not runnable here (or the backend recorded a fallback/failure); native sampling is used and the reason is in the diagnostics `upscaler` object. |
+| `building` | Kernels compiling in the background; frames render with native sampling until ready. |
+| `scalar` | Generic compute shaders. |
+| `simdgroupMatrix` | Apple `simdgroup_matrix` (M1-M4/A14+). |
+| `cooperativeMatrix` | Vulkan `VK_KHR_cooperative_matrix` next to D3D11 (Tensor Cores / WMMA / XMX). |
+| `linalgMatrix` | D3D12 SM 6.10 `linalg::Matrix`, an opt-in preview. |
+| `videoProcessor` | D3D11 video processor vendor extension: NVIDIA RTX Video / Intel VSR. |
+| `videoToolbox` | VideoToolbox super resolution. |
+| `metalFx` | MetalFX spatial scaler. |
+| `tensorOps` | Metal 4 tensor ops (Apple10 GPUs: M5/A19). |
 
-The upscaler only engages when the drawable shows the video larger than its
-source resolution, so a 1080p source in a 1080p (or smaller) view stays
-`inactive`. C4F16 is the real-time recommendation; C4F16 DS targets heavily
-compressed or noisy sources at the same compute cost. On Apple, C4F32 generally
-needs an M-Pro/Max-class GPU at 1080p input; on Android, both models use Vulkan
-compute and GLES reports an explicit `inactive` fallback. See
-`docs/architecture.md` for the renderer-side design.
+`getUpscalerStatus().lastGpuDuration` is now filled on Windows as well
+(D3D11 timestamp queries).
+
+Limits worth surfacing in a UI: RTX Video Super Resolution (`platformVideo` on
+Windows) needs an RTX GPU, the NVIDIA App / Control Panel setting enabled, and
+SDR video; the VideoToolbox scaler accepts only 2x, 8-bit 4:2:0 sources between
+96x96 and 960x960 on macOS/iOS/tvOS 26+; D3D12 linalg is an opt-in preview; the
+wgpu renderers (Linux, Android, OpenHarmony, Windows wgpu fallback) run every
+network mode and `fsr1`, while `platformVideo` and `metalFxSpatial` report
+`inactive`. R8F64 is only practical on matrix units and SD/720p sources.
+
+`loadUpscalerModel(Uint8List data, {String name = 'custom'})` loads a custom
+network (an Erika `.esr` file or an FSRCNNX / Anime4K CNN mpv hook shader; the
+host supplies the file because FSRCNNX is not bundled for licensing reasons),
+then call `setUpscaler(ErikaUpscalerMode.custom)`. `clearUpscalerModel()`
+unloads it. The Linux plugin exposes only the JSON file-path method
+(`loadUpscalerModelFile`).
+
+See `docs/architecture.md` for the renderer-side design.
 
 ## Ownership Rule
 
-Flutter owns layout and controls. Erika owns the video plane, subtitle plane,
+Flutter owns layout and controls. liberika owns the video plane, subtitle plane,
 danmaku plane, audio, and timing. The plugin bridges commands and events through
 a `MethodChannel`; rendering never passes through Dart.
 
@@ -336,4 +430,7 @@ a `MethodChannel`; rendering never passes through Dart.
 Flutter after GPU readback. Wayland can use `ErikaWindowOverlayVideoView` as a
 native plane below transparent Flutter UI; this avoids per-frame texture
 readback but does not support Flutter clipping or color filters on the video.
-Build the runtime locally and set `ERIKA_LIBRARY_DIR`; see [Linux integration](linux.md).
+Download a v0.3.7 Linux x86_64 or ARM64 runtime archive (`bundled` or `system`),
+or build from source, then set `ERIKA_LIBRARY_DIR` to the absolute directory
+containing `liberika_capi.so` (`lib` in the archive). Linux runtimes are not downloaded
+automatically; see [Linux integration](linux.md).

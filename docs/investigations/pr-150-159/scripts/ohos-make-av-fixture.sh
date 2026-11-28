@@ -1,0 +1,1 @@
+ffmpeg -hide_banner -loglevel error -y -i /review-logs/bbb-10s.mp4 -f lavfi -i sine=frequency=440:sample_rate=48000:duration=10 -map 0:v -map 1:a -c:v copy -c:a aac -shortest /review-logs/bbb-av-10s.mp4

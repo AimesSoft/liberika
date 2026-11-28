@@ -6,7 +6,7 @@ import 'dart:developer';
 import 'dart:io';
 
 import 'package:erika_flutter/erika_flutter.dart';
-import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter/services.dart';
 
 Future<void> main() async {
@@ -16,7 +16,10 @@ Future<void> main() async {
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
-  runApp(const MaterialApp(home: _Smoke()));
+  runApp(WidgetsApp(
+    color: const Color(0xff000000),
+    builder: (context, child) => const _Smoke(),
+  ));
 }
 
 class _Smoke extends StatefulWidget {
@@ -128,9 +131,9 @@ class _SmokeState extends State<_Smoke> {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        backgroundColor: Colors.black,
-        body: ErikaVideoView(player: player),
+  Widget build(BuildContext context) => ColoredBox(
+        color: const Color(0xff000000),
+        child: ErikaVideoView(player: player),
       );
 
   @override

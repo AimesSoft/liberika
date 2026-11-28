@@ -1,9 +1,9 @@
 # Third-Party Notices
 
-Erika's own source code is licensed under **MPL-2.0** (see `LICENSE`).
+liberika's own source code is licensed under **MPL-2.0** (see `LICENSE`).
 
 The prebuilt `erika_capi` binaries in this bundle **statically link** the
-following third-party native libraries, built with Erika's `lgpl` dependency
+following third-party native libraries, built with liberika's `lgpl` dependency
 profile. Their licenses apply to the corresponding portions of the binary.
 
 | Component | Version | License |
@@ -17,7 +17,7 @@ profile. Their licenses apply to the corresponding portions of the binary.
 | zlib | 1.3.x | zlib |
 | SoundTouch | 2.3.2 | LGPL v2.1 |
 
-The Erika binary also embeds these assets:
+The liberika binary also embeds these assets:
 
 | Asset | Copyright / author | License |
 |-------|--------------------|---------|
@@ -37,9 +37,9 @@ These binaries link LGPL components statically. To honor the LGPL's relinking
 requirement, the complete corresponding source and the reproducible build
 system that produced these binaries are publicly available:
 
-- **Erika source** (this exact build): the Git tag named in the release / the
+- **liberika source** (this exact build): the Git tag named in the release / the
   commit recorded in the bundle's `MANIFEST.txt`, at
-  <https://github.com/AimesSoft/Erika>.
+  <https://github.com/AimesSoft/liberika>.
 - **Native dependency build**: `xtask deps build --all --profile lgpl` plus the
   per-target build described in `docs/building.md` in that source tree.
 
@@ -51,7 +51,7 @@ SoundTouch 2.3.2 is bundled by the Cargo packages pinned in `Cargo.lock`
 (`soundtouch` 0.5.4 and `soundtouch-ffi` 0.4.1). Its corresponding source ships
 inside the `soundtouch-ffi` package downloaded by Cargo. SoundTouch is copyright
 © Olli Parviainen 2001–2022. A recipient can patch or replace that dependency
-and rebuild the complete Erika static library with Cargo to relink against a
+and rebuild the complete liberika static library with Cargo to relink against a
 modified SoundTouch. The LGPL v2.1 text is included at
 `licenses/LICENSE.LGPL-2.1`.
 

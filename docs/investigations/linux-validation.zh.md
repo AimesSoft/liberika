@@ -41,7 +41,7 @@ Mesa llvmpipe 以及 Mesa D3D12 / NVIDIA GeForce RTX 5070。独立 Linux 桌面�
 | 最终 presenter 定向单元测试 | 24 通过 |
 | NipaPlay 1.10.12 Linux release 实际 UI | 播放、数分钟暂停后恢复、seek、全屏进入/退出、中文字幕和进度弹幕通过 |
 | NipaPlay 原始 RGBA 截图及缩略图保存 | 427×240、409920 字节，保存成功 |
-| 安装包动态链接与版本 | 从安装目录解析 Erika，SHA256 与 release 构建一致 |
+| 安装包动态链接与版本 | 从安装目录解析 liberika，SHA256 与 release 构建一致 |
 
 原生 Wayland 视频层更新后另行验证：NipaPlay 1.11.9 / Flutter 3.47.0-0.3.pre
 的 Rust 与 Flutter release 构建成功，Weston 截图确认透明控件、视频、中文字幕及

@@ -172,6 +172,10 @@ pub struct MediaRequest {
     /// retains behind the reader. `None` uses the 16 MiB engine default
     /// (`HTTP_CACHE_RETAIN_BYTES`).
     pub http_back_buffer_bytes: Option<u64>,
+    /// Where the media opens: the engine seeks there before its worker starts,
+    /// so the first frame presented is the one at this position, not the
+    /// media's first. `None` (or zero, or past the end) opens at the start.
+    pub start_position: Option<Duration>,
 }
 
 /// Hand-written so that credentials carried by custom headers (`Authorization`,
@@ -204,7 +208,15 @@ impl MediaRequest {
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
             http_back_buffer_bytes: None,
+            start_position: None,
         }
+    }
+
+    /// Opens at [position] instead of the start (see [`Self::start_position`]).
+    /// Zero is treated as `None`.
+    pub fn with_start_position(mut self, position: Option<Duration>) -> Self {
+        self.start_position = position.filter(|position| !position.is_zero());
+        self
     }
 
     pub fn with_http_headers(mut self, http_headers: Vec<(String, String)>) -> Self {
@@ -290,6 +302,15 @@ fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
     left
 }
 
+/// What the opened media's container says of itself: its demuxer's short
+/// name (`matroska,webm`, `mov,mp4,m4a,3gp,3g2,mj2`) and its overall bit
+/// rate, when the container states one or FFmpeg estimates it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerInfo {
+    pub format: Option<String>,
+    pub bit_rate: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackInfo {
     pub id: i64,
@@ -307,6 +328,9 @@ pub struct TrackInfo {
     pub level: Option<i32>,
     pub bit_rate: Option<u64>,
     pub frame_rate: Option<FrameRate>,
+    /// The Dolby Vision profile the container signals for a video track
+    /// (`dvcC`/`dvvC`), `None` when it signals none.
+    pub dolby_vision_profile: Option<u8>,
     pub selected: bool,
     pub source: TrackSource,
     pub can_remove: bool,
@@ -330,6 +354,7 @@ impl TrackInfo {
             level: None,
             bit_rate: None,
             frame_rate: None,
+            dolby_vision_profile: None,
             selected: false,
             source: TrackSource::Embedded,
             can_remove: false,
@@ -343,6 +368,14 @@ impl TrackInfo {
             ..Self::embedded(id, kind)
         }
     }
+}
+
+/// A container chapter on the same zero-based timeline as playback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterInfo {
+    pub title: String,
+    pub start: Duration,
+    pub end: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -473,6 +506,9 @@ pub enum PlayerEvent {
     SurfaceAttached(PlatformSurface),
     SurfaceDetached,
     Error(PlayerError),
+    /// The media played to its end on its own (not a stop asked for). Sent
+    /// right after the `Stopped` state that the end brings.
+    Ended,
 }
 
 pub struct PlayerVideoFrame {
@@ -541,6 +577,166 @@ pub struct RendererFrameCapture {
     pub rgba: Vec<u8>,
 }
 
+const EXPORT_UNSUPPORTED: &str = "native texture export is unsupported by this renderer; select WgpuFallback on Linux/Vulkan or Apple/Metal";
+
+/// Native resource type carried by an [`ExternalTextureFrame`].
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalTextureKind {
+    Metal = 1,
+    VulkanOpaqueFd = 2,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalTextureFormat {
+    Rgba8Unorm = 1,
+}
+
+/// Version-independent native texture metadata. Pixels are SDR sRGB-encoded
+/// values in RGBA8Unorm storage, matching `capture_frame_rgba`.
+///
+/// Handles are borrowed from the frame. Vulkan import consumes an FD, so import
+/// a `dup` of `native_handle`, never the original. Vulkan images use dedicated
+/// allocations, one mip/layer/sample, and the exact format/usage/tiling below.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalTextureInfo {
+    pub kind: ExternalTextureKind,
+    pub format: ExternalTextureFormat,
+    pub width: u32,
+    pub height: u32,
+    /// `id<MTLTexture>` pointer or borrowed OPAQUE_FD (zero is a valid FD).
+    pub native_handle: u64,
+    /// Metal MTLDevice registry ID; zero for Vulkan.
+    pub device_id: u64,
+    pub allocation_size: u64,
+    pub memory_type_index: u32,
+    pub vulkan_format: u32,
+    pub vulkan_usage: u32,
+    pub vulkan_tiling: u32,
+    pub device_uuid: [u8; 16],
+    pub driver_uuid: [u8; 16],
+}
+
+/// Owns an immutable, GPU-complete texture without reading pixels to the CPU.
+///
+/// Keep the frame alive until all consumer GPU work and imported aliases have
+/// been retired. Frames can outlive their presenter and renderer. The consumer
+/// must use the same GPU. Vulkan consumers must acquire queue-family ownership
+/// from EXTERNAL with old layout GENERAL before reading; do not modify pixels.
+/// Metal consumers may instead retain the native MTLTexture independently and
+/// then drop this guard; that native reference must cover all consumer GPU work.
+pub struct ExternalTextureFrame {
+    info: ExternalTextureInfo,
+    _resource: Box<dyn Send + Sync>,
+}
+
+impl ExternalTextureFrame {
+    pub fn info(&self) -> &ExternalTextureInfo {
+        &self.info
+    }
+
+    #[cfg(all(
+        feature = "wgpu",
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
+    pub(crate) fn new(info: ExternalTextureInfo, resource: impl Send + Sync + 'static) -> Self {
+        Self {
+            info,
+            _resource: Box::new(resource),
+        }
+    }
+}
+
+/// An exported frame as a Linux dma-buf: one linear, single-planar RGBA8
+/// image that another API imports directly (GTK's `GdkDmabufTexture`, EGL,
+/// Wayland, a compositor).
+///
+/// The buffer is described by `fourcc = ABGR8888`, `modifier = 0`, one
+/// plane, with the layout here: `offset` bytes in, `stride` bytes between
+/// rows, `width × height` pixels.
+///
+/// Unlike [`ExternalTextureFrame`], nothing has to be imported into a second
+/// Vulkan device: the consumer maps the memory itself. The descriptor owns
+/// the allocation, so a consumer may keep reading it after this value and
+/// the producer's image are gone — close the last handle to free it.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[derive(Debug)]
+pub struct DmabufFrame {
+    fd: std::os::fd::OwnedFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+    offset: u32,
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+impl DmabufFrame {
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn new(
+        fd: std::os::fd::OwnedFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        offset: u32,
+    ) -> Self {
+        Self {
+            fd,
+            width,
+            height,
+            stride,
+            offset,
+        }
+    }
+
+    /// The dma-buf, borrowed. Import it with the layout below, not with
+    /// assumptions about the row order.
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+
+    /// The dma-buf's raw descriptor, borrowed (it stays owned by the frame).
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.fd)
+    }
+
+    /// The dma-buf, owned: the caller closes it (GTK's release callback).
+    pub fn into_fd(self) -> std::os::fd::OwnedFd {
+        self.fd
+    }
+
+    /// A new descriptor for the same buffer, owned by the caller.
+    pub fn try_clone_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.fd.try_clone()
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Bytes from one row to the next (at least `width * 4`).
+    pub fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// Bytes from the start of the descriptor to the first pixel.
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+}
+
 impl<'a> RenderFrameContext<'a> {
     pub fn new(media_time: Duration, generation: u64) -> Self {
         Self {
@@ -587,7 +783,7 @@ impl PlatformSurface {
     }
 }
 
-/// Exact native drawable/swapchain extent. Surface width and height in Erika's
+/// Exact native drawable/swapchain extent. Surface width and height in liberika's
 /// public API are physical pixels and are never derived from the content scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfacePhysicalExtent {
@@ -808,10 +1004,32 @@ pub trait RendererBackend {
         Ok(())
     }
 
+    /// A danmaku edit advanced the layout generation while the
+    /// current frame still has no danmaku. Other scene inputs retain their keys.
+    #[cfg(target_os = "windows")]
+    fn advance_empty_danmaku_scene(&mut self, _previous_generation: u64, _generation: u64) {}
+
     /// Render the current frame (optionally compositing `overlay`) to the attached
     /// surface. Returns `false` if there is no current frame to draw, letting the
     /// caller fall back to a test frame.
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool>;
+
+    /// Requests immutable overlay ownership when the backend can retain it
+    /// without copying. The presenter allocates shared frames only on demand.
+    fn prefers_shared_overlay(&self) -> bool {
+        false
+    }
+
+    /// Render with the immutable owner of exactly `context.overlay`.
+    /// Implementations must check that identity before retaining it. Other backends
+    /// keep the original rendering contract through this default forwarding.
+    fn render_current_frame_shared(
+        &mut self,
+        context: RenderFrameContext<'_>,
+        _overlay_owner: &Arc<OverlayFrame>,
+    ) -> Result<bool> {
+        self.render_current_frame(context)
+    }
 
     /// Selects the native GPU texture that receives the next Flutter texture
     /// frame. Apple embedders pass an `id<MTLTexture>` pointer as `raw_texture`.
@@ -835,6 +1053,36 @@ pub trait RendererBackend {
         _height: u32,
     ) -> Result<Option<RendererFrameCapture>> {
         Ok(None)
+    }
+
+    /// Checks that `export_current_frame_texture` can produce a texture of this
+    /// size, before the presenter does any per-frame work for it.
+    fn validate_export_texture_size(&mut self, _width: u32, _height: u32) -> Result<()> {
+        Err(PlayerError::Renderer(EXPORT_UNSUPPORTED.into()))
+    }
+
+    /// Render video, subtitles and danmaku directly into an immutable native
+    /// texture. Unsupported backends return an error, never a CPU fallback.
+    fn export_current_frame_texture(
+        &mut self,
+        _context: RenderFrameContext<'_>,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<ExternalTextureFrame>> {
+        Err(PlayerError::Renderer(EXPORT_UNSUPPORTED.into()))
+    }
+
+    /// Render video, subtitles and danmaku into a linear dma-buf the host
+    /// imports without a Vulkan device of its own (Linux). Unsupported
+    /// backends return an error, never a CPU fallback.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn export_current_frame_dmabuf(
+        &mut self,
+        _context: RenderFrameContext<'_>,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<crate::core::DmabufFrame>> {
+        Err(PlayerError::Renderer(EXPORT_UNSUPPORTED.into()))
     }
 
     fn runtime_stats(&self) -> RendererRuntimeStats {
@@ -871,6 +1119,41 @@ pub trait RendererBackend {
     /// upscaler implementation ignore the request.
     fn set_luma_upscaler(&mut self, _mode: crate::renderer::pipeline::LumaUpscalerMode) {}
 
+    /// Why the upscaler is `Inactive` or degraded, and the engine running it
+    /// (for example `scalar`, `cooperative_matrix`, `metal4_tensor_ops`,
+    /// `fsr1`, `nvidia_rtx_video`). Reported in diagnostics JSON.
+    fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        (None, None)
+    }
+
+    /// Installs the network run by `LumaUpscalerMode::Custom` (already
+    /// validated and optimized); `None` clears it. Backends without a network
+    /// engine ignore it.
+    fn set_custom_upscaler_model(
+        &mut self,
+        _model: Option<std::sync::Arc<crate::renderer::sr::model::SrModel>>,
+    ) {
+    }
+
+    /// Reports the built-in upscaler modes, custom network support, and
+    /// post-processing shader support available on this backend and GPU device.
+    fn supported_upscalers(&self) -> crate::renderer::pipeline::UpscalerCapabilities {
+        crate::renderer::pipeline::UpscalerCapabilities::default()
+    }
+
+    /// Installs or clears the active RGB post-processing shader applied to the
+    /// rendered video picture before subtitle and danmaku overlays.
+    fn set_post_process_shader(
+        &mut self,
+        _shader: Option<std::sync::Arc<crate::renderer::post_process::PostProcessShader>>,
+    ) {
+    }
+
+    /// Current runtime status of the active RGB post-processing shader.
+    fn post_process_status(&self) -> crate::renderer::post_process::PostProcessRuntimeInfo {
+        crate::renderer::post_process::PostProcessRuntimeInfo::default()
+    }
+
     /// Publishes the display's current HDR/SDR headroom ratio. Android uses
     /// this for queryable runtime status; renderers that do not expose dynamic
     /// display headroom may ignore the update.
@@ -903,16 +1186,44 @@ pub trait RendererBackend {
     fn windows_flutter_texture_iunknown(&self) -> Option<*mut std::ffi::c_void> {
         None
     }
+
+    /// Enables or disables maintaining a GPU snapshot of each rendered
+    /// composition frame for alpha-blended compositing (for example Windows
+    /// `CompositionDrawingSurface` while the host visual has `0 < Opacity < 1`).
+    fn set_composition_blended(&mut self, _enabled: bool) {}
+
+    /// Borrowed `ID3D11Texture2D` pointer and monotonic frame generation for
+    /// the latest blended composition snapshot. No `AddRef`.
+    fn composition_blended_texture(&self) -> Option<(*mut std::ffi::c_void, u64)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LumaUpscalerBackendStatus {
     #[default]
     Off,
+    /// The mode is not available on this backend or failed; native sampling
+    /// is used and diagnostics carry the reason.
     Inactive,
     Building,
+    /// Generic compute shaders (scalar ALUs).
     Scalar,
+    /// Apple `simdgroup_matrix` kernels.
     SimdgroupMatrix,
+    /// Vulkan `VK_KHR_cooperative_matrix` kernels (NVIDIA Tensor Cores, AMD
+    /// WMMA, Intel XMX) driven next to a D3D11 renderer.
+    CooperativeMatrix,
+    /// Direct3D 12 Shader Model 6.10 `linalg::Matrix` kernels.
+    LinalgMatrix,
+    /// A D3D11 video processor vendor extension (NVIDIA RTX Video, Intel VSR).
+    VideoProcessor,
+    /// VideoToolbox super resolution.
+    VideoToolbox,
+    /// MetalFX spatial scaling.
+    MetalFx,
+    /// Metal 4 tensor ops on the GPU matrix units of Apple10 GPUs (M5/A19).
+    TensorOps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -956,7 +1267,7 @@ pub struct RendererRuntimeStats {
 }
 
 /// Snapshot of memory visible from the renderer. Individual fields describe
-/// resources tracked by Erika; `device_current_allocated_bytes` is Metal's
+/// resources tracked by liberika; `device_current_allocated_bytes` is Metal's
 /// process-wide device counter and can therefore include driver allocations
 /// that do not belong to a single presenter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -975,6 +1286,7 @@ pub struct RendererResourceStats {
 }
 
 struct PlayerInner {
+    cancelled_cold_open: bool,
     state: PlayerState,
     ended: bool,
     media: Option<MediaRequest>,
@@ -986,6 +1298,8 @@ struct PlayerInner {
     audio_output_epoch: u64,
     surface: Option<PlatformSurface>,
     tracks: Vec<TrackInfo>,
+    chapters: Vec<ChapterInfo>,
+    container: ContainerInfo,
     track_selection: TrackSelection,
     subscribers: Vec<Sender<PlayerEvent>>,
     video_frame_sender: Option<Sender<PlayerVideoFrame>>,
@@ -1155,6 +1469,7 @@ pub struct Player {
     decoder_resources: PlaybackDecoderResources,
     inner: Arc<Mutex<PlayerInner>>,
     lifecycle: Arc<Mutex<PlayerLifecycle>>,
+    timing_counters: Arc<crate::diagnostics::PlaybackTimingCounters>,
 }
 
 impl Player {
@@ -1164,6 +1479,7 @@ impl Player {
             config,
             decoder_resources: PlaybackDecoderResources::default(),
             inner: Arc::new(Mutex::new(PlayerInner {
+                cancelled_cold_open: false,
                 state: PlayerState::Idle,
                 ended: false,
                 media: None,
@@ -1175,6 +1491,8 @@ impl Player {
                 audio_output_epoch: 1,
                 surface: None,
                 tracks: Vec::new(),
+                chapters: Vec::new(),
+                container: ContainerInfo::default(),
                 track_selection: TrackSelection::default(),
                 subscribers: Vec::new(),
                 video_frame_sender: None,
@@ -1186,7 +1504,14 @@ impl Player {
                 epoch: 1,
                 playback: None,
             })),
+            timing_counters: Arc::new(crate::diagnostics::PlaybackTimingCounters::new()),
         }
+    }
+
+    /// Scheduler, clock-discipline, buffering and queue counters of the
+    /// current media. Lock-free to read from any thread.
+    pub fn timing_counters(&self) -> &crate::diagnostics::PlaybackTimingCounters {
+        &self.timing_counters
     }
 
     #[cfg(target_env = "ohos")]
@@ -1211,7 +1536,8 @@ impl Player {
         self.inner.lock().expect("player mutex poisoned").state
     }
 
-    pub(crate) fn is_stopped_at_end(&self) -> bool {
+    /// Playback stopped because the media ended, as opposed to `stop()`.
+    pub fn is_stopped_at_end(&self) -> bool {
         let inner = self.inner.lock().expect("player mutex poisoned");
         inner.state == PlayerState::Stopped && inner.ended
     }
@@ -1243,6 +1569,14 @@ impl Player {
             generation: inner.playback_generation.max(1),
             state: inner.state,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_playback_snapshot_for_test(&self, snapshot: PlaybackSnapshot) {
+        let mut inner = self.inner.lock().expect("player mutex poisoned");
+        inner.playback_clock = snapshot.clock;
+        inner.playback_generation = snapshot.generation;
+        inner.state = snapshot.state;
     }
 
     pub fn duration(&self) -> Option<Duration> {
@@ -1319,6 +1653,16 @@ impl Player {
     }
 
     pub fn open(&self, media: MediaRequest) -> Result<()> {
+        self.open_with_cold_open_cancellation(media, None)
+    }
+
+    pub fn open_with_cold_open_cancellation(
+        &self,
+        media: MediaRequest,
+        cold_open_cancellation: Option<crate::source::ClaimedColdOpenCancellation>,
+    ) -> Result<()> {
+        let cold_open_cancellation =
+            cold_open_cancellation.map(|capability| capability.into_inner());
         let epoch = {
             let mut lifecycle = self
                 .lifecycle
@@ -1338,13 +1682,18 @@ impl Player {
             self.emit(PlayerEvent::BufferingChanged(false));
             epoch
         };
-        let mut engine = match VideoPlaybackEngine::open_with_decoder_resources(
+        let mut engine = match VideoPlaybackEngine::open_with_cold_open_cancellation(
             &media,
             self.config.playback,
             self.decoder_resources.clone(),
+            cold_open_cancellation.clone(),
         ) {
             Ok(engine) => engine,
             Err(error) => {
+                if cold_open_cancellation.as_ref().is_some_and(|c| !c.finish()) {
+                    self.finish_cancelled_cold_open(epoch);
+                    return Err(self.superseded_open_error());
+                }
                 let error = PlayerError::Playback(error.to_string());
                 let lifecycle = self
                     .lifecycle
@@ -1359,6 +1708,29 @@ impl Player {
             }
         };
         let info = engine.info().clone();
+        // Seek before the worker starts, so the first frame it presents is
+        // the one at the start position.
+        let start = media
+            .start_position
+            .filter(|start| info.duration.is_none_or(|duration| *start < duration));
+        if let Some(start) = start {
+            if let Err(error) = engine.seek(start) {
+                trace::diagnostic(
+                    serde_json::json!({
+                        "event": "open_start_position",
+                        "stage": "seek_failed",
+                        "positionMicros": start.as_micros() as u64,
+                        "reason": error.to_string(),
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        let start = start.unwrap_or(Duration::ZERO);
+        if cold_open_cancellation.as_ref().is_some_and(|c| !c.finish()) {
+            self.finish_cancelled_cold_open(epoch);
+            return Err(self.superseded_open_error());
+        }
         let decoder_events = engine.take_video_decoder_events();
         let mut lifecycle = self
             .lifecycle
@@ -1375,15 +1747,18 @@ impl Player {
             let generation = inner.playback_generation.saturating_add(1).max(1);
             inner.media = Some(media);
             inner.duration = info.duration;
-            inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
+            inner.playback_clock = PlaybackClock::paused_at(start);
             inner.playback_generation = generation;
             inner.playback_command_sequence = 0;
             inner.pending_play_sequence = None;
             inner.ended = false;
             inner.tracks = info.tracks.clone();
+            inner.chapters = info.chapters.clone();
+            inner.container = info.container.clone();
             inner.track_selection = info.track_selection();
             generation
         };
+        engine.attach_timing_counters(Arc::clone(&self.timing_counters));
         lifecycle.playback = Some(PlaybackRuntime::spawn(
             engine,
             Arc::clone(&self.inner),
@@ -1398,6 +1773,9 @@ impl Player {
         }
         for event in decoder_events {
             self.emit(PlayerEvent::VideoDecoderChanged(event));
+        }
+        if !start.is_zero() {
+            self.emit(PlayerEvent::PositionChanged(start));
         }
         self.transition(PlayerState::Ready)?;
         Ok(())
@@ -1577,8 +1955,13 @@ impl Player {
         self.send_playback_command(PlaybackCommand::SelectAudioTrack(track_id))
     }
 
+    /// Selects a subtitle track, or none. Asking for none while no media is
+    /// open succeeds and changes nothing: no subtitle is shown then.
     pub fn select_subtitle_track(&self, track_id: Option<i64>) -> Result<()> {
         self.ensure_not_closed()?;
+        if track_id.is_none() && self.optional_playback_commands().is_none() {
+            return Ok(());
+        }
         self.send_playback_command(PlaybackCommand::SelectSubtitleTrack(track_id))
     }
 
@@ -1597,8 +1980,36 @@ impl Player {
             .track_selection
     }
 
+    /// The container of the current media, as read while opening it.
+    pub fn container(&self) -> ContainerInfo {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .container
+            .clone()
+    }
+
+    /// Chapters read while opening the current media; empty when absent.
+    pub fn chapters(&self) -> Vec<ChapterInfo> {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .chapters
+            .clone()
+    }
+
     pub fn stop(&self) -> Result<()> {
         self.ensure_not_closed()?;
+        // Cancellation can finish before any playback worker exists. Stopping
+        // that already-stopped empty generation is a successful no-op.
+        if self
+            .inner
+            .lock()
+            .expect("player mutex poisoned")
+            .cancelled_cold_open
+        {
+            return Ok(());
+        }
         let commands = self.playback_commands()?;
         let (
             previous_clock,
@@ -1743,13 +2154,6 @@ impl Player {
         ) {
             Ok(()) => {}
             Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                // A resume whose command never entered the FIFO must be
-                // retried, or a worker that recovers later stays suspended
-                // and keeps video decoding parked forever. An ACK timeout
-                // needs no compensation: the command is already queued.
-                if !suspended {
-                    enqueue_video_decode_resume_after_timeout(&commands);
-                }
                 return Err(PlayerError::Playback(format!(
                     "timed out after {} ms while sending video decode mode to the playback worker",
                     timeout.as_millis(),
@@ -1809,14 +2213,6 @@ impl Player {
         ) {
             Ok(()) => {}
             Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                // Same compensation rule as the suspend path: a resume whose
-                // command never entered the FIFO must be retried, or a worker
-                // that recovers later keeps frame output quiesced forever and
-                // both the video tick and the audio prefill stay parked. An
-                // ACK timeout needs no compensation: the command is queued.
-                if !quiesced {
-                    enqueue_frame_output_resume_after_timeout(&commands);
-                }
                 let message = format!(
                     "timed out after {} ms while sending frame output {action} to the playback worker",
                     timeout.as_millis(),
@@ -1900,8 +2296,11 @@ impl Player {
         drop(previous);
         {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.cancelled_cold_open = false;
             inner.media = None;
             inner.tracks.clear();
+            inner.chapters.clear();
+            inner.container = ContainerInfo::default();
             inner.track_selection = TrackSelection::default();
             inner.duration = None;
             inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
@@ -1961,6 +2360,11 @@ impl Player {
             .clone())
     }
 
+    /// Whether a media is open (opening counts): a playback worker exists.
+    pub fn has_open_media(&self) -> bool {
+        self.optional_playback_commands().is_some()
+    }
+
     fn optional_playback_commands(&self) -> Option<Sender<PlaybackCommand>> {
         self.lifecycle
             .lock()
@@ -1968,6 +2372,31 @@ impl Player {
             .playback
             .as_ref()
             .map(|runtime| runtime.commands.clone())
+    }
+
+    fn finish_cancelled_cold_open(&self, epoch: u64) {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("player lifecycle mutex poisoned");
+        if lifecycle.epoch != epoch {
+            return;
+        }
+        {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.cancelled_cold_open = true;
+            inner.media = None;
+            inner.tracks.clear();
+            inner.chapters.clear();
+            inner.container = ContainerInfo::default();
+            inner.track_selection = TrackSelection::default();
+            inner.duration = None;
+            inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
+            inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
+            inner.ended = false;
+            inner.pending_play_sequence = None;
+        }
+        let _ = self.transition(PlayerState::Stopped);
     }
 
     fn superseded_open_error(&self) -> PlayerError {
@@ -1994,6 +2423,9 @@ impl Player {
     fn transition_to_opening(&self) {
         let previous = {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.cancelled_cold_open = false;
+            inner.chapters.clear();
+            inner.container = ContainerInfo::default();
             // A racing Play may have cloned the old worker sender before this
             // Open took the lifecycle lock, then queued behind Shutdown. The
             // old worker is joined above, so invalidate that orphaned intent
@@ -2186,7 +2618,17 @@ fn run_playback_worker(
                     &mut audio_output_backpressure,
                 );
             }
+        }
 
+        // Subtitles are delivered while paused too: a seek (or a subtitle
+        // chosen) on a paused player presents a frame, and the cue that is
+        // on at that time has to arrive with it, not after the next play.
+        if !frame_output_quiesced
+            && matches!(
+                engine.state(),
+                PlaybackRunState::Playing | PlaybackRunState::Paused
+            )
+        {
             match engine.tick_subtitle() {
                 Ok(Some(frame)) => emit_subtitle_frame_from_worker(
                     &inner,
@@ -2224,10 +2666,12 @@ fn run_playback_worker(
         let after_av = std::time::Instant::now();
 
         if let Some(buffering) = buffering_event {
+            engine.timing_counters().record_buffering(buffering);
             emit_from_worker(&inner, PlayerEvent::BufferingChanged(buffering));
         }
 
         emit_video_decoder_events_from_worker(engine, &inner);
+        engine.publish_queue_depths();
 
         if last_position_event.is_some_and(|(generation, _)| generation != playback_generation) {
             last_position_event = None;
@@ -2909,12 +3353,10 @@ fn handle_playback_command(
                     let _ = reply.send(Ok(track));
                 }
                 Err(error) => {
-                    let message = error.to_string();
-                    emit_from_worker(
-                        inner,
-                        PlayerEvent::Error(PlayerError::Playback(message.clone())),
-                    );
-                    let _ = reply.send(Err(message));
+                    // The media is still open. Report this command's failure
+                    // to its caller without turning a bad sidecar into a
+                    // fatal playback event for every embedding application.
+                    let _ = reply.send(Err(error.to_string()));
                 }
             }
         }
@@ -3181,6 +3623,10 @@ fn publish_natural_eof_events_from_worker(
                 .is_ok()
         });
     }
+    // A stop asked for is `Stopped` too; this says the media ended.
+    inner
+        .subscribers
+        .retain(|sender| sender.send(PlayerEvent::Ended).is_ok());
     *eof_published = true;
 }
 
@@ -3717,7 +4163,23 @@ mod tests {
         engine
             .seek_with_playback_intent(Duration::from_millis(5_125), false)
             .unwrap();
+        engine.play().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if engine.tick().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the asynchronous seek preview"
+            );
+            std::thread::yield_now();
+        }
         let engine_clock = engine.clock();
+        assert!(
+            engine_clock.is_running(),
+            "precondition: worker clock is running"
+        );
 
         player.pause().expect("queue pause command");
         let pause_sequence = match commands
@@ -3725,8 +4187,10 @@ mod tests {
             .expect("pause command")
         {
             PlaybackCommand::Pause { sequence, .. } => sequence,
-            other => panic!("expected pause command"),
+            _ => panic!("expected pause command"),
         };
+        let parked_clock = player.inner.lock().unwrap().playback_clock.clone();
+        assert!(!parked_clock.is_running());
         // The intent bumped the command sequence past everything the worker
         // has executed, parked the shared clock, and published Paused.
         assert_eq!(pause_sequence, 1);
@@ -3755,8 +4219,14 @@ mod tests {
             "a pending pause intent must not be overwritten by the worker clock"
         );
 
+        assert_eq!(player.inner.lock().unwrap().playback_clock, parked_clock);
+        assert!(last_worker_clock.is_none());
+
         // Executing the pause command releases the sync: the engine clock is
         // authoritative again.
+        engine.pause();
+        let engine_clock = engine.clock();
+        assert!(!engine_clock.is_running());
         sync_playback_clock_from_worker(
             &engine,
             &player.inner,
@@ -3858,6 +4328,22 @@ mod tests {
     fn frame_output_barrier_is_a_noop_without_open_media() {
         let player = Player::new(PlayerConfig::default());
         assert!(!player.set_frame_output_quiesced(true).unwrap());
+    }
+
+    #[test]
+    fn selecting_no_subtitle_without_open_media_succeeds_and_a_track_does_not() {
+        let player = Player::new(PlayerConfig::default());
+        assert!(!player.has_open_media());
+        player.select_subtitle_track(None).unwrap();
+        let error = player.select_subtitle_track(Some(3)).unwrap_err();
+        assert!(error.to_string().contains("no media is open"), "{error}");
+        let receiver = install_test_runtime(&player, 2);
+        assert!(player.has_open_media());
+        player.select_subtitle_track(None).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            PlaybackCommand::SelectSubtitleTrack(None)
+        ));
     }
 
     #[test]
@@ -4574,6 +5060,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn media_request_start_position_treats_zero_as_the_start() {
+        assert_eq!(
+            MediaRequest::new("a.mkv")
+                .with_start_position(Some(Duration::ZERO))
+                .start_position,
+            None
+        );
+        assert_eq!(
+            MediaRequest::new("a.mkv")
+                .with_start_position(Some(Duration::from_secs(5)))
+                .start_position,
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn player_opens_at_the_start_position_when_env_is_set() {
+        let Some(path) = std::env::var_os("ERIKA_TEST_SAMPLE") else {
+            return;
+        };
+        let player = Player::new(PlayerConfig::default());
+        let events = player.subscribe();
+        player
+            .open(
+                MediaRequest::new(path.to_string_lossy().into_owned())
+                    .with_start_position(Some(Duration::from_secs(3))),
+            )
+            .unwrap();
+        let mut said = None;
+        loop {
+            match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                PlayerEvent::PositionChanged(position) => said = Some(position),
+                PlayerEvent::StateChanged(PlayerState::Ready) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(said, Some(Duration::from_secs(3)));
+        assert_eq!(player.current_media_time(), Duration::from_secs(3));
+        player.close().unwrap();
+    }
+
     fn ended_playback_fixture_engine() -> Option<VideoPlaybackEngine> {
         let Some(path) = std::env::var_os("ERIKA_PLAYBACK_FIXTURE") else {
             return None;
@@ -4584,6 +5112,7 @@ mod tests {
             http_headers: Vec::new(),
             http_read_ahead_bytes: None,
             http_back_buffer_bytes: None,
+            start_position: None,
         };
         let mut engine = VideoPlaybackEngine::open(
             &request,
@@ -5073,6 +5602,7 @@ mod tests {
             vec![
                 PlayerEvent::PositionChanged(Duration::from_secs(8)),
                 PlayerEvent::StateChanged(PlayerState::Stopped),
+                PlayerEvent::Ended,
             ]
         );
     }
@@ -5452,6 +5982,40 @@ mod tests {
     }
 
     #[test]
+    fn invalid_external_subtitle_is_nonfatal_and_allows_replacement() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/playback");
+        let player = Player::new(PlayerConfig::default());
+        player
+            .open(MediaRequest::new(
+                root.join("playback-fixture.mkv").to_string_lossy(),
+            ))
+            .unwrap();
+        let events = player.subscribe();
+        let tracks = player.tracks();
+
+        // Plain source text is readable but cannot be opened as a subtitle.
+        assert!(
+            player
+                .add_external_subtitle(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .is_err()
+        );
+        assert_eq!(player.state(), PlayerState::Ready);
+        assert_eq!(player.tracks(), tracks);
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, PlayerEvent::Error(_)))
+        );
+
+        player
+            .add_external_subtitle(root.join("track-a.srt").to_string_lossy())
+            .unwrap();
+        assert_eq!(player.state(), PlayerState::Ready);
+        assert_eq!(player.tracks().len(), tracks.len() + 1);
+        player.close().unwrap();
+    }
+
+    #[test]
     fn player_open_sample_emits_probe_events_when_env_is_set() {
         let Ok(sample) = std::env::var("ERIKA_TEST_SAMPLE") else {
             return;
@@ -5489,6 +6053,47 @@ mod tests {
             events.recv().unwrap(),
             PlayerEvent::StateChanged(PlayerState::Ready)
         );
+    }
+
+    #[test]
+    fn container_chapters_reach_player_and_clear_on_reopen_or_failure() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let chapter_file = root.join("chapters/chapters.mkv");
+        let player = Player::new(PlayerConfig::default());
+        player
+            .open(MediaRequest::new(chapter_file.to_string_lossy()))
+            .unwrap();
+        let chapters = player.chapters();
+        assert_eq!(chapters.len(), 6);
+        assert_eq!(
+            chapters[1],
+            ChapterInfo {
+                title: "OP".into(),
+                start: Duration::from_secs(10),
+                end: Some(Duration::from_secs(20)),
+            }
+        );
+        assert_eq!(chapters[4].title, "ED");
+        assert_eq!(chapters[4].end, Some(Duration::from_secs(50)));
+        player
+            .open(MediaRequest::new(
+                root.join("playback/playback-fixture.mkv").to_string_lossy(),
+            ))
+            .unwrap();
+        assert!(player.chapters().is_empty());
+        player
+            .open(MediaRequest::new(chapter_file.to_string_lossy()))
+            .unwrap();
+        assert!(
+            player
+                .open(MediaRequest::new(
+                    root.join("missing.mkv").to_string_lossy()
+                ))
+                .is_err()
+        );
+        assert!(player.chapters().is_empty());
+        player.close().unwrap();
+        assert!(player.chapters().is_empty());
     }
 
     #[test]
