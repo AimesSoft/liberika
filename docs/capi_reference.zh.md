@@ -669,6 +669,11 @@ ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *, ErikaEvent *out_e
 所以传**呈现时间戳**，不是 wall-clock 增量。若 `out_stats` 非 `NULL`，会填入流水线
 计数器快照。`poll_event` 非阻塞，空闲时返回 `NoEvent`。
 
+PCM 供给和音频时钟反馈由独立音频线程执行，渲染阻塞不会停止供音。
+`erika_presenter_audio_only_tick` 保留后台视频暂停及前台恢复的状态控制职责；
+不要在正常视频播放时另开定时器调用它。宿主仍负责后台播放许可，并在需要停止声音时
+调用 pause/stop/close；仅停止显示定时器不会停止供音。
+
 `get_stats` 填入同样的 `ErikaPresenterStats` 快照，但不渲染帧。当宿主采样计数器的
 节奏与显示循环不同时用它；它不推进呈现。
 
@@ -817,7 +822,7 @@ free(rgba);
 scale factor 为 1；捕获无需绑定 surface，也不要求先调用 `render_tick`。
 新接口不含调试 HUD，SDR RGBA8、缓冲区和错误约定与截图接口一致。
 捕获会同步准备并缓存短时间窗口；调整尺寸、seek 或修改弹幕配置后，下一次调用可能
-重新准备布局。音频输出仍需常规 `render_tick`；`audio_only_tick` 会暂停视频解码。
+重新准备布局。已启动的音频在独立线程上继续播放。进入后台纯音频模式时调用 `audio_only_tick`。
 
 Rust 对应入口为 `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`：
 

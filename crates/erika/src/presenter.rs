@@ -11,29 +11,12 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 
-#[cfg(target_os = "android")]
-use crate::android::aaudio::{AAudioOutput, AAudioOutputConfig};
-#[cfg(target_os = "macos")]
-use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
-#[cfg(any(target_os = "ios", target_os = "tvos"))]
-use crate::apple::iosaudio::{IosAudioQueueOutput, IosAudioQueueOutputConfig};
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "macos",
-    any(target_os = "ios", target_os = "tvos"),
-    target_os = "windows",
-    target_os = "linux",
-    target_env = "ohos"
-)))]
-use crate::audio::BufferedAudioOutput;
-use crate::audio::{
-    AudioClockSnapshot, AudioOutputBackend, AudioOutputRuntimeStats, AudioRingBufferConfig,
-};
+use crate::audio::{AudioOutputRuntimeStats, AudioRingBufferConfig};
 use crate::core::{
-    AudioOutputEvent, MediaRequest, PlatformSurface, PlaybackSnapshot, Player, PlayerAudioFrame,
-    PlayerConfig, PlayerSubtitleFrame, PlayerVideoFrame, RenderFrameContext, RendererBackend,
-    RendererBackendPreference, RendererRuntimeStats, SurfaceMetrics, TrackInfo, TrackSelection,
-    VideoDecoderEvent, VideoFrameImportFailure, pcm_audio_frame_playback_duration,
+    MediaRequest, PlatformSurface, PlaybackSnapshot, Player, PlayerConfig, PlayerSubtitleFrame,
+    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererBackendPreference,
+    RendererRuntimeStats, SurfaceMetrics, TrackInfo, TrackSelection, VideoDecoderEvent,
+    VideoFrameImportFailure,
 };
 use crate::danmaku::{
     DANMAKU_DEBUG_BUCKETS, DanmakuColor, DanmakuConfigChange, DanmakuDebugBucket,
@@ -44,11 +27,7 @@ use crate::danmaku::{
 };
 use crate::debug_hud::{DebugHud, DebugHudSnapshot};
 use crate::ffmpeg::DecoderBackend;
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-use crate::linux::PulseAudioOutput;
 use crate::luma_stats::LumaSmoother;
-#[cfg(target_env = "ohos")]
-use crate::ohos::ohaudio::{OHAudioOutput, OHAudioOutputConfig};
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
 #[cfg(any(target_os = "windows", target_os = "android"))]
 use crate::playback::VideoDecodePreference;
@@ -67,19 +46,24 @@ use crate::subtitle::{
     SubtitleTrackConfig, SubtitleViewport, decoded_subtitle_frames_to_timeline,
 };
 use crate::trace;
-#[cfg(target_os = "windows")]
-use crate::windows::wasapi::{WasapiAudioOutput, WasapiAudioOutputConfig};
 use crate::{PlayerError, Result};
 
-const AUDIO_START_BUFFER: Duration = Duration::from_millis(250);
-// Bound each display tick by decoded PCM playback duration rather than raw
-// frame count so short-frame codecs (such as 40-sample TrueHD) match the burst
-// headroom of 1024-sample AAC (~341 ms for 16 frames) and can refill the start
-// buffer, SoundTouch warmup, or buffering recovery in one tick while keeping
-// CPU time bounded to AUDIO_PUMP_TIME_BUDGET.
-const AUDIO_PUMP_DURATION_LIMIT: Duration = Duration::from_millis(350);
-const AUDIO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
-const PLAYBACK_RATE_EPSILON: f64 = 0.001;
+#[cfg(target_os = "android")]
+use crate::android::aaudio::AAudioOutputConfig;
+#[cfg(target_os = "macos")]
+use crate::apple::coreaudio::CoreAudioOutputConfig;
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
+use crate::apple::iosaudio::IosAudioQueueOutputConfig;
+#[cfg(target_env = "ohos")]
+use crate::ohos::ohaudio::OHAudioOutputConfig;
+#[cfg(target_os = "windows")]
+use crate::windows::wasapi::WasapiAudioOutputConfig;
+
+mod audio;
+#[cfg(all(test, feature = "wgpu"))]
+mod audio_integration;
+use audio::{AudioCommand, AudioService, AudioServiceSnapshot};
+
 const VIDEO_PUMP_FRAME_LIMIT: usize = 8;
 const VIDEO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
 // A foreground resume that keeps failing must not retry once per display
@@ -335,16 +319,11 @@ pub struct PresenterRuntime {
     player: Player,
     renderer: Box<dyn RendererBackend>,
     video_frames: Receiver<PlayerVideoFrame>,
-    audio_frames: Receiver<PlayerAudioFrame>,
     subtitle_frames: Receiver<PlayerSubtitleFrame>,
     player_events: Receiver<crate::core::PlayerEvent>,
-    audio_output: Box<dyn AudioOutputBackend>,
-    audio_configured: bool,
-    audio_started: bool,
-    last_audio_clock_report: Option<AudioClockReportState>,
-    last_audio_runtime_stats: AudioOutputRuntimeStats,
-    playback_rate: f64,
-    pending_playback_rate: Option<PendingPlaybackRate>,
+    audio: AudioService,
+    uploaded_video_generation: Option<u64>,
+    audio_ready_generation: Option<u64>,
     audio_only_tick_active: bool,
     resume_pending: bool,
     video_decode_resume_attempts: u32,
@@ -454,20 +433,6 @@ fn measure_frame_scene_avg(frame: &PlayerVideoFrame, smoother: &mut LumaSmoother
 
 fn should_report_video_frame_backpressure(drop_count: u64) -> bool {
     drop_count == 1 || drop_count.is_power_of_two()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AudioClockReportState {
-    media_time: Duration,
-    queued_frames: usize,
-    read_frames: u64,
-    underflow_frames: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PendingPlaybackRate {
-    rate: f64,
-    commit_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -838,20 +803,16 @@ impl PresenterRuntime {
         let danmaku = DfmLayoutEngine::new(danmaku_timeline.clone(), danmaku_config.clone());
         let danmaku_planner =
             AsyncDanmakuPlanner::new(danmaku.clone(), danmaku_timeline, danmaku_config);
+        let audio = AudioService::new(player.clone(), audio_frames, config.audio)?;
         Ok(Self {
             player,
             renderer,
             video_frames,
-            audio_frames,
             subtitle_frames,
             player_events,
-            audio_output: build_audio_output(config.audio),
-            audio_configured: false,
-            audio_started: false,
-            last_audio_clock_report: None,
-            last_audio_runtime_stats: AudioOutputRuntimeStats::default(),
-            playback_rate: 1.0,
-            pending_playback_rate: None,
+            audio,
+            uploaded_video_generation: None,
+            audio_ready_generation: None,
             audio_only_tick_active: false,
             resume_pending: false,
             video_decode_resume_attempts: 0,
@@ -1001,7 +962,6 @@ impl PresenterRuntime {
                 self.danmaku_trace.last_surface_resize_log_at = Some(now);
             }
         }
-        self.last_audio_clock_report = None;
         Ok(())
     }
 
@@ -1043,60 +1003,47 @@ impl PresenterRuntime {
         self.subtitle_resolution.reset_budget();
         self.quiesce_frame_output("open")?;
         self.reset_video_decode_resume_state();
-        self.reset_audio_output_with_committed_rate();
+        self.audio.command(AudioCommand::SetAudioOnly(false))?;
+        self.reset_audio_output_with_committed_rate()?;
         self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
-        self.drain_pending_player_frames();
+        self.drain_pending_player_frames()?;
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;
         self.presentation.reset();
         let result = self
             .player
             .open_with_cold_open_cancellation(media, cancellation);
-        let rate_result = if result.is_ok() && !playback_rate_matches(self.playback_rate, 1.0) {
-            self.player.set_playback_rate(self.playback_rate)
+        let rate = self.audio.snapshot().playback_rate;
+        let rate_result = if result.is_ok() && (rate - 1.0).abs() > 0.001 {
+            self.player.set_playback_rate(rate)
         } else {
             Ok(())
         };
         // Player::open joins the previous producer before returning, so this
         // second drain deterministically removes anything it emitted between
         // the first drain and shutdown. The new engine is still paused.
-        self.drain_pending_player_frames();
-        result.and(rate_result)
+        self.drain_pending_player_frames()?;
+        result.and(rate_result)?;
+        self.audio.command(AudioCommand::Resume)
     }
 
     pub fn play(&mut self) -> Result<()> {
         if self.player.is_stopped_at_end() {
+            self.audio.command(AudioCommand::Quiesce)?;
             self.cancel_pending_video_decode_resume();
-            self.reset_audio_output_with_committed_rate();
-            self.drain_pending_player_frames();
+            self.reset_audio_output_with_committed_rate()?;
+            self.drain_pending_player_frames()?;
             self.bump_danmaku_generation();
             self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
         }
-        self.player.play()
+        self.player.play()?;
+        self.audio.command(AudioCommand::Resume)
     }
 
     pub fn pause(&mut self) -> Result<()> {
         let result = self.player.pause();
-        if self.pending_playback_rate.is_some() {
-            // A pending transition is measured against wall time while the
-            // output is running. Pausing that output would otherwise leave the
-            // old-rate bridge queued but allow the stale deadline to commit on
-            // the next play. Flush the bridge and commit the requested rate
-            // while the clock is parked.
-            self.reset_audio_output();
-            let rate_result = self.commit_pending_playback_rate_now();
-            return result.and(rate_result);
-        }
-        if let Err(error) = self.audio_output.pause() {
-            self.stats.audio_failures += 1;
-            trace::diagnostic_at(
-                trace::LogLevel::Warn,
-                format!("Erika presenter audio pause failed: {error}"),
-            );
-        }
-        self.audio_started = false;
-        self.last_audio_clock_report = None;
-        result
+        let audio_result = self.audio.command(AudioCommand::Pause);
+        result.and(audio_result)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -1115,7 +1062,7 @@ impl PresenterRuntime {
         let quiesced = self.quiesce_frame_output("stop")?;
         let result = self.player.stop();
         self.cancel_pending_video_decode_resume();
-        self.reset_audio_output_with_committed_rate();
+        self.reset_audio_output_with_committed_rate()?;
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
         let transition = self.finish_frame_output_transition("stop", quiesced, true);
@@ -1125,22 +1072,24 @@ impl PresenterRuntime {
     pub fn close(&mut self) -> Result<()> {
         self.quiesce_frame_output("close")?;
         self.reset_video_decode_resume_state();
-        self.reset_audio_output_with_committed_rate();
+        let mode = self.audio.command(AudioCommand::SetAudioOnly(false));
+        let reset = self.reset_audio_output_with_committed_rate();
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(Duration::ZERO, TransitionFramePolicy::Clear);
-        self.drain_pending_player_frames();
+        let pending = self.drain_pending_player_frames();
         self.latest_video_decoder = None;
-        let result = self.player.close();
-        // Shutdown is joined at this point; no producer can refill a receiver.
-        self.drain_pending_player_frames();
-        result
+        // Retire the decoder even if device teardown fails, then discard any
+        // frames published during shutdown.
+        let close = self.player.close();
+        let remaining = self.drain_pending_player_frames();
+        mode.and(reset).and(pending).and(close).and(remaining)
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         let quiesced = self.quiesce_frame_output("seek")?;
         let result = self.player.seek(position);
         let rate_result = self.commit_pending_playback_rate_now();
-        self.reset_audio_output();
+        self.reset_audio_output()?;
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(position, TransitionFramePolicy::PreserveRendererSnapshot);
         let transition = self.finish_frame_output_transition("seek", quiesced, true);
@@ -1148,45 +1097,7 @@ impl PresenterRuntime {
     }
 
     pub fn set_playback_rate(&mut self, rate: f64) -> Result<()> {
-        let next_rate = normalize_playback_rate(rate);
-        if playback_rate_request_is_idempotent(
-            self.playback_rate,
-            self.pending_playback_rate,
-            next_rate,
-        ) {
-            return Ok(());
-        }
-        self.player.invalidate_audio_clock();
-        self.audio_output.set_playback_rate(next_rate);
-        self.last_audio_clock_report = None;
-
-        let bridge = audio_transition_bridge(
-            self.audio_output.clock_snapshot(),
-            self.audio_output.queued_output_duration(),
-        );
-        if self.is_playing()
-            && let Some(bridge) = bridge
-        {
-            self.pending_playback_rate = Some(PendingPlaybackRate {
-                rate: next_rate,
-                commit_at: Instant::now() + bridge,
-            });
-            return Ok(());
-        }
-
-        // A paused output keeps its queued PCM. Discard it before committing a
-        // new rate so a later resume cannot play old-rate samples while the
-        // player clock is already running at the new rate.
-        if !self.is_playing() && bridge.is_some() {
-            self.reset_audio_output();
-        }
-        if let Err(error) = self.player.set_playback_rate(next_rate) {
-            self.audio_output.set_playback_rate(self.playback_rate);
-            return Err(error);
-        }
-        self.playback_rate = next_rate;
-        self.pending_playback_rate = None;
-        Ok(())
+        self.audio.command(AudioCommand::SetRate(rate))
     }
 
     /// The volume the host chose. While muted it is kept, and applied on
@@ -1212,8 +1123,13 @@ impl PresenterRuntime {
     }
 
     fn apply_volume(&mut self) {
-        self.audio_output
-            .set_volume(if self.muted { 0.0 } else { self.volume });
+        let gain = if self.muted { 0.0 } else { self.volume };
+        if let Err(error) = self.audio.command(AudioCommand::SetVolume(gain)) {
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("audio volume command failed: {error}"),
+            );
+        }
     }
 
     pub fn set_debug_hud_enabled(&mut self, enabled: bool) {
@@ -1715,7 +1631,7 @@ impl PresenterRuntime {
         let quiesced = self.quiesce_frame_output("select_audio_track")?;
         let result = self.player.select_audio_track(track_id);
         let rate_result = self.commit_pending_playback_rate_now();
-        self.reset_audio_output();
+        self.reset_audio_output()?;
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(
             self.current_media_time,
@@ -1736,7 +1652,7 @@ impl PresenterRuntime {
         let quiesced = self.quiesce_frame_output("select_subtitle_track")?;
         let result = self.player.select_subtitle_track(track_id);
         let rate_result = self.commit_pending_playback_rate_now();
-        self.reset_audio_output();
+        self.reset_audio_output()?;
         self.bump_danmaku_generation();
         self.clear_playback_visual_state(
             self.current_media_time,
@@ -1821,7 +1737,6 @@ impl PresenterRuntime {
                 .sampled_at
         });
         self.presentation.on_tick(frame_time);
-        self.commit_pending_playback_rate()?;
         let pump_started = Instant::now();
         self.pump_frame_inputs(Some(frame_time), untimed_sample);
 
@@ -1912,7 +1827,7 @@ impl PresenterRuntime {
             self.last_render_current_duration = Duration::ZERO;
             self.last_render_test_duration = Duration::ZERO;
             self.last_tick_duration = tick_started.elapsed();
-            return Ok(self.stats);
+            return Ok(self.stats());
         }
         let render_started = Instant::now();
         let render_result = if let Some(owner) = overlay_owner {
@@ -1926,11 +1841,12 @@ impl PresenterRuntime {
         match render_result {
             Ok(true) => {
                 self.stats.rendered_video_frames += 1;
+                self.notify_video_presented()?;
                 self.presentation.on_render(
                     frame_time,
                     true,
                     self.is_playing(),
-                    self.playback_rate,
+                    self.audio.snapshot().playback_rate,
                 );
             }
             Ok(false) => {
@@ -1974,17 +1890,20 @@ impl PresenterRuntime {
                 renderer.rendered_frames,
                 renderer.offscreen_frames,
                 renderer.last_gpu_duration.as_secs_f64() * 1000.0,
-                self.audio_output
-                    .clock_snapshot()
+                self.audio
+                    .snapshot()
+                    .clock
                     .map(|snapshot| snapshot.queued_frames)
                     .unwrap_or(0),
-                self.audio_output
-                    .clock_snapshot()
+                self.audio
+                    .snapshot()
+                    .clock
                     .and_then(|snapshot| snapshot.queued_duration)
                     .map(|duration| duration.as_secs_f64() * 1000.0)
                     .unwrap_or(0.0),
-                self.audio_output
-                    .clock_snapshot()
+                self.audio
+                    .snapshot()
+                    .clock
                     .map(|snapshot| snapshot.underflow_frames)
                     .unwrap_or(0),
                 self.current_surface_metrics
@@ -1996,10 +1915,10 @@ impl PresenterRuntime {
                     .map_or(0, |plan| plan.items.len()),
             ));
         }
-        Ok(self.stats)
+        Ok(self.stats())
     }
 
-    /// Pumps subtitles, video and audio, then applies one clock sample. Plain
+    /// Pumps subtitles and video, then applies one clock sample. Plain
     /// render ticks retain their pre-pump clock epoch; captures can sample now.
     fn pump_frame_inputs(
         &mut self,
@@ -2016,13 +1935,7 @@ impl PresenterRuntime {
         self.pump_video();
         self.last_video_pump_duration = video_started.elapsed();
 
-        let audio_started = Instant::now();
-        // Publish a callback-observed disconnection before clock/push recovery
-        // advances the backend to recovering or stable during this tick.
-        self.report_audio_output_runtime_stats();
-        self.pump_audio();
-        self.report_audio_output_runtime_stats();
-        self.last_audio_pump_duration = audio_started.elapsed();
+        self.refresh_audio_stats();
 
         let sync_started = Instant::now();
         let latest = self.player.playback_snapshot();
@@ -2039,7 +1952,6 @@ impl PresenterRuntime {
 
     pub fn audio_only_tick(&mut self) -> Result<PresenterStats> {
         let tick_started = Instant::now();
-        self.commit_pending_playback_rate()?;
         // A background tick starts a new foreground-resume window. If a
         // previous foreground attempt failed, do not carry its pending flag or
         // its spent attempt budget into the next foreground frame.
@@ -2047,17 +1959,14 @@ impl PresenterRuntime {
         self.video_decode_resume_attempts = 0;
         if !self.audio_only_tick_active {
             self.player.set_video_decode_suspended(true)?;
+            self.audio.command(AudioCommand::SetAudioOnly(true))?;
             self.discard_pending_video_frames();
             self.audio_only_tick_active = true;
         }
         let pump_started = Instant::now();
         self.last_subtitle_pump_duration = Duration::ZERO;
         self.last_video_pump_duration = Duration::ZERO;
-        self.report_audio_output_runtime_stats();
-        let audio_started = Instant::now();
-        self.pump_audio();
-        self.report_audio_output_runtime_stats();
-        self.last_audio_pump_duration = audio_started.elapsed();
+        self.refresh_audio_stats();
         let sync_started = Instant::now();
         self.sync_media_time_from_player();
         self.last_clock_sync_duration = sync_started.elapsed();
@@ -2067,7 +1976,7 @@ impl PresenterRuntime {
         self.last_render_test_duration = Duration::ZERO;
         self.last_pump_duration = pump_started.elapsed();
         self.last_tick_duration = tick_started.elapsed();
-        Ok(self.stats)
+        Ok(self.stats())
     }
 
     fn discard_pending_video_frames(&self) {
@@ -2122,7 +2031,11 @@ impl PresenterRuntime {
 
     fn resume_video_decode_now(&mut self) {
         self.discard_pending_video_frames();
-        match self.player.set_video_decode_suspended(false) {
+        match self
+            .player
+            .set_video_decode_suspended(false)
+            .and_then(|_| self.audio.command(AudioCommand::SetAudioOnly(false)))
+        {
             Ok(_) => {
                 self.audio_only_tick_active = false;
                 self.resume_pending = false;
@@ -2184,9 +2097,10 @@ impl PresenterRuntime {
             .audio
             .and_then(|selected| tracks.iter().find(|track| track.id == selected));
         let renderer = self.renderer.runtime_stats();
-        let clock = self.audio_output.clock_snapshot();
+        let audio = self.audio.snapshot();
+        let clock = audio.clock;
         let output = self.renderer.output_status();
-        let audio_runtime = self.audio_output.runtime_stats();
+        let audio_runtime = audio.runtime;
         let surface = self.current_surface_metrics;
         let decoder = self.latest_video_decoder.as_ref();
         DebugHudSnapshot {
@@ -2217,7 +2131,7 @@ impl PresenterRuntime {
             player_state: format!("{:?}", self.player.state()).to_lowercase(),
             media_time: self.current_media_time,
             duration: self.player.duration(),
-            playback_rate: self.playback_rate,
+            playback_rate: audio.playback_rate,
             surface_width: surface.map_or(0, |metrics| metrics.physical_extent.width),
             surface_height: surface.map_or(0, |metrics| metrics.physical_extent.height),
             decoded_video_frames: self.stats.decoded_video_frames,
@@ -2385,7 +2299,7 @@ impl PresenterRuntime {
     /// rules are documented on [`crate::ExternalTextureFrame`].
     ///
     /// Call once per host frame instead of `render_tick`: each call pumps
-    /// subtitles, video and audio. `content_scale` is the host's physical
+    /// subtitles and video. The audio owner runs independently. `content_scale` is the host's physical
     /// pixels per logical point, as for `resize_surface`. Danmaku uses the same
     /// background planner as on-screen playback, so after a seek, track or size
     /// change comments can appear a few frames later. Without an attached
@@ -2412,7 +2326,6 @@ impl PresenterRuntime {
         }
         let tick_started = Instant::now();
         self.presentation.on_tick(tick_started);
-        self.commit_pending_playback_rate()?;
         // Set before pumping, so a new video frame already plans for it.
         let viewport =
             surface_metrics_to_viewport(SurfaceMetrics::new(width, height, content_scale));
@@ -2456,11 +2369,12 @@ impl PresenterRuntime {
         let frame = result.inspect_err(|_| self.stats.render_failures += 1)?;
         if frame.is_some() {
             self.stats.rendered_video_frames += 1;
+            self.notify_video_presented()?;
             self.presentation.on_render(
                 Instant::now(),
                 true,
                 self.is_playing(),
-                self.playback_rate,
+                self.audio.snapshot().playback_rate,
             );
         }
         Ok(frame)
@@ -2505,7 +2419,6 @@ impl PresenterRuntime {
         }
         let tick_started = Instant::now();
         self.presentation.on_tick(tick_started);
-        self.commit_pending_playback_rate()?;
         let viewport =
             surface_metrics_to_viewport(SurfaceMetrics::new(width, height, content_scale));
         self.export_danmaku_viewport = Some(viewport);
@@ -2547,11 +2460,12 @@ impl PresenterRuntime {
         let frame = result.inspect_err(|_| self.stats.render_failures += 1)?;
         if frame.is_some() {
             self.stats.rendered_video_frames += 1;
+            self.notify_video_presented()?;
             self.presentation.on_render(
                 Instant::now(),
                 true,
                 self.is_playing(),
-                self.playback_rate,
+                self.audio.snapshot().playback_rate,
             );
         }
         Ok(frame)
@@ -2594,10 +2508,22 @@ impl PresenterRuntime {
     }
 
     pub fn stats(&self) -> PresenterStats {
-        self.stats
+        self.stats_with_audio(self.audio.snapshot())
+    }
+
+    fn stats_with_audio(&self, audio: AudioServiceSnapshot) -> PresenterStats {
+        PresenterStats {
+            pushed_audio_frames: audio.pushed_audio_frames,
+            audio_failures: audio.audio_failures,
+            ..self.stats
+        }
     }
 
     pub fn runtime_snapshot(&self) -> PresenterRuntimeSnapshot {
+        self.runtime_snapshot_with_audio(self.audio.snapshot())
+    }
+
+    fn runtime_snapshot_with_audio(&self, audio: AudioServiceSnapshot) -> PresenterRuntimeSnapshot {
         let renderer = self.renderer.runtime_stats();
         let resources = self.renderer.resource_stats();
         let output = self.renderer.output_status();
@@ -2614,9 +2540,9 @@ impl PresenterRuntime {
             .current_danmaku
             .as_ref()
             .map_or(Default::default(), |plan| plan.frame_stats);
-        let audio_snapshot = self.audio_output.clock_snapshot();
+        let audio_snapshot = audio.clock;
         PresenterRuntimeSnapshot {
-            stats: self.stats,
+            stats: self.stats_with_audio(audio),
             renderer,
             resources,
             output,
@@ -2628,7 +2554,7 @@ impl PresenterRuntime {
                 .map_or(0, |snapshot| snapshot.written_frames),
             audio_output_underflow_frames: audio_snapshot
                 .map_or(0, |snapshot| snapshot.underflow_frames),
-            audio_output_runtime_stats: self.audio_output.runtime_stats(),
+            audio_output_runtime_stats: audio.runtime,
             media_time: self.current_media_time,
             generation: self.current_generation,
             playing: self.is_playing(),
@@ -2678,7 +2604,8 @@ impl PresenterRuntime {
 
         self.refresh_video_decoder_status();
         let now = Instant::now();
-        let snapshot = self.runtime_snapshot();
+        let audio = self.audio.snapshot();
+        let snapshot = self.runtime_snapshot_with_audio(audio);
         let renderer = &snapshot.renderer;
         let tracks = self.player.tracks();
         let selection = self.player.track_selection();
@@ -2718,7 +2645,7 @@ impl PresenterRuntime {
             json!({ "trackId": track.id, "codec": track.codec, "language": track.language })
         });
         let timing = self.player.timing_counters();
-        let audio_ring = self.audio_output.stats();
+        let audio_ring = audio.ring;
         let audio_runtime = snapshot.audio_output_runtime_stats;
         let queues = timing.queues_json();
         let channel = |queued: usize, capacity: Option<usize>| json!({ "queued": queued, "capacity": capacity });
@@ -2731,7 +2658,7 @@ impl PresenterRuntime {
                 "playing": snapshot.playing,
                 "mediaTimeSeconds": snapshot.media_time.as_secs_f64(),
                 "durationSeconds": self.player.duration().map(|duration| duration.as_secs_f64()),
-                "playbackRate": self.playback_rate,
+                "playbackRate": audio.playback_rate,
                 "generation": snapshot.generation,
                 "audioOnly": self.audio_only_tick_active,
                 "buffering": timing.buffering_json(),
@@ -2786,10 +2713,10 @@ impl PresenterRuntime {
             "resources": diag::resources_json(&snapshot.resources, snapshot.current_danmaku_atlas_bytes),
             "upscaler": diag::upscaler_json(renderer, self.renderer.upscaler_status_detail()),
             "audio": {
-                "outputState": format!("{:?}", self.audio_output.state()).to_lowercase(),
-                "configured": self.audio_configured,
-                "started": self.audio_started,
-                "volume": self.audio_output.volume(),
+                "outputState": format!("{:?}", audio.state).to_lowercase(),
+                "configured": audio.configured,
+                "started": audio.started,
+                "volume": audio.volume,
                 "pushedFrames": snapshot.stats.pushed_audio_frames,
                 "failures": snapshot.stats.audio_failures,
                 "queuedFrames": snapshot.audio_output_queued_frames,
@@ -2809,7 +2736,7 @@ impl PresenterRuntime {
             "buffers": {
                 "playback": queues,
                 "presenterVideoFrames": channel(self.video_frames.len(), self.video_frames.capacity()),
-                "presenterAudioFrames": channel(self.audio_frames.len(), self.audio_frames.capacity()),
+                "presenterAudioFrames": channel(audio.frames_queued, audio.frames_capacity),
                 "presenterSubtitleFrames": channel(self.subtitle_frames.len(), self.subtitle_frames.capacity()),
                 "audioOutputQueuedMs": diag::optional_duration_ms(snapshot.audio_output_queued_duration),
             },
@@ -2859,6 +2786,7 @@ impl PresenterRuntime {
                     self.stats.decoded_video_frames += 1;
                     match self.renderer.upload_player_frame(&frame) {
                         Ok(()) => {
+                            self.uploaded_video_generation = Some(frame.generation);
                             if self.rejected_video_import_route.is_some() {
                                 self.rejected_video_import_route = None;
                             }
@@ -3708,13 +3636,14 @@ impl PresenterRuntime {
         media_time: Duration,
         frame_policy: TransitionFramePolicy,
     ) {
+        self.uploaded_video_generation = None;
+        self.audio_ready_generation = None;
         self.rejected_video_import_route = None;
         self.current_overlay = None;
         self.subtitle_resolution.source = None;
         self.subtitles.clear();
         self.clear_current_danmaku_state();
         self.current_media_time = media_time;
-        self.last_audio_clock_report = None;
         match frame_policy {
             TransitionFramePolicy::Clear => self.release_current_video_frame(),
             TransitionFramePolicy::PreserveRendererSnapshot => {
@@ -3769,6 +3698,9 @@ impl PresenterRuntime {
     }
 
     fn quiesce_frame_output(&mut self, operation: &'static str) -> Result<bool> {
+        // Stop frame production before parking the consumer. If the producer
+        // times out, its normal recovery can continue supplying the live owner.
+        // No decoder or output is reset until both barriers acknowledge.
         let started = Instant::now();
         trace::diagnostic(
             serde_json::json!({
@@ -3780,6 +3712,13 @@ impl PresenterRuntime {
         );
         match self.player.set_frame_output_quiesced(true) {
             Ok(active) => {
+                if let Err(error) = self.audio.command(AudioCommand::Quiesce) {
+                    // A timed-out command may already be executing. Restore
+                    // producer then consumer order before returning the error.
+                    self.player.set_frame_output_quiesced(false)?;
+                    self.audio.command(AudioCommand::Resume)?;
+                    return Err(error);
+                }
                 trace::diagnostic(
                     serde_json::json!({
                         "event": "player_frame_output_transition",
@@ -3816,11 +3755,11 @@ impl PresenterRuntime {
     ) -> Result<()> {
         if !active {
             if drain_all_streams {
-                self.drain_pending_player_frames();
+                self.drain_pending_player_frames()?;
             } else {
                 self.drain_pending_video_frames();
             }
-            return Ok(());
+            return self.audio.command(AudioCommand::Resume);
         }
         // A second quiesce command is a FIFO barrier behind the transition
         // command. Its ACK proves decoder replacement finished while output
@@ -3846,7 +3785,7 @@ impl PresenterRuntime {
                     .to_string(),
                 );
                 if drain_all_streams {
-                    self.drain_pending_player_frames();
+                    self.drain_pending_player_frames()?;
                 } else {
                     self.drain_pending_video_frames();
                 }
@@ -3893,7 +3832,7 @@ impl PresenterRuntime {
                 // output resumed, so the pending receivers are now safe to drain.
                 if barrier_error.is_some() {
                     if drain_all_streams {
-                        self.drain_pending_player_frames();
+                        self.drain_pending_player_frames()?;
                     } else {
                         self.drain_pending_video_frames();
                     }
@@ -3913,13 +3852,18 @@ impl PresenterRuntime {
             }
         }
 
+        let audio_result = if resume_result.is_ok() {
+            self.audio.command(AudioCommand::Resume)
+        } else {
+            Ok(())
+        };
         match (barrier_error, resume_result) {
             (None, result) => result.map(|_| ()),
             (Some(barrier_error), Ok(_)) => Err(barrier_error),
             (Some(barrier_error), Err(resume_error)) => Err(PlayerError::Playback(format!(
                 "frame output transition barrier failed: {barrier_error}; resume failed: {resume_error}",
             ))),
-        }
+        }.and(audio_result)
     }
 
     fn sync_danmaku_engine_timeline(&mut self) {
@@ -3960,253 +3904,46 @@ impl PresenterRuntime {
         }
     }
 
-    fn pump_audio(&mut self) {
-        let started = Instant::now();
-        let mut pumped_duration = Duration::ZERO;
-        let rate = self
-            .pending_playback_rate
-            .map_or(self.playback_rate, |pending| pending.rate);
-        loop {
-            if pumped_duration >= AUDIO_PUMP_DURATION_LIMIT
-                || started.elapsed() >= AUDIO_PUMP_TIME_BUDGET
-            {
-                break;
-            }
-            if !self.audio_output.can_accept_audio_frame() {
-                break;
-            }
-            match self.audio_frames.try_recv() {
-                Ok(frame) => {
-                    if frame.generation != self.player.playback_generation() {
-                        continue;
-                    }
-                    let frame_duration = pcm_audio_frame_playback_duration(&frame.frame, rate);
-                    self.push_audio(frame);
-                    pumped_duration = pumped_duration.saturating_add(frame_duration);
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
-        }
-        self.ensure_audio_started();
-        if self.audio_started {
-            self.report_audio_clock_snapshot();
-        }
+    fn reset_audio_output(&mut self) -> Result<()> {
+        self.audio.command(AudioCommand::Reset)
     }
 
-    fn report_audio_clock_snapshot(&mut self) {
-        // During a rate transition the audio ring already uses the requested
-        // rate while the player clock still uses the old one. Do not enqueue a
-        // mixed-rate clock sample; the first sample after commit is coherent.
-        if self.pending_playback_rate.is_some() {
-            return;
-        }
-        // configure/start/push can recover the device during this pump. Publish
-        // its new epoch before sampling, not only after feedback is enqueued.
-        self.report_audio_output_runtime_stats();
-        let Some(observation) = self
-            .player
-            .capture_audio_clock(|| self.audio_output.clock_snapshot())
-        else {
-            return;
-        };
-        let snapshot = observation.snapshot();
-        // Report queue/underflow movement even when the engine later rejects the clock for sync.
-        if !self.should_report_audio_clock(snapshot) {
-            return;
-        }
-        trace::log(format!(
-            "[erika-clock-trace] stage=presenter_audio_snapshot media={} queued={} queued_frames={} read={} written={} underflow={}",
-            trace::duration_label(snapshot.media_time),
-            trace::duration_label(snapshot.queued_duration),
-            snapshot.queued_frames,
-            snapshot.read_frames,
-            snapshot.written_frames,
-            snapshot.underflow_frames,
-        ));
-        let _ = self.player.update_audio_clock_observation(observation);
-    }
-
-    fn should_report_audio_clock(&mut self, snapshot: AudioClockSnapshot) -> bool {
-        let Some(media_time) = snapshot.media_time else {
-            return false;
-        };
-        let next = AudioClockReportState {
-            media_time,
-            queued_frames: snapshot.queued_frames,
-            read_frames: snapshot.read_frames,
-            underflow_frames: snapshot.underflow_frames,
-        };
-        let should_report = self.last_audio_clock_report.is_none_or(|previous| {
-            snapshot.read_frames > previous.read_frames
-                || snapshot.underflow_frames > previous.underflow_frames
-                || snapshot.queued_frames != previous.queued_frames
-                || media_time > previous.media_time
-        });
-        if should_report {
-            self.last_audio_clock_report = Some(next);
-        }
-        should_report
-    }
-
-    fn push_audio(&mut self, frame: PlayerAudioFrame) {
-        if !self.audio_configured {
-            self.player.invalidate_audio_clock();
-            if let Err(error) = self.audio_output.configure(frame.frame.format) {
-                self.stats.audio_failures += 1;
-                trace::diagnostic_at(
-                    trace::LogLevel::Warn,
-                    format!("Erika presenter audio configure failed: {error}"),
-                );
-                return;
-            }
-            self.audio_configured = true;
-            self.last_audio_clock_report = None;
-        }
-        match self.audio_output.push(frame.frame) {
-            Ok(_) => self.stats.pushed_audio_frames += 1,
-            Err(error) => {
-                self.stats.audio_failures += 1;
-                trace::diagnostic_at(
-                    trace::LogLevel::Warn,
-                    format!("Erika presenter audio push failed: {error}"),
-                );
-                return;
-            }
-        }
-
-        self.ensure_audio_started();
-    }
-
-    fn ensure_audio_started(&mut self) {
-        if !self.is_playing()
-            || self.audio_started
-            || !self.audio_output_ready_to_start()
-            || !self.audio_start_allowed()
-        {
-            return;
-        }
-        if let Err(error) = self.audio_output.start() {
-            self.stats.audio_failures += 1;
-            trace::diagnostic_at(
-                trace::LogLevel::Warn,
-                format!("Erika presenter audio start failed: {error}"),
-            );
-            return;
-        }
-        self.audio_started = true;
-        self.last_audio_clock_report = None;
-    }
-
-    fn audio_output_ready_to_start(&self) -> bool {
-        self.audio_output
-            .clock_snapshot()
-            .and_then(|snapshot| snapshot.queued_duration)
-            .is_some_and(|queued| queued >= AUDIO_START_BUFFER)
-    }
-
-    fn audio_start_allowed(&self) -> bool {
-        self.player.track_selection().video.is_none() || self.stats.rendered_video_frames > 0
-    }
-
-    fn reset_audio_output(&mut self) {
-        self.player.invalidate_audio_clock();
-        if let Err(error) = self.audio_output.stop() {
-            self.stats.audio_failures += 1;
-            trace::diagnostic_at(
-                trace::LogLevel::Warn,
-                format!("Erika presenter audio reset failed: {error}"),
-            );
-        }
-        self.audio_configured = false;
-        self.audio_started = false;
-        self.last_audio_clock_report = None;
-    }
-
-    fn reset_audio_output_with_committed_rate(&mut self) {
-        self.pending_playback_rate = None;
-        self.reset_audio_output();
-        self.audio_output.set_playback_rate(self.playback_rate);
-    }
-
-    fn commit_pending_playback_rate(&mut self) -> Result<()> {
-        let Some(pending) = self.pending_playback_rate else {
-            return Ok(());
-        };
-        if !self.is_playing() || Instant::now() < pending.commit_at {
-            return Ok(());
-        }
-        self.commit_pending_playback_rate_now()
+    fn reset_audio_output_with_committed_rate(&mut self) -> Result<()> {
+        self.audio.command(AudioCommand::ResetCommitted)
     }
 
     fn commit_pending_playback_rate_now(&mut self) -> Result<()> {
-        let Some(rate) = self.pending_playback_rate.map(|pending| pending.rate) else {
-            return Ok(());
-        };
-        if let Err(error) = self.player.set_playback_rate(rate) {
-            self.reset_audio_output_with_committed_rate();
-            return Err(error);
+        self.audio.command(AudioCommand::CommitPendingRate)
+    }
+
+    fn notify_video_presented(&mut self) -> Result<()> {
+        if let Some(generation) = self.uploaded_video_generation
+            && self.audio_ready_generation != Some(generation)
+        {
+            self.audio
+                .command(AudioCommand::VideoPresented(generation))?;
+            self.audio_ready_generation = Some(generation);
         }
-        self.playback_rate = rate;
-        self.pending_playback_rate = None;
-        self.player.invalidate_audio_clock();
-        self.last_audio_clock_report = None;
         Ok(())
     }
 
-    fn report_audio_output_runtime_stats(&mut self) {
-        let stats = self.audio_output.runtime_stats();
-        if stats.transition_sequence == self.last_audio_runtime_stats.transition_sequence {
-            return;
-        }
-        self.player.invalidate_audio_clock();
-        self.last_audio_clock_report = None;
-        self.last_audio_runtime_stats = stats;
-        let event = AudioOutputEvent { stats };
-        trace::diagnostic(event.structured_message());
-        self.player.report_audio_output_event(event);
+    fn refresh_audio_stats(&mut self) {
+        let audio = self.audio.snapshot();
+        self.stats.pushed_audio_frames = audio.pushed_audio_frames;
+        self.stats.audio_failures = audio.audio_failures;
+        self.last_audio_pump_duration = audio.pump_duration;
     }
 
-    fn drain_pending_player_frames(&mut self) {
+    fn drain_pending_player_frames(&mut self) -> Result<()> {
         self.drain_pending_video_frames();
-        while self.audio_frames.try_recv().is_ok() {}
+        self.audio.command(AudioCommand::Drain)?;
         while self.subtitle_frames.try_recv().is_ok() {}
+        Ok(())
     }
 
     fn drain_pending_video_frames(&mut self) {
         while self.video_frames.try_recv().is_ok() {}
     }
-}
-
-fn normalize_playback_rate(rate: f64) -> f64 {
-    if rate.is_finite() && rate > 0.0 {
-        rate
-    } else {
-        1.0
-    }
-}
-
-fn playback_rate_matches(lhs: f64, rhs: f64) -> bool {
-    (lhs - rhs).abs() <= PLAYBACK_RATE_EPSILON
-}
-
-fn playback_rate_request_is_idempotent(
-    current_rate: f64,
-    pending: Option<PendingPlaybackRate>,
-    next_rate: f64,
-) -> bool {
-    pending.is_some_and(|pending| playback_rate_matches(pending.rate, next_rate))
-        || (pending.is_none() && playback_rate_matches(current_rate, next_rate))
-}
-
-fn audio_transition_bridge(
-    snapshot: Option<AudioClockSnapshot>,
-    queued_output_duration: Duration,
-) -> Option<Duration> {
-    snapshot
-        .and_then(|snapshot| snapshot.queued_duration)
-        .map(|duration| duration.saturating_add(queued_output_duration))
-        .filter(|duration| !duration.is_zero())
 }
 
 #[cfg(test)]
@@ -4565,55 +4302,6 @@ fn resolve_presenter_player_config(
     _renderer_preference: RendererBackendPreference,
     _supports_mediacodec_surface: bool,
 ) {
-}
-
-fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBackend> {
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    {
-        Box::new(PulseAudioOutput::new(config.ring_buffer))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(CoreAudioOutput::new(CoreAudioOutputConfig {
-            ring_buffer: config.ring_buffer,
-        }))
-    }
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    {
-        Box::new(IosAudioQueueOutput::new(IosAudioQueueOutputConfig {
-            ring_buffer: config.ring_buffer,
-        }))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Box::new(WasapiAudioOutput::new(WasapiAudioOutputConfig {
-            ring_buffer: config.ring_buffer,
-        }))
-    }
-
-    #[cfg(target_os = "android")]
-    {
-        Box::new(AAudioOutput::new(AAudioOutputConfig {
-            ring_buffer: config.ring_buffer,
-        }))
-    }
-    #[cfg(target_env = "ohos")]
-    {
-        Box::new(OHAudioOutput::new(OHAudioOutputConfig {
-            ring_buffer: config.ring_buffer,
-        }))
-    }
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "macos",
-        any(target_os = "ios", target_os = "tvos"),
-        target_os = "windows",
-        target_os = "linux",
-        target_env = "ohos"
-    )))]
-    {
-        Box::new(BufferedAudioOutput::new(config.ring_buffer))
-    }
 }
 
 #[cfg(feature = "wgpu")]
@@ -5188,45 +4876,32 @@ mod tests {
         }
     }
 
-    struct ClockReanchoringAudioProbe {
-        output: crate::audio::BufferedAudioOutput,
+    struct ClockReanchoringVideoProbe {
         player: Player,
         origin: Instant,
         pump_interval: Arc<Mutex<Option<(Instant, Instant)>>>,
     }
 
-    impl AudioOutputBackend for ClockReanchoringAudioProbe {
-        fn configure(&mut self, f: crate::ffmpeg::PcmFormat) -> crate::audio::Result<()> {
-            self.output.configure(f)
+    impl RendererBackend for ClockReanchoringVideoProbe {
+        fn attach_surface(&mut self, _: PlatformSurface) -> Result<()> {
+            Ok(())
         }
-        fn start(&mut self) -> crate::audio::Result<()> {
-            self.output.start()
+        fn detach_surface(&mut self) -> Result<()> {
+            Ok(())
         }
-        fn pause(&mut self) -> crate::audio::Result<()> {
-            self.output.pause()
+        fn resize_surface(&mut self, _: SurfaceMetrics) -> Result<()> {
+            Ok(())
         }
-        fn stop(&mut self) -> crate::audio::Result<()> {
-            self.output.stop()
+        fn render_test_frame(&mut self, _: f64) -> Result<()> {
+            Ok(())
         }
-        fn set_volume(&mut self, v: f32) {
-            self.output.set_volume(v);
+        fn render_current_frame(&mut self, _: RenderFrameContext<'_>) -> Result<bool> {
+            Ok(false)
         }
-        fn volume(&self) -> f32 {
-            self.output.volume()
+        fn runtime_stats(&self) -> RendererRuntimeStats {
+            RendererRuntimeStats::default()
         }
-        fn push(
-            &mut self,
-            f: crate::ffmpeg::PcmAudioFrame,
-        ) -> crate::audio::Result<crate::audio::AudioPushResult> {
-            self.output.push(f)
-        }
-        fn state(&self) -> crate::audio::AudioOutputState {
-            self.output.state()
-        }
-        fn stats(&self) -> crate::audio::AudioRingBufferStats {
-            self.output.stats()
-        }
-        fn can_accept_audio_frame(&self) -> bool {
+        fn upload_player_frame(&mut self, _: &PlayerVideoFrame) -> Result<()> {
             let started = Instant::now();
             thread::sleep(Duration::from_millis(10));
             let ended = Instant::now();
@@ -5238,7 +4913,7 @@ mod tests {
             );
             self.player.set_playback_snapshot_for_test(latest);
             *self.pump_interval.lock().unwrap() = Some((started, ended));
-            false
+            Ok(())
         }
     }
 
@@ -5256,8 +4931,21 @@ mod tests {
                 state: PlayerState::Playing,
             });
             let pump_interval = Arc::new(Mutex::new(None));
-            p.audio_output = Box::new(ClockReanchoringAudioProbe {
-                output: crate::audio::BufferedAudioOutput::new(AudioRingBufferConfig::default()),
+            let source = Player::new(PlayerConfig::default());
+            let frames = source.subscribe_video_frames();
+            let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/playback/playback-fixture.mkv");
+            source
+                .open(MediaRequest::new(fixture.to_string_lossy()))
+                .unwrap();
+            source.play().unwrap();
+            let mut frame = frames.recv_timeout(Duration::from_secs(4)).unwrap();
+            frame.generation = p.player.playback_generation();
+            source.close().unwrap();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            tx.send(frame).unwrap();
+            p.video_frames = rx;
+            p.renderer = Box::new(ClockReanchoringVideoProbe {
                 player: p.player.clone(),
                 origin,
                 pump_interval: pump_interval.clone(),
@@ -6393,402 +6081,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
-    fn repeated_playback_rate_request_keeps_pending_transition_deadline() {
-        let deadline = Instant::now() + Duration::from_millis(250);
-        let pending = PendingPlaybackRate {
-            rate: 2.0,
-            commit_at: deadline,
-        };
-
-        assert!(playback_rate_request_is_idempotent(1.0, Some(pending), 2.0));
-        assert_eq!(pending.commit_at, deadline);
-        assert!(playback_rate_request_is_idempotent(2.0, None, 2.0));
-        assert!(!playback_rate_request_is_idempotent(
-            1.0,
-            Some(pending),
-            1.5
-        ));
-    }
-
-    #[test]
-    fn audio_transition_bridge_includes_platform_output_duration() {
-        let snapshot = AudioClockSnapshot {
-            media_time: Some(Duration::from_secs(1)),
-            queued_duration: Some(Duration::from_millis(250)),
-            queued_frames: 12_000,
-            read_frames: 0,
-            written_frames: 12_000,
-            underflow_frames: 0,
-        };
-
-        assert_eq!(
-            audio_transition_bridge(Some(snapshot), Duration::from_millis(60)),
-            Some(Duration::from_millis(310))
-        );
-        assert_eq!(
-            audio_transition_bridge(
-                Some(AudioClockSnapshot {
-                    queued_duration: Some(Duration::ZERO),
-                    ..snapshot
-                }),
-                Duration::from_millis(60),
-            ),
-            Some(Duration::from_millis(60))
-        );
-    }
-
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn audio_reset_preserves_pending_rate_for_transition() {
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        presenter.pending_playback_rate = Some(PendingPlaybackRate {
-            rate: 2.0,
-            commit_at: Instant::now(),
-        });
-
-        presenter.reset_audio_output();
-        assert_eq!(
-            presenter.pending_playback_rate.map(|pending| pending.rate),
-            Some(2.0)
-        );
-    }
-
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn terminal_audio_reset_restores_committed_rate() {
-        use crate::audio::BufferedAudioOutput;
-        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
-
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
-        output.set_playback_rate(2.0);
-        presenter.audio_output = Box::new(output);
-        presenter.playback_rate = 1.0;
-        presenter.pending_playback_rate = Some(PendingPlaybackRate {
-            rate: 2.0,
-            commit_at: Instant::now(),
-        });
-
-        presenter.reset_audio_output_with_committed_rate();
-        let format = PcmFormat::f32_interleaved(48_000, 2);
-        presenter
-            .audio_output
-            .push(PcmAudioFrame {
-                format,
-                pts: Some(Duration::ZERO),
-                frames: 24_000,
-                samples: vec![0.0; 48_000],
-            })
-            .unwrap();
-
-        assert_eq!(
-            presenter
-                .audio_output
-                .clock_snapshot()
-                .unwrap()
-                .queued_frames,
-            24_000
-        );
-        assert!(presenter.pending_playback_rate.is_none());
-    }
-
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn failed_pending_rate_commit_clears_transition_state() {
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        presenter.pending_playback_rate = Some(PendingPlaybackRate {
-            rate: 2.0,
-            commit_at: Instant::now(),
-        });
-
-        assert!(presenter.commit_pending_playback_rate_now().is_err());
-        assert!(presenter.pending_playback_rate.is_none());
-        assert_eq!(presenter.playback_rate, 1.0);
-    }
-
-    #[test]
-    fn audio_frame_pump_duration_uses_supported_rate_bounds() {
-        let frame = crate::ffmpeg::PcmAudioFrame {
-            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
-            pts: None,
-            frames: 48_000,
-            samples: vec![0.0; 96_000],
-        };
-
-        assert_eq!(
-            pcm_audio_frame_playback_duration(&frame, f64::MIN_POSITIVE),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            pcm_audio_frame_playback_duration(&frame, 64.0),
-            Duration::from_secs_f64(1.0 / 16.0)
-        );
-        assert_eq!(
-            pcm_audio_frame_playback_duration(&frame, f64::NAN),
-            Duration::from_secs(1)
-        );
-
-        let zero_rate = crate::ffmpeg::PcmAudioFrame {
-            format: crate::ffmpeg::PcmFormat::f32_interleaved(0, 2),
-            pts: None,
-            frames: 40,
-            samples: Vec::new(),
-        };
-        assert_eq!(
-            pcm_audio_frame_playback_duration(&zero_rate, 1.0),
-            Duration::ZERO
-        );
-
-        let empty = crate::ffmpeg::PcmAudioFrame {
-            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
-            pts: None,
-            frames: 0,
-            samples: Vec::new(),
-        };
-        assert_eq!(
-            pcm_audio_frame_playback_duration(&empty, 1.0),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn audio_pump_duration_limit_reaches_start_buffer_for_short_and_common_frames() {
-        for (sample_rate, pcm_frames, playback_rate) in [
-            (48_000, 40, 1.0),    // TrueHD 48 kHz
-            (48_000, 40, 2.0),    // TrueHD 48 kHz @ 2x
-            (96_000, 80, 1.0),    // TrueHD 96 kHz
-            (48_000, 1_024, 1.0), // AAC 48 kHz
-            (44_100, 1_024, 1.0), // AAC 44.1 kHz
-            (48_000, 960, 1.0),   // Opus 20 ms
-            (48_000, 1_152, 1.0), // MP3 24 ms
-            (48_000, 1_536, 1.0), // AC-3 32 ms
-            (48_000, 1_024, 2.0), // AAC 48 kHz @ 2x
-        ] {
-            let frame = crate::ffmpeg::PcmAudioFrame {
-                format: crate::ffmpeg::PcmFormat::f32_interleaved(sample_rate, 2),
-                pts: None,
-                frames: pcm_frames,
-                samples: vec![0.0; pcm_frames * 2],
-            };
-            let frame_duration = pcm_audio_frame_playback_duration(&frame, playback_rate);
-            let mut pumped_duration = Duration::ZERO;
-            let mut pumped_frames = 0usize;
-            while pumped_duration < AUDIO_PUMP_DURATION_LIMIT {
-                pumped_duration = pumped_duration.saturating_add(frame_duration);
-                pumped_frames += 1;
-            }
-            assert!(
-                pumped_duration >= AUDIO_START_BUFFER,
-                "{sample_rate} Hz ({pcm_frames} samples) at {playback_rate}x only pumped {pumped_duration:?}"
-            );
-            if pcm_frames == 40 {
-                // Must dramatically exceed the legacy 16/24-frame limits.
-                assert!(pumped_frames >= 300);
-            }
-        }
-    }
-
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn pump_audio_fills_start_buffer_with_short_truehd_frames_in_one_tick() {
-        use crate::audio::BufferedAudioOutput;
-        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
-
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        presenter.audio_output =
-            Box::new(BufferedAudioOutput::new(AudioRingBufferConfig::default()));
-        let (tx, rx) = crossbeam_channel::bounded(600);
-        presenter.audio_frames = rx;
-
-        let format = PcmFormat::f32_interleaved(48_000, 2);
-        let generation = presenter.player.playback_generation();
-        // Queue 500 ms (600 x 40-sample frames) of TrueHD-sized PCM.
-        for index in 0..600usize {
-            tx.send(PlayerAudioFrame {
-                frame: PcmAudioFrame {
-                    format,
-                    pts: Some(Duration::from_secs_f64((index * 40) as f64 / 48_000.0)),
-                    frames: 40,
-                    samples: vec![0.0; 80],
-                },
-                generation,
-            })
-            .unwrap();
-        }
-
-        presenter.pump_audio();
-        // A single tick is bounded by AUDIO_PUMP_DURATION_LIMIT (350 ms = 420
-        // 40-sample frames) and leaves remaining frames queued for later ticks.
-        assert!(presenter.stats.pushed_audio_frames <= 421);
-        assert!(!presenter.audio_frames.is_empty());
-
-        // Under normal scheduling a single tick fills AUDIO_START_BUFFER; allow
-        // up to 3 extra ticks so an unoptimized CI host preempted past
-        // AUDIO_PUMP_TIME_BUDGET (4 ms) cannot flake (the legacy 16-frame cap
-        // could pump at most 64 frames / 53 ms in 4 ticks).
-        for _ in 0..3 {
-            if presenter.audio_output_ready_to_start() {
-                break;
-            }
-            presenter.pump_audio();
-        }
-
-        let queued = presenter
-            .audio_output
-            .clock_snapshot()
-            .and_then(|snapshot| snapshot.queued_duration)
-            .expect("queued audio duration");
-        assert!(
-            queued >= AUDIO_START_BUFFER,
-            "expected at least {:?} queued, got {:?}",
-            AUDIO_START_BUFFER,
-            queued
-        );
-    }
-
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn pump_audio_refills_buffer_at_fast_rate_with_soundtouch_warmup() {
-        use crate::audio::BufferedAudioOutput;
-        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
-
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
-        output.set_playback_rate(2.0);
-        presenter.audio_output = Box::new(output);
-        presenter.playback_rate = 2.0;
-
-        let (tx, rx) = crossbeam_channel::bounded(128);
-        presenter.audio_frames = rx;
-        let format = PcmFormat::f32_interleaved(48_000, 2);
-        let generation = presenter.player.playback_generation();
-        // Queue ~1.7 s of source PCM (~850 ms at 2x). Unoptimized debug builds
-        // may hit AUDIO_PUMP_TIME_BUDGET (4 ms) inside SoundTouch, so allow a
-        // few back-to-back ticks without waiting for wall-clock intervals.
-        for index in 0..80usize {
-            tx.send(PlayerAudioFrame {
-                frame: PcmAudioFrame {
-                    format,
-                    pts: Some(Duration::from_secs_f64((index * 1_024) as f64 / 48_000.0)),
-                    frames: 1_024,
-                    samples: vec![0.0; 2_048],
-                },
-                generation,
-            })
-            .unwrap();
-        }
-
-        for _ in 0..8 {
-            presenter.pump_audio();
-            if presenter.audio_output_ready_to_start() {
-                break;
-            }
-        }
-
-        let queued = presenter
-            .audio_output
-            .clock_snapshot()
-            .and_then(|snapshot| snapshot.queued_duration)
-            .expect("queued audio duration at 2x");
-        assert!(
-            queued >= AUDIO_START_BUFFER,
-            "expected SoundTouch 2x refill to reach {:?}, got {:?}",
-            AUDIO_START_BUFFER,
-            queued
-        );
-    }
-
-    #[cfg(feature = "wgpu")]
-    #[test]
-    fn pump_audio_counts_oversized_and_failed_frames_against_the_budget() {
-        use crate::audio::{
-            AudioError, AudioOutputState, AudioRingBufferStats, BufferedAudioOutput,
-        };
-        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
-
-        // 1. Oversized frame (> AUDIO_PUMP_DURATION_LIMIT) is admitted once per tick.
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        presenter.audio_output =
-            Box::new(BufferedAudioOutput::new(AudioRingBufferConfig::default()));
-        let (tx, rx) = crossbeam_channel::bounded(4);
-        presenter.audio_frames = rx;
-        let format = PcmFormat::f32_interleaved(48_000, 2);
-        let generation = presenter.player.playback_generation();
-        for index in 0..2usize {
-            tx.send(PlayerAudioFrame {
-                frame: PcmAudioFrame {
-                    format,
-                    pts: Some(Duration::from_millis((index * 500) as u64)),
-                    frames: 24_000,
-                    samples: vec![0.0; 48_000],
-                },
-                generation,
-            })
-            .unwrap();
-        }
-
-        presenter.pump_audio();
-        assert_eq!(presenter.stats.pushed_audio_frames, 1);
-        assert_eq!(presenter.audio_frames.len(), 1);
-
-        // A failing output drains two 200 ms frames before reaching the 350 ms limit.
-        struct FailingAudioOutput;
-        impl AudioOutputBackend for FailingAudioOutput {
-            fn configure(&mut self, _format: PcmFormat) -> crate::audio::Result<()> {
-                Ok(())
-            }
-            fn start(&mut self) -> crate::audio::Result<()> {
-                Ok(())
-            }
-            fn pause(&mut self) -> crate::audio::Result<()> {
-                Ok(())
-            }
-            fn stop(&mut self) -> crate::audio::Result<()> {
-                Ok(())
-            }
-            fn set_volume(&mut self, _volume: f32) {}
-            fn volume(&self) -> f32 {
-                1.0
-            }
-            fn push(
-                &mut self,
-                _frame: PcmAudioFrame,
-            ) -> crate::audio::Result<crate::audio::AudioPushResult> {
-                Err(AudioError::Backend("simulated disconnect".to_string()))
-            }
-            fn state(&self) -> AudioOutputState {
-                AudioOutputState::Stopped
-            }
-            fn stats(&self) -> AudioRingBufferStats {
-                AudioRingBufferStats::default()
-            }
-        }
-
-        let mut failing_presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        failing_presenter.audio_output = Box::new(FailingAudioOutput);
-        let (tx, rx) = crossbeam_channel::bounded(4);
-        failing_presenter.audio_frames = rx;
-        let generation = failing_presenter.player.playback_generation();
-        for _ in 0..3 {
-            tx.send(PlayerAudioFrame {
-                frame: PcmAudioFrame {
-                    format,
-                    pts: Some(Duration::ZERO),
-                    frames: 9_600,
-                    samples: vec![0.0; 19_200],
-                },
-                generation,
-            })
-            .unwrap();
-        }
-
-        failing_presenter.pump_audio();
-        assert_eq!(failing_presenter.stats.audio_failures, 2);
-        assert_eq!(failing_presenter.stats.pushed_audio_frames, 0);
-        assert_eq!(failing_presenter.audio_frames.len(), 1);
-    }
-
-    #[test]
     #[cfg(feature = "wgpu")]
     fn layout_config_generation_does_not_disturb_the_playback_clock() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
@@ -7577,75 +6869,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     #[test]
     #[cfg(feature = "wgpu")]
-    fn audio_clock_report_tracks_queue_and_underflow_changes() {
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-
-        let first = AudioClockSnapshot {
-            media_time: Some(Duration::from_secs(1)),
-            queued_duration: Some(Duration::from_millis(500)),
-            queued_frames: 24_000,
-            read_frames: 0,
-            written_frames: 24_000,
-            underflow_frames: 0,
-        };
-        assert!(presenter.should_report_audio_clock(first));
-        assert!(!presenter.should_report_audio_clock(first));
-        assert!(presenter.should_report_audio_clock(AudioClockSnapshot {
-            media_time: Some(Duration::from_secs(1)),
-            queued_duration: Some(Duration::from_millis(300)),
-            queued_frames: 14_400,
-            read_frames: 0,
-            written_frames: 19_200,
-            underflow_frames: 0,
-        }));
-        assert!(presenter.should_report_audio_clock(AudioClockSnapshot {
-            media_time: Some(Duration::from_millis(100)),
-            queued_duration: Some(Duration::ZERO),
-            queued_frames: 0,
-            read_frames: 0,
-            written_frames: 24_000,
-            underflow_frames: 512,
-        }));
-
-        presenter.playback_rate = 2.0;
-        assert!(presenter.should_report_audio_clock(AudioClockSnapshot {
-            media_time: Some(Duration::from_secs(1)),
-            queued_duration: Some(Duration::from_millis(300)),
-            queued_frames: 14_400,
-            read_frames: 14_400,
-            written_frames: 28_800,
-            underflow_frames: 0,
-        }));
-    }
-
-    #[test]
-    #[cfg(feature = "wgpu")]
-    fn audio_start_is_blocked_while_player_is_not_playing() {
-        use crate::audio::{AudioOutputState, BufferedAudioOutput};
-        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
-
-        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
-        let format = PcmFormat::f32_interleaved(48_000, 2);
-        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
-        output.configure(format).unwrap();
-        output
-            .push(PcmAudioFrame {
-                format,
-                pts: Some(Duration::ZERO),
-                frames: 12_000,
-                samples: vec![0.0; 24_000],
-            })
-            .unwrap();
-        presenter.audio_output = Box::new(output);
-
-        presenter.ensure_audio_started();
-
-        assert!(!presenter.audio_started);
-        assert_eq!(presenter.audio_output.state(), AudioOutputState::Stopped);
-    }
-
-    #[test]
-    #[cfg(feature = "wgpu")]
     fn presenter_volume_is_clamped() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
 
@@ -7666,16 +6889,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         presenter.set_volume(0.6);
         presenter.set_muted(true);
         assert!(presenter.muted());
-        assert_eq!(presenter.audio_output.volume(), 0.0);
+        assert_eq!(presenter.audio.snapshot().volume, 0.0);
         assert!((presenter.volume() - 0.6).abs() < 0.000_001);
 
         presenter.set_volume(0.3);
-        assert_eq!(presenter.audio_output.volume(), 0.0);
+        assert_eq!(presenter.audio.snapshot().volume, 0.0);
         assert!((presenter.volume() - 0.3).abs() < 0.000_001);
 
         presenter.set_muted(false);
         assert!(!presenter.muted());
-        assert!((presenter.audio_output.volume() - 0.3).abs() < 0.000_001);
+        assert!((presenter.audio.snapshot().volume - 0.3).abs() < 0.000_001);
     }
 
     #[test]

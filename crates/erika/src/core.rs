@@ -4316,6 +4316,75 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn failed_seek_releases_audio_owner_after_producer_resume() {
+        use crate::presenter::{PresenterConfig, PresenterRuntime};
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let player = presenter.player().clone();
+        let commands = install_fake_playback(&player, PlayerState::Ready, Duration::ZERO, 1, false);
+        let frames = player
+            .inner
+            .lock()
+            .unwrap()
+            .audio_frame_sender
+            .clone()
+            .unwrap();
+        let (recovered, recovery) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            let mut withhold_first = true;
+            let mut delayed_reply = None;
+            while let Ok(command) = commands.recv() {
+                match command {
+                    PlaybackCommand::SetFrameOutputQuiesced {
+                        quiesced: true,
+                        reply,
+                    } if withhold_first => {
+                        withhold_first = false;
+                        // Keep the sender alive so the real producer barrier expires.
+                        delayed_reply = Some(reply);
+                    }
+                    PlaybackCommand::SetFrameOutputQuiesced { quiesced, reply } => {
+                        let _ = reply.send(());
+                        if !quiesced && delayed_reply.take().is_some() {
+                            recovered.send(()).unwrap();
+                        }
+                    }
+                    PlaybackCommand::Shutdown => break,
+                    _ => {}
+                }
+            }
+        });
+        presenter.play().unwrap();
+        let wait_for_consumer = || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            frames.send(test_audio_frame(1)).unwrap();
+            while !frames.is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            frames.is_empty()
+        };
+        assert!(
+            wait_for_consumer(),
+            "audio must be running before the transition"
+        );
+        let error = presenter.seek(Duration::from_secs(3)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not acknowledge frame output quiesce")
+        );
+        recovery.recv_timeout(Duration::from_secs(1)).unwrap();
+        let resumed = wait_for_consumer();
+        presenter.close().unwrap();
+        worker.join().unwrap();
+        assert!(
+            resumed,
+            "producer recovered but the audio owner stayed parked"
+        );
+    }
+
     #[test]
     fn frame_output_barrier_and_runtime_owner_do_not_form_an_inner_cycle() {
         let player = Player::new(PlayerConfig::default());

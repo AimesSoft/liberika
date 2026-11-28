@@ -769,8 +769,13 @@ animation, so pass the presentation timestamp, not wall-clock deltas. If
 `out_stats` is non-`NULL` it is filled with a snapshot of pipeline counters.
 `poll_event` is non-blocking and returns `NoEvent` when idle.
 
-`audio_only_tick` advances audio output without rendering, for hosts that have
-no surface attached:
+`audio_only_tick` selects background video suspension and refreshes playback
+state without rendering. PCM delivery and audio-clock feedback run on the
+independent audio owner, so a render stall does not stop sound. Hosts still
+apply their background-playback policy and call pause/stop/close when audio must
+stop; merely stopping the display timer does not stop audio. Do not call this
+entry point from a second timer during normal video playback, because it changes
+video suspension and foreground-resume state:
 
 ```c
 ErikaStatus erika_presenter_audio_only_tick(ErikaPresenterHandle *, ErikaPresenterStats *out_stats);
@@ -955,8 +960,8 @@ requested pixel size with scale factor 1; no surface or preceding `render_tick`
 is required for capture. It excludes the debug HUD and has the same SDR RGBA8,
 buffer and error contract as the screenshot API. Capture prepares and caches
 short timeline windows synchronously; resizing, seeking or changing danmaku
-settings may require preparation on the next call. Audio output still needs
-regular `render_tick` calls; `audio_only_tick` suspends video decoding.
+settings may require preparation on the next call. Active audio continues on its own thread. Use
+`audio_only_tick` when the host enters background audio-only playback.
 
 The Rust equivalent is
 `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`:

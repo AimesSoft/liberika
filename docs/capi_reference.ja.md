@@ -680,6 +680,12 @@ Windows のフレームスケジューラなど）。`time_seconds` はそのフ
 ラインカウンタのスナップショットが書き込まれます。`poll_event` は非ブロッキングで、
 アイドル時は `NoEvent` を返します。
 
+PCM 供給と音声時刻の報告は専用スレッドで実行するため、描画の停止で音声供給は
+止まりません。`erika_presenter_audio_only_tick` は background の video 停止と
+foreground 復帰の状態を制御します。通常の video 再生中に別の timer から呼ばないで
+ください。host は引き続き background 再生の許可を管理し、音声を止めるときは
+pause/stop/close を呼びます。display timer の停止だけでは音声は止まりません。
+
 `get_stats` は同じ `ErikaPresenterStats` スナップショットを、フレームを描画せずに
 書き込みます。ホストが表示ループとは別の周期でカウンタをサンプリングする場合に
 使ってください。プレゼンテーションは進みません。
@@ -840,7 +846,7 @@ UI を独自に合成するホスト（Wayland 上の Dioxus など）は、同�
 事前の `render_tick` は不要です。debug HUD は含まず、SDR RGBA8、バッファとエラーの
 契約は screenshot API と同じです。短い時間窓を同期的に準備してキャッシュするため、
 リサイズ、seek、弾幕設定の変更後は次の呼び出しで再準備する場合があります。
-音声出力には通常の `render_tick` が必要です。`audio_only_tick` は映像デコードを停止します。
+再生中の音声は専用スレッドで継続します。バックグラウンドで音声のみを再生するときに `audio_only_tick` を呼びます。
 
 Rust の入口は `PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)` です。
 

@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### Playback
+
+- Native playback feeds PCM and updates the audio clock on a dedicated thread. Once playback starts, a delayed render tick no longer starves the audio device.
+
 ### Browser
 
 - The Web runtime is published to npm as `@aimessoft/liberika-web`, and as `@aimessoft/liberika-web-nofont` without the fallback font; Vite bundles it without configuration.

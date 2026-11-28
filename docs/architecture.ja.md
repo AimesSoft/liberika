@@ -84,7 +84,7 @@ Decoder availability は session invariant です。video track が選択され�
 generation、command sequence、output epoch、単調な取得時刻を保持します。
 worker は現在の再生意図と実行済みコマンドの両方を照合し、取得から 500 ms で
 観測値を失効させます。キューと buffering の判断にも同じ検証を適用します。
-presenter は出力リセット、再設定、デバイス状態の遷移、速度変更で epoch を
+音声の所有者は出力リセット、再設定、デバイス状態の遷移、速度変更で epoch を
 更新します。取得と出力変更は引き続き出力の所有者が直列化します。
 
 engine は最初に基準値を記録し、消費した PCM frame 数と media time の両方が
@@ -96,12 +96,23 @@ background 再生と foreground の video 復帰中も、動作中の audio mast
 
 従来の Rust API `update_audio_clock(snapshot)` は現在の時間軸で即座に取得する
 同期フィードバック向けに残ります。保存済み snapshot の取得時の識別情報は
-復元できないため、遅延する呼び出しには観測 API を使います。C ABI とキューの
-目標量は変更せず、250 ms の速度変更 bridge と遷移中の混在した速度の観測を
-抑制する契約を維持します。音声供給はまだ presenter tick 内で行うため、描画が
-止まると underflow は発生し得ます。時刻の復旧と音声供給の独立化は別の処理です。
+復元できないため、遅延する呼び出しには観測 API を使います。C ABI は変えません。
+専用の音声スレッドが backend の作成、呼び出し、破棄をすべて担当し、backend の
+`Send` 実装は不要です。worker の有界 PCM channel を消費し、SoundTouch、時刻と
+デバイスの報告、速度変更の確定を描画から独立して行います。キューへの追加には
+既存の 250 ms bridge の目標を使い、速度が混在する期間の観測抑制を維持します。
 
-- **macOS**: ring buffer と PTS-tracking clock snapshot を持つ CoreAudio 出力。presenter は snapshot を player worker に返し、audio-master clock discipline を維持します。
+シークやトラック切り替えでは、Presenter がまず再生スレッドにフレーム送信の停止を要求します。
+その確認を待つ間も音声スレッドはデバイスに PCM を供給できます。次に音声スレッドを停止し、
+実行中の書き込みが完了するまで待ちます。双方の確認後に出力をリセットし、キューを空にします。
+再開時は再生スレッドを先に戻し、その後に音声スレッドを戻します。
+
+前景の映像再生では、新しい世代のフレームが表示されると音声が始まります。バックグラウンドの
+音声のみの再生では、シーク後も映像デコードを停止したまま音声を再開できます。
+自然な EOF では残りの PCM をデバイスに渡し、最後の音まで再生します。音声を止める場合は
+ホストから pause、stop、close を呼びます。表示タイマーを停止しても再生中の音声は継続します。
+
+- **macOS**: ring buffer と PTS-tracking clock snapshot を持つ CoreAudio 出力。音声の所有者は snapshot を player worker に返し、audio-master clock discipline を維持します。
 - **iOS**: 同じ ring buffer / clock snapshot model を持つ AudioQueue 出力。
 - Ring buffer: interleaved f32、容量可変、overflow は oldest drop、volume control 対応。
 

@@ -4865,6 +4865,12 @@ impl VideoPlaybackEngine {
             self.session.seek_with_decoder_flush(position, true, true)?;
         } else {
             self.session.set_video_decode_suspended(true);
+            if self.waiting_for_first_frame {
+                self.waiting_for_first_frame = false;
+                if self.state == PlaybackRunState::Playing && !self.buffering {
+                    self.clock.play(Instant::now());
+                }
+            }
         }
         if !suspended {
             self.pending_frame = None;
@@ -5247,12 +5253,7 @@ impl VideoPlaybackEngine {
         )?;
         let now = now();
         let before = self.clock.media_time_at(now);
-        // Park the clock on the seek target until the first post-seek frame is
-        // actually presented. Letting it run through preroll makes the reported
-        // position drift forward over frames nobody has seen yet, which the
-        // first-frame `sync_to` then has to pull back — a visible backward step
-        // for every clock consumer. `tick_with_now` starts it on that frame.
-        self.clock.reset(media_time, false, now);
+        self.reset_clock_after_seek(media_time, self.state, now);
         self.reset_audio_clock_tracking(media_time);
         trace_clock_reset("reset_streams_at", before, media_time, self.state);
         self.last_presented_pts = None;
@@ -5261,7 +5262,6 @@ impl VideoPlaybackEngine {
         self.buffering_video_pts = None;
         self.last_buffering_video_drain_at = None;
         self.buffering_video_drained_frames = 0;
-        self.waiting_for_first_frame = self.state == PlaybackRunState::Playing;
         self.paused_seek_frame_pending = self.state == PlaybackRunState::Paused;
         self.video_seek_floor = Some(media_time);
         self.audio_seek_floor = Some(media_time);
@@ -5300,7 +5300,22 @@ impl VideoPlaybackEngine {
     }
 
     pub(crate) fn has_video_output(&self) -> bool {
-        self.info().selected_video_track.is_some()
+        !self.session.video_decode_suspended && self.info().selected_video_track.is_some()
+    }
+
+    fn reset_clock_after_seek(
+        &mut self,
+        position: Duration,
+        state: PlaybackRunState,
+        now: Instant,
+    ) {
+        // Visible video starts the clock on its first post-seek frame. During
+        // audio-only playback the clock must advance to release PCM beyond
+        // the initial audio lead window.
+        let playing = state == PlaybackRunState::Playing;
+        self.waiting_for_first_frame = playing && self.has_video_output();
+        self.clock
+            .reset(position, playing && !self.waiting_for_first_frame, now);
     }
 
     pub(crate) fn begin_buffering_at(&mut self, now: Instant) -> bool {
@@ -5450,7 +5465,7 @@ impl VideoPlaybackEngine {
 
     fn start_playback_at(&mut self, now: Instant) {
         let before = self.clock.media_time_at(now);
-        let waiting_for_first_frame = self.last_presented_pts.is_none();
+        let waiting_for_first_frame = self.last_presented_pts.is_none() && self.has_video_output();
         if !waiting_for_first_frame {
             self.clock.play(now);
         }
@@ -5597,10 +5612,7 @@ impl VideoPlaybackEngine {
         let state_before = self.state;
         let state_after = playback_state_after_seek_intent(state_before, resume_after_seek);
         let before = self.clock.media_time_at(now);
-        // Park on the seek target; the first presented frame starts the clock
-        // (see `reset_streams_at`). Running it through preroll would report a
-        // position no frame has reached yet and then step backward.
-        self.clock.reset(position, false, now);
+        self.reset_clock_after_seek(position, state_after, now);
         self.reset_audio_clock_tracking(position);
         trace_clock_reset("seek", before, position, state_after);
         self.last_presented_pts = None;
@@ -5610,7 +5622,6 @@ impl VideoPlaybackEngine {
         self.buffering_video_pts = None;
         self.last_buffering_video_drain_at = None;
         self.buffering_video_drained_frames = 0;
-        self.waiting_for_first_frame = state_after == PlaybackRunState::Playing;
         self.paused_seek_frame_pending = state_after == PlaybackRunState::Paused;
         self.video_seek_floor = Some(position);
         self.audio_seek_floor = Some(position);
@@ -7267,6 +7278,40 @@ mod tests {
         .unwrap();
 
         assert!(opened.is_none());
+    }
+
+    #[test]
+    fn playback_fixture_background_seek_supplies_audio_past_initial_lead() {
+        let mut engine = playback_fixture_engine();
+        let start = Instant::now();
+        engine.play_at(start);
+        assert!(engine.is_waiting_for_first_frame());
+        engine.set_video_decode_suspended(true).unwrap();
+        assert!(!engine.is_waiting_for_first_frame());
+        assert!(engine.clock().is_running());
+        let target = Duration::from_secs(3);
+        engine.seek_at(target, start).unwrap();
+
+        // Use actual decoded PCM. No video frame is available to start the
+        // post-seek clock when video decode is suspended.
+        let now = start + Duration::from_millis(500);
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        let mut frames = 0;
+        loop {
+            if let Some(frame) = engine.tick_audio_at(now).unwrap() {
+                frames += frame.frame.frames;
+                if frames >= 12_000 {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {frames} PCM frames emitted after seek"
+            );
+            thread::yield_now();
+        }
+        assert!(!engine.is_waiting_for_first_frame());
+        assert!(engine.media_time_at(now) >= target + Duration::from_millis(500));
     }
 
     #[test]

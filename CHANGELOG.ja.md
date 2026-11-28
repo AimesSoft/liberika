@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### 再生
+
+- ネイティブ再生では専用スレッドが PCM を供給し、音声クロックを更新します。再生開始後は描画 tick が遅れても音声の供給が続きます。
+
 ### ブラウザー
 
 - Web ランタイムを npm の `@aimessoft/liberika-web`、およびフォールバックフォントを含まない `@aimessoft/liberika-web-nofont` として公開。Vite は設定なしでバンドルできます。

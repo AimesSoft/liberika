@@ -12,7 +12,7 @@ use crate::trace;
 pub(crate) mod spsc;
 
 // Keep enough old-rate PCM to cover SoundTouch startup and one normal output
-// prefill. The presenter commits the media clock at the end of this bridge.
+// prefill. The audio owner commits the media clock at the end of this bridge.
 pub(crate) const AUDIO_OUTPUT_QUEUE_HIGH_WATER: Duration = Duration::from_millis(250);
 const RATE_CHANGE_AUDIO_BRIDGE: Duration = AUDIO_OUTPUT_QUEUE_HIGH_WATER;
 const SOUNDTOUCH_SEQUENCE_MS: i32 = 25;
@@ -779,7 +779,7 @@ pub trait AudioOutputBackend {
     fn volume(&self) -> f32;
     fn set_playback_rate(&mut self, _rate: f64) {}
     /// Returns false while the output owns enough queued PCM to preserve the
-    /// bounded playback-rate transition latency. The presenter leaves decoded
+    /// bounded playback-rate transition latency. The audio owner leaves decoded
     /// frames in the worker channel, which applies backpressure safely.
     fn can_accept_audio_frame(&self) -> bool {
         true
