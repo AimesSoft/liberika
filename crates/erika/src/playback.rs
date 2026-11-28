@@ -6259,6 +6259,21 @@ impl VideoPlaybackEngine {
                 }
             }
 
+            // While paused, the worker does not consume tail audio. Finish the
+            // preview as soon as video is exhausted and leave the audio for play().
+            if self.state == PlaybackRunState::Paused
+                && self.paused_seek_frame_pending
+                && !self.session.has_queued_video_frames()
+            {
+                self.reset_audio_eof_stall_state();
+                self.paused_seek_frame_pending = false;
+                trace::log(format!(
+                    "[erika-playback-trace] stage=paused_seek_frame_abandoned reason=eof target={}",
+                    trace::duration_label(self.video_seek_floor),
+                ));
+                return Ok(());
+            }
+
             let queued_audio = self.session.queued_audio_frame_count();
             let pending_audio = self.pending_audio.is_some();
             if self.audio_output_active && (pending_audio || queued_audio > 0) {
@@ -6275,19 +6290,6 @@ impl VideoPlaybackEngine {
                 self.pending_audio.is_some(),
                 self.session.has_queued_audio_frames(),
             ) {
-                return Ok(());
-            }
-            if self.state == PlaybackRunState::Paused && self.paused_seek_frame_pending {
-                // The preview pump ran a paused seek to the end of the media.
-                // The user's session is paused, not finished: abandon the
-                // preview instead of flipping a paused session into Ended,
-                // which would publish a spurious end-of-media and turn the
-                // next play() into a rewind-from-ended full reopen.
-                self.paused_seek_frame_pending = false;
-                trace::log(format!(
-                    "[erika-playback-trace] stage=paused_seek_frame_abandoned reason=eof target={}",
-                    trace::duration_label(self.video_seek_floor),
-                ));
                 return Ok(());
             }
             self.eof = true;
@@ -8002,6 +8004,15 @@ mod tests {
 
     #[test]
     fn playback_fixture_paused_seek_past_the_last_frame_stays_paused() {
+        assert_paused_seek_past_last_frame(false);
+    }
+
+    #[test]
+    fn playback_fixture_paused_seek_eof_with_active_audio_preserves_tail() {
+        assert_paused_seek_past_last_frame(true);
+    }
+
+    fn assert_paused_seek_past_last_frame(audio_output_active: bool) {
         let mut engine = playback_fixture_engine();
         let t0 = Instant::now();
         engine.play_at(t0);
@@ -8011,11 +8022,10 @@ mod tests {
         engine.pause_at(paused_at);
         // The fixture is 8 s long and its frames end before the target, so
         // every decoded frame is seek preroll and the preview pump reaches
-        // demux EOF without ever presenting a frame. Audio output stays off
-        // so the queued tail audio is discarded at EOF instead of stalling it.
+        // demux EOF without ever presenting a frame.
         let target = Duration::from_secs(8);
         engine.seek_at(target, paused_at).unwrap();
-        engine.set_audio_output_active(false);
+        engine.set_audio_output_active(audio_output_active);
 
         assert_eq!(engine.state(), PlaybackRunState::Paused);
         assert_eq!(engine.media_time_at(paused_at), target);
@@ -8042,6 +8052,10 @@ mod tests {
         }
         assert!(ticks > 0);
         assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert_eq!(
+            engine.session.has_queued_audio_frames(),
+            audio_output_active
+        );
     }
 
     #[test]
