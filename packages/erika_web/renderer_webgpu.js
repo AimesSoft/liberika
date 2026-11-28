@@ -5,7 +5,7 @@
 // subtitles, single-draw instanced danmaku, and color emoji composite in one
 // render pass; neural/spatial SR runs in a cached compute pass ahead of it.
 
-const FRAME_UNIFORM_BYTES = 32;
+const FRAME_UNIFORM_BYTES = 48;
 const SUBTITLE_UNIFORM_BYTES = 32;
 const SR_PARAMS_BYTES = 1104;
 const DANMAKU_INSTANCE_FLOATS = 20; // 80 bytes per comment group
@@ -36,6 +36,8 @@ struct FrameUniforms {
   sr_mode: u32,
   _pad0: u32,
   luma_coeff: vec4<f32>,
+  canvas_resolution: vec2<f32>,
+  _pad1: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(0) @binding(1) var video_tex: texture_2d<f32>;
@@ -113,6 +115,8 @@ struct FrameUniforms {
   sr_mode: u32,
   _pad0: u32,
   luma_coeff: vec4<f32>,
+  canvas_resolution: vec2<f32>,
+  _pad1: vec2<f32>,
 };
 struct SubUniforms {
   rect: vec4<f32>,
@@ -153,6 +157,8 @@ struct FrameUniforms {
   sr_mode: u32,
   _pad0: u32,
   luma_coeff: vec4<f32>,
+  canvas_resolution: vec2<f32>,
+  _pad1: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(1) @binding(0) var<storage, read> glyphs: array<vec4<f32>>;
@@ -180,7 +186,7 @@ fn vs_main(
 ) -> VertexOut {
   let unit = vec2<f32>(f32(vid & 1u), f32((vid >> 1u) & 1u));
   let pixel = rect.xy + unit * rect.zw;
-  let res = max(frame.resolution, vec2<f32>(1.0));
+  let res = max(frame.canvas_resolution, vec2<f32>(1.0));
   let ndc = vec2<f32>(pixel.x / res.x * 2.0 - 1.0, 1.0 - pixel.y / res.y * 2.0);
   return VertexOut(
     vec4<f32>(ndc, 0.0, 1.0),
@@ -229,6 +235,8 @@ struct FrameUniforms {
   sr_mode: u32,
   _pad0: u32,
   luma_coeff: vec4<f32>,
+  canvas_resolution: vec2<f32>,
+  _pad1: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(1) @binding(0) var emoji_tex: texture_2d<f32>;
@@ -249,7 +257,7 @@ fn vs_main(
 ) -> VertexOut {
   let unit = vec2<f32>(f32(vid & 1u), f32((vid >> 1u) & 1u));
   let p = rect.xy + unit * rect.zw;
-  let res = max(frame.resolution, vec2<f32>(1.0));
+  let res = max(frame.canvas_resolution, vec2<f32>(1.0));
   let ndc = vec2<f32>(p.x / res.x * 2.0 - 1.0, 1.0 - p.y / res.y * 2.0);
   return VertexOut(
     vec4<f32>(ndc, 0.0, 1.0),
@@ -1402,6 +1410,10 @@ export class WebGpuRenderer {
     this.frameUniformF32[5] = BT709_LUMA[1];
     this.frameUniformF32[6] = BT709_LUMA[2];
     this.frameUniformF32[7] = 0;
+    this.frameUniformF32[8] = this.canvas.width;
+    this.frameUniformF32[9] = this.canvas.height;
+    this.frameUniformF32[10] = 0;
+    this.frameUniformF32[11] = 0;
     this.device.queue.writeBuffer(
       this.frameUniformBuffer,
       0,
@@ -1500,6 +1512,7 @@ export class WebGpuRenderer {
 
   subtitles() {
     if (!this.pass || !this.subtitleImages?.length) return;
+    this.pass.setViewport(this.x, this.y, this.width, this.height, 0, 1);
     this.pass.setPipeline(this.subtitlePipeline);
     this.pass.setBindGroup(0, this.frameBindGroup);
     for (const image of this.subtitleImages) {
@@ -1638,8 +1651,8 @@ export class WebGpuRenderer {
       }
       const f32 = this.groupScratchF32;
       const u32 = this.groupScratchU32;
-      const w = this.width;
-      const h = this.height;
+      const w = this.canvas.width;
+      const h = this.canvas.height;
       let instanceCount = 0;
 
       for (let n = 0; n < plan.groups.length; n += 16) {
@@ -1703,6 +1716,7 @@ export class WebGpuRenderer {
           BUF.VERTEX | BUF.COPY_DST,
         );
         d.queue.writeBuffer(this.groupBuffer, 0, this.groupScratch, 0, uploadBytes);
+        this.pass.setViewport(0, 0, w, h, 0, 1);
         this.pass.setPipeline(this.danmakuPipeline);
         this.pass.setBindGroup(0, this.frameBindGroup);
         this.pass.setBindGroup(1, this.danmakuBindGroup);
@@ -1716,6 +1730,9 @@ export class WebGpuRenderer {
 
   pictures(plan) {
     if (!this.pass || !plan.pictures?.length) return;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    if (!w || !h) return;
     const count = (plan.pictures.length / 9) | 0;
     if (count <= 0) return;
     this.ensureBuffer(
@@ -1725,6 +1742,7 @@ export class WebGpuRenderer {
       BUF.VERTEX | BUF.COPY_DST,
     );
     this.device.queue.writeBuffer(this.pictureBuffer, 0, plan.pictures);
+    this.pass.setViewport(0, 0, w, h, 0, 1);
     this.pass.setPipeline(this.picturePipeline);
     this.pass.setBindGroup(0, this.frameBindGroup);
     this.pass.setBindGroup(1, this.pictureBindGroup);

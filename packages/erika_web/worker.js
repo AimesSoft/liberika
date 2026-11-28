@@ -354,8 +354,8 @@ function draw(t) {
     renderer.danmaku(
       danmaku.frame(
         Math.max(0, time - danmakuDelay),
-        renderer.width,
-        renderer.height,
+        renderer.canvas.width,
+        renderer.canvas.height,
         dpr,
         performance.now(),
       ),

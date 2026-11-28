@@ -27,6 +27,8 @@ function createMockWebGpu({
     computeDispatches: 0,
     renderPasses: 0,
     renderDraws: [],
+    renderDrawDetails: [],
+    bufferWrites: [],
     submits: 0,
     copyExternalCalls: 0,
     writeTextures: 0,
@@ -79,8 +81,18 @@ function createMockWebGpu({
     },
     lost: lostPromise,
     queue: {
-      writeBuffer() {
+      writeBuffer(buffer, offset, data, dataOffset = 0, size) {
         log.writeBuffers++;
+        let copy = null;
+        if (data instanceof ArrayBuffer) {
+          const byteLen = size ?? data.byteLength - dataOffset;
+          copy = new Uint8Array(data.slice(dataOffset, dataOffset + byteLen));
+        } else if (ArrayBuffer.isView(data)) {
+          const elemOffset = data.byteOffset + dataOffset;
+          const byteLen = size ?? data.byteLength - dataOffset;
+          copy = new Uint8Array(data.buffer.slice(elemOffset, elemOffset + byteLen));
+        }
+        log.bufferWrites.push({ buffer, offset, bytes: copy });
       },
       writeTexture() {
         log.writeTextures++;
@@ -184,7 +196,10 @@ function createMockWebGpu({
         beginRenderPass() {
           log.renderPasses++;
           return {
-            setViewport() {},
+            _viewport: null,
+            setViewport(x, y, w, h, minDepth, maxDepth) {
+              this._viewport = [x, y, w, h, minDepth, maxDepth];
+            },
             setPipeline(pipeline) {
               this._pipeline = pipeline;
             },
@@ -199,6 +214,12 @@ function createMockWebGpu({
             },
             draw(vertexCount, instanceCount = 1) {
               log.renderDraws.push({ vertexCount, instanceCount });
+              log.renderDrawDetails.push({
+                pipeline: this._pipeline,
+                viewport: this._viewport ? [...this._viewport] : null,
+                vertexCount,
+                instanceCount,
+              });
             },
             end() {},
           };
@@ -594,6 +615,76 @@ test("WebGPU rebuilds danmakuBindGroup even when atlas resizes on a glyph-less f
   renderer.end();
   assert.equal(log.boundDestroyedResource, false);
   assert.equal(log.submits, 3);
+  renderer.destroy();
+});
+
+test("WebGpuRenderer keeps video and subtitles in the picture while danmaku spans letterbox bars", async () => {
+  const { gpu, canvas, log } = createMockWebGpu();
+  const renderer = await WebGpuRenderer.create(canvas, { gpu });
+
+  // Pillarbox: 1600x720 canvas with 1280x720 video leaves 160px bars on each side.
+  renderer.size(1600, 720, 1280, 720);
+  renderer.upload({ displayWidth: 1280, displayHeight: 720 });
+  renderer.subtitleImages = [{ bindGroup: { entries: [] } }];
+
+  renderer.begin();
+  renderer.subtitles();
+  renderer.danmaku({
+    width: 64,
+    height: 64,
+    fill: new Uint8Array(64 * 64),
+    outline: new Uint8Array(64 * 64),
+    glyphs: new Float32Array([
+      12, 30, 80, 24, 0, 0, 0.2, 0.2,
+      1500, 30, 80, 24, 0.2, 0, 0.2, 0.2,
+    ]),
+    groups: new Float32Array([
+      0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0.5, 1, 1,
+      1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0.5, 1, 1,
+    ]),
+    pictures: new Float32Array([1510, 80, 32, 32, 0, 0, 1, 1, 1]),
+    pictureWidth: 32,
+    pictureHeight: 32,
+    pictureAtlas: new Uint8Array(32 * 32 * 4),
+  });
+  renderer.end();
+
+  const frameWrite = log.bufferWrites.findLast((w) => w.buffer === renderer.frameUniformBuffer);
+  assert.ok(frameWrite);
+  const frameF32 = new Float32Array(
+    frameWrite.bytes.buffer,
+    frameWrite.bytes.byteOffset,
+    frameWrite.bytes.byteLength / 4,
+  );
+  assert.deepEqual([frameF32[0], frameF32[1]], [1280, 720], "picture resolution stays aspect-fit");
+  assert.deepEqual([frameF32[8], frameF32[9]], [1600, 720], "canvas resolution covers pillarbox bars");
+
+  const videoDraw = log.renderDrawDetails.find((d) => d.pipeline === renderer.videoPipeline);
+  const subDraw = log.renderDrawDetails.find((d) => d.pipeline === renderer.subtitlePipeline);
+  const danmakuDraw = log.renderDrawDetails.find((d) => d.pipeline === renderer.danmakuPipeline);
+  const pictureDraw = log.renderDrawDetails.find((d) => d.pipeline === renderer.picturePipeline);
+  assert.deepEqual(videoDraw.viewport, [160, 0, 1280, 720, 0, 1]);
+  assert.deepEqual(subDraw.viewport, [160, 0, 1280, 720, 0, 1]);
+  assert.deepEqual(danmakuDraw.viewport, [0, 0, 1600, 720, 0, 1]);
+  assert.equal(danmakuDraw.instanceCount, 2, "glyphs inside left and right bars must not be clipped");
+  assert.deepEqual(pictureDraw.viewport, [0, 0, 1600, 720, 0, 1]);
+
+  // Letterbox with emoji-only danmaku: must still switch viewport to full canvas.
+  log.renderDrawDetails.length = 0;
+  renderer.size(1280, 1000, 1280, 720);
+  renderer.subtitleImages = [];
+  renderer.begin();
+  renderer.danmaku({
+    glyphs: new Float32Array(0),
+    groups: new Float32Array(0),
+    pictures: new Float32Array([40, 20, 32, 32, 0, 0, 1, 1, 1]),
+  });
+  renderer.end();
+
+  const letterboxVideo = log.renderDrawDetails.find((d) => d.pipeline === renderer.videoPipeline);
+  const letterboxEmoji = log.renderDrawDetails.find((d) => d.pipeline === renderer.picturePipeline);
+  assert.deepEqual(letterboxVideo.viewport, [0, 140, 1280, 720, 0, 1]);
+  assert.deepEqual(letterboxEmoji.viewport, [0, 0, 1280, 1000, 0, 1]);
   renderer.destroy();
 });
 
