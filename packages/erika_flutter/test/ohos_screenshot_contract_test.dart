@@ -7,25 +7,24 @@ void main() {
     final plugin = File(
       'ohos/src/main/ets/components/plugin/ErikaFlutterPlugin.ets',
     ).readAsStringSync();
+    // Every presenter operation runs on the presenter's owner thread; the
+    // bridge exports each one through a single dispatch table, with an
+    // `Async` variant that resolves a promise on the ArkTS thread.
     final nativeBridge = File(
-      'ohos/src/main/cpp/erika_flutter_plugin.cpp',
+      'ohos/src/main/cpp/presenter_bridge.h',
     ).readAsStringSync();
 
     expect(plugin, contains('this.captureFrame(args, result);'));
-    expect(plugin, contains('erikaNative.nativeCaptureFrame('));
+    expect(plugin, contains('erikaNative.nativeCaptureFrameAsync('));
     expect(plugin, contains('as Uint8Array | null'));
 
-    expect(nativeBridge, contains('napi_value NativeCaptureFrame('));
     expect(
       nativeBridge,
       contains('erika_presenter_capture_frame_rgba('),
     );
     expect(nativeBridge, contains('napi_create_arraybuffer('));
     expect(nativeBridge, contains('napi_create_typedarray('));
-    expect(
-      nativeBridge,
-      contains('{"nativeCaptureFrame", nullptr, NativeCaptureFrame'),
-    );
+    expect(nativeBridge, contains('{"nativeCaptureFrame", Op::Capture}'));
   });
 
   test('OpenHarmony exposes the complete subtitle memory font API', () {
@@ -33,11 +32,11 @@ void main() {
       'ohos/src/main/ets/components/plugin/ErikaFlutterPlugin.ets',
     ).readAsStringSync();
     final nativeBridge = File(
-      'ohos/src/main/cpp/erika_flutter_plugin.cpp',
+      'ohos/src/main/cpp/presenter_bridge.h',
     ).readAsStringSync();
 
     expect(plugin, contains("call.method === 'registerSubtitleMemoryFont'"));
-    expect(plugin, contains('nativeRegisterSubtitleMemoryFont('));
+    expect(plugin, contains('nativeRegisterSubtitleMemoryFontAsync('));
     for (final method in <String>[
       'selectSubtitleMemoryFonts',
       'clearSubtitleMemoryFonts',
@@ -47,18 +46,11 @@ void main() {
     }
     expect(
       nativeBridge,
-      contains('napi_value NativeRegisterSubtitleMemoryFont('),
-    );
-    expect(
-      nativeBridge,
       contains('erika_presenter_register_subtitle_memory_font('),
     );
     expect(
       nativeBridge,
-      contains(
-        '{"nativeRegisterSubtitleMemoryFont", nullptr, '
-        'NativeRegisterSubtitleMemoryFont',
-      ),
+      contains('{"nativeRegisterSubtitleMemoryFont", Op::Font}'),
     );
   });
 

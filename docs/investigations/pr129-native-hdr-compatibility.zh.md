@@ -2,7 +2,7 @@
 
 ## 范围
 
-- 原 PR：AimesSoft/Erika#129，head `2c5e470fd33b4a7297fa5b15bb22cb65ace1899e`。
+- 原 PR：AimesSoft/liberika#129，head `2c5e470fd33b4a7297fa5b15bb22cb65ace1899e`。
 - 对照 main：`7b0fa9179d0cd3b85e28974844f213d0e00aa058`。
 - 本地修复分支：`codex/pr129-preserve-native-hdr`。
 - 普通播放继续沿用 main 的原生 Windows HWND/swapchain 和 HDR10 协商路径；不以 Flutter texture 替换主路径。

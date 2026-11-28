@@ -89,6 +89,206 @@ class ErikaGifExportResult {
   }
 }
 
+/// What [ErikaPlayer.exportFrame] returns the picture as.
+enum ErikaFrameFormat {
+  /// RGBA rows of exactly `width * 4` bytes, top row first; alpha is 255.
+  rgba(0),
+
+  /// The bytes of a PNG file (8-bit RGB).
+  png(1);
+
+  const ErikaFrameFormat(this.nativeValue);
+
+  final int nativeValue;
+}
+
+/// One picture exported by [ErikaPlayer.exportFrame].
+@immutable
+class ErikaExportedFrame {
+  const ErikaExportedFrame({
+    required this.width,
+    required this.height,
+    required this.format,
+    required this.bytes,
+    required this.timestamp,
+    required this.sourceWidth,
+    required this.sourceHeight,
+    this.duration,
+    this.toneMapped = false,
+  });
+
+  final int width;
+  final int height;
+  final ErikaFrameFormat format;
+  final Uint8List bytes;
+
+  /// Where in the media the picture is: the last frame at or before the
+  /// requested position (the first frame when the position precedes it).
+  final Duration timestamp;
+
+  /// The video's decoded size.
+  final int sourceWidth;
+  final int sourceHeight;
+
+  /// The media's duration, when its container reports one.
+  final Duration? duration;
+
+  /// The source is HDR (PQ, HLG or Dolby Vision) and the picture was tone
+  /// mapped to SDR the way Erika renders it on an SDR display.
+  final bool toneMapped;
+
+  factory ErikaExportedFrame.fromMap(Map<dynamic, dynamic> map) {
+    final format = (map['format'] as num?)?.toInt() ?? 1;
+    final durationMicros = (map['durationMicros'] as num?)?.toInt() ?? 0;
+    return ErikaExportedFrame(
+      width: (map['width'] as num?)?.toInt() ?? 0,
+      height: (map['height'] as num?)?.toInt() ?? 0,
+      format: ErikaFrameFormat.values.firstWhere(
+        (value) => value.nativeValue == format,
+        orElse: () => ErikaFrameFormat.png,
+      ),
+      bytes: map['bytes'] as Uint8List? ?? Uint8List(0),
+      timestamp: Duration(
+        microseconds: (map['timestampMicros'] as num?)?.toInt() ?? 0,
+      ),
+      sourceWidth: (map['sourceWidth'] as num?)?.toInt() ?? 0,
+      sourceHeight: (map['sourceHeight'] as num?)?.toInt() ?? 0,
+      duration: durationMicros > 0 ? Duration(microseconds: durationMicros) : null,
+      toneMapped: map['toneMapped'] == true,
+    );
+  }
+}
+
+/// A media kept open for taking many pictures with [ErikaPlayer.exportFrame]'s
+/// semantics: one demuxer and one decoder serve every request, and a request
+/// after the previous one continues decoding where it stopped instead of
+/// opening and seeking again. Requests in ascending time order are the
+/// cheapest; any order works. Calls on one session run one after another, off
+/// the UI thread. [close] releases the media; a session that is not closed
+/// keeps its decoder.
+final class ErikaFrameExportSession {
+  ErikaFrameExportSession._(this.uri, this._sessionId, this._native);
+
+  /// The media the session was opened on.
+  final String uri;
+  final int? _sessionId;
+  final NativeFrameExportSession? _native;
+  bool _closed = false;
+
+  /// Opens [uri] (a local path or HTTP(S) URL). Throws [StateError] with
+  /// liberika's message when the media cannot be read or has no video, and
+  /// [UnsupportedError] where the bundled native library or platform has no
+  /// frame export session.
+  static Future<ErikaFrameExportSession> open(
+    String uri, {
+    Map<String, String> httpHeaders = const <String, String>{},
+    int httpReadAheadBytes = 0,
+  }) async {
+    if (uri.trim().isEmpty) {
+      throw ArgumentError.value(uri, 'uri', 'must not be empty');
+    }
+    if (httpReadAheadBytes < 0) {
+      throw ArgumentError.value(
+        httpReadAheadBytes,
+        'httpReadAheadBytes',
+        'must not be negative',
+      );
+    }
+    final arguments = <String, Object?>{
+      'uri': uri,
+      if (httpHeaders.isNotEmpty) 'httpHeaders': httpHeaders,
+      if (httpReadAheadBytes > 0) 'httpReadAheadBytes': httpReadAheadBytes,
+    };
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.macOS) {
+      final id = await _channelFrameExport<int>('openFrameExportSession', arguments);
+      if (id == null) {
+        throw StateError('Erika frame export session returned no id.');
+      }
+      return ErikaFrameExportSession._(uri, id, null);
+    }
+    return ErikaFrameExportSession._(
+      uri,
+      null,
+      await NativeFrameExportSession.open(arguments),
+    );
+  }
+
+  /// The picture shown at [position]; bounds and format as in
+  /// [ErikaPlayer.exportFrame].
+  Future<ErikaExportedFrame> frameAt(
+    Duration position, {
+    int width = 0,
+    int height = 0,
+    ErikaFrameFormat format = ErikaFrameFormat.png,
+  }) async {
+    if (_closed) {
+      throw StateError('The frame export session is closed.');
+    }
+    _validateFrameArguments(position, width, height);
+    final arguments = <String, Object?>{
+      'positionMillis': position.inMilliseconds,
+      'width': width,
+      'height': height,
+      'format': format.nativeValue,
+    };
+    final sessionId = _sessionId;
+    final Map<dynamic, dynamic>? result = sessionId != null
+        ? await _channelFrameExport<Map<dynamic, dynamic>>(
+            'exportSessionFrame',
+            <String, Object?>{'sessionId': sessionId, ...arguments},
+          )
+        : await _native!.frame(arguments);
+    if (result == null) {
+      throw StateError('Erika frame export returned no result.');
+    }
+    return ErikaExportedFrame.fromMap(result);
+  }
+
+  /// Releases the media. Further [frameAt] calls throw [StateError].
+  Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    final sessionId = _sessionId;
+    if (sessionId != null) {
+      await _channelFrameExport<void>(
+        'closeFrameExportSession',
+        <String, Object?>{'sessionId': sessionId},
+      );
+    } else {
+      await _native!.close();
+    }
+  }
+}
+
+void _validateFrameArguments(Duration position, int width, int height) {
+  if (position.isNegative) {
+    throw ArgumentError.value(position, 'position', 'must not be negative');
+  }
+  if (width < 0 || height < 0 || width > 16384 || height > 16384) {
+    throw ArgumentError('width and height must be in 0..=16384.');
+  }
+}
+
+/// One frame export call over the macOS plugin channel, with the plugin's
+/// error codes mapped to Dart errors.
+Future<T?> _channelFrameExport<T>(
+  String method,
+  Map<String, Object?> arguments,
+) async {
+  try {
+    return await ErikaPlayer._channel.invokeMethod<T>(method, arguments);
+  } on MissingPluginException {
+    throw UnsupportedError('Erika frame export is not available here.');
+  } on PlatformException catch (error) {
+    if (error.code == 'ERIKA_UNSUPPORTED') {
+      throw UnsupportedError(error.message ?? 'Erika frame export is unsupported.');
+    }
+    throw StateError(error.message ?? error.code);
+  }
+}
+
 @immutable
 class ErikaMediaMetadata {
   const ErikaMediaMetadata({
@@ -111,10 +311,10 @@ class ErikaMediaMetadata {
   };
 }
 
-/// Subtitle text colour Erika falls back to, as `0xRRGGBBAA`: opaque white.
+/// Subtitle text colour liberika falls back to, as `0xRRGGBBAA`: opaque white.
 const int kErikaDefaultSubtitlePrimaryColorRgba = 0xFFFFFFFF;
 
-/// Subtitle outline colour Erika falls back to: half-transparent black.
+/// Subtitle outline colour liberika falls back to: half-transparent black.
 const int kErikaDefaultSubtitleOutlineColorRgba = 0x0000007F;
 
 /// Base subtitle font size in ASS script units, before [ErikaPlayer.setSubtitleScale].
@@ -167,7 +367,7 @@ enum ErikaVideoAlphaMode {
   opaque(0),
 
   /// The left half is colour and the right half is a grayscale alpha mask.
-  /// Erika presents the video at half of its encoded width and reconstructs a
+  /// liberika presents the video at half of its encoded width and reconstructs a
   /// premultiplied-alpha frame in the GPU presentation shader.
   packedAlphaRight(1);
 
@@ -330,7 +530,7 @@ class ErikaPresenterResourceStatus {
   });
 
   /// Metal's process-wide counter for the current device. This can include
-  /// allocations from other Erika presenters and other Metal users.
+  /// allocations from other liberika presenters and other Metal users.
   final int deviceCurrentAllocatedBytes;
   final int deviceRecommendedWorkingSetBytes;
   final int drawableEstimatedBytes;
@@ -396,11 +596,33 @@ class ErikaSubtitleMemoryFontStatus {
   }
 }
 
+/// Super-resolution mode. ArtCNN and Anime4K target anime; [fsr1] and
+/// [platformVideo] (NVIDIA RTX Video / Intel VSR on Windows, VideoToolbox on
+/// Apple platforms) suit live-action content. Unsupported modes fall back to
+/// native sampling and report [ErikaUpscalerBackendStatus.inactive].
 enum ErikaUpscalerMode {
   off(0),
   artCnnC4F16(1),
   artCnnC4F32(2),
-  artCnnC4F16Ds(3);
+  artCnnC4F16Ds(3),
+  artCnnC4F16Dn(4),
+  artCnnC4F32Ds(5),
+  artCnnC4F32Dn(6),
+  artCnnR8F64(7),
+  anime4kS(16),
+  anime4kM(17),
+  anime4kL(18),
+  anime4kVl(19),
+  anime4kUl(20),
+  anime4kDenoiseS(21),
+  anime4kDenoiseM(22),
+  anime4kDenoiseL(23),
+  anime4kDenoiseVl(24),
+  anime4kDenoiseUl(25),
+  fsr1(32),
+  platformVideo(48),
+  metalFxSpatial(49),
+  custom(64);
 
   const ErikaUpscalerMode(this.nativeValue);
 
@@ -411,6 +633,24 @@ enum ErikaUpscalerMode {
       1 => ErikaUpscalerMode.artCnnC4F16,
       2 => ErikaUpscalerMode.artCnnC4F32,
       3 => ErikaUpscalerMode.artCnnC4F16Ds,
+      4 => ErikaUpscalerMode.artCnnC4F16Dn,
+      5 => ErikaUpscalerMode.artCnnC4F32Ds,
+      6 => ErikaUpscalerMode.artCnnC4F32Dn,
+      7 => ErikaUpscalerMode.artCnnR8F64,
+      16 => ErikaUpscalerMode.anime4kS,
+      17 => ErikaUpscalerMode.anime4kM,
+      18 => ErikaUpscalerMode.anime4kL,
+      19 => ErikaUpscalerMode.anime4kVl,
+      20 => ErikaUpscalerMode.anime4kUl,
+      21 => ErikaUpscalerMode.anime4kDenoiseS,
+      22 => ErikaUpscalerMode.anime4kDenoiseM,
+      23 => ErikaUpscalerMode.anime4kDenoiseL,
+      24 => ErikaUpscalerMode.anime4kDenoiseVl,
+      25 => ErikaUpscalerMode.anime4kDenoiseUl,
+      32 => ErikaUpscalerMode.fsr1,
+      48 => ErikaUpscalerMode.platformVideo,
+      49 => ErikaUpscalerMode.metalFxSpatial,
+      64 => ErikaUpscalerMode.custom,
       _ => ErikaUpscalerMode.off,
     };
   }
@@ -421,7 +661,13 @@ enum ErikaUpscalerBackendStatus {
   inactive(1),
   building(2),
   scalar(3),
-  simdgroupMatrix(4);
+  simdgroupMatrix(4),
+  cooperativeMatrix(5),
+  linalgMatrix(6),
+  videoProcessor(7),
+  videoToolbox(8),
+  metalFx(9),
+  tensorOps(10);
 
   const ErikaUpscalerBackendStatus(this.nativeValue);
 
@@ -433,6 +679,12 @@ enum ErikaUpscalerBackendStatus {
       2 => ErikaUpscalerBackendStatus.building,
       3 => ErikaUpscalerBackendStatus.scalar,
       4 => ErikaUpscalerBackendStatus.simdgroupMatrix,
+      5 => ErikaUpscalerBackendStatus.cooperativeMatrix,
+      6 => ErikaUpscalerBackendStatus.linalgMatrix,
+      7 => ErikaUpscalerBackendStatus.videoProcessor,
+      8 => ErikaUpscalerBackendStatus.videoToolbox,
+      9 => ErikaUpscalerBackendStatus.metalFx,
+      10 => ErikaUpscalerBackendStatus.tensorOps,
       _ => ErikaUpscalerBackendStatus.off,
     };
   }
@@ -670,6 +922,50 @@ class ErikaDanmakuTrackInfo {
       itemCount: (map['itemCount'] as num?)?.toInt() ?? 0,
       name: map['name'] as String?,
       source: map['source'] as String?,
+    );
+  }
+}
+
+class ErikaChapterInfo {
+  const ErikaChapterInfo({
+    required this.index,
+    this.title,
+    required this.start,
+    this.end,
+  });
+
+  final int index;
+  final String? title;
+  final Duration start;
+  final Duration? end;
+
+  factory ErikaChapterInfo.fromMap(Map<dynamic, dynamic> map) {
+    final endMs = (map['endMs'] as num?)?.toInt();
+    return ErikaChapterInfo(
+      index: (map['index'] as num?)?.toInt() ?? 0,
+      title: map['title'] as String?,
+      start: Duration(milliseconds: (map['startMs'] as num?)?.toInt() ?? 0),
+      end: endMs == null ? null : Duration(milliseconds: endMs),
+    );
+  }
+}
+
+class ErikaContainerInfo {
+  const ErikaContainerInfo({
+    this.format,
+    this.bitRate,
+    required this.mediaOpen,
+  });
+
+  final String? format;
+  final int? bitRate;
+  final bool mediaOpen;
+
+  factory ErikaContainerInfo.fromMap(Map<dynamic, dynamic> map) {
+    return ErikaContainerInfo(
+      format: map['format'] as String?,
+      bitRate: (map['bitRate'] as num?)?.toInt(),
+      mediaOpen: map['mediaOpen'] == true,
     );
   }
 }
@@ -985,12 +1281,17 @@ class ErikaPlayer {
   /// without a network request. Null or zero uses the native 16 MiB default.
   /// Size it from the bitrate for high-bitrate media (a -10 s skip at 71 Mbps
   /// covers ~89 MB). Local files ignore the value.
-  Future<void> open(
+  /// [startPosition] opens the media there instead of at its start: the
+  /// engine seeks before presenting, so the first frame shown is the one at
+  /// that position. Returns whether this native library takes it (false: the
+  /// media opens at its start, and a seek is the caller's).
+  Future<bool> open(
     String uri, {
     Map<String, String>? httpHeaders,
     int? httpReadAheadBytes,
     int? httpBackBufferBytes,
     ErikaMediaMetadata? metadata,
+    Duration? startPosition,
   }) async {
     if (httpReadAheadBytes != null && httpReadAheadBytes < 0) {
       throw ArgumentError.value(
@@ -1007,7 +1308,7 @@ class ErikaPlayer {
       );
     }
     final playerId = await ensureCreated();
-    await _invoke('open', <String, Object?>{
+    final arguments = <String, Object?>{
       'playerId': playerId,
       'uri': uri,
       if (httpHeaders != null && httpHeaders.isNotEmpty)
@@ -1017,7 +1318,47 @@ class ErikaPlayer {
       if (httpBackBufferBytes != null && httpBackBufferBytes > 0)
         'httpBackBufferBytes': httpBackBufferBytes,
       'metadata': metadata?.toMap(),
-    });
+    };
+    var startTaken = startPosition == null || startPosition <= Duration.zero;
+    final atomicStart =
+        !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.windows) &&
+        !startTaken;
+    if (atomicStart) {
+      try {
+        final taken = await _channel.invokeMethod<bool>(
+          'openWithStartPosition',
+          <String, Object?>{
+            ...arguments,
+            'startPositionMicros': startPosition.inMicroseconds,
+          },
+        );
+        if (_disposed) {
+          throw StateError('ErikaPlayer has been disposed.');
+        }
+        return taken ?? false;
+      } on MissingPluginException {
+        if (_disposed) {
+          throw StateError('ErikaPlayer has been disposed.');
+        }
+      }
+    }
+    if (!startTaken) {
+      try {
+        final reply = await invokeJson('setOpenStartPosition', {
+          'positionMicros': startPosition.inMicroseconds,
+        });
+        startTaken = reply['ok'] == true;
+      } on UnsupportedError {
+        startTaken = false;
+      }
+    }
+    if (atomicStart && _disposed) {
+      throw StateError('ErikaPlayer has been disposed.');
+    }
+    await _invoke('open', arguments);
+    return startTaken;
   }
 
   Future<void> setMediaMetadata(ErikaMediaMetadata metadata) async {
@@ -1080,12 +1421,70 @@ class ErikaPlayer {
     });
   }
 
+  /// Silences the output, or restores it, without losing the volume: a
+  /// volume set while muted applies on unmute. Returns `false` when the
+  /// native runtime cannot.
+  Future<bool> setMuted(bool muted) async {
+    try {
+      final reply = await invokeJson('setMuted', {'muted': muted});
+      return reply['ok'] == true;
+    } on UnsupportedError {
+      return false;
+    }
+  }
+
+  /// The volume chosen (kept while muted) and whether the output is muted;
+  /// null when the native runtime cannot tell.
+  Future<({double volume, bool muted})?> getVolume() async {
+    try {
+      final reply = await invokeJson('volume');
+      final value = reply['value'];
+      if (reply['ok'] != true || value is! Map) return null;
+      final volume = value['volume'];
+      final muted = value['muted'];
+      if (volume is! num || muted is! bool) return null;
+      return (volume: volume.toDouble(), muted: muted);
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
   Future<void> setUpscaler(ErikaUpscalerMode mode) async {
     final playerId = await ensureCreated();
     await _invoke('setUpscaler', <String, Object?>{
       'playerId': playerId,
       'mode': mode.nativeValue,
     });
+  }
+
+  /// Loads a custom super-resolution network from memory.
+  ///
+  /// [data] is either an Erika `.esr` network or an mpv hook shader (FSRCNNX
+  /// or the Anime4K CNN dialect). FSRCNNX is not bundled with Erika for
+  /// licensing reasons; the host application supplies the file. Loading does
+  /// not enable the network: call
+  /// `setUpscaler(ErikaUpscalerMode.custom)` afterwards. Throws a
+  /// [PlatformException] carrying the native error when the model is rejected
+  /// or the native library predates custom model support.
+  Future<void> loadUpscalerModel(
+    Uint8List data, {
+    String name = 'custom',
+  }) async {
+    if (data.isEmpty) {
+      throw ArgumentError.value(data, 'data', 'must not be empty');
+    }
+    final playerId = await ensureCreated();
+    await _invoke('loadUpscalerModel', <String, Object?>{
+      'playerId': playerId,
+      'name': name,
+      'data': data,
+    });
+  }
+
+  /// Unloads the custom super-resolution network loaded by
+  /// [loadUpscalerModel].
+  Future<void> clearUpscalerModel() async {
+    await _invokeForPlayer('clearUpscalerModel');
   }
 
   Future<void> setSubtitleScale(double scale) async {
@@ -1095,6 +1494,49 @@ class ErikaPlayer {
       'playerId': playerId,
       'scale': clampedScale,
     });
+  }
+
+  /// Shows subtitles later (positive [delay]) or earlier (negative) than
+  /// their timestamps, embedded and external tracks alike; clamped to ten
+  /// minutes either way. Returns false when this native library cannot.
+  Future<bool> setSubtitleDelay(Duration delay) async {
+    try {
+      final reply = await invokeJson('setSubtitleDelay', {
+        'delayMicros': delay.inMicroseconds,
+      });
+      return reply['ok'] == true;
+    } on UnsupportedError {
+      return false;
+    }
+  }
+
+  /// The subtitle delay currently in force; null when this native library
+  /// cannot report it.
+  Future<Duration?> getSubtitleDelay() async {
+    try {
+      final reply = await invokeJson('subtitleDelay');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      if (value is! Map) return null;
+      final micros = value['delayMicros'];
+      return micros is num ? Duration(microseconds: micros.toInt()) : null;
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
+  /// What the subtitles say now, the delay applied: the text cues showing
+  /// (ASS dialogue without its override tags; bitmap subtitles have none),
+  /// joined by line breaks. Null when this native library cannot tell.
+  Future<String?> subtitleText() async {
+    try {
+      final reply = await invokeJson('subtitleText');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      return value is Map ? value['text'] as String? : null;
+    } on UnsupportedError {
+      return null;
+    }
   }
 
   Future<int> registerSubtitleMemoryFont(Uint8List data) async {
@@ -1313,6 +1755,182 @@ class ErikaPlayer {
     return ErikaPresenterStats.fromMap(stats);
   }
 
+  /// Log levels accepted by [getLogs], from least to most severe.
+  static const List<String> logLevels = <String>[
+    'trace',
+    'debug',
+    'info',
+    'warn',
+    'error',
+  ];
+
+  /// One-call diagnostics snapshot of this player (schema 1).
+  ///
+  /// Sections: `playback`, `media`, `decoder` (requested/active backend,
+  /// hardware, fallbacks), `video`, `presenter`, `output`, `hdr`,
+  /// `resources`, `upscaler`, `audio`, `buffers` and `timing` (scheduler late
+  /// drops, presentation cadence and jitter, clock drift and corrections).
+  /// Values that are not known are `null`. See `docs/capi_reference.md`,
+  /// "Diagnostics", for every field.
+  ///
+  /// Throws [UnsupportedError] when this platform plugin or the bundled
+  /// native library does not provide diagnostics.
+  Future<Map<String, Object?>> getDiagnosticsSnapshot() async {
+    final playerId = await ensureCreated();
+    return _decodeJsonDocumentOffUi(
+      await _invokeOptional('getDiagnosticsSnapshot', <String, Object?>{
+        'playerId': playerId,
+      }),
+      'getDiagnosticsSnapshot',
+    );
+  }
+
+  /// Recent entries of liberika's process-wide log ring (schema 1): its own
+  /// operational diagnostics plus FFmpeg warnings and errors, oldest first.
+  /// Text is redacted (URL query strings and user info, credentials, the
+  /// user's home directory).
+  ///
+  /// [limit] keeps the newest entries after filtering (`0` returns every
+  /// retained entry). [minLevel] is one of [logLevels]. Pass the previous
+  /// result's `nextSeq` as [sinceSeq] to read incrementally. The ring is
+  /// shared by every player; any live player returns the same log.
+  ///
+  /// Throws [UnsupportedError] when unavailable, like
+  /// [getDiagnosticsSnapshot].
+  Future<Map<String, Object?>> getLogs({
+    int limit = 200,
+    String? minLevel,
+    int? sinceSeq,
+  }) async {
+    if (limit < 0) {
+      throw ArgumentError.value(limit, 'limit', 'must be zero or positive');
+    }
+    if (minLevel != null && !logLevels.contains(minLevel)) {
+      throw ArgumentError.value(
+        minLevel,
+        'minLevel',
+        'must be one of ${logLevels.join(', ')}',
+      );
+    }
+    if (sinceSeq != null && sinceSeq < 0) {
+      throw ArgumentError.value(sinceSeq, 'sinceSeq', 'must be zero or positive');
+    }
+    final playerId = await ensureCreated();
+    return _decodeJsonDocumentOffUi(
+      await _invokeOptional('getLogs', <String, Object?>{
+        'playerId': playerId,
+        'limit': limit,
+        if (minLevel != null) 'minLevel': minLevel,
+        if (sinceSeq != null) 'sinceSeq': sinceSeq,
+      }),
+      'getLogs',
+    );
+  }
+
+  /// Calls any method of liberika's JSON method table directly.
+  ///
+  /// Returns liberika's response envelope unchanged:
+  /// `{ok: true, status: 0, value: …}` or
+  /// `{ok: false, status: …, error: '…', code?: 'unknown_method' | …}`.
+  /// Native failures are reported in the envelope, not thrown. Call
+  /// `invokeJson('listMethods')` for the table: every method with its
+  /// arguments and result. New engine capabilities become reachable here
+  /// without plugin or Dart changes.
+  ///
+  /// Throws [UnsupportedError] when this platform plugin or the bundled
+  /// native library has no pass-through.
+  Future<Map<String, Object?>> invokeJson(
+    String method, [
+    Map<String, Object?> arguments = const <String, Object?>{},
+  ]) async {
+    if (method.isEmpty) {
+      throw ArgumentError.value(method, 'method', 'must not be empty');
+    }
+    final playerId = await ensureCreated();
+    final Object? raw;
+    try {
+      raw = await _invokeOptional('invokeJson', <String, Object?>{
+        'playerId': playerId,
+        'method': method,
+        'arguments': arguments,
+      });
+    } on PlatformException catch (error) {
+      // Platforms that unwrap envelopes natively report failures of the
+      // pass-through itself (bad arguments) as exceptions; keep the
+      // envelope contract.
+      return <String, Object?>{
+        'ok': false,
+        'status': 3,
+        'error': error.message ?? error.code,
+      };
+    }
+    return _decodeJsonDocumentOffUi(raw, 'invokeJson');
+  }
+
+  Future<Object?> _invokeOptional(
+    String method,
+    Map<String, Object?> arguments,
+  ) async {
+    try {
+      return await _channel.invokeMethod<Object?>(method, arguments);
+    } on MissingPluginException {
+      throw UnsupportedError(
+        'Erika $method is not supported by the $defaultTargetPlatform plugin.',
+      );
+    } on PlatformException catch (error) {
+      final message = error.message ?? '';
+      if (error.code == 'ERIKA_UNSUPPORTED' ||
+          message.contains('unsupported Erika presenter method: $method') ||
+          message.contains('unsupported Erika Android method: $method')) {
+        throw UnsupportedError(
+          message.isEmpty
+              ? 'Erika $method is not supported by the bundled native library.'
+              : message,
+        );
+      }
+      rethrow;
+    }
+  }
+
+  /// JSON text at least this long is decoded on a background isolate: a
+  /// full log ring is up to 512 KiB, more than the UI isolate should parse.
+  static const int _backgroundDecodeChars = 64 * 1024;
+
+  static Future<Map<String, Object?>> _decodeJsonDocumentOffUi(
+    Object? raw,
+    String method,
+  ) async {
+    if (raw is String && raw.length >= _backgroundDecodeChars) {
+      return compute(_decodeJsonDocumentMessage, <String>[raw, method]);
+    }
+    return _decodeJsonDocument(raw, method);
+  }
+
+  static Map<String, Object?> _decodeJsonDocumentMessage(List<String> message) =>
+      _decodeJsonDocument(message[0], message[1]);
+
+  static Map<String, Object?> _decodeJsonDocument(Object? raw, String method) {
+    final Object? decoded = raw is String ? jsonDecode(raw) : raw;
+    final Object? normalized = _normalizeJson(decoded);
+    if (normalized is! Map<String, Object?>) {
+      throw StateError('Erika $method returned no JSON object.');
+    }
+    return normalized;
+  }
+
+  static Object? _normalizeJson(Object? value) {
+    if (value is Map) {
+      return <String, Object?>{
+        for (final entry in value.entries)
+          entry.key.toString(): _normalizeJson(entry.value),
+      };
+    }
+    if (value is List) {
+      return <Object?>[for (final item in value) _normalizeJson(item)];
+    }
+    return value;
+  }
+
   Future<void> setDebugHudEnabled(bool enabled) async {
     final playerId = await ensureCreated();
     await _channel.invokeMethod<void>('setDebugHudEnabled', <String, Object?>{
@@ -1321,22 +1939,28 @@ class ErikaPlayer {
     });
   }
 
-  Future<Uint8List?> screenshot({int? viewId, int? width, int? height}) async {
+  Future<Uint8List?> screenshot({
+    int? viewId,
+    int? width,
+    int? height,
+    bool includeDanmaku = false,
+  }) async {
     final playerId = await ensureCreated();
     return _channel.invokeMethod<Uint8List>('screenshot', <String, Object?>{
       'playerId': playerId,
       if (viewId != null) 'viewId': viewId,
       if (width != null) 'width': width,
       if (height != null) 'height': height,
+      if (includeDanmaku) 'includeDanmaku': true,
     });
   }
 
-  /// Exports an animated GIF through Erika's independent headless pipeline.
+  /// Exports an animated GIF through liberika's independent headless pipeline.
   /// Playback can continue while this operation runs.
   ///
-  /// Supported on every native platform published by Erika: Android, iOS,
+  /// Supported on every native platform published by liberika: Android, iOS,
   /// tvOS, macOS, Windows, and OpenHarmony. Web is not supported because it
-  /// cannot load Erika's native C API or write an arbitrary output path.
+  /// cannot load liberika's native C API or write an arbitrary output path.
   static Future<ErikaGifExportResult> exportGif(
     ErikaGifExportOptions options,
   ) async {
@@ -1372,6 +1996,95 @@ class ErikaPlayer {
       throw StateError('Erika GIF export returned no result.');
     }
     return ErikaGifExportResult.fromMap(result);
+  }
+
+  /// Decodes the picture shown at [position] of [uri] (a local path or
+  /// HTTP(S) URL) through liberika's independent headless pipeline, its own
+  /// demuxer and multi-threaded software decoder, and returns it as [format].
+  ///
+  /// [width] and [height] bound the picture in pixels (0 leaves that side
+  /// unbounded); the display aspect ratio is kept and the picture is never
+  /// larger than the video, so the result can be smaller than asked. No
+  /// player is involved and playback may continue meanwhile; the work runs
+  /// off the UI thread (a native worker on macOS, a background isolate
+  /// elsewhere).
+  ///
+  /// Throws [UnsupportedError] where the bundled native library or platform
+  /// has no frame export, and [StateError] with liberika's message when the
+  /// media cannot be read, has no video, or [position] is not before its end.
+  static Future<ErikaExportedFrame> exportFrame(
+    String uri, {
+    required Duration position,
+    int width = 0,
+    int height = 0,
+    ErikaFrameFormat format = ErikaFrameFormat.png,
+    Map<String, String> httpHeaders = const <String, String>{},
+    int httpReadAheadBytes = 0,
+  }) async {
+    if (uri.trim().isEmpty) {
+      throw ArgumentError.value(uri, 'uri', 'must not be empty');
+    }
+    _validateFrameArguments(position, width, height);
+    if (httpReadAheadBytes < 0) {
+      throw ArgumentError.value(
+        httpReadAheadBytes,
+        'httpReadAheadBytes',
+        'must not be negative',
+      );
+    }
+    final arguments = <String, Object?>{
+      'uri': uri,
+      'positionMillis': position.inMilliseconds,
+      'width': width,
+      'height': height,
+      'format': format.nativeValue,
+      if (httpHeaders.isNotEmpty) 'httpHeaders': httpHeaders,
+      if (httpReadAheadBytes > 0) 'httpReadAheadBytes': httpReadAheadBytes,
+    };
+    final Map<dynamic, dynamic>? result =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.macOS
+            ? await _channelFrameExport<Map<dynamic, dynamic>>(
+                'exportFrame',
+                arguments,
+              )
+            : await exportFrameNative(arguments);
+    if (result == null) {
+      throw StateError('Erika frame export returned no result.');
+    }
+    return ErikaExportedFrame.fromMap(result);
+  }
+
+  /// The pictures shown at [positions] of [uri], in the order given, from one
+  /// [ErikaFrameExportSession]: the media is opened once. The first position
+  /// that cannot be exported throws, as [exportFrame] would.
+  static Future<List<ErikaExportedFrame>> exportFrames(
+    String uri, {
+    required Iterable<Duration> positions,
+    int width = 0,
+    int height = 0,
+    ErikaFrameFormat format = ErikaFrameFormat.png,
+    Map<String, String> httpHeaders = const <String, String>{},
+    int httpReadAheadBytes = 0,
+  }) async {
+    final session = await ErikaFrameExportSession.open(
+      uri,
+      httpHeaders: httpHeaders,
+      httpReadAheadBytes: httpReadAheadBytes,
+    );
+    try {
+      final frames = <ErikaExportedFrame>[];
+      for (final position in positions) {
+        frames.add(await session.frameAt(
+          position,
+          width: width,
+          height: height,
+          format: format,
+        ));
+      }
+      return frames;
+    } finally {
+      await session.close();
+    }
   }
 
   Future<int> addExternalSubtitle(String uri) async {
@@ -1501,6 +2214,35 @@ class ErikaPlayer {
     await _invokeForPlayer('clearDanmaku');
   }
 
+  /// Inserts a viewer-sent bordered live danmaku comment at [position] (or the
+  /// current playback time when omitted). [color] is `0xRRGGBB` (white by
+  /// default) and [mode] is `'scroll'`, `'top'`, or `'bottom'`. Returns the
+  /// manual track ID, or null when the native library does not support it.
+  Future<int?> sendDanmaku(
+    String text, {
+    int color = 0xFFFFFF,
+    String mode = 'scroll',
+    Duration? position,
+  }) async {
+    if (text.trim().isEmpty) {
+      throw ArgumentError.value(text, 'text', 'must not be empty');
+    }
+    try {
+      final reply = await invokeJson('sendDanmaku', <String, Object?>{
+        'text': text,
+        'color': color & 0xFFFFFF,
+        'mode': mode,
+        if (position != null) 'positionMicros': position.inMicroseconds,
+      });
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      if (value is! Map) return null;
+      return (value['trackId'] as num?)?.toInt();
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
   Future<void> setDanmakuEnabled(bool enabled) async {
     final playerId = await ensureCreated();
     await _invoke('setDanmakuEnabled', <String, Object?>{
@@ -1511,7 +2253,7 @@ class ErikaPlayer {
 
   Future<void> setDanmakuConfig({
     bool? enabled,
-    // NipaPlay/Flutter logical danmaku font size. Erika uses the NipaPlay
+    // NipaPlay/Flutter logical danmaku font size. liberika uses the NipaPlay
     // default danmaku font and applies the native surface scale internally.
     double? fontSize,
     double? opacity,
@@ -1675,6 +2417,55 @@ class ErikaPlayer {
         .whereType<Map<dynamic, dynamic>>()
         .map(ErikaTrackInfo.fromMap)
         .toList(growable: false);
+  }
+
+  /// Currently selected track IDs; null when this native library cannot report
+  /// them.
+  Future<ErikaTrackSelection?> trackSelection() async {
+    try {
+      final reply = await invokeJson('trackSelection');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      return value is Map<dynamic, dynamic>
+          ? ErikaTrackSelection.fromMap(value)
+          : null;
+    } on UnsupportedError {
+      return null;
+    }
+  }
+
+  /// Container chapters on the playback timeline, or an empty list when no
+  /// media is open or the native library cannot report chapters.
+  Future<List<ErikaChapterInfo>> chapters() async {
+    try {
+      final reply = await invokeJson('chapters');
+      if (reply['ok'] != true) return const <ErikaChapterInfo>[];
+      final value = reply['value'];
+      if (value is! Map) return const <ErikaChapterInfo>[];
+      final rawChapters = value['chapters'];
+      if (rawChapters is! List) return const <ErikaChapterInfo>[];
+      return rawChapters
+          .whereType<Map<dynamic, dynamic>>()
+          .map(ErikaChapterInfo.fromMap)
+          .toList(growable: false);
+    } on UnsupportedError {
+      return const <ErikaChapterInfo>[];
+    }
+  }
+
+  /// Opened container format and overall bit rate; null when this native
+  /// library cannot report container metadata.
+  Future<ErikaContainerInfo?> containerInfo() async {
+    try {
+      final reply = await invokeJson('container');
+      if (reply['ok'] != true) return null;
+      final value = reply['value'];
+      return value is Map<dynamic, dynamic>
+          ? ErikaContainerInfo.fromMap(value)
+          : null;
+    } on UnsupportedError {
+      return null;
+    }
   }
 
   Future<void> attachView(int viewId) async {

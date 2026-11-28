@@ -48,17 +48,30 @@ void main() {
         '$platform/Classes/ErikaFlutterPlugin.swift',
       ).readAsStringSync();
 
+      // Stats are read on the presenter's owner, where the render tick
+      // stores them, so no lock or main-thread wait is involved.
       expect(
         plugin,
         contains(
           'func presenterStats() -> [String: Any] {\n'
-          '    nativeCallLock.lock()\n'
-          '    defer { nativeCallLock.unlock() }\n'
+          '    owner.assertCurrent()\n'
           '    return latestPresenterStats.toFlutterMap()',
         ),
       );
     });
   }
+
+  test('Apple platforms ship the same presenter owner', () {
+    final canonical =
+        File('macos/Classes/ErikaPresenterOwner.swift').readAsStringSync();
+    for (final platform in <String>['ios', 'tvos']) {
+      expect(
+        File('$platform/Classes/ErikaPresenterOwner.swift').readAsStringSync(),
+        canonical,
+        reason: platform,
+      );
+    }
+  });
 
   test('Metal limits contentsFormat switching to UIKit and tvOS', () {
     final rendererFile = File('../../crates/erika/src/renderer/metal/apple.rs');

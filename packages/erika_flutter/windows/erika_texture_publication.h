@@ -13,7 +13,9 @@
 
 namespace erika_flutter {
 
-// Publish only completed, immutable GPU textures. The UI thread owns latest_,
+// Publish only completed, immutable GPU textures. The worker transfers an
+// AddRef'd texture in a platform completion, guarded by its surface generation.
+// The platform thread publishes latest_ under mutex_,
 // while Flutter's raster callback pins sampled_ until its next invocation.
 // The descriptor therefore also survives the engine's reads AFTER opening the
 // handle. No frame-count timeout or release_callback is a lifetime guarantee.

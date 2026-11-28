@@ -138,6 +138,7 @@ pub mod wasapi {
         render_thread: Option<WasapiRenderThread>,
         buffer: Arc<Mutex<AudioRingBuffer>>,
         volume: Arc<AtomicU32>,
+        endpoint_queued_frames: Arc<AtomicU32>,
         signals: Arc<RecoverySignals>,
     }
 
@@ -149,6 +150,7 @@ pub mod wasapi {
                 render_thread: None,
                 buffer: Arc::new(Mutex::new(AudioRingBuffer::new(config.ring_buffer))),
                 volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+                endpoint_queued_frames: Arc::new(AtomicU32::new(0)),
                 signals: Arc::new(RecoverySignals::default()),
             }
         }
@@ -157,10 +159,12 @@ pub mod wasapi {
             stop_render_thread(&mut self.render_thread);
             configure_buffer(&self.buffer, format)?;
             self.signals.reset();
+            self.endpoint_queued_frames.store(0, Ordering::Release);
             let render_thread = WasapiRenderThread::spawn(
                 format,
                 Arc::clone(&self.buffer),
                 Arc::clone(&self.volume),
+                Arc::clone(&self.endpoint_queued_frames),
                 Arc::clone(&self.signals),
             )?;
             self.render_thread = Some(render_thread);
@@ -316,6 +320,17 @@ pub mod wasapi {
             self.clock_snapshot().ok()
         }
 
+        fn queued_output_duration(&self) -> Duration {
+            let frames = self.endpoint_queued_frames.load(Ordering::Acquire) as u64;
+            let Some(sample_rate) = self.format.map(|format| u64::from(format.sample_rate)) else {
+                return Duration::ZERO;
+            };
+            if sample_rate == 0 {
+                return Duration::ZERO;
+            }
+            Duration::from_secs_f64(frames as f64 / sample_rate as f64)
+        }
+
         fn runtime_stats(&self) -> AudioOutputRuntimeStats {
             WasapiAudioOutput::runtime_stats(self)
         }
@@ -331,6 +346,7 @@ pub mod wasapi {
             format: PcmFormat,
             buffer: Arc<Mutex<AudioRingBuffer>>,
             volume: Arc<AtomicU32>,
+            endpoint_queued_frames: Arc<AtomicU32>,
             signals: Arc<RecoverySignals>,
         ) -> Result<Self> {
             let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
@@ -338,10 +354,20 @@ pub mod wasapi {
             let worker = thread::Builder::new()
                 .name("erika-wasapi-render".to_string())
                 .spawn(move || {
-                    let result =
-                        run_render_thread(format, buffer, volume, signals, commands_rx, init_tx);
+                    let result = run_render_thread(
+                        format,
+                        buffer,
+                        volume,
+                        endpoint_queued_frames,
+                        signals,
+                        commands_rx,
+                        init_tx,
+                    );
                     if let Err(error) = result {
-                        eprintln!("erika WASAPI render thread stopped: {error}");
+                        crate::trace::diagnostic_at(
+                            crate::trace::LogLevel::Error,
+                            format!("erika WASAPI render thread stopped: {error}"),
+                        );
                     }
                 })
                 .map_err(|error| WasapiAudioOutputError::Wasapi {
@@ -390,10 +416,36 @@ pub mod wasapi {
         Shutdown,
     }
 
+    fn schedule_render_recovery(
+        error: WasapiAudioOutputError,
+        render_state: &mut Option<WasapiRenderState>,
+        recovery_plan: &mut RenderRecoveryPlan,
+        next_recovery_at: &mut Option<Instant>,
+        endpoint_queued_frames: &AtomicU32,
+        signals: &RecoverySignals,
+    ) {
+        let code = device_loss_code(&error).unwrap_or_else(|| error_hresult(&error));
+        *render_state = None;
+        endpoint_queued_frames.store(0, Ordering::Release);
+        signals.mark_disconnected(code);
+        match recovery_plan.next_step() {
+            RecoveryStep::RetryAfter(delay) => *next_recovery_at = Some(Instant::now() + delay),
+            RecoveryStep::GiveUp => {
+                signals.recovery_failed(code);
+                *next_recovery_at = None;
+            }
+        }
+        crate::trace::diagnostic_at(
+            crate::trace::LogLevel::Warn,
+            format!("erika WASAPI render error (HRESULT 0x{code:08X}): {error}"),
+        );
+    }
+
     fn run_render_thread(
         format: PcmFormat,
         buffer: Arc<Mutex<AudioRingBuffer>>,
         volume: Arc<AtomicU32>,
+        endpoint_queued_frames: Arc<AtomicU32>,
         signals: Arc<RecoverySignals>,
         commands: Receiver<WasapiRenderCommand>,
         init_tx: Sender<Result<()>>,
@@ -416,32 +468,25 @@ pub mod wasapi {
         let mut recovery_plan = RenderRecoveryPlan::new();
         let mut next_recovery_at: Option<Instant> = None;
 
-        // Losing the default endpoint (unplugged headphones, default device
-        // switch) must not kill this thread: the producer keeps pushing into
-        // the ring buffer and expects playback to resume on the new default
-        // device. Device-loss HRESULTs therefore drop the client and drive the
-        // recovery schedule below; only non-recoverable errors still propagate.
-        let on_device_error = |error: WasapiAudioOutputError,
+        // Nothing on this thread may exit through a propagated error: the
+        // producer keeps pushing into the ring buffer and would only see the
+        // thread's death as silent drop-oldest starvation with runtime_stats
+        // still reporting Stable. Every error therefore drops the client and
+        // drives the bounded recovery schedule -- known device-loss HRESULTs
+        // keep their code, anything else reports its own HRESULT the same way.
+        let on_render_error = |error: WasapiAudioOutputError,
                                render_state: &mut Option<WasapiRenderState>,
                                recovery_plan: &mut RenderRecoveryPlan,
                                next_recovery_at: &mut Option<Instant>|
          -> Result<()> {
-            let Some(code) = device_loss_code(&error) else {
-                return Err(error);
-            };
-            *render_state = None;
-            signals.mark_disconnected(code);
-            recovery_plan.reset();
-            match recovery_plan.next_step() {
-                RecoveryStep::RetryAfter(delay) => {
-                    *next_recovery_at = Some(Instant::now() + delay);
-                }
-                RecoveryStep::GiveUp => {
-                    signals.recovery_failed(code);
-                    *next_recovery_at = None;
-                }
-            }
-            eprintln!("erika WASAPI device lost (HRESULT 0x{code:08X}): {error}");
+            schedule_render_recovery(
+                error,
+                render_state,
+                recovery_plan,
+                next_recovery_at,
+                &endpoint_queued_frames,
+                &signals,
+            );
             Ok(())
         };
 
@@ -452,7 +497,7 @@ pub mod wasapi {
                         match &render_state {
                             Some(state) => {
                                 if !playing && let Err(error) = state.client_start() {
-                                    on_device_error(
+                                    on_render_error(
                                         error,
                                         &mut render_state,
                                         &mut recovery_plan,
@@ -482,7 +527,7 @@ pub mod wasapi {
                             if let Some(state) = &render_state
                                 && let Err(error) = state.client_stop()
                             {
-                                on_device_error(
+                                on_render_error(
                                     error,
                                     &mut render_state,
                                     &mut recovery_plan,
@@ -500,7 +545,7 @@ pub mod wasapi {
                                 state.client_reset()
                             };
                             if let Err(error) = result {
-                                on_device_error(
+                                on_render_error(
                                     error,
                                     &mut render_state,
                                     &mut recovery_plan,
@@ -508,12 +553,14 @@ pub mod wasapi {
                                 )?;
                             }
                         }
+                        endpoint_queued_frames.store(0, Ordering::Release);
                         playing = false;
                     }
                     WasapiRenderCommand::Shutdown => {
                         if playing && let Some(state) = &render_state {
                             let _ = state.client_stop();
                         }
+                        endpoint_queued_frames.store(0, Ordering::Release);
                         return Ok(());
                     }
                 }
@@ -528,8 +575,12 @@ pub mod wasapi {
                     Ok(state) => {
                         render_state = Some(state);
                         next_recovery_at = None;
-                        recovery_plan.reset();
-                        signals.recovery_succeeded();
+                        // Reopening is not proof that a playing endpoint can
+                        // render. Keep its retry budget until a render succeeds.
+                        if !playing {
+                            recovery_plan.reset();
+                            signals.recovery_succeeded();
+                        }
                     }
                     Err(error) => {
                         let code = error_hresult(&error);
@@ -547,16 +598,30 @@ pub mod wasapi {
                                 next_recovery_at = None;
                             }
                         }
-                        eprintln!("erika WASAPI device recovery failed: {error}");
+                        crate::trace::diagnostic_at(
+                            crate::trace::LogLevel::Warn,
+                            format!("erika WASAPI device recovery failed: {error}"),
+                        );
                     }
                 }
             }
 
             if playing && let Some(state) = &mut render_state {
                 let target_volume = f32::from_bits(volume.load(Ordering::Relaxed));
-                match state.render_available_frames(&buffer, last_applied_volume, target_volume) {
-                    Ok(reached) => last_applied_volume = reached,
-                    Err(error) => on_device_error(
+                match state.render_available_frames(
+                    &buffer,
+                    last_applied_volume,
+                    target_volume,
+                    &endpoint_queued_frames,
+                ) {
+                    Ok(reached) => {
+                        last_applied_volume = reached;
+                        if recovery_plan.backoff.attempts() > 0 {
+                            recovery_plan.reset();
+                            signals.recovery_succeeded();
+                        }
+                    }
+                    Err(error) => on_render_error(
                         error,
                         &mut render_state,
                         &mut recovery_plan,
@@ -622,9 +687,15 @@ pub mod wasapi {
             buffer: &Arc<Mutex<AudioRingBuffer>>,
             from_volume: f32,
             to_volume: f32,
+            endpoint_queued_frames: &AtomicU32,
         ) -> Result<f32> {
             let padding = unsafe { self.client.GetCurrentPadding() }
                 .map_err(|error| wasapi_error("IAudioClient::GetCurrentPadding", error))?;
+            // Publish how much decoded PCM the endpoint still holds beyond the
+            // ring buffer: the presenter's playback-rate transition bridge has
+            // to cover it, or the rate switch lands ~100 ms early (the shared
+            // poll model keeps this buffer nearly full).
+            endpoint_queued_frames.store(padding, Ordering::Release);
             let frames = self.buffer_frames.saturating_sub(padding);
             if frames == 0 {
                 // Nothing was written, so the ramp made no progress.
@@ -665,7 +736,12 @@ pub mod wasapi {
             };
             let release_result = unsafe { self.render_client.ReleaseBuffer(frames, release_flags) }
                 .map_err(|error| wasapi_error("IAudioRenderClient::ReleaseBuffer", error));
-            result.and(release_result).map(|()| reached_volume)
+            result.and(release_result).map(|()| {
+                // Include the buffer just handed to WASAPI, not only the old
+                // padding sampled before reading the software ring.
+                endpoint_queued_frames.store(padding.saturating_add(frames), Ordering::Release);
+                reached_volume
+            })
         }
     }
 
@@ -811,6 +887,189 @@ pub mod wasapi {
             assert_eq!(block_align, 8);
             assert_eq!(avg_bytes_per_sec, 384_000);
             assert_eq!(bits_per_sample, 32);
+        }
+
+        // Exercise the real COM calls in render_available_frames without
+        // depending on whether the runner has a connected audio device.
+        #[windows_core::implement(IAudioClient, IAudioRenderClient)]
+        struct TestEndpoint {
+            padding: AtomicU32,
+            samples: Mutex<Vec<f32>>,
+        }
+
+        impl ::windows::Win32::Media::Audio::IAudioClient_Impl for TestEndpoint_Impl {
+            fn Initialize(
+                &self,
+                _: ::windows::Win32::Media::Audio::AUDCLNT_SHAREMODE,
+                _: u32,
+                _: i64,
+                _: i64,
+                _: *const WAVEFORMATEX,
+                _: *const windows_core::GUID,
+            ) -> windows_core::Result<()> {
+                Ok(())
+            }
+            fn GetBufferSize(&self) -> windows_core::Result<u32> {
+                Ok(4800)
+            }
+            fn GetStreamLatency(&self) -> windows_core::Result<i64> {
+                Ok(1_000_000)
+            }
+            fn GetCurrentPadding(&self) -> windows_core::Result<u32> {
+                Ok(self.padding.load(Ordering::Acquire))
+            }
+            fn IsFormatSupported(
+                &self,
+                _: ::windows::Win32::Media::Audio::AUDCLNT_SHAREMODE,
+                _: *const WAVEFORMATEX,
+                _: *mut *mut WAVEFORMATEX,
+            ) -> windows_core::HRESULT {
+                windows_core::HRESULT(0)
+            }
+            fn GetMixFormat(&self) -> windows_core::Result<*mut WAVEFORMATEX> {
+                Err(windows_core::Error::from_hresult(
+                    ::windows::Win32::Foundation::E_NOTIMPL,
+                ))
+            }
+            fn GetDevicePeriod(&self, _: *mut i64, _: *mut i64) -> windows_core::Result<()> {
+                Ok(())
+            }
+            fn Start(&self) -> windows_core::Result<()> {
+                Ok(())
+            }
+            fn Stop(&self) -> windows_core::Result<()> {
+                Ok(())
+            }
+            fn Reset(&self) -> windows_core::Result<()> {
+                self.padding.store(0, Ordering::Release);
+                Ok(())
+            }
+            fn SetEventHandle(
+                &self,
+                _: ::windows::Win32::Foundation::HANDLE,
+            ) -> windows_core::Result<()> {
+                Ok(())
+            }
+            fn GetService(
+                &self,
+                _: *const windows_core::GUID,
+                _: *mut *mut std::ffi::c_void,
+            ) -> windows_core::Result<()> {
+                Err(windows_core::Error::from_hresult(
+                    ::windows::Win32::Foundation::E_NOTIMPL,
+                ))
+            }
+        }
+
+        impl ::windows::Win32::Media::Audio::IAudioRenderClient_Impl for TestEndpoint_Impl {
+            fn GetBuffer(&self, frames: u32) -> windows_core::Result<*mut u8> {
+                assert!(frames <= 4800);
+                Ok(self.samples.lock().unwrap().as_mut_ptr().cast())
+            }
+            fn ReleaseBuffer(&self, frames: u32, _: u32) -> windows_core::Result<()> {
+                self.padding.fetch_add(frames, Ordering::AcqRel);
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn unexpected_render_errors_exhaust_recovery_until_explicitly_rearmed() {
+            use crate::audio::AudioRecoveryState;
+            let mut state = None;
+            let mut plan = RenderRecoveryPlan::new();
+            let mut next = None;
+            let queued = AtomicU32::new(4800);
+            let signals = RecoverySignals::default();
+            let code = 0x8000ffffu32 as i32;
+            assert!(!is_device_loss_hresult(code));
+            for attempt in 0..=RECOVERY_MAX_ATTEMPTS {
+                schedule_render_recovery(
+                    WasapiAudioOutputError::Wasapi {
+                        operation: "test render",
+                        code,
+                        message: "persistent failure".to_string(),
+                    },
+                    &mut state,
+                    &mut plan,
+                    &mut next,
+                    &queued,
+                    &signals,
+                );
+                assert_eq!(queued.load(Ordering::Acquire), 0);
+                assert_eq!(signals.snapshot().last_error_code, code);
+                if attempt < RECOVERY_MAX_ATTEMPTS {
+                    assert!(next.is_some());
+                    assert_eq!(
+                        signals.snapshot().recovery_state,
+                        AudioRecoveryState::Disconnected
+                    );
+                    signals.begin_recovery();
+                } else {
+                    assert!(next.is_none());
+                    assert_eq!(
+                        signals.snapshot().recovery_state,
+                        AudioRecoveryState::Failed
+                    );
+                }
+            }
+            plan.reset();
+            assert!(matches!(plan.next_step(), RecoveryStep::RetryAfter(_)));
+        }
+
+        #[test]
+        fn endpoint_queue_includes_the_newly_released_buffer() {
+            use windows_core::Interface;
+            let client: IAudioClient = TestEndpoint {
+                padding: AtomicU32::new(1200),
+                samples: Mutex::new(vec![0.0; 9600]),
+            }
+            .into();
+            let render_client = client.cast::<IAudioRenderClient>().unwrap();
+            let mut state = WasapiRenderState {
+                client,
+                render_client,
+                buffer_frames: 4800,
+                channels: 2,
+                _com: ComApartment::new().unwrap(),
+            };
+            let buffer = Arc::new(Mutex::new(
+                AudioRingBuffer::with_format(AudioRingBufferConfig::default(), stereo_format())
+                    .unwrap(),
+            ));
+            let queued = AtomicU32::new(0);
+            state
+                .render_available_frames(&buffer, 1.0, 1.0, &queued)
+                .unwrap();
+            let actual = unsafe { state.client.GetCurrentPadding() }.unwrap();
+            assert_eq!(actual, 4800);
+            assert_eq!(queued.load(Ordering::Acquire), actual);
+            let mut output = WasapiAudioOutput::default();
+            output.format = Some(stereo_format());
+            output
+                .endpoint_queued_frames
+                .store(queued.load(Ordering::Acquire), Ordering::Release);
+            assert_eq!(output.queued_output_duration(), Duration::from_millis(100));
+        }
+
+        #[test]
+        #[ignore = "requires a Windows default audio endpoint"]
+        fn native_endpoint_queue_includes_the_newly_released_buffer() {
+            let mut state = initialize_render_client(stereo_format()).unwrap();
+            let buffer = Arc::new(Mutex::new(
+                AudioRingBuffer::with_format(AudioRingBufferConfig::default(), stereo_format())
+                    .unwrap(),
+            ));
+            let queued = AtomicU32::new(0);
+            state
+                .render_available_frames(&buffer, 1.0, 1.0, &queued)
+                .unwrap();
+            let actual = unsafe { state.client.GetCurrentPadding() }.unwrap();
+            assert!(
+                actual > 0,
+                "the stopped endpoint holds the submitted silent buffer"
+            );
+            assert_eq!(queued.load(Ordering::Acquire), actual);
+            state.client_reset().unwrap();
         }
 
         #[test]

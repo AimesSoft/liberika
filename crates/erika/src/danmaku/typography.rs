@@ -1,4 +1,4 @@
-//! Erika danmaku font-size policy.
+//! liberika danmaku font-size policy.
 //!
 //! NipaPlay and Flutter express font size as pixels per em. `ab_glyph` uses a
 //! different `PxScale`: the pixel height from the font ascent to its descent.

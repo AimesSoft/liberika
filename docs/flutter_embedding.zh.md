@@ -2,14 +2,14 @@
 
 [中文](flutter_embedding.zh.md) | [English](flutter_embedding.md) | [日本語](flutter_embedding.ja.md)
 
-Erika 不是 Flutter 视频渲染器。Flutter 只是可选宿主 UI。播放器内部负责解码、时序、原生渲染、字幕、弹幕、音频和 HDR 呈现。
+liberika 不是 Flutter 视频渲染器。Flutter 只是可选宿主 UI。播放器内部负责解码、时序、原生渲染、字幕、弹幕、音频和 HDR 呈现。
 
 ## API Families
 
 有两组 C ABI 入口：
 
 - `ErikaHandle`：控制与事件 API。适合宿主管理自己的 presenter loop，或只想探测/控制播放的场景。
-- `ErikaPresenterHandle`：presenter-owned API。适合 Erika 自己持有 `Player + renderer + audio output`，宿主只提供 native surface 和 display tick callback 的场景。
+- `ErikaPresenterHandle`：presenter-owned API。适合 liberika 自己持有 `Player + renderer + audio output`，宿主只提供 native surface 和 display tick callback 的场景。
 
 两组入口都声明在 `crates/erika_capi/include/erika.h`。
 
@@ -33,7 +33,7 @@ Apple HDR 路径使用 native Metal-backed surface，而不是 Flutter Texture�
 4. widget 跟踪自身位置，并通过 surface generation number 发送几何更新，因此已销毁 widget 的旧 hide 调用不会影响新 attach 的 surface。
 5. attach retry 使用 exponential backoff 处理 window readiness 时机。
 
-这个 overlay 路径是 NipaPlay 和其他 full-player UI 的推荐方案。它让视频呈现由 Erika/Metal 持有，而 Flutter 继续承担控制层和布局层。iOS/tvOS 上 native side 使用 window 加 sibling `UIView`/`CAMetalLayer`；macOS 上使用 host `NSWindow` 加 sibling `NSView`/`CAMetalLayer`。
+这个 overlay 路径是 NipaPlay 和其他 full-player UI 的推荐方案。它让视频呈现由 liberika/Metal 持有，而 Flutter 继续承担控制层和布局层。iOS/tvOS 上 native side 使用 window 加 sibling `UIView`/`CAMetalLayer`；macOS 上使用 host `NSWindow` 加 sibling `NSView`/`CAMetalLayer`。
 
 触摸事件会穿透两种 native video strategy，因此 Flutter controls 可以保持在视频 surface 上方或周围。
 
@@ -44,6 +44,8 @@ Apple HDR 路径使用 native Metal-backed surface，而不是 Flutter Texture�
 macOS 上当 `blendMode` 不是 `srcOver` 时，widget 会改走 native platform view，让 Core Animation 基于真实背景做混合（见下文"透明视频与混合模式"）。
 
 Windows 上 `ErikaVideoView` 默认继续使用原生 HWND/swapchain，保留普通视频的 HDR10 输出；不会根据当前片源或 `outputMode` 自动切入 Flutter Texture。显式使用 `ErikaTextureVideoView` 才启用 SDR BGRA8 texture；`srcOver` 支持 Flutter 的透明度、裁剪、变换和颜色滤镜，`overlay` 转入原生 Windows Composition，其余混合模式明确报错。
+
+Windows 原生 HWND 视频层位于 Flutter 宿主窗口下方，宿主必须将视频区域及窗口合成背景设为透明，控件仍由上方的 Flutter 绘制。不能通过把视频 HWND 提到宿主上方解决黑底，否则视频会遮住播放控件；`WS_EX_TRANSPARENT` 和不使用 `WS_EX_TOPMOST` 都不能保证视觉层级正确。不提供透明宿主的应用可显式选择 SDR 的 `ErikaTextureVideoView`。
 
 Windows texture 每次画面内容变化后通过 GPU copy 发布完成且不可变的快照，无 CPU 像素回读；复制完成前不会交给 Flutter。暂停且字幕/弹幕/HUD 未变化时复用已发布快照，不重复通知 Flutter。尺寸变化、seek、字幕、弹幕和 HUD 更新均会使输出失效。Flutter 打开共享句柄不等于 GPU 采样结束，因此已发布快照永不被再次写入。插件仅保留最新和正在被 raster callback 读取的快照，未消费的中间 resize 快照可立即回收。
 
@@ -79,7 +81,7 @@ surface 取为 `OHNativeWindow` 并 attach 给 presenter；wgpu 随后通过 Vul
 
 ## 透明视频与混合模式
 
-Erika 可以呈现带透明度的视频素材，同时保留 Flutter 的布局与合成能力。透明度按 player 请求：
+liberika 可以呈现带透明度的视频素材，同时保留 Flutter 的布局与合成能力。透明度按 player 请求：
 
 ```dart
 final player = ErikaPlayer(
@@ -108,15 +110,15 @@ ErikaTextureVideoView(
 | Windows 窗口 overlay（DirectComposition） | `srcOver`、`overlay`；其他值抛插件错误 | `IDCompositionEffectGroup` opacity |
 | Android / iOS / OpenHarmony | 接受创建参数但不消费 | texture 路径上由 Flutter 侧应用 |
 
-overlay 混合是背景感知的：macOS 的 native 层基于窗口内视频背后的内容合成，Windows 的 blend effect 采样同一个 HWND，因此底层的 Flutter 或游戏画面保持可见。Windows 透明 overlay 视频使用绑定到 Flutter HWND 的 SDR BGRA8 预乘 composition swap chain；HDR 片源会在 Erika 内部 tone map 到该合成空间。不透明的 Windows overlay 视频仍沿用之前的专用子 HWND 路径；解码器或输出设备重建 swap chain 时会自动重新绑定 composition 内容。
+overlay 混合是背景感知的：macOS 的 native 层基于窗口内视频背后的内容合成，Windows 的 blend effect 采样同一个 HWND，因此底层的 Flutter 或游戏画面保持可见。Windows 透明 overlay 视频使用绑定到 Flutter HWND 的 SDR BGRA8 预乘 composition swap chain；HDR 片源会在 liberika 内部 tone map 到该合成空间。不透明的 Windows overlay 视频仍沿用之前的专用子 HWND 路径；解码器或输出设备重建 swap chain 时会自动重新绑定 composition 内容。
 
 ## iOS Build Path
 
-iOS plugin 通过 CocoaPod script phase 把 Erika C ABI static library 链接进 app。默认下载匹配的预构建归档；设 `ERIKA_FORCE_SOURCE_BUILD=1`（配合 `ERIKA_REPO_ROOT`）才会为目标 iOS architecture 从源码构建 Rust `erika_capi` crate。
+iOS plugin 通过 CocoaPod script phase 把 liberika C ABI static library 链接进 app。默认下载匹配的预构建归档；设 `ERIKA_FORCE_SOURCE_BUILD=1`（配合 `ERIKA_REPO_ROOT`）才会为目标 iOS architecture 从源码构建 Rust `erika_capi` crate。
 
 ## tvOS Build Path
 
-tvOS plugin 通过 CocoaPod script phase 链接 Erika C ABI static library；与 iOS 一样默认下载预构建归档，`ERIKA_FORCE_SOURCE_BUILD=1` 时才从源码构建。支持 tvOS 13+、arm64 真机，以及 arm64/x86_64 模拟器。详细的 Rust nightly、预构建包和源码构建选项见 [`packages/erika_flutter/README.zh.md`](../packages/erika_flutter/README.zh.md)。
+tvOS plugin 通过 CocoaPod script phase 链接 liberika C ABI static library；与 iOS 一样默认下载预构建归档，`ERIKA_FORCE_SOURCE_BUILD=1` 时才从源码构建。支持 tvOS 13+、arm64 真机，以及 arm64/x86_64 模拟器。详细的 Rust nightly、预构建包和源码构建选项见 [`packages/erika_flutter/README.zh.md`](../packages/erika_flutter/README.zh.md)。
 
 ## macOS Build Path
 
@@ -168,6 +170,10 @@ Apple HDR 路径仍使用 native Metal，Windows 使用 native Direct3D 11 渲�
 GLES 或能力协商失败会明确回退 SDR。Android SDR 已验证，API 35 HDR 真机 active path
 仍待验收；Linux 提供实验性 X11 / Wayland 与 Flutter 接入。
 
+Windows 上每个 presenter 在自己的原生 worker 线程上运行：create、命令、surface attach/resize/detach、渲染 tick、截图和 destroy 都在该线程执行，帧请求会合并（每个 presenter 至多一个排队或运行中的 tick）。方法结果、`EventSink` 事件、SMTC 更新、texture 注册和 HWND/DirectComposition 操作仍留在平台线程，所以较慢的渲染 tick 不再阻塞窗口消息循环。设置 `ERIKA_FLUTTER_FRAME_TRACE=1` 会在每个 presenter 首次启动时记录一次 `presenter_worker ... platform_thread=... render_thread=... off_platform=true`，并记录在 worker 上测得的慢 tick（`frame_tick ... work_ms=`）。
+
+其他平台采用同样的 owner 模型。Linux 共用规范的 `windows/erika_presenter_worker.h`，并由自己的 16 ms 单调时钟驱动；GTK、view 与 Flutter texture 注册仍留在平台线程，结果和事件通过 idle source 送回平台线程。OpenHarmony（Flutter 插件与 `erika_ohos` 包）在 `presenter_bridge.h` 之后为每个 presenter 提供一个 owner 线程；每个 N-API 函数还有对应的 `...Async` 变体，在 ArkTS 线程上 resolve promise，而旧版 C 辅助函数 `ErikaOhosPlayerFromId` 现在返回 null，因为原生代码不得访问由其他线程持有的 presenter。Android 仍为每个 presenter 使用专用的 `HandlerThread`。在 macOS、iOS 和 tvOS 上，每个 presenter 拥有一个专用线程（`ErikaPresenterOwner.swift`），按 FIFO 顺序执行 create、所有原生命令、渲染、事件轮询、截图和 destroy，帧 tick 会合并；`CVDisplayLink` 与 `CADisplayLink` 只负责唤醒它，主线程则解析参数、按顺序送回结果和事件，并处理 AppKit/UIKit 工作（now-playing、远程命令、view）。因此缓慢的 `open`、`seek` 或 `dispose` 既不会阻塞 UI 线程，也不会延迟渲染；`ERIKA_FLUTTER_FRAME_TRACE=1` 会记录每个 tick 与命令所在的线程。
+
 ## Dart API
 
 安装、播放控制、HTTP 缓存参数、事件与视图示例统一维护在
@@ -204,7 +210,7 @@ player.events.listen((event) {
 
 ## 原生调试 HUD
 
-`setDebugHudEnabled(true)` 让 Erika 在原生视频合成中绘制诊断 HUD；它不经过 Dart 渲染，
+`setDebugHudEnabled(true)` 让 liberika 在原生视频合成中绘制诊断 HUD；它不经过 Dart 渲染，
 也不会改变 Flutter widget 层级。默认关闭，适合开发、性能分析和问题截图前的现场观察。
 
 HUD 以低频快照显示轨道编码/分辨率/码率/帧率、播放位置与倍速、实时解码与渲染 FPS、硬件或
@@ -215,30 +221,85 @@ HUD 以低频快照显示轨道编码/分辨率/码率/帧率、播放位置与�
 如需自行设计 UI，使用 `getPresenterStats()` 获取最近一次原生显示 tick 的统计快照；它不是
 HUD 的驱动机制，数据新鲜度取决于已挂载 surface 的显示循环。
 
+## 面向宿主与智能体的诊断
+
+三个方法把内核自身的视角交给自动排查（卡顿、花屏、解不了、音画不同步）：
+
+- `getDiagnosticsSnapshot()` 一次返回一个 JSON map（schema 1）：解码器与硬解路径及回退、
+  presenter 计数、输出/HDR、资源、超分、音频、缓冲深度，以及时序——调度器迟到丢帧、
+  呈现节奏与抖动、时钟漂移与纠偏。取不到的值为 `null`。
+- `getLogs({limit, minLevel, sinceSeq})` 读取进程级、已脱敏的日志环形缓冲：liberika 的
+  运维诊断加上 FFmpeg 的警告与错误。
+- `invokeJson(method, [arguments])` 调用原生 JSON 方法表中的任意一项并返回其信封
+  （`{ok, status, value | error, code?}`）；`invokeJson('listMethods')` 列出方法表，内核
+  新增能力无需改 Dart。
+
+字段说明见 [capi_reference.zh.md](capi_reference.zh.md) 的“智能体诊断（JSON）”与
+“JSON 桥”。平台插件或随包原生库缺少该方法时抛出 `UnsupportedError`。本版本状态：
+macOS、iOS、tvOS 以可选方式加载新符号；Linux、鸿蒙、Android 走共享 JSON 方法表；
+Windows 抛出 `UnsupportedError`。
+
+在 macOS 和 iOS 上，插件在 presenter 的 owner 线程上执行 `invokeJson` 与 `getDiagnosticsSnapshot`，
+在工具队列上执行 `getLogs`，再回到主线程应答，因此耗时的调用（大字幕文件的 `addExternalSubtitle`、
+`exportFrame`）不会占用主线程。耗时的 presenter 方法会推迟该 presenter 的下一帧（帧在命令之间执行），
+但不会卡住界面；`scope` 为 `global` 的方法（`exportFrame`、`exportFrames`、`getLogs`、`listMethods`）
+不使用 presenter 句柄。
+`listMethods` 为每个方法标出 `blocking`（做完才返回，耗时随输入增长）与 `writesFiles`
+（会创建文件，结果列出路径）。
+
+## 不经播放器取画面
+
+`ErikaPlayer.exportFrame(uri, position: ...)` 用自己的 demuxer 和多线程软件解码器取出某个媒体时间
+显示的画面，格式为 RGBA 或 PNG，不涉及播放器。HDR 源（PQ、HLG、杜比视界）按播放器在 SDR 显示器上
+使用的运算做色调映射到 SDR，`ErikaExportedFrame.toneMapped` 会标明。要从同一个媒体取多张时，
+打开一个 `ErikaFrameExportSession`（或调用 `ErikaPlayer.exportFrames`）：媒体只打开一次，按时间
+递增的请求接着解码而不是重新 seek。工作都在 UI 线程之外：macOS 用原生工作队列，FFI 平台（iOS、
+tvOS、Android、Windows、Linux、鸿蒙）每个会话一个后台 isolate。用 `close()` 关闭会话。设置
+`ERIKA_FLUTTER_LIBRARY` 为某个库路径，可让 FFI 导出走待测的构建。
+
 ## Neural Upscaler Status
 
-`setUpscaler` 只是在请求一个模式；kernel 会在后台线程编译，所以宿主应该轮询 `getUpscalerStatus` 来驱动 UI：
+`setUpscaler(ErikaUpscalerMode)` 请求一个模式（ArtCNN、Anime4K、`fsr1`、`platformVideo`、`metalFxSpatial`、
+`custom`；模式及各平台运行内容见[集成指南](integration.zh.md#超分)）。kernel 会在后台线程编译，所以宿主应该轮询
+`getUpscalerStatus` 来驱动 UI：
 
 | `activeBackend` | 含义 |
 |-----------------|------|
 | `off` | 没有请求任何模式。 |
-| `building` | kernel 正在编译（首次使用该模式）；在准备好之前视频会保持未放大。 |
-| `inactive` | 请求了模式但未生效——内核未就绪（且不在编译中），或后端记录了回退/失败。 |
-| `scalar` | 运行在 Metal scalar 或 wgpu compute backend 上。 |
-| `simdgroupMatrix` | 运行在 `simdgroup_matrix` backend 上（Apple Silicon 默认）。 |
+| `inactive` | 请求了模式但在此无法运行（或后端记录了回退/失败）；使用原生采样，原因见诊断 `upscaler` 对象。 |
+| `building` | kernel 正在后台编译；在准备好之前使用原生采样渲染。 |
+| `scalar` | 通用 compute shader。 |
+| `simdgroupMatrix` | Apple `simdgroup_matrix`（M1-M4/A14+）。 |
+| `cooperativeMatrix` | 与 D3D11 并行的 Vulkan `VK_KHR_cooperative_matrix`（Tensor Core / WMMA / XMX）。 |
+| `linalgMatrix` | D3D12 SM 6.10 `linalg::Matrix`，可选预览。 |
+| `videoProcessor` | D3D11 video processor 厂商扩展：NVIDIA RTX Video / Intel VSR。 |
+| `videoToolbox` | VideoToolbox 超分。 |
+| `metalFx` | MetalFX spatial scaler。 |
+| `tensorOps` | Metal 4 tensor ops（Apple10 GPU：M5/A19）。 |
 
-只有当 drawable 显示的视频尺寸大于源分辨率时，upscaler 才会生效，所以 1080p 源在
-1080p（或更小）视图里会保持 `inactive`。C4F16 是实时推荐；C4F16 DS 以相同算力成本面向严重压制或噪声片源；Apple 上的 C4F32 在 1080p
-输入下通常需要 M-Pro/Max 级别 GPU。Android 上两个模型都使用 Vulkan compute，GLES 会
-明确报告 `inactive` fallback。渲染器侧设计见 `docs/architecture.md`。
+`getUpscalerStatus().lastGpuDuration` 现在在 Windows 上也会填充（D3D11 timestamp query）。
+
+适合在 UI 里提示的限制：RTX Video Super Resolution（Windows 上的 `platformVideo`）需要 RTX GPU、在 NVIDIA App /
+控制面板中启用对应设置，且仅限 SDR 视频；VideoToolbox 缩放器只接受 2x、8 位 4:2:0、尺寸 96x96 到 960x960 的片源，
+且需要 macOS/iOS/tvOS 26+；D3D12 linalg 是可选预览；wgpu renderer（Linux、Android、OpenHarmony、Windows 的
+wgpu 回退）运行全部网络模式和 `fsr1`，`platformVideo` 与 `metalFxSpatial` 报告 `inactive`。R8F64 只在矩阵单元和 SD/720p 片源上实用。
+
+`loadUpscalerModel(Uint8List data, {String name = 'custom'})` 加载自定义网络（Erika `.esr` 文件，或 FSRCNNX /
+Anime4K CNN 的 mpv hook shader；因授权原因不内置 FSRCNNX，由宿主提供文件），随后调用
+`setUpscaler(ErikaUpscalerMode.custom)`。`clearUpscalerModel()` 将其卸载。Linux 插件只提供 JSON 文件路径方法
+（`loadUpscalerModelFile`）。
+
+渲染器侧设计见 `docs/architecture.md`。
 
 ## Ownership Rule
 
-Flutter 负责布局和 controls。Erika 负责 video plane、subtitle plane、danmaku plane、audio 和 timing。plugin 通过 `MethodChannel` 传递命令和事件；渲染不会经过 Dart。
+Flutter 负责布局和 controls。liberika 负责 video plane、subtitle plane、danmaku plane、audio 和 timing。plugin 通过 `MethodChannel` 传递命令和事件；渲染不会经过 Dart。
 
 ## Linux 视频表面
 
 `ErikaVideoView` 与 `ErikaTextureVideoView` 将 GPU 合成结果读回为 SDR RGBA 纹理。
 Wayland 的 `ErikaWindowOverlayVideoView` 使用透明 Flutter UI 下的原生视频层，
-减少逐帧纹理读回；视频本身不接受 Flutter 裁剪或颜色滤镜。先构建本地内核并设置
-`ERIKA_LIBRARY_DIR`，步骤在 [Linux 接入](linux.zh.md)。
+减少逐帧纹理读回；视频本身不接受 Flutter 裁剪或颜色滤镜。下载 v0.3.7 Linux
+x86_64 或 ARM64 运行库包（`bundled` 或 `system`），或从源码构建，然后将
+`ERIKA_LIBRARY_DIR` 设为包含 `liberika_capi.so` 的目录绝对路径（压缩包内为 `lib`）。
+Linux 运行库不会自动下载，步骤在 [Linux 接入](linux.zh.md)。

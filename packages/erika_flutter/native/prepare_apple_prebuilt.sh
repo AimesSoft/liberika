@@ -49,7 +49,7 @@ CACHE_KEY="$(printf '%s' "$PREBUILT_TAG" | tr -c 'A-Za-z0-9._-' '_')"
 WORK="$CACHE_BASE/$CACHE_KEY/$ASSET"
 ZIP="$WORK/$ASSET.zip"
 UNPACKED="$WORK/unpacked"
-URL="https://github.com/AimesSoft/Erika/releases/download/$PREBUILT_TAG/$ASSET.zip"
+URL="https://github.com/AimesSoft/liberika/releases/download/$PREBUILT_TAG/$ASSET.zip"
 mkdir -p "$WORK"
 
 verify_sha256() {

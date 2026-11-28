@@ -1,11 +1,11 @@
 # Deterministic playback fixture
 
-`playback-fixture.mkv` is a small, deterministic input for Erika playback
+`playback-fixture.mkv` is a small, deterministic input for liberika playback
 state and track-switching tests. It is eight seconds long and contains, in
 this exact order:
 
 Every input and output in this directory is original synthetic material made
-for the Erika repository. The video and audio come from deterministic FFmpeg
+for the liberika repository. The video and audio come from deterministic FFmpeg
 filters, and the subtitle cues and supporting files were authored for this
 fixture. No third-party media is included. The inputs, generated output,
 script, and documentation are distributed under the repository root's
@@ -46,3 +46,13 @@ the generator or either subtitle source:
 Review the resulting binary and checksum diff before committing it. Different
 FFmpeg versions are rejected because encoder or Matroska muxer changes can
 otherwise produce a structurally valid but byte-different fixture.
+
+The companion `../chapters/chapters.mkv` is a silent, synthetic 60-second
+video for chapter navigation. Its metadata defines Prologue at 0 s, OP at
+10–20 s, Part A at 20 s, Part B at 35 s, ED at 40–50 s, and Preview at 50 s.
+`bash ../chapters/generate.sh` rebuilds it from the adjacent FFmetadata file
+and FFmpeg's color source. `container_chapters_reach_player_and_clear_on_reopen_or_failure`
+checks that the demuxer exposes these chapters and that reopening an unmarked
+file or failing to open a new file clears them. This companion is also
+original synthetic material under MPL-2.0; it does not change the playback
+fixture or its hashes above.

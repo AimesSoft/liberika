@@ -2,14 +2,14 @@
 #define ERIKA_H
 
 /*
- * Erika media playback engine — C ABI.
+ * liberika media playback engine — C ABI.
  *
  * Full reference: docs/capi_reference.md. Embedding walkthrough:
  * docs/integration.md.
  *
  * Two independent entry points; pick one per integration:
  *   - ErikaHandle:          pull model. The host renders and pulls state.
- *   - ErikaPresenterHandle: push model. Erika owns decode/timing/audio/render;
+ *   - ErikaPresenterHandle: push model. liberika owns decode/timing/audio/render;
  *                           the host gives it a surface and calls render_tick.
  *                           Compiled on macOS / iOS / Windows / Android /
  *                           OpenHarmony / Linux; on other targets
@@ -21,7 +21,7 @@
  *   - On a non-Ok/NoEvent result a human-readable message is stored in a
  *     THREAD-LOCAL slot; read it on the same thread via
  *     erika_last_error_message() and free with erika_string_free().
- *   - Any char* Erika returns is caller-owned: free standalone strings with
+ *   - Any char* liberika returns is caller-owned: free standalone strings with
  *     erika_string_free(); free strings inside ErikaTrackInfo /
  *     ErikaDanmakuTrackInfo with the matching *_info_free() function.
  *   - const char* arguments are borrowed for the call only and must be
@@ -46,6 +46,8 @@ extern "C" {
 /* Opaque handles. ErikaHandle = pull model, ErikaPresenterHandle = push model. */
 typedef struct ErikaHandle ErikaHandle;
 typedef struct ErikaPresenterHandle ErikaPresenterHandle;
+/* A media kept open for taking many pictures; see erika_frame_export_session_open. */
+typedef struct ErikaFrameExportSession ErikaFrameExportSession;
 
 typedef struct ErikaHttpHeader {
   const char *name;
@@ -60,13 +62,18 @@ typedef struct ErikaHttpHeader {
  * rewind budget (in bytes): how much already-played data stays cached so a
  * rewind inside it is served without a network request; 0 uses the 16 MiB
  * default (a -10 s skip at 71 Mbps covers ~89 MB, so hosts playing
- * high-bitrate media should size this from the bitrate). */
+ * high-bitrate media should size this from the bitrate).
+ * start_position_micros opens the media there instead of at its start: the
+ * engine seeks before presenting, so the first frame shown is the one at that
+ * position; 0 opens at the start (it was the first reserved slot, so callers
+ * that zero the struct keep opening at the start). */
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;
   uint64_t http_back_buffer_bytes;
-  uint64_t reserved[2];
+  uint64_t start_position_micros;
+  uint64_t reserved[1];
 } ErikaOpenOptions;
 
 /* Headless GIF export. Times are milliseconds. The function is synchronous;
@@ -100,6 +107,75 @@ typedef struct ErikaGifExportResult {
   uint64_t frame_count;
   uint64_t file_size;
 } ErikaGifExportResult;
+
+/* Headless single-frame export: the picture shown at position_millis (a
+ * media time) as RGBA or PNG. max_width/max_height bound the output (0 =
+ * unbounded); the display aspect ratio is kept and the picture is never
+ * larger than the video. HDR sources (PQ, HLG, Dolby Vision) are tone mapped
+ * to SDR the way Erika renders them on an SDR display. Synchronous; UI
+ * integrations must call it from a worker thread. Owns an independent
+ * demux/decode pipeline (multi-threaded software decoding) and requires no
+ * player or presenter handle. */
+typedef enum ErikaFrameExportFormat {
+  ErikaFrameExportFormat_Rgba = 0, /* rows of width * 4 bytes, alpha 255 */
+  ErikaFrameExportFormat_Png = 1,  /* PNG file bytes, 8-bit RGB */
+} ErikaFrameExportFormat;
+
+typedef struct ErikaFrameExportOptions {
+  const char *input_uri;
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t position_millis;
+  uint64_t http_read_ahead_bytes;
+  uint32_t max_width;
+  uint32_t max_height;
+  int32_t format;
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportOptions;
+
+/* data stays owned by liberika until erika_frame_export_result_free. Times
+ * are microseconds: timestamp_micros is where the picture is, duration_micros
+ * the media duration (0 when the container reports none). reserved_flags
+ * carries ERIKA_FRAME_EXPORT_TONE_MAPPED when the picture was tone mapped. */
+#define ERIKA_FRAME_EXPORT_TONE_MAPPED 1u
+
+typedef struct ErikaFrameExportResult {
+  uint8_t *data;
+  uintptr_t data_len;
+  uint64_t timestamp_micros;
+  uint64_t duration_micros;
+  uint32_t width;
+  uint32_t height;
+  uint32_t source_width;
+  uint32_t source_height;
+  int32_t format;
+  uint32_t reserved_flags;
+  uint64_t reserved[2];
+} ErikaFrameExportResult;
+
+/* Frame export session: the media is opened once and pictures are taken from
+ * it one after another. A request after the previous one continues decoding
+ * from where the decoder stopped when no keyframe lies between, and seeks
+ * otherwise (backwards included), so requests in ascending time order are the
+ * cheapest. Results are the same as erika_export_frame's. */
+typedef struct ErikaFrameExportSessionOptions {
+  const char *input_uri;
+  const ErikaHttpHeader *headers;
+  uintptr_t header_count;
+  uint64_t http_read_ahead_bytes;
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportSessionOptions;
+
+typedef struct ErikaFrameExportRequest {
+  uint64_t position_millis;
+  uint32_t max_width;
+  uint32_t max_height;
+  int32_t format; /* ErikaFrameExportFormat */
+  uint32_t reserved_flags;
+  uint64_t reserved[4];
+} ErikaFrameExportRequest;
 
 typedef enum ErikaStatus {
   ErikaStatus_Ok = 0,
@@ -135,6 +211,11 @@ typedef enum ErikaEventKind {
   ErikaEventKind_TrackSelectionChanged = 10,
   ErikaEventKind_VideoDecoderChanged = 11,
   ErikaEventKind_AudioOutputChanged = 12,
+  /* 13 is the hosts' own (a system media control asked for the previous or
+   * next item); the engine never sends it. */
+  /* The media played to its end on its own. Follows the Stopped state the
+   * end brings; a stop asked for sends no Ended. */
+  ErikaEventKind_Ended = 14,
 } ErikaEventKind;
 
 typedef enum ErikaTrackKind {
@@ -202,11 +283,33 @@ typedef enum ErikaOutputSurfaceFormat {
   ErikaOutputSurfaceFormat_SixteenBitFloat = 2,
 } ErikaOutputSurfaceFormat;
 
+/* Upscaler modes. Values are grouped by family and stable: 1-15 ArtCNN,
+ * 16-31 Anime4K, 32-47 spatial shaders, 48-63 platform scalers, 64 a
+ * runtime-loaded network (erika_presenter_load_upscaler_model). Backends
+ * that cannot run a mode keep native sampling and report Inactive. */
 typedef enum ErikaLumaUpscalerMode {
   ErikaLumaUpscalerMode_Off = 0,
   ErikaLumaUpscalerMode_ArtCnnC4F16 = 1,
   ErikaLumaUpscalerMode_ArtCnnC4F32 = 2,
   ErikaLumaUpscalerMode_ArtCnnC4F16Ds = 3,
+  ErikaLumaUpscalerMode_ArtCnnC4F16Dn = 4,
+  ErikaLumaUpscalerMode_ArtCnnC4F32Ds = 5,
+  ErikaLumaUpscalerMode_ArtCnnC4F32Dn = 6,
+  ErikaLumaUpscalerMode_ArtCnnR8F64 = 7,
+  ErikaLumaUpscalerMode_Anime4kS = 16,
+  ErikaLumaUpscalerMode_Anime4kM = 17,
+  ErikaLumaUpscalerMode_Anime4kL = 18,
+  ErikaLumaUpscalerMode_Anime4kVl = 19,
+  ErikaLumaUpscalerMode_Anime4kUl = 20,
+  ErikaLumaUpscalerMode_Anime4kDenoiseS = 21,
+  ErikaLumaUpscalerMode_Anime4kDenoiseM = 22,
+  ErikaLumaUpscalerMode_Anime4kDenoiseL = 23,
+  ErikaLumaUpscalerMode_Anime4kDenoiseVl = 24,
+  ErikaLumaUpscalerMode_Anime4kDenoiseUl = 25,
+  ErikaLumaUpscalerMode_Fsr1 = 32,
+  ErikaLumaUpscalerMode_PlatformVideo = 48,
+  ErikaLumaUpscalerMode_MetalFxSpatial = 49,
+  ErikaLumaUpscalerMode_Custom = 64,
 } ErikaLumaUpscalerMode;
 
 typedef enum ErikaUpscalerBackendStatus {
@@ -215,6 +318,12 @@ typedef enum ErikaUpscalerBackendStatus {
   ErikaUpscalerBackendStatus_Building = 2,
   ErikaUpscalerBackendStatus_Scalar = 3,
   ErikaUpscalerBackendStatus_SimdgroupMatrix = 4,
+  ErikaUpscalerBackendStatus_CooperativeMatrix = 5,
+  ErikaUpscalerBackendStatus_LinalgMatrix = 6,
+  ErikaUpscalerBackendStatus_VideoProcessor = 7,
+  ErikaUpscalerBackendStatus_VideoToolbox = 8,
+  ErikaUpscalerBackendStatus_MetalFx = 9,
+  ErikaUpscalerBackendStatus_TensorOps = 10,
 } ErikaUpscalerBackendStatus;
 
 typedef enum ErikaVideoAlphaMode {
@@ -344,7 +453,7 @@ typedef struct ErikaSubtitleMemoryFontInfo {
 
 typedef struct ErikaDanmakuConfig {
   bool enabled;
-  /* NipaPlay/Flutter logical danmaku font size. Erika uses the NipaPlay
+  /* NipaPlay/Flutter logical danmaku font size. liberika uses the NipaPlay
    * default danmaku font and multiplies by the surface scale for glyph pixels. */
   float font_size;
   float opacity;
@@ -473,9 +582,30 @@ void erika_destroy(ErikaHandle *handle);
 char *erika_last_error_message(void);
 void erika_string_free(char *value);
 
+/* The font built into this library and its length, or NULL without one. The bytes
+ * live as long as the process and are not freed. A host serving a browser page
+ * can pass them to it, so that the page needs no font of its own. */
+const uint8_t *erika_embedded_fallback_font(uintptr_t *out_length);
+
 ErikaStatus erika_export_gif(
     const ErikaGifExportOptions *options,
     ErikaGifExportResult *out_result);
+ErikaStatus erika_export_frame(
+    const ErikaFrameExportOptions *options,
+    ErikaFrameExportResult *out_result);
+void erika_frame_export_result_free(ErikaFrameExportResult *result);
+/* Synchronous: opening reads the container header and each frame call decodes
+ * on the calling thread. Calls on one session are serialised; the session is
+ * released with erika_frame_export_session_close (NULL is accepted), and no
+ * call on it may be running or follow. *out_session is NULL after a failure. */
+ErikaStatus erika_frame_export_session_open(
+    const ErikaFrameExportSessionOptions *options,
+    ErikaFrameExportSession **out_session);
+ErikaStatus erika_frame_export_session_frame(
+    ErikaFrameExportSession *session,
+    const ErikaFrameExportRequest *request,
+    ErikaFrameExportResult *out_result);
+void erika_frame_export_session_close(ErikaFrameExportSession *session);
 
 /* Playback control. uri is a local path or HTTP(S) URL; times are microseconds.
  * open() synchronously probes streams and transitions to Ready. */
@@ -575,9 +705,11 @@ ErikaPresenterHandle *erika_presenter_create_with_output_mode_and_alpha(
 void erika_presenter_destroy(ErikaPresenterHandle *handle);
 
 /* Playback and runtime parameters. volume is 0.0–1.0; rate 1.0 is normal speed;
- * set_upscaler takes an ErikaLumaUpscalerMode. Metal and capable wgpu/Vulkan
- * renderers execute ArtCNN; other backends retain native luma sampling and
- * report an explicit Inactive fallback. */
+ * set_upscaler takes an ErikaLumaUpscalerMode. D3D11 runs every network mode,
+ * FSR 1.0 and (on NVIDIA/Intel) PlatformVideo; Metal runs the network modes
+ * and its platform scalers; wgpu/Vulkan runs the legacy ArtCNN modes. A
+ * backend that cannot run a mode keeps native sampling and reports Inactive
+ * (see erika_presenter_get_upscaler_status and the diagnostics JSON). */
 ErikaStatus erika_presenter_open(ErikaPresenterHandle *handle, const char *uri);
 ErikaStatus erika_presenter_open_with_headers(
     ErikaPresenterHandle *handle,
@@ -598,8 +730,30 @@ ErikaStatus erika_presenter_close(ErikaPresenterHandle *handle);
 ErikaStatus erika_presenter_seek(ErikaPresenterHandle *handle, uint64_t position_micros);
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *handle, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *handle, double volume);
+/* Silences the output (true) or restores it (false) without losing the
+ * volume: set_volume while muted is kept and applied on unmute. */
+ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *handle, bool muted);
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *handle, int32_t mode);
+/* Loads the network used by ErikaLumaUpscalerMode_Custom from memory: an
+ * Erika .esr model (see crates/erika/assets/artcnn/export_artcnn_esr.py) or
+ * an mpv hook shader of the FSRCNNX / Anime4K CNN dialect. Weights are never
+ * bundled for such models; the host supplies them. Select the network with
+ * erika_presenter_set_upscaler(handle, ErikaLumaUpscalerMode_Custom). */
+ErikaStatus erika_presenter_load_upscaler_model(
+    ErikaPresenterHandle *handle,
+    const char *name,
+    const uint8_t *data,
+    uintptr_t data_len);
+ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle *handle);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *handle, double scale);
+/* Shows subtitles later (positive delay_micros) or earlier (negative) than
+ * their timestamps, embedded and external tracks alike; clamped to ten
+ * minutes either way. 0 restores the timestamps. */
+ErikaStatus erika_presenter_set_subtitle_delay(ErikaPresenterHandle *handle, int64_t delay_micros);
+/* Where the next open on this presenter starts (microseconds) when its
+ * options leave start_position_micros at 0, for hosts whose open path cannot
+ * carry it. Taken by that open; 0 clears it. */
+ErikaStatus erika_presenter_set_open_start_position(ErikaPresenterHandle *handle, uint64_t position_micros);
 /* Fallback subtitle font. NULL or empty clears that half of the selection.
  * A container ASS script keeps its own font unless the font-name override bit
  * is passed through erika_presenter_set_subtitle_style. */
@@ -721,6 +875,9 @@ ErikaStatus erika_presenter_set_danmaku_font(
 ErikaStatus erika_presenter_set_danmaku_block_words_json(
     ErikaPresenterHandle *handle,
     const char *json);
+ErikaStatus erika_presenter_set_danmaku_random_colors(
+    ErikaPresenterHandle *handle,
+    bool enabled);
 ErikaStatus erika_presenter_track_selection(
     ErikaPresenterHandle *handle,
     ErikaTrackSelection *out_selection);
@@ -794,6 +951,7 @@ ErikaStatus erika_presenter_attach_windows_hwnd(
     uint32_t height,
     double scale);
 
+#ifdef _WIN32
 /* Windows only. Returns an AddRef'd IUnknown for a DirectComposition swap
  * chain created by an attachment whose direct_composition capability is true.
  * The caller owns the returned COM reference and must Release it. */
@@ -807,6 +965,7 @@ ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(
 ErikaStatus erika_presenter_windows_flutter_texture_iunknown(
     ErikaPresenterHandle *handle,
     void **out_texture);
+#endif
 
 ErikaStatus erika_presenter_resize_surface(
     ErikaPresenterHandle *handle,
@@ -846,8 +1005,17 @@ ErikaStatus erika_presenter_get_stats(
 ErikaStatus erika_presenter_poll_event(ErikaPresenterHandle *handle, ErikaEvent *out_event);
 
 /* JSON bridge used by embedders whose platform channel already serializes
- * structured arguments. Returned strings are owned by Erika and must be
- * released with erika_string_free. poll_event_json returns NULL when idle. */
+ * structured arguments. Returned strings are owned by liberika and must be
+ * released with erika_string_free. poll_event_json returns NULL when idle.
+ *
+ * invoke_json is also the generic pass-through into liberika: method names
+ * come from one dispatch table, and "listMethods" returns that table (name,
+ * scope, arguments, result) so hosts can forward new capabilities without
+ * code changes. Methods with scope "global" ("listMethods", "getLogs")
+ * accept a NULL handle. The response is {"ok":true,"status":0,"value":...}
+ * or {"ok":false,"status":n,"error":"..."}; an unknown method adds
+ * "code":"unknown_method" and "method", malformed arguments JSON adds
+ * "code":"invalid_arguments". */
 char *erika_presenter_invoke_json(
     ErikaPresenterHandle *handle,
     const char *method,
@@ -856,6 +1024,46 @@ char *erika_presenter_render_tick_json(
     ErikaPresenterHandle *handle,
     double time_seconds);
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *handle);
+
+/* ===== Diagnostics (JSON) =====
+ * New diagnostic data is returned as JSON documents, never as new fields on
+ * the structs above. Both functions may be missing from older native
+ * libraries: resolve them optionally (dlsym / GetProcAddress) and treat a
+ * missing symbol as "not supported". On Ok, *out_json receives a caller-owned
+ * NUL-terminated UTF-8 document; free it with erika_string_free. It is NULL on
+ * any other status. Each document has a "schema" number; fields are only
+ * added within a schema. Layout: docs/capi_reference.md, "Diagnostics". */
+typedef enum ErikaLogLevel {
+  ErikaLogLevel_Trace = 0,
+  ErikaLogLevel_Debug = 1,
+  ErikaLogLevel_Info = 2,
+  ErikaLogLevel_Warn = 3,
+  ErikaLogLevel_Error = 4,
+} ErikaLogLevel;
+
+/* Process-wide log ring: liberika's operational diagnostics plus FFmpeg
+ * warnings and errors. Returns the newest `limit` entries (0 = every retained
+ * entry) at or above min_level (an ErikaLogLevel, or -1 for every level) with
+ * seq >= since_seq (0 = from the oldest; pass the previous "nextSeq" to read
+ * incrementally). Entries are oldest first and redacted: URL query strings
+ * and user info, credential-like values and headers, the user's home
+ * directory. The ring holds at most 2000 entries / 512 KiB. Needs no handle
+ * and may be called from any thread. */
+ErikaStatus erika_log_read_json(
+    uint32_t limit,
+    int32_t min_level,
+    uint64_t since_seq,
+    char **out_json);
+
+/* One-call presenter snapshot: decoder and hardware-decode path, presenter
+ * counters and stage durations, output/HDR, resources, upscaler, audio,
+ * buffer depths, and timing (scheduler late drops, presentation cadence and
+ * jitter, clock drift and corrections). Unknown values are null. It only
+ * reads counters: no decoding or rendering, and it never waits on the
+ * playback worker. Same threading rule as every other handle call. */
+ErikaStatus erika_presenter_get_diagnostics_json(
+    ErikaPresenterHandle *handle,
+    char **out_json);
 
 /* Screenshot: render the current composited frame (video + subtitle, no
  * danmaku) off-screen into a caller-allocated RGBA8 buffer at the requested
@@ -868,12 +1076,90 @@ ErikaStatus erika_presenter_capture_frame_rgba(
     uint8_t *out_rgba,
     uintptr_t out_capacity);
 
+/* Off-screen host composition: same buffer, SDR output and error contract as
+ * capture_frame_rgba, with enabled danmaku included (no debug HUD). No surface
+ * or preceding render_tick is required. Danmaku follows the current playback
+ * clock and is laid out at width*height pixels with scale factor 1. */
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(
+    ErikaPresenterHandle *handle,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out_rgba,
+    uintptr_t out_capacity);
+
 /* Consume the latest Linux Flutter texture frame after render_tick. Includes
  * video, subtitles, danmaku and HUD. Returns NoEvent when no frame is ready.
  * The caller allocates at least surface_width*surface_height*4 bytes. */
 ErikaStatus erika_presenter_copy_flutter_frame_rgba(
     ErikaPresenterHandle *handle, uint8_t *out_rgba, uintptr_t capacity,
     uint32_t *out_width, uint32_t *out_height);
+
+typedef struct ErikaTextureFrame ErikaTextureFrame;
+typedef enum ErikaExternalTextureKind {
+    ErikaExternalTextureKind_Metal = 1,
+    ErikaExternalTextureKind_VulkanOpaqueFd = 2,
+} ErikaExternalTextureKind;
+typedef enum ErikaExternalTextureFormat {
+    ErikaExternalTextureFormat_Rgba8Unorm = 1,
+} ErikaExternalTextureFormat;
+
+typedef struct ErikaExternalTextureInfo {
+    ErikaExternalTextureKind kind;
+    ErikaExternalTextureFormat format;
+    uint32_t width;
+    uint32_t height;
+    uint64_t native_handle;
+    uint64_t device_id;
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+    uint32_t vulkan_format;
+    uint32_t vulkan_usage;
+    uint32_t vulkan_tiling;
+    uint8_t device_uuid[16];
+    uint8_t driver_uuid[16];
+} ErikaExternalTextureInfo;
+
+/* Native, immutable SDR texture: video + subtitle + enabled danmaku, no HUD.
+ * Select WgpuFallback. Supports Linux/Vulkan OPAQUE_FD and Apple/Metal. No
+ * surface, Flutter registrar, CPU pixel readback or GPU texture copy. Waits
+ * for producer GPU completion before returning. Unsupported backends and
+ * sizes fail before any playback work.
+ * Call once per host frame; also pumps audio, so render_tick is not required.
+ * content_scale is physical pixels per logical point (as for resize_surface)
+ * and sets danmaku size and speed. Danmaku is planned in the background like
+ * on screen, so it can appear a few frames after a seek or size change.
+ * NoEvent means no video yet. *out_frame is null on every non-Ok result.
+ * Frames can outlive the presenter. Release only after consumer GPU work and
+ * imported aliases are retired. Native handles from get_info are borrowed:
+ * Metal is id<MTLTexture> on device_id (registryID).
+ * Metal consumers may retain MTLTexture independently before releasing the
+ * frame; that retained reference must cover all consumer GPU use.
+ * Vulkan is an OPAQUE_FD (0 is valid), to be duplicated before import. Match
+ * device AND driver UUIDs.
+ * Vulkan: dedicated allocation, identical format/usage/tiling, 2D, 1 mip/layer/
+ * sample, flags 0. Import allocation_size and memory_type_index. Acquire queue
+ * ownership from EXTERNAL, old layout GENERAL, before reading. Read-only.
+ * Pixels are sRGB-encoded RGBA in UNORM storage; the host compositor applies
+ * any needed transfer conversion. */
+ErikaStatus erika_presenter_export_frame_texture(
+    ErikaPresenterHandle *handle, uint32_t width, uint32_t height,
+    double content_scale, ErikaTextureFrame **out_frame);
+/* Select the wgpu renderer, including on Apple where the default presenter
+ * uses the native renderer. Returns NULL and sets last_error on failure. */
+ErikaPresenterHandle *erika_presenter_create_for_texture_export(ErikaPresenterConfig config);
+ErikaStatus erika_texture_frame_get_info(
+    const ErikaTextureFrame *frame, ErikaExternalTextureInfo *out_info);
+void erika_texture_frame_release(ErikaTextureFrame *frame);
+
+/* Experimental per-open capability. Never shares a presenter across threads.
+ * Release after cancel callers and the synchronous open have finished. */
+typedef struct ErikaColdOpenCancellation ErikaColdOpenCancellation;
+ErikaStatus erika_open_validate(const char *uri, const ErikaOpenOptions *options);
+ErikaColdOpenCancellation *erika_cold_open_cancellation_create(void);
+void erika_cold_open_cancellation_cancel(const ErikaColdOpenCancellation *ticket);
+void erika_cold_open_cancellation_release(ErikaColdOpenCancellation *ticket);
+ErikaStatus erika_presenter_open_with_options_cancellable(ErikaPresenterHandle *presenter,
+    const char *uri, const ErikaOpenOptions *options, const ErikaColdOpenCancellation *ticket);
 
 #ifdef __cplusplus
 }

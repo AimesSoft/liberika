@@ -1,8 +1,8 @@
-# Contributing to Erika
+# Contributing to liberika
 
 > [中文](CONTRIBUTING.zh.md) | [日本語](CONTRIBUTING.ja.md)
 
-Erika is the in-house playback core for NipaPlay: a Rust engine that owns
+liberika is the in-house playback core for NipaPlay: a Rust engine that owns
 everything from demux/decode to GPU presentation, audio, subtitles, and danmaku,
 exposed to hosts through a C ABI and a Flutter plugin. This document is the
 orientation map for working on it.
@@ -87,8 +87,9 @@ example for end-to-end validation.
 `crates/erika_capi` is the stable surface for every non-Rust host. When you
 change it:
 
-- **Keep panics inside.** Every export wraps its body in `catch_unwind` and maps
-  panics to `ErikaStatus_Panic` — never let an unwind cross the boundary.
+- **Contain panics.** Use `catch_unwind` where recovery is supported, and map caught
+  panics to the return type and an error message. Some exports do not currently
+  catch panics, and aborting builds cannot recover; see [panic safety](docs/capi_reference.md#panic-safety).
 - **Honor ownership.** Strings handed out are caller-owned and freed via the
   matching `*_free`; document new ones in [capi_reference.md](docs/capi_reference.md).
 - **Regenerate / hand-edit `erika.h`** to match, and annotate new functions.
@@ -141,4 +142,4 @@ follow the threading and ownership implications.
 
 ## Documentation ownership
 
-Documentation starts at [docs/README.md](docs/README.md). Keep SDK usage in its package README, implementation/design in `docs/`, and dated investigation results in `docs/investigations/`. Add new topics to the documentation index and update matching translations with API changes.
+Documentation starts at [docs/README.md](docs/README.md). Keep SDK usage in its package README, implementation/design in `docs/`, and dated investigation results in `docs/investigations/` (conclusions, key figures and reproduction steps only; no raw logs, screenshots or captured data). Add new topics to the documentation index and update matching translations with API changes.

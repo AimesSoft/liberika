@@ -1,30 +1,72 @@
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod apple;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod audio;
+mod color_glyph;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod core;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod core {
+    use thiserror::Error;
+
+    #[derive(Debug, Error, Clone, PartialEq, Eq)]
+    pub enum PlayerError {
+        #[error("renderer error: {0}")]
+        Renderer(String),
+    }
+
+    pub type Result<T> = std::result::Result<T, PlayerError>;
+}
+#[cfg(target_vendor = "apple")]
+mod coretext;
 pub mod danmaku;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod debug_hud;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod diagnostics;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod export;
+#[cfg(not(target_arch = "wasm32"))]
+mod export_color;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ffmpeg;
+pub mod font;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod luma_stats;
 #[cfg(target_env = "ohos")]
 pub mod ohos;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod opening;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod overlay;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod playback;
+pub mod plugin;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod presenter;
 pub mod renderer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod source;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod subtitle;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod subtitle_charset;
+pub mod system_font;
 pub mod text;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
 mod trace;
 
-pub(crate) const NIPAPLAY_FALLBACK_FONT: &[u8] = include_bytes!("../assets/subfont.ttf");
+#[cfg(any(test, feature = "embedded-fallback-font"))]
+// A static: a const would be copied into every crate and module that uses it.
+pub(crate) static NIPAPLAY_FALLBACK_FONT: &[u8] = include_bytes!("../assets/subfont.ttf");
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use core::*;

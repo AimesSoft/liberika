@@ -1,11 +1,11 @@
 name: erika_flutter
-description: Cross-platform Flutter media player powered by Erika, with hardware decoding, HDR video, ASS subtitles, danmaku, and system media controls.
-version: 0.2.1
+description: Cross-platform Flutter media player powered by liberika, with hardware decoding, HDR video, ASS subtitles, danmaku, and system media controls.
+version: 0.3.8
 
-homepage: https://github.com/AimesSoft/Erika
-repository: https://github.com/AimesSoft/Erika
-issue_tracker: https://github.com/AimesSoft/Erika/issues
-documentation: https://github.com/AimesSoft/Erika/tree/main/docs
+homepage: https://github.com/AimesSoft/liberika
+repository: https://github.com/AimesSoft/liberika
+issue_tracker: https://github.com/AimesSoft/liberika/issues
+documentation: https://github.com/AimesSoft/liberika/tree/main/docs
 
 topics:
   - video-player

@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
 
-#[cfg(feature = "libass")]
+#[cfg(all(feature = "libass", any(test, feature = "embedded-fallback-font")))]
 use crate::NIPAPLAY_FALLBACK_FONT;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -38,36 +38,9 @@ pub enum SubtitleError {
 
 pub type Result<T> = std::result::Result<T, SubtitleError>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubtitleFontAttachment {
-    pub name: String,
-    pub mime_type: Option<String>,
-    pub families: Vec<String>,
-    pub data: Arc<[u8]>,
-}
-
-pub const MAX_MEMORY_SUBTITLE_FONT_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_MEMORY_SUBTITLE_FONT_TOTAL_BYTES: usize = 128 * 1024 * 1024;
-
-impl SubtitleFontAttachment {
-    pub fn new(
-        name: impl Into<String>,
-        mime_type: Option<String>,
-        families: Vec<String>,
-        data: impl Into<Arc<[u8]>>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            mime_type,
-            families,
-            data: data.into(),
-        }
-    }
-
-    pub fn byte_len(&self) -> usize {
-        self.data.len()
-    }
-}
+pub use crate::font::{
+    MAX_MEMORY_SUBTITLE_FONT_BYTES, MAX_MEMORY_SUBTITLE_FONT_TOTAL_BYTES, SubtitleFontAttachment,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssTrackResources {
@@ -783,7 +756,7 @@ impl Default for LibassRenderConfig {
     }
 }
 
-/// Text colour Erika falls back to when nothing else specifies one, as
+/// Text colour liberika falls back to when nothing else specifies one, as
 /// `0xRRGGBBAA` with alpha 255 meaning fully opaque.
 pub const DEFAULT_SUBTITLE_PRIMARY_COLOR_RGBA: u32 = 0xffff_ffff;
 /// Outline/shadow colour fallback, half-transparent black.
@@ -810,7 +783,7 @@ pub const SUBTITLE_OVERRIDE_ALL: u32 = SUBTITLE_OVERRIDE_LEGACY_FORCE
     | SUBTITLE_OVERRIDE_MARGINS
     | SUBTITLE_OVERRIDE_BLUR;
 
-/// User-chosen subtitle look. Empty strings mean "keep Erika's default", so
+/// User-chosen subtitle look. Empty strings mean "keep liberika's default", so
 /// [`SubtitleStyleConfig::default`] reproduces the built-in style exactly.
 ///
 /// The font and colours act as *fallbacks*: a container ASS script keeps its
@@ -888,7 +861,7 @@ impl Default for SubtitleStyleConfig {
 impl SubtitleStyleConfig {
     /// Trims caller-provided paths and family names, and clamps the metrics to
     /// a range libass can render. An empty string stays the "unset" marker; a
-    /// non-finite metric falls back to Erika's default.
+    /// non-finite metric falls back to liberika's default.
     pub fn normalized(mut self) -> Self {
         self.font_family = self.font_family.trim().to_string();
         self.font_file_path = self.font_file_path.trim().to_string();
@@ -1048,6 +1021,7 @@ struct LibassRuntime {
     /// rarely the font selector is rebuilt.
     fonts_generation: u64,
     custom_font_loads: u64,
+    log_style_state: Option<(bool, i32)>,
     _log_context: Box<LibassLogContext>,
     _log_bridge: Box<libass_ffi::ErikaAssLogBridge>,
 }
@@ -1089,6 +1063,7 @@ impl LibassRuntime {
             });
             libass_ffi::erika_ass_install_log_bridge(library.as_ptr(), &mut *log_bridge);
             libass_ffi::ass_set_extract_fonts(library.as_ptr(), 1);
+            #[cfg(any(test, feature = "embedded-fallback-font"))]
             add_bundled_ass_fallback_font(library.as_ptr(), track_id);
             add_attached_ass_fonts(library.as_ptr(), track_id, memory_fonts);
             add_attached_ass_fonts(library.as_ptr(), track_id, fonts);
@@ -1116,6 +1091,7 @@ impl LibassRuntime {
                 custom_font_loads: 0,
                 _log_context: log_context,
                 _log_bridge: log_bridge,
+                log_style_state: None,
             }
         };
         runtime.configure_style(style, memory_fonts, 1.0, 288);
@@ -1139,6 +1115,11 @@ impl LibassRuntime {
     ) {
         let fonts_changed = self.configure_fonts(style, memory_fonts);
         let override_bits = self.configure_style_override(style, font_scale, play_res_height);
+        let state = (fonts_changed, override_bits);
+        if self.log_style_state == Some(state) {
+            return;
+        }
+        self.log_style_state = Some(state);
         crate::trace::diagnostic(
             serde_json::json!({
                 "event": "subtitle_font_fallback",
@@ -1176,17 +1157,34 @@ impl LibassRuntime {
         for font in memory_fonts {
             fallback_families.extend(font.families.iter().cloned());
         }
-        fallback_families.push(BUNDLED_ASS_FALLBACK_FONT_FAMILY.to_string());
+        let custom_font = style
+            .font_file_path()
+            .filter(|path| self.custom_font_file_is_current(path))
+            .and_then(|path| CString::new(path).ok());
+        let system_font = custom_font
+            .is_none()
+            .then(system_ass_default_font)
+            .flatten();
+        // What the system offers goes first. A named family wins over the default
+        // file, so the built-in family stays out when that file is the system's.
+        if !cfg!(test) {
+            fallback_families.extend(
+                crate::system_font::PREFERRED_FAMILIES
+                    .iter()
+                    .map(|family| family.to_string()),
+            );
+        }
+        #[cfg(any(test, feature = "embedded-fallback-font"))]
+        if system_font.is_none() {
+            fallback_families.push(BUNDLED_ASS_FALLBACK_FONT_FAMILY.to_string());
+        }
         let mut seen = HashSet::new();
         fallback_families.retain(|family| !family.is_empty() && seen.insert(family.clone()));
         let family = CString::new(fallback_families.join("\u{1f}"))
             .unwrap_or_else(|_| default_ass_font_family_cstr().to_owned());
         let selection = LibassFontSelection {
             family,
-            default_font: style
-                .font_file_path()
-                .filter(|path| self.custom_font_file_is_current(path))
-                .and_then(|path| CString::new(path).ok()),
+            default_font: custom_font.or(system_font),
         };
         if self.fonts.as_ref() == Some(&selection) {
             return false;
@@ -1582,6 +1580,17 @@ impl LibassSubtitleRenderer {
         if chunk.is_empty() {
             return Ok(());
         }
+        self.process_chunk_data(chunk, start, end)?;
+        self.chunks.push((chunk.to_string(), start, end));
+        Ok(())
+    }
+
+    fn process_chunk_data(
+        &mut self,
+        chunk: &str,
+        start: Duration,
+        end: Option<Duration>,
+    ) -> Result<()> {
         let chunk_size = i32::try_from(chunk.len()).map_err(|_| {
             SubtitleError::Libass("ASS event chunk exceeds libass integer range".to_string())
         })?;
@@ -1597,7 +1606,23 @@ impl LibassSubtitleRenderer {
                 duration_ms,
             );
         }
-        self.chunks.push((chunk.to_string(), start, end));
+        Ok(())
+    }
+
+    fn replay_chunk_data_into(&self, replacement: &mut Self) -> Result<()> {
+        debug_assert!(replacement.chunks.is_empty());
+        for (chunk, start, end) in &self.chunks {
+            replacement.process_chunk_data(chunk, *start, *end)?;
+        }
+        Ok(())
+    }
+
+    /// Replays into an uncommitted replacement, preserving the original on error.
+    /// After replay succeeds, transfers the log without reallocating its strings;
+    /// callers must immediately replace this renderer, whose log is now empty.
+    pub(crate) fn transfer_chunks_to(&mut self, replacement: &mut Self) -> Result<()> {
+        self.replay_chunk_data_into(replacement)?;
+        replacement.chunks = std::mem::take(&mut self.chunks);
         Ok(())
     }
 
@@ -1631,8 +1656,8 @@ impl LibassSubtitleRenderer {
         );
     }
 
-    /// Height the override metrics are normalized against, which must be the
-    /// height the frame is rendered at — not the script's own `PlayResY`. libass
+    /// Logical height the override metrics are normalized against: the video's
+    /// height before subtitle supersampling, not the script's own `PlayResY`. libass
     /// scales the override style by `PlayResY / 288`, and cancelling that against
     /// the frame height is what makes the metrics land on the same pixels as the
     /// non-override baseline whatever `PlayResY` a script declares.
@@ -1707,9 +1732,7 @@ impl LibassSubtitleRenderer {
                 self.memory_fonts.clone(),
             )?,
         };
-        for (chunk, start, end) in &self.chunks {
-            replacement.process_chunk(chunk, *start, *end)?;
-        }
+        self.replay_chunk_data_into(&mut replacement)?;
         replacement.font_scale = self.font_scale;
         replacement.override_font_scale = self.override_font_scale;
         replacement.play_res_height = self.play_res_height;
@@ -1719,6 +1742,7 @@ impl LibassSubtitleRenderer {
             replacement.override_font_scale,
             replacement.play_res_height,
         );
+        replacement.chunks = std::mem::take(&mut self.chunks);
         *self = replacement;
         Ok(())
     }
@@ -2104,11 +2128,11 @@ impl SubtitleTimeline {
 
 pub fn parse_srt(input: &str) -> Result<SubtitleTimeline> {
     let mut cues = Vec::new();
-    for block in input.replace("\r\n", "\n").split("\n\n") {
-        let lines = block
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>();
+    // SRT and WebVTT separators may contain spaces or tabs. Treat any
+    // whitespace-only line as a boundary, preserving multiline cue text.
+    let normalized = input.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    for lines in lines.split(|line| line.trim().is_empty()) {
         if lines.is_empty() {
             continue;
         }
@@ -2288,7 +2312,15 @@ fn parse_timestamp(value: &str) -> Result<Duration> {
         ),
         _ => return Err(SubtitleError::InvalidTimestamp(value)),
     };
-    Ok(Duration::from_secs(hours * 3600 + minutes * 60) + seconds)
+    // Checked so an absurd-but-parseable timestamp ("99999999999:00:00.000")
+    // reports an error instead of overflowing or panicking.
+    let base = hours
+        .checked_mul(3600)
+        .and_then(|product| product.checked_add(minutes.checked_mul(60)?))
+        .ok_or_else(|| SubtitleError::InvalidTimestamp(value.clone()))?;
+    Duration::from_secs(base)
+        .checked_add(seconds)
+        .ok_or_else(|| SubtitleError::InvalidTimestamp(value))
 }
 
 fn parse_int(value: &str) -> Result<u64> {
@@ -2301,7 +2333,8 @@ fn parse_seconds(value: &str) -> Result<Duration> {
     let seconds = value
         .parse::<f64>()
         .map_err(|_| SubtitleError::InvalidTimestamp(value.to_string()))?;
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| SubtitleError::InvalidTimestamp(value.to_string()))
 }
 
 fn clean_ass_text(value: &str) -> String {
@@ -2394,24 +2427,33 @@ const MIN_ASS_FONT_SIZE: f64 = 8.0;
 const MAX_ASS_FONT_SIZE: f64 = 400.0;
 const MAX_ASS_OUTLINE: f64 = 32.0;
 
-/// Attachment name Erika registers the bundled `assets/subfont.ttf` under.
+/// Attachment name liberika registers the bundled `assets/subfont.ttf` under.
+#[cfg(any(test, feature = "embedded-fallback-font"))]
 const BUNDLED_ASS_FALLBACK_FONT_NAME: &str = "subfont.ttf";
 /// Family name carried by the bundled fallback face. Keep in sync with the
 /// asset itself; `bundled_ass_fallback_family_matches_asset` locks the two.
+#[cfg(any(test, feature = "embedded-fallback-font"))]
 const BUNDLED_ASS_FALLBACK_FONT_FAMILY: &str = "Droid Sans Fallback";
 
 #[cfg(target_os = "macos")]
 const DEFAULT_ASS_FONT_FAMILY: &str = "PingFang SC";
 #[cfg(target_os = "windows")]
 const DEFAULT_ASS_FONT_FAMILY: &str = "Arial";
-// Every other target renders without a system font provider (mobile selects
-// `ASS_FONTPROVIDER_NONE`, and the vendored libass build has fontconfig
-// disabled), so the bundled fallback family is the only one libass resolves.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "windows")),
+    any(test, feature = "embedded-fallback-font")
+))]
 const DEFAULT_ASS_FONT_FAMILY: &str = BUNDLED_ASS_FALLBACK_FONT_FAMILY;
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "windows")),
+    not(any(test, feature = "embedded-fallback-font"))
+))]
+const DEFAULT_ASS_FONT_FAMILY: &str = "sans-serif";
 
 #[cfg(feature = "libass")]
 fn default_ass_font_provider() -> libc::c_int {
+    // On iOS and tvOS CoreText would offer PingFang, which FreeType cannot read:
+    // its outlines are in Apple's `hvgl` table.
     if cfg!(any(
         target_os = "ios",
         target_os = "tvos",
@@ -2425,14 +2467,28 @@ fn default_ass_font_provider() -> libc::c_int {
     }
 }
 
+/// libass has no font provider on Android and OpenHarmony, so it opens the
+/// system's fallback face itself. The face of a collection follows an ASCII
+/// unit separator, as liberika's libass patch reads it.
+#[cfg(feature = "libass")]
+fn system_ass_default_font() -> Option<CString> {
+    if !cfg!(any(target_os = "android", target_env = "ohos")) || cfg!(test) {
+        return None;
+    }
+    let font = crate::system_font::fallback()?;
+    CString::new(format!("{}\u{1f}{}", font.path.display(), font.index)).ok()
+}
+
 #[cfg(feature = "libass")]
 fn default_ass_font_family_cstr() -> &'static CStr {
-    if cfg!(target_os = "macos") {
-        c"Droid Sans Fallback"
-    } else if cfg!(target_os = "windows") {
+    if cfg!(target_os = "windows") {
         c"Arial"
-    } else {
+    } else if cfg!(any(test, feature = "embedded-fallback-font")) {
         c"Droid Sans Fallback"
+    } else if cfg!(target_os = "macos") {
+        c"PingFang SC"
+    } else {
+        c"sans-serif"
     }
 }
 
@@ -2476,15 +2532,24 @@ unsafe extern "C" fn libass_log_sink(
         return;
     }
     drop(seen);
-    crate::trace::diagnostic(
-        serde_json::json!({
-            "event": "subtitle_libass",
-            "stage": stage,
-            "trackId": context.track_id,
-            "level": level,
-            "message": message,
-        })
-        .to_string(),
+    let line = serde_json::json!({
+        "event": "subtitle_libass",
+        "stage": stage,
+        "trackId": context.track_id,
+        "level": level,
+        "message": message,
+    })
+    .to_string();
+    // libass: 0 fatal, 1 error, 2 warning, 3..5 informational. Missing styles
+    // and fonts stay at least a warning whatever level libass used.
+    let libass_level = match level {
+        0 | 1 => crate::trace::LogLevel::Error,
+        2 => crate::trace::LogLevel::Warn,
+        _ => crate::trace::LogLevel::Info,
+    };
+    crate::trace::diagnostic_at(
+        libass_level.max(crate::trace::classify_diagnostic(&line)),
+        line,
     );
 }
 
@@ -2546,7 +2611,7 @@ unsafe fn add_attached_ass_fonts(
 /// requested family, but a script that names a font nobody has - or one that
 /// covers none of the codepoints in the line - falls back here instead of
 /// rendering nothing.
-#[cfg(feature = "libass")]
+#[cfg(all(feature = "libass", any(test, feature = "embedded-fallback-font")))]
 unsafe fn add_bundled_ass_fallback_font(library: *mut libass_ffi::AssLibrary, track_id: i64) {
     let Ok(data_size) = libc::c_int::try_from(NIPAPLAY_FALLBACK_FONT.len()) else {
         crate::trace::diagnostic(
@@ -2715,7 +2780,24 @@ unsafe fn raw_ass_image_to_alpha_bitmap(image: &RawAssImage) -> Result<SubtitleA
     let height = image.h as u32;
     let stride = image.stride.max(0) as usize;
     let required = required_bitmap_len(width, height, stride)?;
-    let alpha = unsafe { std::slice::from_raw_parts(image.bitmap, required) }.to_vec();
+    let alpha = if required == 0 {
+        Vec::new()
+    } else if stride == width as usize || height <= 1 {
+        // This span contains only visible pixels, with no inter-row padding.
+        unsafe { std::slice::from_raw_parts(image.bitmap, required) }.to_vec()
+    } else {
+        let mut alpha = Vec::with_capacity(required);
+        for row in 0..height as usize {
+            let offset = row * stride;
+            // libass permits uninitialized row padding. Keep the public
+            // stride/span, but initialize gaps without reading source padding.
+            alpha.resize(offset, 0);
+            let visible =
+                unsafe { std::slice::from_raw_parts(image.bitmap.add(offset), width as usize) };
+            alpha.extend_from_slice(visible);
+        }
+        alpha
+    };
     Ok(SubtitleAlphaBitmap::new(
         SubtitleBitmapPlacement::new(image.dst_x, image.dst_y, width, height),
         stride,
@@ -2730,7 +2812,16 @@ fn required_bitmap_len(width: u32, height: u32, stride: usize) -> Result<usize> 
     if width == 0 || height == 0 {
         return Ok(0);
     }
-    Ok(stride * height.saturating_sub(1) + width as usize)
+    stride
+        .checked_mul(height - 1)
+        .and_then(|prefix| prefix.checked_add(width as usize))
+        .filter(|&required| required <= isize::MAX as usize)
+        .ok_or(SubtitleError::InvalidBitmap {
+            width,
+            height: height as u32,
+            stride,
+            bytes: usize::MAX,
+        })
 }
 
 fn duration_to_millis_i64(value: Duration) -> i64 {
@@ -2782,6 +2873,62 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "Hello"
         );
         assert!(timeline.active_cues(Duration::from_millis(3500)).is_empty());
+    }
+
+    #[test]
+    fn parse_srt_rejects_unrepresentable_timestamps_instead_of_panicking() {
+        // "inf" parses as f64 infinity and "-1.5" as a negative value, both of
+        // which Duration::from_secs_f64 panics on; absurd hour counts overflow
+        // the seconds arithmetic. All of them are invalid timestamps.
+        let finite_overflow = parse_srt("1\n00:00:01,000 --> 0:00:1e100\nboom\n");
+        assert!(finite_overflow.is_err());
+
+        let infinite = parse_srt("1\n00:00:01,000 --> 0:00:inf\nboom\n");
+        assert!(infinite.is_err());
+
+        let negative = parse_srt("1\n00:00:01,000 --> 0:00:-1.500\nboom\n");
+        assert!(negative.is_err());
+
+        let overflow =
+            parse_srt("1\n99999999999999999:00:00,000 --> 99999999999999999:00:01,000\nboom\n");
+        assert!(overflow.is_err());
+    }
+
+    #[test]
+    fn subtitle_cues_split_on_whitespace_separators_with_lf_and_crlf() {
+        for newline in ["\n", "\r\n"] {
+            for separator in [" ", "\t", " \t "] {
+                let srt = [
+                    "1",
+                    "00:00:01,000 --> 00:00:02,000",
+                    "First",
+                    "continued",
+                    separator,
+                    "2",
+                    "00:00:03,000 --> 00:00:04,000",
+                    "Second",
+                ]
+                .join(newline);
+                let timeline = parse_srt(&srt).unwrap();
+                assert_eq!(
+                    timeline.cues().len(),
+                    2,
+                    "newline={newline:?}, separator={separator:?}"
+                );
+                assert_eq!(timeline.cues()[0].text, "First\ncontinued");
+                assert_eq!(timeline.cues()[1].text, "Second");
+                assert_eq!(timeline.active_cues(Duration::from_millis(3500)).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn webvtt_cues_split_on_whitespace_separators_and_preserve_multiline_text() {
+        let vtt = "WEBVTT\r\n\r\n00:00:01.000 --> 00:00:02.000\r\nFirst\r\ncontinued\r\n \t \r\n00:00:03.000 --> 00:00:04.000\r\nSecond\r\n";
+        let timeline = parse_webvtt(vtt).unwrap();
+        assert_eq!(timeline.cues().len(), 2);
+        assert_eq!(timeline.cues()[0].text, "First\ncontinued");
+        assert_eq!(timeline.cues()[1].text, "Second");
     }
 
     #[test]
@@ -3166,6 +3313,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 LibassRenderOperation::RenderFrame { timestamp_ms: 1234 },
             ]
         );
+    }
+
+    #[test]
+    fn raw_ass_image_import_never_reads_row_padding() {
+        // Two rows of three visible pixels with a stride of five. libass may
+        // leave the padding after each row uninitialized; 0xEE marks it here so
+        // that any read of it shows up in the result.
+        let source = [
+            10u8, 20, 30, 0xEE, 0xEE, //
+            40, 50, 60, 0xEE, 0xEE,
+        ];
+        let image = RawAssImage {
+            w: 3,
+            h: 2,
+            stride: 5,
+            bitmap: source.as_ptr(),
+            color: 0,
+            dst_x: 0,
+            dst_y: 0,
+            next: std::ptr::null(),
+            image_type: 0,
+        };
+
+        let bitmap = unsafe { raw_ass_image_to_alpha_bitmap(&image) }.unwrap();
+
+        // The public stride and span stay the same; the gap between rows is
+        // zero instead of the source padding.
+        assert_eq!(bitmap.stride, 5);
+        assert_eq!(bitmap.alpha, [10, 20, 30, 0, 0, 40, 50, 60]);
+    }
+
+    #[test]
+    fn raw_ass_bitmap_length_rejects_overflowing_layouts() {
+        assert_eq!(required_bitmap_len(3, 2, 5).unwrap(), 8);
+        assert_eq!(required_bitmap_len(0, 2, 5).unwrap(), 0);
+        assert!(required_bitmap_len(1, 3, usize::MAX).is_err());
+        assert!(required_bitmap_len(1, 2, isize::MAX as usize + 1).is_err());
     }
 
     #[test]
@@ -3949,6 +4133,55 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,中文字幕 fallback
                 .to_ascii_lowercase()
                 .contains("failed to find any fallback")),
             "libass reported no usable fallback font: {seen:?}"
+        );
+    }
+    /// `set_play_res_height` runs from the render path, and a host that only
+    /// exports textures alternates between two viewports on every frame. That
+    /// must not re-emit the `subtitle_font_fallback` diagnostic while nothing
+    /// it reports actually changed.
+    #[cfg(feature = "libass")]
+    #[test]
+    fn metrics_only_reconfiguration_does_not_repeat_the_configured_diagnostic() {
+        use crate::trace::{LogQuery, export_logs};
+
+        const TRACK_ID: i64 = 987_654_321;
+
+        let style = SubtitleStyleConfig::default();
+        let mut runtime =
+            LibassRuntime::new(TRACK_ID, &[], &[], LibassRenderConfig::default(), &style)
+                .expect("libass runtime");
+
+        runtime.configure_style(&style, &[], 1.0, 1080);
+        let seq = export_logs(&LogQuery {
+            limit: 0,
+            min_level: None,
+            since_seq: 0,
+        })["nextSeq"]
+            .as_u64()
+            .expect("nextSeq");
+
+        for height in [1080, 360, 1080, 360] {
+            runtime.configure_style(&style, &[], 1.0, height);
+        }
+
+        let exported = export_logs(&LogQuery {
+            limit: 0,
+            min_level: None,
+            since_seq: seq,
+        });
+        let repeated = exported["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|entry| {
+                entry["data"]["event"] == "subtitle_font_fallback"
+                    && entry["data"]["stage"] == "configured"
+                    && entry["data"]["trackId"] == TRACK_ID
+            })
+            .count();
+        assert_eq!(
+            repeated, 0,
+            "only the viewport changed; the diagnostic must not repeat"
         );
     }
 }

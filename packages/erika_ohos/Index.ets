@@ -1,7 +1,15 @@
 export {
+  ErikaDanmakuConfig,
+  ErikaDanmakuTrackOptions,
+  ErikaFrameExportOptions,
+  ErikaFramesExportOptions,
+  ErikaGifExportOptions,
+  ErikaLogOptions,
   ErikaPlayer,
   ErikaNativeResponse,
   ErikaOpenOptions,
   ErikaPlayerConfig,
+  ErikaSendDanmakuOptions,
+  ErikaSubtitleStyleOptions,
   ErikaSurfaceOptions,
 } from './src/main/ets/ErikaPlayer';
