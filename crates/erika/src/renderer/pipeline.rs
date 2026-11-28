@@ -1638,8 +1638,11 @@ fn static_source_peak_nits(source: &SourceColorState) -> f32 {
         .hdr_metadata
         .and_then(|hdr| {
             if source.dovi.is_some_and(|rpu| rpu.source_max_pq != 0) {
-                // dovi() already stored the converted static L0 peak here.
-                hdr.mastering_display?.max_luminance_nits()
+                // dovi() stores the converted static L0 peak here. The caller
+                // may subsequently replace the mastering metadata.
+                hdr.mastering_display?
+                    .max_luminance_nits()
+                    .filter(|peak| peak.is_finite() && *peak > 0.0)
             } else {
                 hdr.mastering_peak_for_tone_mapping()
             }
@@ -3044,6 +3047,21 @@ mod tests {
         // output-mode negotiation stays stable frame to frame.
         let mastering = source.hdr_metadata.unwrap().mastering_display.unwrap();
         assert_eq!(mastering.max_luminance_nits, Some(pq_code_to_nits(3079)));
+    }
+
+    #[test]
+    fn dovi_source_keeps_tone_mapping_with_an_invalid_mastering_peak_override() {
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .dovi(Some(sample_dovi_metadata()));
+        for peak in [0.0, f32::NAN] {
+            let mut hdr = source.hdr_metadata.unwrap();
+            hdr.mastering_display.as_mut().unwrap().max_luminance_nits = Some(peak);
+            let pipeline = VideoRenderPipeline::new(
+                source.hdr_metadata(Some(hdr)),
+                TargetColorState::sdr(ColorPrimaries::Bt709),
+            );
+            assert!(pipeline.requires_tone_mapping(), "override peak: {peak}");
+        }
     }
 
     #[test]
