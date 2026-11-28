@@ -6141,12 +6141,9 @@ unsafe fn mastering_display_metadata(
     let min_luminance_nits = has_luminance
         .then(|| rational_to_positive_f32(metadata.min_luminance))
         .flatten();
-    // Some decoders pass through implausibly dim mastering peaks. Using
-    // one as the HDR source peak suppresses tone mapping on SDR targets.
     let max_luminance_nits = has_luminance
         .then(|| rational_to_positive_f32(metadata.max_luminance))
-        .flatten()
-        .filter(|peak| *peak >= 1.0);
+        .flatten();
 
     if display_primaries.is_none()
         && white_point.is_none()
@@ -7485,7 +7482,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_subnit_mastering_peak_preserves_pq_tone_mapping() {
+    fn decoded_subnit_mastering_peak_is_preserved_without_disabling_pq_tone_mapping() {
         use crate::renderer::pipeline::{SourceColorState, TargetColorState, VideoRenderPipeline};
 
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/software/av1-subnit.ivf");
@@ -7507,7 +7504,7 @@ mod tests {
             "a 0.5 nit mastering display must not disable PQ tone mapping"
         );
         let mastering = hdr.mastering_display.unwrap();
-        assert_eq!(mastering.max_luminance_nits, None);
+        assert_eq!(mastering.max_luminance_nits, Some(0.5));
         assert_close(mastering.min_luminance_nits.unwrap(), 2.0 / 16384.0);
     }
 
