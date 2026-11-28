@@ -199,7 +199,7 @@ impl OhosGlesInterop {
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             // Keep the decoder's current NativeImage buffer latched until the
             // conversion draw completes. This is still zero-copy for the source;
-            // only the GPU converts YUV into Erika's compositing texture.
+            // only the GPU converts YUV into liberika's compositing texture.
             gl.finish();
             gl.bind_vertex_array(None);
             gl.use_program(None);

@@ -697,26 +697,9 @@ pub enum ScalerKernel {
     Lanczos3,
 }
 
-/// Neural 2x luma upscaler applied to the decoded Y plane before plane
-/// sampling. Chroma keeps its source resolution and is reconstructed by the
-/// regular scaler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LumaUpscalerMode {
-    #[default]
-    Off,
-    /// ArtCNN C4F16 (~12K parameters), lightweight real-time anime doubler.
-    ArtCnnC4F16,
-    /// ArtCNN C4F16 DS, denoising and sharpening for degraded anime sources.
-    ArtCnnC4F16Ds,
-    /// ArtCNN C4F32 (~48K parameters), higher quality real-time doubler.
-    ArtCnnC4F32,
-}
-
-impl LumaUpscalerMode {
-    pub fn is_enabled(self) -> bool {
-        self != Self::Off
-    }
-}
+pub use super::upscaler_mode::{
+    LumaUpscalerMode, UpscalerCapabilities, UpscalerDescriptor, UpscalerFamily,
+};
 
 impl Default for ScalerKernel {
     fn default() -> Self {

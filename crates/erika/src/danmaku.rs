@@ -1,4 +1,4 @@
-//! Native Erika danmaku pipeline.
+//! Native liberika danmaku pipeline.
 //!
 //! The DFM-style track retainer and filters are adapted from the MIT-licensed
 //! NipaPlay-Reload DFM+ Rust implementation:
@@ -9,10 +9,11 @@ pub mod dfm_core;
 mod outline;
 mod typography;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,8 +24,9 @@ use ab_glyph::{
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::NIPAPLAY_FALLBACK_FONT;
-use crate::subtitle::SubtitleFontAttachment;
+use crate::color_glyph::{self, ColorBitmap};
+use crate::font::SubtitleFontAttachment;
+use crate::system_font::PREFERRED_FAMILIES;
 use crate::text::TextShaper;
 use outline::{raster_radius, resolve_width_px};
 use typography::{
@@ -32,17 +34,65 @@ use typography::{
     effective_config_font_size, effective_font_size, px_scale_for_em,
 };
 
+/// Source font size of a viewer-sent comment: the size a comment file gives an
+/// ordinary comment, so it renders at the configured size.
+pub(crate) const LIVE_SOURCE_FONT_SIZE: f32 = DEFAULT_SOURCE_FONT_SIZE;
+
 const DEFAULT_SCROLL_DURATION: Duration = Duration::from_millis(9000);
 const DEFAULT_STATIC_DURATION: Duration = Duration::from_millis(3800);
 const DEFAULT_GENERATION: u64 = 1;
 const GLYPH_ATLAS_WIDTH: u32 = 2048;
+/// Emoji pictures start small and grow: most comments have none.
+const COLOR_ATLAS_WIDTH: u32 = 1024;
+const COLOR_ATLAS_MIN_HEIGHT: u32 = 256;
+const COLOR_ATLAS_MAX_HEIGHT: u32 = 4096;
+/// Keeps a picture's edge from filtering into its neighbor.
+const COLOR_ATLAS_GAP: u32 = 2;
+/// What an emoji is measured at in a browser, before the browser draws it.
+#[cfg(target_arch = "wasm32")]
+const BROWSER_EMOJI_ADVANCE: f32 = 1.25;
 const GLYPH_ATLAS_INITIAL_HEIGHT: u32 = 256;
+// Supersample glyphs, never the video surface. Large glyphs already have
+// enough samples; cap their extra raster cost and recycle caches between
+// planning windows so a long session cannot accumulate every size forever.
+const MAX_SUPERSAMPLED_FONT_SIZE: f32 = 128.0;
+const GLYPH_CACHE_SOFT_LIMIT: usize = 4096;
+const TEXT_CACHE_SOFT_LIMIT: usize = 2048;
+const GLYPH_ATLAS_SOFT_HEIGHT: u32 = 8192;
+// Renderer caches key by version and dimensions. A new atlas must never
+// alias an old one after a quality toggle, font change, or cache rollover.
+static NEXT_GLYPH_ATLAS_VERSION: AtomicU64 = AtomicU64::new(1);
 const SCROLL_DURATION_REFERENCE_LOGICAL_WIDTH: f32 = 1280.0;
 const SCROLL_DURATION_MIN_WIDTH_SCALE: f32 = 0.9;
 const SCROLL_DURATION_MAX_WIDTH_SCALE: f32 = 1.3;
 const DEFAULT_DANMAKU_TRACK_ID: u64 = 1;
 const MAX_CUSTOM_DANMAKU_FONT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RESIDENT_FALLBACK_FACES: usize = 8;
 pub const DANMAKU_DEBUG_BUCKETS: usize = 16;
+// An opaque square at the glyph atlas origin. Quads sampling its middle draw
+// flat lines through the glyph pipeline every renderer already implements,
+// so drawing the border of the viewer's own comments needs no new shaders.
+const SOLID_ATLAS_BLOCK: u32 = 4;
+// The border around the viewer's own comments, in logical pixels: a line
+// 1.5 wide, 2 outside the text box.
+const SELF_BORDER_WIDTH: f32 = 1.5;
+const SELF_BORDER_PADDING: f32 = 2.0;
+
+/// The colors [`DanmakuLayoutConfig::random_colors`] picks from: the colorful
+/// entries of the common sending palette, without black, white and grey.
+pub const DANMAKU_RANDOM_COLORS: [DanmakuColor; 11] = [
+    DanmakuColor::rgb_u8(0xfe, 0x05, 0x02),
+    DanmakuColor::rgb_u8(0xff, 0x71, 0x06),
+    DanmakuColor::rgb_u8(0xff, 0xaa, 0x01),
+    DanmakuColor::rgb_u8(0xff, 0xd3, 0x01),
+    DanmakuColor::rgb_u8(0xff, 0xff, 0x00),
+    DanmakuColor::rgb_u8(0xa0, 0xee, 0x02),
+    DanmakuColor::rgb_u8(0x04, 0xcd, 0x00),
+    DanmakuColor::rgb_u8(0x01, 0x98, 0x99),
+    DanmakuColor::rgb_u8(0x42, 0x66, 0xbe),
+    DanmakuColor::rgb_u8(0x89, 0xd5, 0xff),
+    DanmakuColor::rgb_u8(0xcc, 0x01, 0x73),
+];
 
 #[derive(Debug, Error)]
 pub enum DanmakuError {
@@ -117,6 +167,39 @@ impl DanmakuColor {
             (self.alpha * opacity).clamp(0.0, 1.0),
         ]
     }
+
+    fn outline_rgba(self, opacity: f32) -> [f32; 4] {
+        // Only near-black text needs a white stroke. A luminance/contrast
+        // threshold wrongly turns saturated red and blue into white-outlined
+        // text; the source color (not its opacity) decides this policy.
+        let brightest = self.red.max(self.green).max(self.blue);
+        let stroke = if brightest <= 64.0 / 255.0 { 1.0 } else { 0.0 };
+        [stroke, stroke, stroke, self.rgba(opacity)[3]]
+    }
+}
+
+/// Animation data carried by a Bilibili mode 7 ("advanced") comment.
+///
+/// A mode 7 comment's `<d>` payload is a JSON array describing a linear move
+/// from `(x1, y1)` to `(x2, y2)` over `duration_seconds`, with an alpha ramp
+/// from `alpha_from` to `alpha_to`. Coordinates stay in the source player's
+/// pixel space until the layout scales them to the current viewport.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DanmakuSpecial {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+    pub alpha_from: f32,
+    pub alpha_to: f32,
+    pub duration_seconds: f64,
+    /// Z rotation in radians, converted from the degrees in the source JSON.
+    /// Parsed for completeness: the instanced GPU renderers draw axis-aligned
+    /// quads, so rotation is not applied by the render plan yet.
+    pub z_rotate: f32,
+    /// Unix seconds from the XML `date` field. Selects the historical player
+    /// base size used when the layout scales the coordinates.
+    pub source_date: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +211,12 @@ pub struct DanmakuItem {
     pub font_size: f32,
     pub color: DanmakuColor,
     pub opacity: f32,
+    /// The viewer sent this comment; it is drawn inside a thin white border.
+    /// JSON timelines set it with `is_me` / `isMe`.
     pub is_self: bool,
+    /// Mode 7 animation data; `None` for every other comment. A `Special`
+    /// comment without this payload has nothing to draw and stays filtered.
+    pub special: Option<DanmakuSpecial>,
 }
 
 impl DanmakuItem {
@@ -174,6 +262,9 @@ impl DanmakuViewport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DanmakuLayoutConfig {
     pub font_size: f32,
+    /// Rasterize glyphs at twice their display resolution without changing layout.
+    /// Enabled by default; glyphs larger than 128 px retain native resolution.
+    pub supersampling: bool,
     pub opacity: f32,
     pub display_area: f32,
     pub scroll_duration_seconds: f32,
@@ -196,6 +287,10 @@ pub struct DanmakuLayoutConfig {
     pub block_scroll: bool,
     pub block_words: Vec<String>,
     pub enabled: bool,
+    /// Paint every comment in a color picked from [`DANMAKU_RANDOM_COLORS`]
+    /// by its time, mode and text instead of its own color. The same comment
+    /// keeps its color; changing this only repaints.
+    pub random_colors: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -232,6 +327,7 @@ impl Default for DanmakuLayoutConfig {
     fn default() -> Self {
         Self {
             font_size: DEFAULT_CONFIG_FONT_SIZE,
+            supersampling: true,
             opacity: 1.0,
             display_area: 1.0,
             scroll_duration_seconds: 10.0,
@@ -253,12 +349,13 @@ impl Default for DanmakuLayoutConfig {
             block_scroll: false,
             block_words: Vec::new(),
             enabled: true,
+            random_colors: false,
         }
     }
 }
 
 impl DanmakuLayoutConfig {
-    fn sanitized(&self) -> Self {
+    pub(crate) fn sanitized(&self) -> Self {
         let mut config = self.clone();
         config.font_size = sanitize_f32(config.font_size, DEFAULT_CONFIG_FONT_SIZE).max(1.0);
         config.opacity = sanitize_f32(config.opacity, 1.0).clamp(0.0, 1.0);
@@ -291,6 +388,7 @@ impl DanmakuLayoutConfig {
         config.shadow_offset = [0.0, 0.0];
         config.shadow_style = DanmakuShadowStyle::default();
         config.enabled = false;
+        config.random_colors = false;
         config
     }
 
@@ -425,13 +523,12 @@ impl DanmakuTimeline {
         if end < start || self.items.is_empty() {
             return Self::default();
         }
-        let items = self
-            .items
-            .iter()
-            .filter(|item| item.pts >= start && item.pts <= end)
-            .cloned()
-            .collect();
-        Self { items }
+        // Items are kept sorted by pts, so only the window itself is visited.
+        let first = self.items.partition_point(|item| item.pts < start);
+        let last = self.items.partition_point(|item| item.pts <= end);
+        Self {
+            items: self.items[first..last].to_vec(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -472,6 +569,10 @@ pub struct DanmakuTrack {
     timeline: DanmakuTimeline,
     enabled: bool,
     offset: i64,
+    /// Viewer-sent comments are written against this video's own timeline, so
+    /// the global offset, which aligns imported comment files, does not move
+    /// them. Their track offset still applies.
+    live: bool,
 }
 
 impl DanmakuTrack {
@@ -488,6 +589,7 @@ impl DanmakuTrack {
             timeline,
             enabled: true,
             offset: 0,
+            live: false,
         }
     }
 
@@ -599,6 +701,37 @@ impl DanmakuSession {
         self.tracks.clear();
         self.next_track_id = DEFAULT_DANMAKU_TRACK_ID + 1;
         self.add_track_with_id(DEFAULT_DANMAKU_TRACK_ID, timeline, name, source)
+    }
+
+    /// Appends a viewer-sent comment to the session's live track, creating it on
+    /// first use, and returns that track's id. The comment keeps its media time:
+    /// the live track ignores the global offset, which aligns imported files,
+    /// and a track the user turned off stays off.
+    pub fn push_live_item(&mut self, mut item: DanmakuItem) -> Result<u64> {
+        let existing_index = self.tracks.iter().position(|track| track.live);
+        if let Some(index) = existing_index {
+            let track = &mut self.tracks[index];
+            item.id = track
+                .timeline
+                .items()
+                .iter()
+                .map(|existing| existing.id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            track.timeline.push(item)?;
+            let id = track.id;
+            self.mark_dirty();
+            Ok(id)
+        } else {
+            item.id = 1;
+            let timeline = DanmakuTimeline::new(vec![item])?;
+            let id = self.add_track(timeline, "live", DanmakuTrackSource::Manual);
+            if let Some(track) = self.tracks.iter_mut().find(|track| track.id == id) {
+                track.live = true;
+            }
+            Ok(id)
+        }
     }
 
     pub fn clear(&mut self) {
@@ -729,7 +862,8 @@ impl DanmakuSession {
                 continue;
             }
             for item in track.timeline.items() {
-                let offset = track.offset.saturating_add(self.global_offset);
+                let global = if track.live { 0 } else { self.global_offset };
+                let offset = track.offset.saturating_add(global);
                 let Some(pts) = apply_track_offset(item.pts, offset) else {
                     continue;
                 };
@@ -766,11 +900,39 @@ pub struct PreparedDanmakuItem {
     pub scroll_speed: f32,
     pub duration: Duration,
     pub duplicate_count: u32,
+    pub is_self: bool,
     text_layout: Arc<PreparedTextLayout>,
+}
+
+impl PreparedDanmakuItem {
+    /// The comment's color from [`DANMAKU_RANDOM_COLORS`]: an FNV-1a hash of
+    /// its time, mode and text, so the same comment always gets the same one.
+    fn random_color(&self) -> DanmakuColor {
+        let millis = self.time.as_millis().min(u128::from(u64::MAX)) as u64;
+        let mode = mode_to_dfm_type_code(self.mode) as u8;
+        let mut hash = 0x811c_9dc5_u32;
+        for byte in millis
+            .to_le_bytes()
+            .into_iter()
+            .chain([mode])
+            .chain(self.text.bytes())
+        {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        DanmakuColor {
+            alpha: self.color.alpha,
+            ..DANMAKU_RANDOM_COLORS[hash as usize % DANMAKU_RANDOM_COLORS.len()]
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DfmPreparedLayout {
+    // Freeze the completed window's atlas. A background font-size rebuild
+    // appends masks to the shared rasterizer; foreground previews must not
+    // snapshot and upload those partial additions every frame.
+    atlas: Option<Arc<DanmakuGlyphAtlas>>,
     viewport: DanmakuViewport,
     config: DanmakuLayoutConfig,
     dfm_layout: dfm::PreparedLayout,
@@ -790,6 +952,14 @@ impl DfmPreparedLayout {
         self.stats
     }
 
+    pub(crate) fn atlas(&self) -> Option<Arc<DanmakuGlyphAtlas>> {
+        self.atlas.clone()
+    }
+
+    pub(crate) fn font_size(&self) -> f32 {
+        self.config.font_size
+    }
+
     pub(crate) fn apply_paint_config(&mut self, config: &DanmakuLayoutConfig) {
         let config = config.sanitized();
         // A layout replacement is prepared asynchronously. Its previous
@@ -799,6 +969,7 @@ impl DfmPreparedLayout {
         self.config.shadow_offset = config.shadow_offset;
         self.config.shadow_style = config.shadow_style;
         self.config.enabled = config.enabled;
+        self.config.random_colors = config.random_colors;
     }
 
     pub fn frame_layout(&self, media_time: Duration, generation: u64) -> DanmakuFrameLayout {
@@ -811,9 +982,6 @@ impl DfmPreparedLayout {
             let Some(item) = self.items.get(frame_item.item_index) else {
                 return;
             };
-            if item.mode == DanmakuMode::Special {
-                return;
-            }
             items.push(DanmakuPlacedItem {
                 item_id: item.id,
                 text: Arc::clone(&item.text),
@@ -824,12 +992,18 @@ impl DfmPreparedLayout {
                 width: item.width,
                 height: item.height,
                 font_size: item.font_size,
-                color: item.color,
-                opacity: item.opacity * self.config.opacity,
+                color: if self.config.random_colors {
+                    item.random_color()
+                } else {
+                    item.color
+                },
+                // Mode 7 carries a per-frame alpha ramp; other items stay at 1.
+                opacity: item.opacity * self.config.opacity * frame_item.alpha,
                 outline_width: resolve_width_px(item.font_size, self.config.outline_width),
                 shadow_offset: scale_offset(self.config.shadow_offset, self.viewport.scale_factor),
                 shadow_alpha: shadow_style_alpha(self.config.shadow_style),
                 duplicate_count: item.duplicate_count,
+                is_self: item.is_self,
                 text_layout: Arc::clone(&item.text_layout),
             });
         });
@@ -881,6 +1055,8 @@ pub struct DanmakuPlacedItem {
     pub shadow_offset: [f32; 2],
     pub shadow_alpha: f32,
     pub duplicate_count: u32,
+    /// Sent by the viewer: the render plan borders it.
+    pub is_self: bool,
     text_layout: Arc<PreparedTextLayout>,
 }
 
@@ -891,10 +1067,37 @@ pub struct DanmakuRenderPlan {
     pub viewport: DanmakuViewport,
     pub atlas: Option<Arc<DanmakuGlyphAtlas>>,
     pub items: Vec<DanmakuGlyphInstance>,
+    pub color_atlas: Option<Arc<DanmakuColorAtlas>>,
+    pub color_glyphs: Vec<DanmakuColorGlyph>,
     pub frame_stats: DanmakuFrameStats,
 }
 
 impl DanmakuRenderPlan {
+    /// Keep a prepared layout visible during an animated surface resize.
+    /// Render backends all receive geometry in the current surface's pixels.
+    pub(crate) fn retarget(&mut self, viewport: DanmakuViewport) {
+        if self.viewport == viewport {
+            return;
+        }
+        let sx = viewport.width as f32 / self.viewport.width.max(1) as f32;
+        let sy = viewport.height as f32 / self.viewport.height.max(1) as f32;
+        for item in &mut self.items {
+            item.rect[0] *= sx;
+            item.rect[1] *= sy;
+            item.rect[2] *= sx;
+            item.rect[3] *= sy;
+            item.shadow_offset[0] *= sx;
+            item.shadow_offset[1] *= sy;
+        }
+        for glyph in &mut self.color_glyphs {
+            glyph.rect[0] *= sx;
+            glyph.rect[1] *= sy;
+            glyph.rect[2] *= sx;
+            glyph.rect[3] *= sy;
+        }
+        self.viewport = viewport;
+    }
+
     pub fn empty(media_time: Duration, generation: u64, viewport: DanmakuViewport) -> Self {
         Self {
             media_time,
@@ -902,12 +1105,14 @@ impl DanmakuRenderPlan {
             viewport,
             atlas: None,
             items: Vec::new(),
+            color_atlas: None,
+            color_glyphs: Vec::new(),
             frame_stats: DanmakuFrameStats::default(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.color_glyphs.is_empty()
     }
 }
 
@@ -918,6 +1123,7 @@ pub struct DanmakuFrameStats {
     pub scroll_items: usize,
     pub top_items: usize,
     pub bottom_items: usize,
+    pub special_items: usize,
     pub scroll_rows: usize,
     pub scroll_track_min: usize,
     pub scroll_track_max: usize,
@@ -942,6 +1148,7 @@ pub struct DanmakuPreparedStats {
     pub prepared_scroll_items: usize,
     pub prepared_top_items: usize,
     pub prepared_bottom_items: usize,
+    pub prepared_special_items: usize,
     pub prepared_scroll_rows: usize,
     pub prepared_scroll_min_y: f32,
     pub prepared_scroll_max_y: f32,
@@ -979,7 +1186,7 @@ impl DanmakuFrameStats {
                 }
                 DanmakuMode::Top => stats.top_items += 1,
                 DanmakuMode::Bottom => stats.bottom_items += 1,
-                DanmakuMode::Special => {}
+                DanmakuMode::Special => stats.special_items += 1,
             }
         }
         stats.scroll_rows = scroll_rows.len();
@@ -1033,7 +1240,7 @@ impl DanmakuPreparedStats {
                 }
                 DanmakuMode::Top => stats.prepared_top_items += 1,
                 DanmakuMode::Bottom => stats.prepared_bottom_items += 1,
-                DanmakuMode::Special => {}
+                DanmakuMode::Special => stats.prepared_special_items += 1,
             }
         }
         stats.prepared_scroll_rows = scroll_rows.len();
@@ -1073,6 +1280,24 @@ pub struct DanmakuGlyphInstance {
     pub outline_rgba: [f32; 4],
     pub shadow_rgba: [f32; 4],
     pub shadow_offset: [f32; 2],
+}
+
+/// An emoji in a comment: a picture with its own colors, which the comment's
+/// color does not touch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DanmakuColorGlyph {
+    pub rect: [f32; 4],
+    pub tex_rect: [f32; 4],
+    pub opacity: f32,
+}
+
+/// The pictures of the emoji shown so far, as premultiplied RGBA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanmakuColorAtlas {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1136,6 +1361,8 @@ struct PreparedTextLayout {
 
 #[derive(Debug, Clone, PartialEq)]
 struct PreparedGlyphPlacement {
+    /// Where the glyph's picture is in the color atlas, for an emoji.
+    color: Option<PackedGlyph>,
     glyph: Arc<RasterizedGlyph>,
     packed: PackedGlyph,
     pen_x: f32,
@@ -1171,7 +1398,7 @@ impl DanmakuFontFace {
     }
 
     fn glyph_id(&self, ch: char) -> GlyphId {
-        self.font.glyph_id(ch)
+        color_glyph::glyph_id(&self.font, ch)
     }
 
     fn has_glyph(&self, ch: char) -> bool {
@@ -1179,39 +1406,58 @@ impl DanmakuFontFace {
     }
 }
 
+// Keep the existing CJK, generic, then database order. Preferring a color
+// emoji face can hide symbols an outline-capable generic font could paint.
+
 #[derive(Debug)]
 struct SystemFontFallback {
+    /// The system's fonts wait until a character needs them: reading them all
+    /// takes long on a phone, and the fallback face covers nearly everything.
+    unread: bool,
     db: fontdb::Database,
     faces: Vec<fontdb::ID>,
+    /// The faces with pictures, tried first for emoji.
+    emoji_faces: Vec<fontdb::ID>,
+    emoji_cache: HashMap<char, Option<u32>>,
     loaded: HashMap<fontdb::ID, Option<DanmakuFontFace>>,
+    // GlyphCacheKey and kerning bake DanmakuFontFace::id in, so a face evicted
+    // from the resident set must reuse its id when reloaded.
+    face_ids: HashMap<fontdb::ID, u32>,
+    resident: VecDeque<u32>,
+    resident_cap: usize,
     char_cache: HashMap<char, Option<u32>>,
     next_font_id: u32,
 }
 
 impl SystemFontFallback {
     fn new(next_font_id: u32) -> Self {
-        let mut db = fontdb::Database::new();
-        db.load_system_fonts();
-        let preferred = [
-            "PingFang SC",
-            "Hiragino Sans GB",
-            "Hiragino Sans",
-            "Apple SD Gothic Neo",
-            "Songti SC",
-            "STHeiti",
-            "Microsoft YaHei",
-            "SimHei",
-            "Noto Sans CJK SC",
-            "Noto Sans CJK JP",
-            "Noto Sans CJK",
-            "Source Han Sans SC",
-            "Source Han Sans",
-            "Arial Unicode MS",
-            "Arial Unicode",
-            "Segoe UI Symbol",
-        ];
+        Self {
+            unread: true,
+            ..Self::with_database(fontdb::Database::new(), next_font_id)
+        }
+    }
+
+    fn with_database(db: fontdb::Database, next_font_id: u32) -> Self {
+        let faces = Self::faces_in_order(&db);
+        let emoji_faces = Self::emoji_faces(&db);
+        Self {
+            unread: false,
+            db,
+            faces,
+            emoji_faces,
+            emoji_cache: HashMap::new(),
+            loaded: HashMap::new(),
+            face_ids: HashMap::new(),
+            resident: VecDeque::new(),
+            resident_cap: MAX_RESIDENT_FALLBACK_FACES,
+            char_cache: HashMap::new(),
+            next_font_id,
+        }
+    }
+
+    fn faces_in_order(db: &fontdb::Database) -> Vec<fontdb::ID> {
         let mut faces = Vec::new();
-        for family in preferred {
+        for family in PREFERRED_FAMILIES {
             let query = fontdb::Query {
                 families: &[fontdb::Family::Name(family)],
                 weight: fontdb::Weight::NORMAL,
@@ -1237,21 +1483,85 @@ impl SystemFontFallback {
         for id in face_infos {
             push_unique_face(&mut faces, id);
         }
-        Self {
-            db,
-            faces,
-            loaded: HashMap::new(),
-            char_cache: HashMap::new(),
-            next_font_id,
+        faces
+    }
+
+    fn read_system_fonts(&mut self) {
+        if std::mem::take(&mut self.unread) {
+            self.db = crate::system_font::database().clone();
+            self.faces = Self::faces_in_order(&self.db);
+            self.emoji_faces = Self::emoji_faces(&self.db);
         }
     }
 
+    fn emoji_faces(db: &fontdb::Database) -> Vec<fontdb::ID> {
+        db.faces()
+            .filter(|face| {
+                face.families
+                    .iter()
+                    .any(|(family, _)| family.to_lowercase().contains("emoji"))
+            })
+            .map(|face| face.id)
+            .collect()
+    }
+
+    /// The face with a picture of `ch`. Other faces may cover it too, down to a
+    /// system's last-resort box, so these go first.
+    fn resolve_emoji(&mut self, ch: char) -> Option<DanmakuFontFace> {
+        self.read_system_fonts();
+        match self.emoji_cache.get(&ch).copied() {
+            Some(None) => return None,
+            Some(Some(font_id)) => {
+                if let Some(face) = self.loaded_font_by_id(font_id) {
+                    self.touch_resident(font_id);
+                    return Some(face);
+                }
+            }
+            None => {}
+        }
+        let faces = self.emoji_faces.clone();
+        let first = color_glyph::first_char(ch);
+        // A sequence wants the face that joins it, as a flag font does; another
+        // that only knows its parts is what remains.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut parts: Option<DanmakuFontFace> = None;
+        for id in faces {
+            if !self.face_covers(id, first) {
+                continue;
+            }
+            let Some(face) = self.load_face(id) else {
+                continue;
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            if color_glyph::is_sequence(ch) && !color_glyph::draws_as_one(&face.font, ch) {
+                parts.get_or_insert(face);
+                continue;
+            }
+            self.emoji_cache.insert(ch, Some(face.id));
+            return Some(face);
+        }
+        let face = parts.take();
+        self.emoji_cache
+            .insert(ch, face.as_ref().map(|face| face.id));
+        face
+    }
+
     fn resolve(&mut self, ch: char) -> Option<DanmakuFontFace> {
-        if let Some(font_id) = self.char_cache.get(&ch).copied() {
-            return font_id.and_then(|font_id| self.loaded_font_by_id(font_id));
+        self.read_system_fonts();
+        if let Some(cached) = self.char_cache.get(&ch).copied() {
+            let font_id = cached?;
+            if let Some(face) = self.loaded_font_by_id(font_id) {
+                self.touch_resident(font_id);
+                return Some(face);
+            }
+            // The cached face was evicted; resolve from scratch so the same
+            // face (and id) becomes resident again.
         }
         let faces = self.faces.clone();
         for face_id in faces {
+            if !self.face_covers(face_id, ch) {
+                continue;
+            }
             let Some(face) = self.load_face(face_id) else {
                 continue;
             };
@@ -1264,6 +1574,21 @@ impl SystemFontFallback {
         None
     }
 
+    // Borrowed cmap lookup over fontdb's memory-mapped face data: faces that
+    // do not cover `ch` are skipped without copying the font file. The
+    // whitespace shortcut mirrors DanmakuFontFace::has_glyph.
+    fn face_covers(&self, id: fontdb::ID, ch: char) -> bool {
+        ch.is_whitespace()
+            || self
+                .db
+                .with_face_data(id, |data, face_index| {
+                    FontRef::try_from_slice_and_index(data, face_index)
+                        .map(|face| face.glyph_id(ch).0 != 0)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+    }
+
     fn loaded_font_by_id(&self, font_id: u32) -> Option<DanmakuFontFace> {
         self.loaded
             .values()
@@ -1272,25 +1597,79 @@ impl SystemFontFallback {
             .cloned()
     }
 
-    fn load_face(&mut self, id: fontdb::ID) -> Option<DanmakuFontFace> {
-        if let Some(face) = self.loaded.get(&id) {
-            return face.clone();
+    fn face_font(&self, id: fontdb::ID) -> Option<FontArc> {
+        // Apple's emoji run past 130 MB, far too much to copy.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((fontdb::Source::File(path), face_index)) = self.db.face_source(id)
+            && let Some(font) = map_font_file(&path, face_index)
+        {
+            return Some(font);
         }
-        let font = self
-            .db
+        self.db
             .with_face_data(id, |data, face_index| {
                 FontVec::try_from_vec_and_index(data.to_vec(), face_index)
                     .map(FontArc::new)
                     .ok()
             })
-            .flatten();
+            .flatten()
+    }
+
+    fn load_face(&mut self, id: fontdb::ID) -> Option<DanmakuFontFace> {
+        if let Some(face) = self.loaded.get(&id).cloned() {
+            if let Some(face) = &face {
+                self.touch_resident(face.id);
+            }
+            return face;
+        }
+        let font = self.face_font(id);
         let face = font.map(|font| {
-            let id = self.next_font_id;
-            self.next_font_id = self.next_font_id.saturating_add(1).max(1);
-            DanmakuFontFace::new(id, font)
+            let local_id = self.stable_face_id(id);
+            DanmakuFontFace::new(local_id, font)
         });
-        self.loaded.insert(id, face.clone());
+        // A zero cap disables caching entirely: the face is handed out without
+        // ever entering the resident set, so the loaded/resident invariant
+        // (every cached face is resident) still holds.
+        if self.resident_cap > 0 {
+            if let Some(face) = &face {
+                self.evict_over_cap();
+                self.resident.push_back(face.id);
+            }
+            self.loaded.insert(id, face.clone());
+        }
         face
+    }
+
+    fn stable_face_id(&mut self, id: fontdb::ID) -> u32 {
+        if let Some(local_id) = self.face_ids.get(&id) {
+            return *local_id;
+        }
+        let local_id = self.next_font_id;
+        self.next_font_id = self.next_font_id.saturating_add(1);
+        self.face_ids.insert(id, local_id);
+        local_id
+    }
+
+    fn evict_over_cap(&mut self) {
+        while self.resident.len() >= self.resident_cap {
+            let Some(evicted_id) = self.resident.pop_front() else {
+                return;
+            };
+            let evicted_key = self
+                .loaded
+                .iter()
+                .find(|(_, face)| face.as_ref().is_some_and(|f| f.id == evicted_id))
+                .map(|(key, _)| *key);
+            if let Some(key) = evicted_key {
+                self.loaded.remove(&key);
+            }
+        }
+    }
+
+    fn touch_resident(&mut self, font_id: u32) {
+        if let Some(index) = self.resident.iter().position(|id| *id == font_id) {
+            self.resident.remove(index);
+            self.resident.push_back(font_id);
+        }
     }
 }
 
@@ -1329,6 +1708,7 @@ impl TextLayoutCacheKey {
 #[derive(Debug, Clone)]
 pub struct DanmakuTextRasterizer {
     shaper: TextShaper,
+    supersampling: bool,
     primary_font: Option<DanmakuFontFace>,
     selected_fonts: Arc<[DanmakuFontFace]>,
     selected_before_primary: bool,
@@ -1336,6 +1716,7 @@ pub struct DanmakuTextRasterizer {
     glyph_cache: Arc<Mutex<HashMap<GlyphCacheKey, Arc<RasterizedGlyph>>>>,
     text_layout_cache: Arc<Mutex<HashMap<TextLayoutCacheKey, Arc<PreparedTextLayout>>>>,
     glyph_atlas: Arc<Mutex<PersistentGlyphAtlas>>,
+    color_atlas: Arc<Mutex<PersistentColorAtlas>>,
 }
 
 impl Default for DanmakuTextRasterizer {
@@ -1348,6 +1729,7 @@ impl DanmakuTextRasterizer {
     pub fn new(shaper: TextShaper) -> Self {
         Self {
             shaper,
+            supersampling: true,
             primary_font: load_default_font().map(|font| DanmakuFontFace::new(0, font)),
             selected_fonts: Arc::from([]),
             selected_before_primary: false,
@@ -1355,6 +1737,7 @@ impl DanmakuTextRasterizer {
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
             text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
+            color_atlas: Arc::new(Mutex::new(PersistentColorAtlas::new())),
         }
     }
 
@@ -1378,6 +1761,7 @@ impl DanmakuTextRasterizer {
         let next_font_id = first_selected_id.saturating_add(selected_fonts.len() as u32);
         Self {
             shaper,
+            supersampling: config.supersampling,
             primary_font,
             selected_fonts: Arc::from(selected_fonts),
             selected_before_primary: config.custom_font_family.is_empty()
@@ -1386,6 +1770,7 @@ impl DanmakuTextRasterizer {
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
             text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
+            color_atlas: Arc::new(Mutex::new(PersistentColorAtlas::new())),
         }
     }
 
@@ -1402,13 +1787,49 @@ impl DanmakuTextRasterizer {
         self.measure_with_fallback(text, font_size)
     }
 
+    fn recycle_caches_if_needed(&mut self) {
+        let over_budget = {
+            let atlas = self.glyph_atlas.lock().expect("danmaku glyph atlas lock");
+            atlas.height >= GLYPH_ATLAS_SOFT_HEIGHT || atlas.packed.len() >= GLYPH_CACHE_SOFT_LIMIT
+        } || self
+            .text_layout_cache
+            .lock()
+            .expect("danmaku text layout cache lock")
+            .len()
+            >= TEXT_CACHE_SOFT_LIMIT;
+        if over_budget {
+            // Existing prepared frames own the old caches through their cloned
+            // rasterizer. Do not mutate them while the replacement is built.
+            self.glyph_cache = Arc::new(Mutex::new(HashMap::new()));
+            self.text_layout_cache = Arc::new(Mutex::new(HashMap::new()));
+            self.glyph_atlas = Arc::new(Mutex::new(PersistentGlyphAtlas::new()));
+        }
+    }
+
     fn measure_with_fallback(&self, text: &str, font_size: f32) -> TextMeasure {
         let mut width = 0.0f32;
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
         let mut max_line_gap = 0.0f32;
         let mut previous: Option<(u32, GlyphId)> = None;
-        for ch in text.chars() {
+        for ch in color_glyph::fold(text).chars() {
+            if color_glyph::is_emoji_modifier(ch) {
+                continue;
+            }
+            #[cfg(target_arch = "wasm32")]
+            if color_glyph::is_emoji(ch) {
+                width += font_size * BROWSER_EMOJI_ADVANCE;
+                if let Some(primary) = &self.primary_font {
+                    let line = primary
+                        .font
+                        .as_scaled(px_scale_for_em(primary.font.as_ref(), font_size));
+                    max_ascent = max_ascent.max(line.ascent());
+                    max_descent = max_descent.max(line.descent().abs());
+                    max_line_gap = max_line_gap.max(line.line_gap());
+                }
+                previous = None;
+                continue;
+            }
             let Some(face) = self.resolve_font(ch) else {
                 let metrics = self.shaper.measure(&ch.to_string(), font_size);
                 width += metrics.width.max(font_size * 0.5);
@@ -1419,16 +1840,25 @@ impl DanmakuTextRasterizer {
             };
             let scale = px_scale_for_em(face.font.as_ref(), font_size);
             let scaled = face.font.as_scaled(scale);
-            let glyph_id = scaled.glyph_id(ch);
+            let glyph_id = color_glyph::glyph_id(&face.font, ch);
             if let Some((previous_font_id, previous_glyph_id)) = previous {
                 if previous_font_id == face.id {
                     width += scaled.kern(previous_glyph_id, glyph_id);
                 }
             }
             width += scaled.h_advance(glyph_id).max(0.0);
-            max_ascent = max_ascent.max(scaled.ascent());
-            max_descent = max_descent.max(scaled.descent().abs());
-            max_line_gap = max_line_gap.max(scaled.line_gap());
+            // A comment of emoji alone keeps the height of a line of text.
+            let line_face = self
+                .primary_font
+                .as_ref()
+                .filter(|_| color_glyph::is_emoji(ch))
+                .unwrap_or(&face);
+            let line = line_face
+                .font
+                .as_scaled(px_scale_for_em(line_face.font.as_ref(), font_size));
+            max_ascent = max_ascent.max(line.ascent());
+            max_descent = max_descent.max(line.descent().abs());
+            max_line_gap = max_line_gap.max(line.line_gap());
             previous = Some((face.id, glyph_id));
         }
         let ascent = max_ascent.max(font_size * 0.8);
@@ -1477,7 +1907,10 @@ impl DanmakuTextRasterizer {
         let mut glyphs = Vec::new();
         let mut pen_x = 0.0f32;
         let mut previous: Option<(u32, GlyphId)> = None;
-        for ch in key.text.chars() {
+        for ch in color_glyph::fold(&key.text).chars() {
+            if color_glyph::is_emoji_modifier(ch) {
+                continue;
+            }
             let face = self.resolve_font(ch);
             let glyph_id = face.as_ref().map(|face| face.glyph_id(ch));
             if let (Some(face), Some((previous_font_id, previous_glyph_id)), Some(current)) =
@@ -1495,6 +1928,7 @@ impl DanmakuTextRasterizer {
                 ch,
                 font_size,
                 outline_width,
+                self.supersampling,
             );
             let glyph = self.cached_glyph_by_key(glyph_key);
             let packed = if glyph.has_bitmap() {
@@ -1502,10 +1936,17 @@ impl DanmakuTextRasterizer {
             } else {
                 PackedGlyph::default()
             };
+            let color = glyph.color.as_ref().and_then(|bitmap| {
+                self.color_atlas
+                    .lock()
+                    .expect("danmaku color atlas lock")
+                    .pack((glyph.key.font_id, glyph.key.ch), bitmap)
+            });
             let advance = glyph.advance;
             glyphs.push(PreparedGlyphPlacement {
                 glyph,
                 packed,
+                color,
                 pen_x,
             });
             pen_x += advance;
@@ -1529,6 +1970,15 @@ impl DanmakuTextRasterizer {
                 return Some(font.clone());
             }
         }
+        if color_glyph::is_emoji(ch)
+            && let Some(face) = self
+                .fallback_fonts
+                .lock()
+                .expect("danmaku system font fallback lock")
+                .resolve_emoji(ch)
+        {
+            return Some(face);
+        }
         if let Some(font) = &self.primary_font {
             if font.has_glyph(ch) {
                 return Some(font.clone());
@@ -1546,16 +1996,30 @@ impl DanmakuTextRasterizer {
     }
 
     pub fn render_plan(&self, layout: &DanmakuFrameLayout) -> DanmakuRenderPlan {
+        if layout.items.is_empty() {
+            return DanmakuRenderPlan::empty(layout.media_time, layout.generation, layout.viewport);
+        }
+        let atlas = self
+            .glyph_atlas
+            .lock()
+            .expect("danmaku glyph atlas lock")
+            .snapshot();
+        self.render_plan_scaled(layout, 1.0, atlas)
+    }
+
+    /// Preview a new font size using existing masks until async shaping and
+    /// lane placement finish. UVs and the glyph atlas are unchanged.
+    pub(crate) fn render_plan_scaled(
+        &self,
+        layout: &DanmakuFrameLayout,
+        scale: f32,
+        atlas: Option<Arc<DanmakuGlyphAtlas>>,
+    ) -> DanmakuRenderPlan {
         let frame_stats = DanmakuFrameStats::from_layout(layout);
         if layout.items.is_empty() {
             return DanmakuRenderPlan::empty(layout.media_time, layout.generation, layout.viewport);
         }
-        let Some(atlas_snapshot) = self
-            .glyph_atlas
-            .lock()
-            .expect("danmaku glyph atlas lock")
-            .snapshot()
-        else {
+        let Some(atlas_snapshot) = atlas else {
             return DanmakuRenderPlan::empty(layout.media_time, layout.generation, layout.viewport);
         };
         let atlas_w = atlas_snapshot.width.max(1) as f32;
@@ -1563,15 +2027,34 @@ impl DanmakuTextRasterizer {
         let capacity = layout
             .items
             .iter()
-            .map(|item| item.text_layout.glyphs.len())
+            .map(|item| item.text_layout.glyphs.len() + if item.is_self { 4 } else { 0 })
             .sum();
         let mut items = Vec::with_capacity(capacity);
+        let mut color_glyphs = Vec::new();
+        let color_atlas = self
+            .color_atlas
+            .lock()
+            .expect("danmaku color atlas lock")
+            .snapshot();
         for item in &layout.items {
             let color = item.color.rgba(item.opacity);
             if color[3] <= 0.0 {
                 continue;
             }
-            self.append_item_glyphs(item, color, atlas_w, atlas_h, &mut items);
+            if item.is_self {
+                append_self_border(
+                    item,
+                    scale,
+                    layout.viewport.scale_factor,
+                    atlas_w,
+                    atlas_h,
+                    &mut items,
+                );
+            }
+            self.append_item_glyphs(item, color, atlas_w, atlas_h, scale, &mut items);
+            if let Some(atlas) = &color_atlas {
+                append_item_pictures(item, color[3], atlas, scale, &mut color_glyphs);
+            }
         }
         DanmakuRenderPlan {
             media_time: layout.media_time,
@@ -1579,6 +2062,8 @@ impl DanmakuTextRasterizer {
             viewport: layout.viewport,
             atlas: Some(atlas_snapshot),
             items,
+            color_atlas,
+            color_glyphs,
             frame_stats,
         }
     }
@@ -1589,20 +2074,26 @@ impl DanmakuTextRasterizer {
         color: [f32; 4],
         atlas_w: f32,
         atlas_h: f32,
+        scale: f32,
         items: &mut Vec<DanmakuGlyphInstance>,
     ) {
-        let baseline = item.y + item.text_layout.metrics.ascent;
+        let [x, y] = scaled_origin(item, scale);
+        let baseline = y + item.text_layout.metrics.ascent * scale;
+        let outline = item.color.outline_rgba(item.opacity);
         for placement in &item.text_layout.glyphs {
             let glyph = &placement.glyph;
             if glyph.has_bitmap() {
                 let packed = placement.packed;
+                let top = glyph.color.as_ref().map_or(baseline, |bitmap| {
+                    picture_top(item, bitmap, glyph.key.font_size(), y, scale)
+                });
                 items.push(DanmakuGlyphInstance {
                     item_id: item.item_id,
                     rect: [
-                        item.x + placement.pen_x + glyph.offset_x,
-                        baseline + glyph.offset_y,
-                        glyph.width as f32,
-                        glyph.height as f32,
+                        x + (placement.pen_x + glyph.offset_x) * scale,
+                        top + glyph.offset_y * scale,
+                        glyph.width as f32 / glyph.key.raster_scale() * scale,
+                        glyph.height as f32 / glyph.key.raster_scale() * scale,
                     ],
                     tex_rect: [
                         packed.x as f32 / atlas_w,
@@ -1611,9 +2102,7 @@ impl DanmakuTextRasterizer {
                         packed.height as f32 / atlas_h,
                     ],
                     color_rgba: color,
-                    // Keep the outline as opaque as the fill. Capping it at
-                    // 0.75 made an otherwise opaque danmaku look washed out.
-                    outline_rgba: [0.0, 0.0, 0.0, color[3]],
+                    outline_rgba: outline,
                     shadow_rgba: [0.0, 0.0, 0.0, (color[3] * item.shadow_alpha).min(1.0)],
                     shadow_offset: item.shadow_offset,
                 });
@@ -1667,6 +2156,12 @@ impl DanmakuTextRasterizer {
     }
 
     fn rasterize_glyph(&self, key: GlyphCacheKey) -> RasterizedGlyph {
+        #[cfg(target_arch = "wasm32")]
+        if color_glyph::is_emoji(key.ch)
+            && let Some(bitmap) = color_glyph::render_in_browser(key.ch)
+        {
+            return RasterizedGlyph::picture(key, bitmap);
+        }
         if let Some(font) = self.resolve_font(key.ch) {
             if font.id == key.font_id {
                 return rasterize_font_glyph(&font.font, key);
@@ -1676,27 +2171,156 @@ impl DanmakuTextRasterizer {
     }
 }
 
+/// Where an emoji's picture starts: centered on the line, not hung from the
+/// baseline. Where a picture sits around the baseline differs from font to font,
+/// and CJK text is centered well above it.
+fn picture_top(
+    item: &DanmakuPlacedItem,
+    bitmap: &ColorBitmap,
+    font_size: f32,
+    y: f32,
+    scale: f32,
+) -> f32 {
+    let metrics = &item.text_layout.metrics;
+    y + ((metrics.ascent + metrics.descent) - bitmap.em_height * font_size) * 0.5 * scale
+}
+
+/// The emoji of a comment, in the colors they came with, at its opacity.
+fn append_item_pictures(
+    item: &DanmakuPlacedItem,
+    opacity: f32,
+    atlas: &DanmakuColorAtlas,
+    scale: f32,
+    glyphs: &mut Vec<DanmakuColorGlyph>,
+) {
+    let [x, y] = scaled_origin(item, scale);
+    let (atlas_w, atlas_h) = (atlas.width.max(1) as f32, atlas.height.max(1) as f32);
+    for placement in &item.text_layout.glyphs {
+        let (Some(bitmap), Some(packed)) = (&placement.glyph.color, placement.color) else {
+            continue;
+        };
+        let em = placement.glyph.key.font_size() * scale;
+        glyphs.push(DanmakuColorGlyph {
+            rect: [
+                x + placement.pen_x * scale + bitmap.left * em,
+                picture_top(item, bitmap, placement.glyph.key.font_size(), y, scale),
+                bitmap.em_width * em,
+                bitmap.em_height * em,
+            ],
+            tex_rect: [
+                packed.x as f32 / atlas_w,
+                packed.y as f32 / atlas_h,
+                packed.width as f32 / atlas_w,
+                packed.height as f32 / atlas_h,
+            ],
+            opacity,
+        });
+    }
+}
+
+/// Where a comment's text box starts while a font-size preview scales it:
+/// static comments keep their center (top) or bottom edge.
+fn scaled_origin(item: &DanmakuPlacedItem, scale: f32) -> [f32; 2] {
+    let x = match item.mode {
+        DanmakuMode::Top | DanmakuMode::Bottom => item.x + item.width * (1.0 - scale) * 0.5,
+        _ => item.x,
+    };
+    let y = if item.mode == DanmakuMode::Bottom {
+        item.y + item.height * (1.0 - scale)
+    } else {
+        item.y
+    };
+    [x, y]
+}
+
+/// Frame the viewer's own comment with four non-overlapping bars that sample
+/// the atlas's solid block, so every renderer draws them as it draws glyphs:
+/// white at the comment's opacity, with the text's shadow and no outline.
+/// The line is a whole number of device pixels, and its rows sit on the
+/// pixel grid, so it stays crisp while the comment scrolls.
+fn append_self_border(
+    item: &DanmakuPlacedItem,
+    scale: f32,
+    scale_factor: f32,
+    atlas_w: f32,
+    atlas_h: f32,
+    items: &mut Vec<DanmakuGlyphInstance>,
+) {
+    let scale_factor = sanitize_f32(scale_factor, 1.0).max(0.1);
+    let line = (SELF_BORDER_WIDTH * scale_factor).round().max(1.0);
+    let outset = SELF_BORDER_PADDING * scale_factor + line * 0.5;
+    let [x, y] = scaled_origin(item, scale);
+    let left = x - outset;
+    let top = (y - outset).round();
+    let width = item.width * scale + outset * 2.0;
+    let height = ((y + item.height * scale + outset).round() - top).max(line * 2.0);
+    let color = DanmakuColor::WHITE.rgba(item.opacity);
+    let shadow = [0.0, 0.0, 0.0, (color[3] * item.shadow_alpha).min(1.0)];
+    let tex_rect = [
+        1.0 / atlas_w,
+        1.0 / atlas_h,
+        (SOLID_ATLAS_BLOCK - 2) as f32 / atlas_w,
+        (SOLID_ATLAS_BLOCK - 2) as f32 / atlas_h,
+    ];
+    for rect in [
+        [left, top, width, line],
+        [left, top + height - line, width, line],
+        [left, top + line, line, height - line * 2.0],
+        [left + width - line, top + line, line, height - line * 2.0],
+    ] {
+        items.push(DanmakuGlyphInstance {
+            item_id: item.item_id,
+            rect,
+            tex_rect,
+            color_rgba: color,
+            outline_rgba: [0.0; 4],
+            shadow_rgba: shadow,
+            shadow_offset: item.shadow_offset,
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GlyphCacheKey {
     font_id: u32,
     ch: char,
     font_size_milli: u32,
     outline_radius: u16,
+    raster_scale: u8,
 }
 
 impl GlyphCacheKey {
-    fn new(font_id: u32, ch: char, font_size: f32, outline_width: f32) -> Self {
+    fn new(
+        font_id: u32,
+        ch: char,
+        font_size: f32,
+        outline_width: f32,
+        supersampling: bool,
+    ) -> Self {
         Self {
             font_id,
             ch,
             font_size_milli: (sanitize_f32(font_size, DEFAULT_NATIVE_FONT_SIZE).max(1.0) * 1000.0)
                 .round() as u32,
             outline_radius: raster_radius(outline_width),
+            raster_scale: if supersampling && font_size <= MAX_SUPERSAMPLED_FONT_SIZE {
+                2
+            } else {
+                1
+            },
         }
     }
 
     fn font_size(self) -> f32 {
         self.font_size_milli as f32 / 1000.0
+    }
+
+    fn raster_scale(self) -> f32 {
+        f32::from(self.raster_scale)
+    }
+
+    fn raster_outline_radius(self) -> i32 {
+        i32::from(self.outline_radius) * i32::from(self.raster_scale)
     }
 }
 
@@ -1711,9 +2335,50 @@ struct RasterizedGlyph {
     offset_x: f32,
     offset_y: f32,
     advance: f32,
+    /// An emoji's picture, which replaces the masks.
+    color: Option<Arc<ColorBitmap>>,
 }
 
 impl RasterizedGlyph {
+    /// An emoji. Its shape goes in the outline mask, so it gets the outline and
+    /// shadow of the text around it from the same pass; the picture covers the
+    /// inside, and no fill is drawn.
+    fn picture(key: GlyphCacheKey, bitmap: Arc<ColorBitmap>) -> Self {
+        let font_size = key.font_size();
+        let raster_scale = key.raster_scale();
+        let radius = key.raster_outline_radius();
+        let pad = radius + 2 * i32::from(key.raster_scale);
+        let drawn_width = (bitmap.em_width * font_size * raster_scale).ceil().max(1.0) as i32;
+        let drawn_height = (bitmap.em_height * font_size * raster_scale)
+            .ceil()
+            .max(1.0) as i32;
+        let width = (drawn_width + pad * 2) as u32;
+        let height = (drawn_height + pad * 2) as u32;
+        let stride = width as usize;
+        let mut shape = vec![0u8; stride * height as usize];
+        for y in 0..drawn_height {
+            let source_y = (y as u32 * bitmap.height / drawn_height as u32).min(bitmap.height - 1);
+            for x in 0..drawn_width {
+                let source_x = (x as u32 * bitmap.width / drawn_width as u32).min(bitmap.width - 1);
+                let alpha = (source_y * bitmap.width + source_x) as usize * 4 + 3;
+                shape[(y + pad) as usize * stride + (x + pad) as usize] = bitmap.rgba[alpha];
+            }
+        }
+        let outline_alpha = dilate_alpha(&shape, width, height, stride, radius);
+        Self {
+            key,
+            width,
+            height,
+            stride,
+            fill_alpha: vec![0; shape.len()],
+            outline_alpha,
+            offset_x: bitmap.left * font_size - pad as f32 / raster_scale,
+            offset_y: -pad as f32 / raster_scale,
+            advance: bitmap.advance * font_size,
+            color: Some(bitmap),
+        }
+    }
+
     fn placeholder(key: GlyphCacheKey) -> Self {
         Self::empty(key, 0.0)
     }
@@ -1729,6 +2394,7 @@ impl RasterizedGlyph {
             offset_x: 0.0,
             offset_y: 0.0,
             advance,
+            color: None,
         }
     }
 
@@ -1770,22 +2436,114 @@ struct PersistentGlyphAtlas {
     snapshot: Option<Arc<DanmakuGlyphAtlas>>,
 }
 
+/// The pictures of emoji. Each is packed once, whatever size it shows at.
+#[derive(Debug)]
+struct PersistentColorAtlas {
+    height: u32,
+    cursor_x: u32,
+    cursor_y: u32,
+    row_height: u32,
+    rgba: Vec<u8>,
+    packed: HashMap<(u32, char), PackedGlyph>,
+    version: u64,
+    snapshot: Option<Arc<DanmakuColorAtlas>>,
+}
+
+impl PersistentColorAtlas {
+    fn new() -> Self {
+        Self {
+            height: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            row_height: 0,
+            rgba: Vec::new(),
+            packed: HashMap::new(),
+            version: 0,
+            snapshot: None,
+        }
+    }
+
+    /// `None` when the atlas is full: that emoji stays blank, the rest show.
+    fn pack(&mut self, key: (u32, char), bitmap: &ColorBitmap) -> Option<PackedGlyph> {
+        if let Some(packed) = self.packed.get(&key) {
+            return Some(*packed);
+        }
+        if bitmap.width + COLOR_ATLAS_GAP > COLOR_ATLAS_WIDTH {
+            return None;
+        }
+        if self.cursor_x + bitmap.width + COLOR_ATLAS_GAP > COLOR_ATLAS_WIDTH {
+            self.cursor_x = 0;
+            self.cursor_y += self.row_height + COLOR_ATLAS_GAP;
+            self.row_height = 0;
+        }
+        let bottom = self.cursor_y + bitmap.height;
+        if bottom > COLOR_ATLAS_MAX_HEIGHT {
+            return None;
+        }
+        if bottom > self.height {
+            self.height = bottom.next_power_of_two().max(COLOR_ATLAS_MIN_HEIGHT);
+            self.rgba
+                .resize((COLOR_ATLAS_WIDTH * self.height * 4) as usize, 0);
+        }
+        let packed = PackedGlyph {
+            x: self.cursor_x,
+            y: self.cursor_y,
+            width: bitmap.width,
+            height: bitmap.height,
+        };
+        let row_bytes = bitmap.width as usize * 4;
+        for row in 0..bitmap.height as usize {
+            let source = row * row_bytes;
+            let target =
+                ((packed.y as usize + row) * COLOR_ATLAS_WIDTH as usize + packed.x as usize) * 4;
+            self.rgba[target..target + row_bytes]
+                .copy_from_slice(&bitmap.rgba[source..source + row_bytes]);
+        }
+        self.cursor_x += bitmap.width + COLOR_ATLAS_GAP;
+        self.row_height = self.row_height.max(bitmap.height);
+        self.packed.insert(key, packed);
+        self.version = NEXT_GLYPH_ATLAS_VERSION.fetch_add(1, Ordering::Relaxed);
+        self.snapshot = None;
+        Some(packed)
+    }
+
+    fn snapshot(&mut self) -> Option<Arc<DanmakuColorAtlas>> {
+        if self.packed.is_empty() {
+            return None;
+        }
+        Some(Arc::clone(self.snapshot.get_or_insert_with(|| {
+            Arc::new(DanmakuColorAtlas {
+                width: COLOR_ATLAS_WIDTH,
+                height: self.height,
+                rgba: self.rgba.clone(),
+                version: self.version,
+            })
+        })))
+    }
+}
+
 impl PersistentGlyphAtlas {
     fn new() -> Self {
         let width = GLYPH_ATLAS_WIDTH;
         let height = GLYPH_ATLAS_INITIAL_HEIGHT;
         let stride = width as usize;
+        let mut fill_alpha = vec![0; stride * height as usize];
+        let mut outline_alpha = vec![0; stride * height as usize];
+        for row in 0..SOLID_ATLAS_BLOCK as usize {
+            fill_alpha[row * stride..row * stride + SOLID_ATLAS_BLOCK as usize].fill(u8::MAX);
+            outline_alpha[row * stride..row * stride + SOLID_ATLAS_BLOCK as usize].fill(u8::MAX);
+        }
         Self {
             width,
             height,
             stride,
-            cursor_x: 0,
+            cursor_x: SOLID_ATLAS_BLOCK,
             cursor_y: 0,
-            row_height: 0,
-            fill_alpha: vec![0; stride * height as usize],
-            outline_alpha: vec![0; stride * height as usize],
+            row_height: SOLID_ATLAS_BLOCK,
+            outline_alpha,
+            fill_alpha,
             packed: HashMap::new(),
-            version: 1,
+            version: NEXT_GLYPH_ATLAS_VERSION.fetch_add(1, Ordering::Relaxed),
             dirty: true,
             dirty_bounds: None,
             snapshot: None,
@@ -1821,7 +2579,7 @@ impl PersistentGlyphAtlas {
         self.cursor_x += glyph_width;
         self.row_height = self.row_height.max(glyph_height);
         self.packed.insert(glyph.key, packed);
-        self.version = self.version.saturating_add(1).max(1);
+        self.version = NEXT_GLYPH_ATLAS_VERSION.fetch_add(1, Ordering::Relaxed);
         self.dirty = true;
         if packed.width > 0 && packed.height > 0 {
             let right = packed.x.saturating_add(packed.width);
@@ -1954,7 +2712,8 @@ impl DfmLayoutEngine {
         let layout_changed = re_enabling || !self.config.layout_equivalent(&config);
         let font_changed = self.config.custom_font_family != config.custom_font_family
             || self.config.custom_font_file_path != config.custom_font_file_path
-            || self.config.custom_font_face_index != config.custom_font_face_index;
+            || self.config.custom_font_face_index != config.custom_font_face_index
+            || self.config.supersampling != config.supersampling;
         self.config = config;
         if font_changed {
             self.rasterizer =
@@ -1995,17 +2754,34 @@ impl DfmLayoutEngine {
         self.rasterizer.clone()
     }
 
+    /// A copy with the same settings and fonts, but without the timeline,
+    /// prepared layout or placement history.
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            timeline: DanmakuTimeline::default(),
+            config: self.config.clone(),
+            rasterizer: self.rasterizer.clone(),
+            font_selection: self.font_selection.clone(),
+            prepared: None,
+            stable_tracks: HashMap::new(),
+            rejected_items: BTreeSet::new(),
+            stable_viewport: None,
+        }
+    }
+
     pub(crate) fn set_config_with_rasterizer(
         &mut self,
         config: DanmakuLayoutConfig,
         rasterizer: DanmakuTextRasterizer,
-    ) {
-        if self.apply_config(config) == DanmakuConfigChange::Layout {
+    ) -> DanmakuConfigChange {
+        let change = self.apply_config(config);
+        if change == DanmakuConfigChange::Layout {
             // The async planner must pack glyphs into the same atlas that the
             // presenter later snapshots. This is especially important after a
             // custom-font change creates a fresh rasterizer generation.
             self.rasterizer = rasterizer;
         }
+        change
     }
 
     pub fn prepare(&mut self, viewport: DanmakuViewport, _generation: u64) -> DfmPreparedLayout {
@@ -2018,7 +2794,7 @@ impl DfmLayoutEngine {
             .timeline
             .items()
             .iter()
-            .filter(|item| item.mode != DanmakuMode::Special)
+            .filter(|item| item.mode != DanmakuMode::Special || item.special.is_some())
             .filter(|item| !self.rejected_items.contains(&item.id))
             .map(|item| item.id)
             .collect::<BTreeSet<_>>();
@@ -2095,6 +2871,12 @@ impl DfmLayoutEngine {
         let layout = self.frame_layout(media_time, viewport, generation);
         self.rasterizer.render_plan(&layout)
     }
+
+    /// The presenter pairs each prepared result with its rasterizer clone.
+    /// Recycle only there, keeping render_prepared_plan's public API stable.
+    pub(crate) fn recycle_raster_caches_if_needed(&mut self) {
+        self.rasterizer.recycle_caches_if_needed();
+    }
 }
 
 fn prepare_layout(
@@ -2111,11 +2893,14 @@ fn prepare_layout(
             height: viewport.height as f64,
             scroll_duration_seconds: config.scroll_duration_seconds.max(1.0) as f64,
             static_duration_seconds: DEFAULT_STATIC_DURATION.as_secs_f64(),
+            max_duration_seconds: f64::from(config.scroll_duration_seconds.max(1.0))
+                .max(DEFAULT_STATIC_DURATION.as_secs_f64()),
             items: Vec::new(),
             item_times: Vec::new(),
             track_count: 0,
         };
         return DfmPreparedLayout {
+            atlas: None,
             viewport,
             config: config.clone(),
             dfm_layout,
@@ -2131,7 +2916,10 @@ fn prepare_layout(
     let source_count = timeline.items().len();
     let mut source_items = Vec::new();
     for source in timeline.items() {
-        if source.mode == DanmakuMode::Special || rejected_items.contains(&source.id) {
+        // A Special comment without its JSON payload has nothing to draw.
+        if (source.mode == DanmakuMode::Special && source.special.is_none())
+            || rejected_items.contains(&source.id)
+        {
             continue;
         }
         let font_size =
@@ -2142,12 +2930,24 @@ fn prepare_layout(
             time_seconds: source.pts.as_secs_f64(),
             text: source.text.clone(),
             type_code: mode_to_dfm_type_code(source.mode),
-            color_argb: color_to_argb(source.color, source.opacity),
+            color_argb: color_to_argb(source.color),
             opacity: source.opacity,
             is_me: source.is_self,
             font_size,
             paint_width: measure.width as f64,
             paint_height: measure.height.max(font_size * 1.2) as f64,
+            special: if source.mode == DanmakuMode::Special {
+                source
+                    .special
+                    .as_ref()
+                    .cloned()
+                    .and_then(sanitize_mode7_special)
+                    .map(|special| {
+                        scale_special_to_viewport(&special, viewport.width, viewport.height)
+                    })
+            } else {
+                None
+            },
         });
     }
     let supported_count = source_items.len();
@@ -2177,6 +2977,9 @@ fn prepare_layout(
         height: viewport.height as f64,
         scroll_duration_seconds: scroll_duration.as_secs_f64(),
         static_duration_seconds: DEFAULT_STATIC_DURATION.as_secs_f64(),
+        max_duration_seconds: scroll_duration
+            .as_secs_f64()
+            .max(DEFAULT_STATIC_DURATION.as_secs_f64()),
         items: Vec::new(),
         item_times: Vec::new(),
         track_count: 0,
@@ -2211,6 +3014,7 @@ fn prepare_layout(
                 scroll_speed: item.scroll_speed as f32,
                 duration: Duration::from_secs_f64(item.duration_seconds.max(0.0)),
                 duplicate_count: item.duplicate_count,
+                is_self: item.is_me,
                 text_layout,
             }
         })
@@ -2229,6 +3033,11 @@ fn prepare_layout(
         dfm_layout.track_count.max(0) as usize,
     );
     DfmPreparedLayout {
+        atlas: rasterizer
+            .glyph_atlas
+            .lock()
+            .expect("danmaku glyph atlas lock")
+            .snapshot(),
         viewport,
         config: config.clone(),
         dfm_layout,
@@ -2238,6 +3047,173 @@ fn prepare_layout(
         item_times,
         items: prepared,
     }
+}
+
+/// Bilibili player sizes used as the coordinate space of mode 7 comments.
+/// The old player was 545x388 before 2013-11-10; newer comments use 862x568.
+const MODE7_BASE_OLD: (f64, f64) = (545.0, 388.0);
+const MODE7_BASE_NEW: (f64, f64) = (862.0, 568.0);
+const MODE7_HISTORICAL_CUTOFF_DATE: i64 = 1_384_099_200;
+/// Mode 7 durations come from untrusted XML/JSON. Cap them at the same upper
+/// bound as `scroll_duration_seconds` so a single comment cannot widen the
+/// frame look-behind window (shared by every item) without bound.
+const MODE7_MIN_DURATION_SECONDS: f64 = 0.1;
+const MODE7_MAX_DURATION_SECONDS: f64 = 60.0;
+
+/// Resolve a mode 7 payload into display text, an effective mode and its
+/// animation data. Returns `None` when the item cannot be rendered at all.
+///
+/// A plain (non-JSON) mode 7 comment degrades to a fixed top comment, matching
+/// the behaviour of desktop players.
+fn resolve_mode7(
+    text: &str,
+    source_date: i64,
+) -> Option<(String, DanmakuMode, Option<DanmakuSpecial>)> {
+    if !text.trim_start().starts_with('[') {
+        // Plain-text mode 7 still uses Bilibili's `/n` line-break escape. The
+        // render plan is single-line, so fold it into a space here too.
+        return Some((text.replace("/n", " "), DanmakuMode::Top, None));
+    }
+    let (text, special) = parse_mode7_json(text, source_date)?;
+    Some((text, DanmakuMode::Special, Some(special)))
+}
+
+/// Parse the JSON array carried by a mode 7 comment.
+///
+/// Three shapes exist in the wild:
+///
+/// - new (>=9 elements): `[x1,y1,"a-b",dur,text,zRot,yRot,x2,y2,...]`
+/// - old (7 elements):   `[x1,y1,"a-b",dur,text,x2,y2]`
+/// - old (5 elements):   `[x1,y1,"a-b",dur,text]` (no movement)
+///
+/// Numbers may also arrive as strings, e.g. `"50"`.
+fn parse_mode7_json(raw: &str, source_date: i64) -> Option<(String, DanmakuSpecial)> {
+    let values: Vec<Value> = serde_json::from_str(raw.trim()).ok()?;
+    if values.len() < 5 {
+        return None;
+    }
+    let number = |value: &Value| -> Option<f64> {
+        let parsed = match value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(text) => text.trim().parse().ok(),
+            _ => None,
+        };
+        // Numeric strings such as "NaN", "inf" and "1e400" parse successfully
+        // but would poison coordinates and the shared frame window.
+        parsed.filter(|value| value.is_finite())
+    };
+    let x1 = number(values.first()?)?;
+    let y1 = number(values.get(1)?)?;
+    let (alpha_from, alpha_to) = parse_mode7_alpha(values.get(2)?)?;
+    let duration_seconds = number(values.get(3)?)?;
+    // `/n` is the source's escaped line break. The GPU render plan lays out a
+    // single line, so fold it into a space rather than shaping a control
+    // character that has no glyph.
+    let text = values.get(4)?.as_str()?.replace("/n", " ");
+    if text.trim().is_empty() {
+        return None;
+    }
+    let (z_rotate_deg, x2, y2) = if values.len() >= 9 {
+        (
+            number(values.get(5)?).unwrap_or(0.0),
+            number(values.get(7)?)?,
+            number(values.get(8)?)?,
+        )
+    } else if values.len() >= 7 {
+        (0.0, number(values.get(5)?)?, number(values.get(6)?)?)
+    } else {
+        (0.0, x1, y1)
+    };
+    Some((
+        text,
+        sanitize_mode7_special(DanmakuSpecial {
+            x1,
+            y1,
+            x2,
+            y2,
+            alpha_from,
+            alpha_to,
+            duration_seconds,
+            z_rotate: (z_rotate_deg as f32).to_radians(),
+            source_date,
+        })?,
+    ))
+}
+
+/// Alpha field of a mode 7 array, e.g. `"0.1-1.00"`.
+fn parse_mode7_alpha(value: &Value) -> Option<(f32, f32)> {
+    let (from, to) = match value {
+        Value::String(text) => {
+            let (from, to) = text.trim().split_once('-')?;
+            (
+                from.trim().parse::<f32>().ok()?,
+                to.trim().parse::<f32>().ok()?,
+            )
+        }
+        Value::Number(number) => {
+            let alpha = number.as_f64()? as f32;
+            (alpha, alpha)
+        }
+        _ => return None,
+    };
+    (from.is_finite() && to.is_finite()).then_some((from, to))
+}
+
+/// Reject non-finite animation values and cap the lifetime. Payloads may also
+/// be built by callers through the public `DanmakuSpecial` fields, so the
+/// layout applies this too: the frame look-behind window is shared by every
+/// item and would otherwise grow with one malformed duration.
+fn sanitize_mode7_special(mut special: DanmakuSpecial) -> Option<DanmakuSpecial> {
+    let finite = [
+        special.x1,
+        special.y1,
+        special.x2,
+        special.y2,
+        special.duration_seconds,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        && special.alpha_from.is_finite()
+        && special.alpha_to.is_finite()
+        && special.z_rotate.is_finite();
+    if !finite {
+        return None;
+    }
+    special.duration_seconds = special
+        .duration_seconds
+        .clamp(MODE7_MIN_DURATION_SECONDS, MODE7_MAX_DURATION_SECONDS);
+    Some(special)
+}
+
+/// Map mode 7 source coordinates onto the current viewport.
+///
+/// When every coordinate is a fraction in `[0, 1]` the source used normalized
+/// coordinates and is scaled by the viewport directly. Otherwise the values
+/// are absolute pixels in one of the historical player sizes, chosen by the
+/// comment's date.
+fn scale_special_to_viewport(
+    special: &DanmakuSpecial,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> DanmakuSpecial {
+    let mut scaled = special.clone();
+    let width = viewport_width.max(1) as f64;
+    let height = viewport_height.max(1) as f64;
+    let normalized = [scaled.x1, scaled.y1, scaled.x2, scaled.y2]
+        .iter()
+        .all(|&value| (0.0..=1.0).contains(&value));
+    let (sx, sy) = if normalized {
+        (width, height)
+    } else if scaled.source_date < MODE7_HISTORICAL_CUTOFF_DATE {
+        (width / MODE7_BASE_OLD.0, height / MODE7_BASE_OLD.1)
+    } else {
+        (width / MODE7_BASE_NEW.0, height / MODE7_BASE_NEW.1)
+    };
+    scaled.x1 *= sx;
+    scaled.x2 *= sx;
+    scaled.y1 *= sy;
+    scaled.y2 *= sy;
+    scaled
 }
 
 pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
@@ -2265,19 +3241,38 @@ pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
             .get(1)
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);
-        let mode = DanmakuMode::from_bilibili_mode(mode_code);
-        if mode == DanmakuMode::Special {
+        // Code (8) and BAS (9) comments carry scripts, not drawable text.
+        if matches!(mode_code, 8 | 9) {
             continue;
         }
-        let Ok(pts) = parse_float_field(fields.first(), "pts") else {
+        let mode = DanmakuMode::from_bilibili_mode(mode_code);
+        let Some(pts) = parse_float_field(fields.first(), "pts")
+            .ok()
+            .and_then(item_duration)
+        else {
             continue;
         };
+        let source_date = fields
+            .get(4)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let (text, mode, special) = if mode == DanmakuMode::Special {
+            let Some(resolved) = resolve_mode7(&text, source_date) else {
+                continue;
+            };
+            resolved
+        } else {
+            (text, mode, None)
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
         items.push(DanmakuItem {
             id: fields
                 .get(7)
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(index as u64 + 1),
-            pts: Duration::from_secs_f64(pts.max(0.0)),
+            pts,
             mode,
             font_size: fields
                 .get(2)
@@ -2292,6 +3287,7 @@ pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
             opacity: 1.0,
             is_self: false,
             text,
+            special,
         });
     }
     Ok(items)
@@ -2337,11 +3333,8 @@ fn dfm_type_code_to_mode(type_code: i32) -> DanmakuMode {
     DanmakuMode::from_bilibili_mode(type_code.max(0) as u32)
 }
 
-fn color_to_argb(color: DanmakuColor, opacity: f32) -> i32 {
-    let alpha = (color.alpha * opacity)
-        .clamp(0.0, 1.0)
-        .mul_add(255.0, 0.0)
-        .round() as u32;
+fn color_to_argb(color: DanmakuColor) -> i32 {
+    let alpha = color.alpha.clamp(0.0, 1.0).mul_add(255.0, 0.0).round() as u32;
     let red = (color.red.clamp(0.0, 1.0) * 255.0).round() as u32;
     let green = (color.green.clamp(0.0, 1.0) * 255.0).round() as u32;
     let blue = (color.blue.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -2365,13 +3358,25 @@ fn item_from_json_value(value: &Value, fallback_id: u64) -> Result<DanmakuItem> 
         .or_else(|| object.get("r"))
         .and_then(parse_color_value)
         .unwrap_or(DanmakuColor::WHITE);
+    let pts = item_duration(numeric_field(object, &["time", "t"]).unwrap_or(0.0))
+        .ok_or_else(|| DanmakuError::InvalidField("time".to_string()))?;
+    let source_date =
+        numeric_field(object, &["date", "ctime", "timestamp", "send_time"]).unwrap_or(0.0) as i64;
+    let (text, mode, special) = if mode == DanmakuMode::Special {
+        // Only a JSON array payload is a real mode 7 comment. A bare
+        // "special" type keeps the historical behaviour (filtered out),
+        // whereas Bilibili XML degrades those to fixed top comments.
+        if text.trim_start().starts_with('[') {
+            resolve_mode7(&text, source_date).ok_or(DanmakuError::MissingText)?
+        } else {
+            return Err(DanmakuError::MissingText);
+        }
+    } else {
+        (text, mode, None)
+    };
     Ok(DanmakuItem {
         id: u64_field(object, &["id"]).unwrap_or(fallback_id),
-        pts: Duration::from_secs_f64(
-            numeric_field(object, &["time", "t"])
-                .unwrap_or(0.0)
-                .max(0.0),
-        ),
+        pts,
         text,
         mode,
         font_size: numeric_field(object, &["font_size", "fontSize", "size", "s"])
@@ -2379,6 +3384,7 @@ fn item_from_json_value(value: &Value, fallback_id: u64) -> Result<DanmakuItem> 
         color,
         opacity: numeric_field(object, &["opacity", "alpha", "a"]).unwrap_or(1.0) as f32,
         is_self: bool_field(object, &["is_me", "isMe", "self", "mine"]).unwrap_or(false),
+        special,
     })
 }
 
@@ -2457,6 +3463,14 @@ fn parse_float_field(field: Option<&&str>, name: &'static str) -> Result<f64> {
         .ok_or_else(|| DanmakuError::InvalidField(name.to_string()))?
         .parse::<f64>()
         .map_err(|_| DanmakuError::InvalidField(name.to_string()))
+}
+
+/// Preserve negative-time clamping while rejecting unrepresentable durations.
+fn item_duration(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds.max(0.0)).ok()
 }
 
 fn decode_xml_entities(text: &str) -> String {
@@ -2635,18 +3649,21 @@ fn load_font_from_path(
 }
 
 fn load_font_family(family: &str) -> Option<FontArc> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+    let db = crate::system_font::database();
     let query = fontdb::Query {
         families: &[fontdb::Family::Name(family)],
         weight: fontdb::Weight::NORMAL,
         stretch: fontdb::Stretch::Normal,
         style: fontdb::Style::Normal,
     };
-    db.query(&query).and_then(|id| load_fontdb_face(&db, id))
+    db.query(&query).and_then(|id| load_fontdb_face(db, id))
 }
 
 fn load_fontdb_face(db: &fontdb::Database, id: fontdb::ID) -> Option<FontArc> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((fontdb::Source::File(path), index)) = db.face_source(id) {
+        return map_font_file(&path, index);
+    }
     db.with_face_data(id, |data, face_index| {
         load_font_data(data.to_vec(), face_index)
     })
@@ -2659,20 +3676,33 @@ fn load_font_data(data: Vec<u8>, face_index: u32) -> Option<FontArc> {
         .ok()
 }
 
+/// System fonts run to tens of megabytes, so they stay mapped from their file.
+#[cfg(not(target_arch = "wasm32"))]
+fn map_font_file(path: &Path, face_index: u32) -> Option<FontArc> {
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: system font files do not change while the system runs.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    SharedFont::try_new(Arc::new(map), face_index).map(FontArc::new)
+}
+
+type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 #[derive(Clone)]
 struct SharedFont {
     // This field must be dropped before `data`, because its internal references
-    // point into the allocation kept alive by `data`.
+    // point into the memory kept alive by `data`.
     font: FontRef<'static>,
-    data: Arc<[u8]>,
+    data: FontBytes,
 }
 
 impl SharedFont {
-    fn try_new(data: Arc<[u8]>, face_index: u32) -> Option<Self> {
-        // SAFETY: `bytes` points into the allocation owned by `data`. The Arc is
-        // stored in the same value and is declared after `font`, so it remains
-        // alive until all references held by FontRef have been dropped.
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+    fn try_new(data: FontBytes, face_index: u32) -> Option<Self> {
+        let bytes = (*data).as_ref();
+        // SAFETY: `bytes` points into the memory owned by `data`, which does not
+        // move. The Arc is stored in the same value and is declared after
+        // `font`, so it remains alive until all references held by FontRef have
+        // been dropped.
+        let bytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let font = FontRef::try_from_slice_and_index(bytes, face_index).ok()?;
         Some(Self { font, data })
     }
@@ -2744,68 +3774,40 @@ impl Font for SharedFont {
     }
 
     fn font_data(&self) -> &[u8] {
-        &self.data
+        (*self.data).as_ref()
     }
 }
 
 fn load_shared_font_data(data: Arc<[u8]>, face_index: u32) -> Option<FontArc> {
-    SharedFont::try_new(data, face_index).map(FontArc::new)
+    SharedFont::try_new(Arc::new(data), face_index).map(FontArc::new)
 }
 
-fn load_default_font() -> Option<FontArc> {
-    if let Ok(font) = FontArc::try_from_slice(NIPAPLAY_FALLBACK_FONT) {
+/// A face given to the player, then the system's, then the one built in.
+pub(crate) fn load_default_font() -> Option<FontArc> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if !cfg!(test)
+        && !crate::font::has_given_fallback_font()
+        && let Some(font) = crate::system_font::fallback()
+        && let Some(font) = map_font_file(&font.path, font.index)
+    {
         return Some(font);
     }
-
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-    let families = [
-        fontdb::Family::Name("PingFang SC"),
-        fontdb::Family::Name("Hiragino Sans GB"),
-        fontdb::Family::Name("Microsoft YaHei"),
-        fontdb::Family::Name("Noto Sans CJK SC"),
-        fontdb::Family::Name("Noto Sans CJK"),
-        fontdb::Family::Name("Source Han Sans SC"),
-        fontdb::Family::SansSerif,
-    ];
-    for family in families {
-        let query = fontdb::Query {
-            families: &[family],
-            weight: fontdb::Weight::NORMAL,
-            stretch: fontdb::Stretch::Normal,
-            style: fontdb::Style::Normal,
-        };
-        if let Some(font) = db.query(&query).and_then(|id| load_fontdb_face(&db, id)) {
-            return Some(font);
-        }
-    }
-    const CANDIDATES: &[&str] = &[
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/SFNS.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-    ];
-    for path in CANDIDATES {
-        if let Ok(font) = load_font_from_path(Path::new(path), 0) {
-            return Some(font);
-        }
-    }
-    None
+    let font = crate::font::fallback_font()?;
+    load_shared_font_data(font.data, font.index)
 }
 
 fn rasterize_font_glyph(font: &FontArc, key: GlyphCacheKey) -> RasterizedGlyph {
+    #[cfg(not(target_arch = "wasm32"))]
+    if color_glyph::is_emoji(key.ch)
+        && let Some(bitmap) = color_glyph::render(font, color_glyph::glyph_id(font, key.ch))
+    {
+        return RasterizedGlyph::picture(key, bitmap);
+    }
     let font_size = key.font_size();
-    let scale = px_scale_for_em(font, font_size);
-    let scaled = font.as_scaled(scale);
+    // Advance/kerning stay in display pixels. Only the outline raster has
+    // more samples; its bearings and quad dimensions are mapped back once.
+    let raster_scale = key.raster_scale();
+    let scaled = font.as_scaled(px_scale_for_em(font, font_size));
     let glyph_id = scaled.glyph_id(key.ch);
     let advance = scaled.h_advance(glyph_id).max(0.0);
     if key.ch.is_whitespace() {
@@ -2813,14 +3815,15 @@ fn rasterize_font_glyph(font: &FontArc, key: GlyphCacheKey) -> RasterizedGlyph {
     }
     let glyph = Glyph {
         id: glyph_id,
-        scale,
+        scale: px_scale_for_em(font, font_size * raster_scale),
         position: ab_glyph::point(0.0, 0.0),
     };
     let Some(outlined) = font.outline_glyph(glyph) else {
         return RasterizedGlyph::empty(key, advance.max(font_size * 0.5));
     };
     let bounds = outlined.px_bounds();
-    let pad = i32::from(key.outline_radius) + 2;
+    let radius = key.raster_outline_radius();
+    let pad = radius + 2 * i32::from(key.raster_scale);
     let width = (bounds.width().ceil() as i32 + pad * 2).max(1) as u32;
     let height = (bounds.height().ceil() as i32 + pad * 2).max(1) as u32;
     let stride = width as usize;
@@ -2836,13 +3839,7 @@ fn rasterize_font_glyph(font: &FontArc, key: GlyphCacheKey) -> RasterizedGlyph {
         fill_alpha[index] = fill_alpha[index].max(value);
     });
     let outline_alpha = if key.outline_radius > 0 {
-        dilate_alpha(
-            &fill_alpha,
-            width,
-            height,
-            stride,
-            i32::from(key.outline_radius),
-        )
+        dilate_alpha(&fill_alpha, width, height, stride, radius)
     } else {
         fill_alpha.clone()
     };
@@ -2853,9 +3850,10 @@ fn rasterize_font_glyph(font: &FontArc, key: GlyphCacheKey) -> RasterizedGlyph {
         stride,
         fill_alpha,
         outline_alpha,
-        offset_x: bounds.min.x.floor() - pad as f32,
-        offset_y: bounds.min.y.floor() - pad as f32,
+        offset_x: (bounds.min.x.floor() - pad as f32) / raster_scale,
+        offset_y: (bounds.min.y.floor() - pad as f32) / raster_scale,
         advance,
+        color: None,
     }
 }
 
@@ -2866,9 +3864,11 @@ fn rasterize_fallback_glyph(shaper: &TextShaper, key: GlyphCacheKey) -> Rasteriz
     }
     let text = key.ch.to_string();
     let metrics = shaper.measure(&text, font_size);
-    let pad = u32::from(key.outline_radius) + 2;
-    let width = metrics.width.ceil().max(1.0) as u32 + pad * 2;
-    let height = metrics.height.ceil().max(1.0) as u32 + pad * 2;
+    let raster_scale = key.raster_scale();
+    let radius = key.raster_outline_radius();
+    let pad = radius as u32 + 2 * u32::from(key.raster_scale);
+    let width = (metrics.width * raster_scale).ceil().max(1.0) as u32 + pad * 2;
+    let height = (metrics.height * raster_scale).ceil().max(1.0) as u32 + pad * 2;
     let stride = width as usize;
     let mut fill_alpha = vec![0u8; stride * height as usize];
     for y in pad..height.saturating_sub(pad) {
@@ -2881,13 +3881,7 @@ fn rasterize_fallback_glyph(shaper: &TextShaper, key: GlyphCacheKey) -> Rasteriz
         }
     }
     let outline_alpha = if key.outline_radius > 0 {
-        dilate_alpha(
-            &fill_alpha,
-            width,
-            height,
-            stride,
-            i32::from(key.outline_radius),
-        )
+        dilate_alpha(&fill_alpha, width, height, stride, radius)
     } else {
         fill_alpha.clone()
     };
@@ -2898,9 +3892,10 @@ fn rasterize_fallback_glyph(shaper: &TextShaper, key: GlyphCacheKey) -> Rasteriz
         stride,
         fill_alpha,
         outline_alpha,
-        offset_x: -(pad as f32),
-        offset_y: -metrics.ascent - pad as f32,
+        offset_x: -(pad as f32) / raster_scale,
+        offset_y: -metrics.ascent - pad as f32 / raster_scale,
         advance: metrics.width.max(font_size * 0.5),
+        color: None,
     }
 }
 
@@ -2908,21 +3903,38 @@ fn dilate_alpha(input: &[u8], width: u32, height: u32, stride: usize, radius: i3
     if radius <= 0 {
         return input.to_vec();
     }
-    let mut output = input.to_vec();
-    for y in 0..height as i32 {
-        for x in 0..width as i32 {
-            let mut max_value = input[y as usize * stride + x as usize];
-            for oy in -radius..=radius {
-                for ox in -radius..=radius {
-                    let nx = x + ox;
-                    let ny = y + oy;
-                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
-                        continue;
-                    }
-                    max_value = max_value.max(input[ny as usize * stride + nx as usize]);
-                }
+    // A circular stroke avoids the square corners of a box dilation. Sliding
+    // row maxima keep the supersampled outline O(radius * pixels), rather
+    // than scanning a full square for every output pixel.
+    let mut output = vec![0; input.len()];
+    let mut queue = VecDeque::<usize>::new();
+    for oy in -radius..=radius {
+        let span = ((radius * radius - oy * oy) as f32).sqrt().floor() as usize;
+        for y in 0..height as i32 {
+            let source_y = y + oy;
+            if source_y < 0 || source_y >= height as i32 {
+                continue;
             }
-            output[y as usize * stride + x as usize] = max_value;
+            let row = &input[source_y as usize * stride..][..width as usize];
+            queue.clear();
+            let mut next = 0;
+            for x in 0..width as usize {
+                let right = (x + span + 1).min(width as usize);
+                while next < right {
+                    while queue.back().is_some_and(|&i| row[i] <= row[next]) {
+                        queue.pop_back();
+                    }
+                    queue.push_back(next);
+                    next += 1;
+                }
+                let left = x.saturating_sub(span);
+                while queue.front().is_some_and(|&i| i < left) {
+                    queue.pop_front();
+                }
+                let index = y as usize * stride + x;
+                output[index] =
+                    output[index].max(row[*queue.front().expect("nonempty row window")]);
+            }
         }
     }
     output
@@ -2931,7 +3943,235 @@ fn dilate_alpha(input: &[u8], width: u32, height: u32, stride: usize, radius: i3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NIPAPLAY_FALLBACK_FONT;
 
+    #[test]
+    fn danmaku_colors_keep_opaque_fills_and_contrasting_outlines() {
+        let colors = [
+            (DanmakuColor::WHITE, [0.0, 0.0, 0.0, 1.0]),
+            (DanmakuColor::rgb_u8(0, 0, 0), [1.0, 1.0, 1.0, 1.0]),
+            (DanmakuColor::rgb_u8(32, 32, 32), [1.0, 1.0, 1.0, 1.0]),
+            (DanmakuColor::rgb_u8(0, 0, 255), [0.0, 0.0, 0.0, 1.0]),
+            (DanmakuColor::rgb_u8(204, 0, 0), [0.0, 0.0, 0.0, 1.0]),
+            (DanmakuColor::rgb_u8(128, 0, 0), [0.0, 0.0, 0.0, 1.0]),
+            (DanmakuColor::rgb_u8(255, 255, 0), [0.0, 0.0, 0.0, 1.0]),
+            (DanmakuColor::rgb_u8(255, 0, 0), [0.0, 0.0, 0.0, 1.0]),
+        ];
+        for (color, outline) in colors {
+            let timeline = DanmakuTimeline::new(vec![DanmakuItem {
+                color,
+                ..item(0.0, "彩色弹幕", DanmakuMode::Top)
+            }])
+            .unwrap();
+            for supersampling in [false, true] {
+                let mut engine = DfmLayoutEngine::new(
+                    timeline.clone(),
+                    DanmakuLayoutConfig {
+                        supersampling,
+                        ..DanmakuLayoutConfig::default()
+                    },
+                );
+                let plan =
+                    engine.render_plan(Duration::from_secs(1), DanmakuViewport::new(640, 360), 1);
+                assert!(!plan.items.is_empty());
+                for glyph in &plan.items {
+                    assert_eq!(glyph.color_rgba, color.rgba(1.0));
+                    assert_eq!(glyph.outline_rgba, outline);
+                }
+                let mut config = engine.config().clone();
+                config.opacity = 0.5;
+                assert_eq!(engine.apply_config(config), DanmakuConfigChange::PaintOnly);
+                let translucent = engine.render_plan(Duration::from_secs(1), plan.viewport, 1);
+                for glyph in &translucent.items {
+                    assert_eq!(glyph.color_rgba, color.rgba(0.5));
+                    assert_eq!(&glyph.outline_rgba[..3], &outline[..3]);
+                    assert_eq!(glyph.outline_rgba[3], 0.5);
+                }
+            }
+        }
+        let transparent_black = DanmakuColor {
+            alpha: 0.5,
+            ..DanmakuColor::rgb_u8(0, 0, 0)
+        };
+        assert_eq!(transparent_black.outline_rgba(0.5), [1.0, 1.0, 1.0, 0.25]);
+    }
+
+    #[test]
+    fn retained_font_preview_keeps_its_atlas_while_new_masks_are_packed() {
+        let viewport = DanmakuViewport::new(640, 360);
+        let mut engine = DfmLayoutEngine::new(
+            DanmakuTimeline::new(vec![item(0.0, "彩色弹幕", DanmakuMode::Top)]).unwrap(),
+            DanmakuLayoutConfig::default(),
+        );
+        let prepared = engine.prepare(viewport, 1);
+        let frame = prepared.frame_layout(Duration::from_secs(1), 1);
+        let before = engine
+            .rasterizer
+            .render_plan_scaled(&frame, 1.0, prepared.atlas());
+        let mut config = engine.config().clone();
+        config.font_size *= 1.5;
+        engine.set_config(config);
+        let replacement = engine.prepare(viewport, 1);
+        assert_ne!(
+            replacement.atlas().unwrap().version,
+            before.atlas.as_ref().unwrap().version
+        );
+        let preview = engine
+            .rasterizer
+            .render_plan_scaled(&frame, 1.5, prepared.atlas());
+        assert!(Arc::ptr_eq(
+            preview.atlas.as_ref().unwrap(),
+            before.atlas.as_ref().unwrap()
+        ));
+        assert_eq!(preview.items[0].tex_rect, before.items[0].tex_rect);
+        assert_eq!(preview.items[0].rect[2], before.items[0].rect[2] * 1.5);
+    }
+
+    #[test]
+    fn source_opacity_is_not_squared_by_dfm_color_round_trip() {
+        let timeline = DanmakuTimeline::new(vec![DanmakuItem {
+            color: DanmakuColor {
+                alpha: 0.5,
+                ..DanmakuColor::WHITE
+            },
+            opacity: 0.5,
+            ..item(0.0, "透明度", DanmakuMode::Top)
+        }])
+        .unwrap();
+        let mut engine = DfmLayoutEngine::new(
+            timeline,
+            DanmakuLayoutConfig {
+                opacity: 0.8,
+                ..DanmakuLayoutConfig::default()
+            },
+        );
+        let plan = engine.render_plan(Duration::from_secs(1), DanmakuViewport::new(640, 360), 1);
+        assert!(!plan.items.is_empty());
+        for glyph in &plan.items {
+            // The color and DFM opacity each have one 8-bit quantization.
+            assert!((glyph.color_rgba[3] - 0.5 * 0.5 * 0.8).abs() < 0.002);
+            assert!((glyph.outline_rgba[3] - glyph.color_rgba[3]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn supersampling_preserves_layout_motion_and_display_size() {
+        let timeline = DanmakuTimeline::new(vec![
+            item(0.0, "清晰弹幕 Aa", DanmakuMode::Scroll),
+            item(0.0, "顶部字幕", DanmakuMode::Top),
+            item(0.0, "底部字幕", DanmakuMode::Bottom),
+        ])
+        .unwrap();
+        for density in [1.0, 1.7725, 2.0] {
+            let viewport = DanmakuViewport::with_scale(1920, 1080, density);
+            let mut native = DfmLayoutEngine::new(
+                timeline.clone(),
+                DanmakuLayoutConfig {
+                    supersampling: false,
+                    ..DanmakuLayoutConfig::default()
+                },
+            );
+            let mut high = DfmLayoutEngine::new(timeline.clone(), DanmakuLayoutConfig::default());
+            for time in [0.5, 1.5] {
+                let time = Duration::from_secs_f64(time);
+                let a = native.frame_layout(time, viewport, 1);
+                let b = high.frame_layout(time, viewport, 1);
+                assert_eq!(a.items.len(), b.items.len());
+                assert!(!a.items.is_empty());
+                for (a, b) in a.items.iter().zip(&b.items) {
+                    assert_eq!((a.x, a.y), (b.x, b.y));
+                    assert_eq!(a.text_layout.metrics, b.text_layout.metrics);
+                    for (a, b) in a.text_layout.glyphs.iter().zip(&b.text_layout.glyphs) {
+                        assert_eq!(a.pen_x, b.pen_x);
+                        assert_eq!(a.glyph.advance, b.glyph.advance);
+                        assert_eq!(b.glyph.key.raster_scale, 2);
+                        assert!((a.glyph.width as f32 - b.glyph.width as f32 / 2.0).abs() <= 1.0);
+                        assert!((a.glyph.offset_x - b.glyph.offset_x).abs() <= 0.5);
+                        assert!((a.glyph.offset_y - b.glyph.offset_y).abs() <= 0.5);
+                    }
+                }
+                let plan = high.rasterizer.render_plan(&b);
+                let atlas = plan.atlas.as_ref().unwrap();
+                for glyph in &plan.items {
+                    assert_close(glyph.tex_rect[2] * atlas.width as f32, glyph.rect[2] * 2.0);
+                    assert_close(glyph.tex_rect[3] * atlas.height as f32, glyph.rect[3] * 2.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supersampling_toggle_rebuilds_atlas_and_large_fonts_limit_raster_cost() {
+        let timeline = DanmakuTimeline::new(vec![item(0.0, "字体", DanmakuMode::Top)]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let first = engine.render_plan(Duration::from_secs(1), DanmakuViewport::new(640, 360), 1);
+        let mut config = engine.config().clone();
+        config.supersampling = false;
+        assert_eq!(engine.apply_config(config), DanmakuConfigChange::Layout);
+        let second = engine.render_plan(Duration::from_secs(1), DanmakuViewport::new(640, 360), 2);
+        assert_ne!(first.atlas.unwrap().version, second.atlas.unwrap().version);
+        assert_eq!(
+            GlyphCacheKey::new(0, '字', 129.0, 2.0, true).raster_scale,
+            1
+        );
+    }
+
+    #[test]
+    fn raster_cache_rollover_preserves_existing_prepared_frames() {
+        let mut rasterizer = DanmakuTextRasterizer::default();
+        let key = GlyphCacheKey::new(0, '字', 30.0, 2.0, true);
+        let glyph = rasterizer.cached_glyph_by_key(key);
+        rasterizer.pack_glyph(&glyph);
+        let old = rasterizer.clone();
+        let old_atlas = old.glyph_atlas.lock().unwrap().snapshot().unwrap();
+        // Trigger the soft budget without allocating a large test texture.
+        rasterizer.glyph_atlas.lock().unwrap().height = GLYPH_ATLAS_SOFT_HEIGHT;
+        rasterizer.recycle_caches_if_needed();
+        assert!(Arc::ptr_eq(
+            &old_atlas,
+            &old.glyph_atlas.lock().unwrap().snapshot().unwrap()
+        ));
+        assert!(rasterizer.glyph_cache.lock().unwrap().is_empty());
+        rasterizer.pack_glyph(&glyph);
+        let new_atlas = rasterizer.glyph_atlas.lock().unwrap().snapshot().unwrap();
+        assert_ne!(old_atlas.version, new_atlas.version);
+    }
+
+    #[test]
+    fn round_outline_matches_disk_reference_with_padded_rows() {
+        let (width, height, stride) = (13, 9, 16);
+        let mut input = vec![0; stride * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                input[y * stride + x] = ((x * 37 + y * 19) % 256) as u8;
+            }
+        }
+        for radius in [1, 2, 4, 16] {
+            let actual = dilate_alpha(&input, width, height, stride, radius);
+            for y in 0..height as i32 {
+                for x in 0..width as i32 {
+                    let mut expected = 0;
+                    for dy in -radius..=radius {
+                        for dx in -radius..=radius {
+                            if dx * dx + dy * dy <= radius * radius
+                                && (0..width as i32).contains(&(x + dx))
+                                && (0..height as i32).contains(&(y + dy))
+                            {
+                                expected = expected
+                                    .max(input[(y + dy) as usize * stride + (x + dx) as usize]);
+                            }
+                        }
+                    }
+                    assert_eq!(actual[y as usize * stride + x as usize], expected);
+                }
+            }
+        }
+        let mut dot = vec![0; 49];
+        dot[24] = 255;
+        let outline = dilate_alpha(&dot, 7, 7, 7, 2);
+        assert_eq!(outline[24 + 2], 255);
+        assert_eq!(outline[24 + 2 + 14], 0, "stroke corners must be round");
+    }
     fn test_ttc() -> Vec<u8> {
         let source = NIPAPLAY_FALLBACK_FONT;
         let face_count = 2u32;
@@ -2965,6 +4205,54 @@ mod tests {
         collection
     }
 
+    #[test]
+    fn live_comments_keep_media_time_and_respect_a_disabled_track() {
+        let mut session = DanmakuSession::new();
+        session.replace_default_track(
+            DanmakuTimeline::new(vec![item(1.0, "imported", DanmakuMode::Scroll)]).unwrap(),
+            "file",
+            DanmakuTrackSource::Json,
+        );
+        // The imported file starts 10 s late; a viewer sends at 5 s.
+        session.set_global_offset(10_000_000);
+        let live = session
+            .push_live_item(item(5.0, "sent", DanmakuMode::Scroll))
+            .unwrap();
+        let shown = |session: &mut DanmakuSession, text: &str| {
+            session
+                .active_timeline()
+                .items()
+                .iter()
+                .find(|item| item.text == text)
+                .map(|item| item.pts)
+        };
+        assert_eq!(
+            shown(&mut session, "imported"),
+            Some(Duration::from_secs(11))
+        );
+        assert_eq!(shown(&mut session, "sent"), Some(Duration::from_secs(5)));
+
+        // Changing the global offset later still leaves live comments in place.
+        session.set_global_offset(-500_000);
+        assert_eq!(shown(&mut session, "sent"), Some(Duration::from_secs(5)));
+        // An offset on the live track itself still applies.
+        assert!(session.set_track_offset(live, 1_000_000));
+        assert_eq!(shown(&mut session, "sent"), Some(Duration::from_secs(6)));
+
+        // Sending again keeps a track the user turned off hidden.
+        assert!(session.set_track_enabled(live, false));
+        assert_eq!(
+            session
+                .push_live_item(item(7.0, "later", DanmakuMode::Top))
+                .unwrap(),
+            live
+        );
+        assert_eq!(shown(&mut session, "sent"), None);
+        assert_eq!(shown(&mut session, "later"), None);
+        assert!(session.set_track_enabled(live, true));
+        assert_eq!(shown(&mut session, "later"), Some(Duration::from_secs(8)));
+    }
+
     fn item(time: f64, text: &str, mode: DanmakuMode) -> DanmakuItem {
         DanmakuItem {
             id: 0,
@@ -2975,6 +4263,7 @@ mod tests {
             color: DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }
     }
 
@@ -3025,6 +4314,37 @@ mod tests {
 
         assert_eq!(timeline.items()[0].id, 9_007_199_254_740_993);
         assert_eq!(timeline.items()[1].id, u64::MAX);
+    }
+
+    #[test]
+    fn skips_finite_timestamps_that_cannot_fit_in_a_duration() {
+        let xml = r#"<i><d p="1e100,1,25,16777215,0,0,0,0">broken</d><d p="2.0,1,25,16777215,0,0,0,1">good</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline.items()[0].text, "good");
+        let json =
+            r#"{"comments":[{"time":"1e100","content":"broken"},{"time":2.0,"content":"good"}]}"#;
+        let timeline = DanmakuTimeline::from_json(json).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline.items()[0].text, "good");
+    }
+
+    #[test]
+    fn skips_items_with_non_finite_timestamps_instead_of_panicking() {
+        // "1e400" parses as f64 infinity, which Duration::from_secs_f64
+        // panics on; such an item must be skipped, not take the load down.
+        let xml = r#"<i><d p="1e400,1,25,16777215,0,0,0,0">broken</d><d p="2.0,1,25,16777215,0,0,0,1">good</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline.items()[0].text, "good");
+
+        let json = r#"{"comments":[
+            {"time":"1e400","content":"broken"},
+            {"time":2.0,"content":"good"}
+        ]}"#;
+        let timeline = DanmakuTimeline::from_json(json).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline.items()[0].text, "good");
     }
 
     #[test]
@@ -3349,6 +4669,127 @@ mod tests {
     }
 
     #[test]
+    fn own_comments_are_framed_by_solid_bars_around_their_text() {
+        let mut own = item(0.0, "我的弹幕", DanmakuMode::Top);
+        own.is_self = true;
+        own.color = DanmakuColor::rgb_u8(0xfe, 0x05, 0x02);
+        let timeline =
+            DanmakuTimeline::new(vec![own, item(0.0, "别人的", DanmakuMode::Bottom)]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        let at = Duration::from_millis(500);
+        let plan = engine.render_plan(at, viewport, 1);
+        let atlas = plan.atlas.as_ref().expect("glyph atlas exists");
+        let layout = engine.frame_layout(at, viewport, 1);
+        let own = layout.items.iter().find(|item| item.is_self).unwrap();
+        let other = layout.items.iter().find(|item| !item.is_self).unwrap();
+        let on_block = |glyph: &DanmakuGlyphInstance| {
+            glyph.tex_rect[0] * (atlas.width as f32) < SOLID_ATLAS_BLOCK as f32
+                && glyph.tex_rect[1] * (atlas.height as f32) < SOLID_ATLAS_BLOCK as f32
+        };
+        let bars: Vec<_> = plan.items.iter().filter(|glyph| on_block(glyph)).collect();
+
+        // Four bars for the viewer's comment, none for anyone else's, and no
+        // glyph of the text shares the solid block.
+        assert_eq!(bars.len(), 4, "{:?}", plan.items);
+        assert!(bars.iter().all(|bar| bar.item_id == own.item_id));
+        assert!(
+            plan.items
+                .iter()
+                .any(|glyph| glyph.item_id == other.item_id)
+        );
+        for y in 0..SOLID_ATLAS_BLOCK as usize {
+            for x in 0..SOLID_ATLAS_BLOCK as usize {
+                assert_eq!(atlas.fill_alpha[y * atlas.stride + x], u8::MAX);
+                assert_eq!(atlas.outline_alpha[y * atlas.stride + x], u8::MAX);
+            }
+        }
+        for bar in &bars {
+            // The middle of the opaque block, whatever the filtering.
+            let [u, v, w, h] = bar.tex_rect;
+            assert_close(u * atlas.width as f32, 1.0);
+            assert_close(v * atlas.height as f32, 1.0);
+            assert_close((u + w) * atlas.width as f32, 3.0);
+            assert_close((v + h) * atlas.height as f32, 3.0);
+            assert_eq!(bar.color_rgba, [1.0, 1.0, 1.0, own.opacity]);
+            assert_eq!(bar.outline_rgba[3], 0.0);
+            assert!(bar.shadow_rgba[3] > 0.0);
+        }
+        // A 1.5-point line is 3 device pixels at 2x, framing the text box
+        // 2 points (4 pixels) out.
+        let [top, bottom, left, right] = [bars[0].rect, bars[1].rect, bars[2].rect, bars[3].rect];
+        assert_close(top[3], 3.0);
+        assert_close(left[2], 3.0);
+        assert_close(top[0], own.x - 4.0 - 1.5);
+        assert_close(top[2], own.width + 2.0 * (4.0 + 1.5));
+        assert!(top[1] <= own.y - 4.0 && top[1].fract() == 0.0);
+        assert!(bottom[1] + bottom[3] >= own.y + own.height + 4.0);
+        assert_close(right[0] + right[2], top[0] + top[2]);
+        // The bars do not overlap, so blending never doubles a corner.
+        assert_close(left[1], top[1] + top[3]);
+        assert_close(left[1] + left[3], bottom[1]);
+    }
+
+    #[test]
+    fn random_colors_repaint_stably_without_a_new_layout() {
+        let comments = ["第一条", "第二条", "第三条", "第四条", "第五条", "第六条"];
+        let timeline = DanmakuTimeline::new(
+            comments
+                .iter()
+                .enumerate()
+                .map(|(n, text)| item(n as f64 * 0.01, text, DanmakuMode::Scroll))
+                .collect(),
+        )
+        .unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let viewport = DanmakuViewport::new(1280, 720);
+        let at = Duration::from_millis(500);
+        let plain = engine.frame_layout(at, viewport, 1);
+        assert_eq!(plain.items.len(), comments.len());
+        assert!(
+            plain
+                .items
+                .iter()
+                .all(|item| item.color == DanmakuColor::WHITE)
+        );
+
+        let config = DanmakuLayoutConfig {
+            random_colors: true,
+            ..DanmakuLayoutConfig::default()
+        };
+        assert_eq!(engine.apply_config(config), DanmakuConfigChange::PaintOnly);
+        let colored = engine.frame_layout(at, viewport, 2);
+        let again = engine.frame_layout(at, viewport, 3);
+        assert_eq!(colored.items.len(), comments.len());
+        for (item, same) in colored.items.iter().zip(&again.items) {
+            assert!(
+                DANMAKU_RANDOM_COLORS.contains(&item.color),
+                "{:?}",
+                item.color
+            );
+            assert_eq!(item.color, same.color);
+        }
+        let distinct = colored
+            .items
+            .iter()
+            .map(|item| color_to_argb(item.color))
+            .collect::<BTreeSet<_>>();
+        assert!(distinct.len() > 1, "{distinct:?}");
+
+        assert_eq!(
+            engine.apply_config(DanmakuLayoutConfig::default()),
+            DanmakuConfigChange::PaintOnly
+        );
+        let restored = engine.frame_layout(at, viewport, 4);
+        assert!(
+            restored
+                .items
+                .iter()
+                .all(|item| item.color == DanmakuColor::WHITE)
+        );
+    }
+
+    #[test]
     fn layout_equivalence_only_ignores_the_declared_paint_only_fields() {
         let base = DanmakuLayoutConfig::default();
 
@@ -3357,6 +4798,7 @@ mod tests {
         paint_only.shadow_offset = [4.0, 4.0];
         paint_only.shadow_style = DanmakuShadowStyle::None;
         paint_only.enabled = !base.enabled;
+        paint_only.random_colors = !base.random_colors;
         assert!(base.layout_equivalent(&paint_only));
 
         // Anything outside that set must force a relayout; the normalization
@@ -3754,6 +5196,325 @@ mod tests {
         assert_eq!(prepared.items().len(), 0);
     }
 
+    fn mode7_special() -> DanmakuSpecial {
+        DanmakuSpecial {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 200.0,
+            y2: 50.0,
+            alpha_from: 0.1,
+            alpha_to: 1.0,
+            duration_seconds: 4.5,
+            z_rotate: 0.0,
+            source_date: 1_291_190_667,
+        }
+    }
+
+    #[test]
+    fn mode7_xml_parses_new_old_and_plain_text_payloads() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?><i>
+<d p="1.5,7,25,16777215,1291190667,0,x,1">["50","245","0.1-1.00","4.50","达成","0","0","350","0","1000","500","0","","Microsoft YaHei"]</d>
+<d p="2.0,7,25,16777215,1291190667,0,x,2">["50","245","0.1-1.00","4.50","旧格式","350","0"]</d>
+<d p="3.0,7,25,16777215,1291190667,0,x,3">["50","245","1-1","2.0","原地/n换行"]</d>
+<d p="4.0,7,25,16777215,1291190667,0,x,4">纯文本/n退化</d>
+<d p="5.0,8,25,16777215,1291190667,0,x,5">代码弹幕</d>
+<d p="6.0,9,25,16777215,1291190667,0,x,6">BAS 弹幕</d>
+<d p="7.0,7,25,16777215,1291190667,0,x,7">["坏","JSON"]</d>
+<d p="8.0,1,25,16777215,1291190667,0,x,8">普通滚动</d>
+</i>"#;
+        let items = parse_bilibili_xml(xml).unwrap();
+        assert_eq!(items.len(), 5);
+
+        assert_eq!(items[0].mode, DanmakuMode::Special);
+        assert_eq!(items[0].text, "达成");
+        let special = items[0].special.as_ref().expect("new mode7 payload");
+        assert_eq!(special.x1, 50.0);
+        assert_eq!(special.y1, 245.0);
+        assert_eq!(special.x2, 350.0);
+        assert_eq!(special.y2, 0.0);
+        assert_close(special.alpha_from, 0.1);
+        assert_close(special.alpha_to, 1.0);
+        assert_eq!(special.duration_seconds, 4.5);
+        assert_eq!(special.source_date, 1_291_190_667);
+        assert_close(special.z_rotate, 0.0);
+
+        // Seven-element (old) payload: x2/y2 sit at indices 5/6.
+        assert_eq!(items[1].mode, DanmakuMode::Special);
+        assert_eq!(items[1].text, "旧格式");
+        let old = items[1].special.as_ref().expect("old mode7 payload");
+        assert_eq!(old.x2, 350.0);
+        assert_eq!(old.y2, 0.0);
+
+        // Five-element payload does not move; `/n` folds into a space.
+        assert_eq!(items[2].text, "原地 换行");
+        let still = items[2].special.as_ref().expect("still mode7 payload");
+        assert_eq!(still.x2, still.x1);
+        assert_eq!(still.y2, still.y1);
+
+        // Plain-text mode 7 degrades to a fixed top comment; 8/9 and broken
+        // JSON payloads are dropped.
+        assert_eq!(items[3].mode, DanmakuMode::Top);
+        assert!(items[3].special.is_none());
+        assert_eq!(items[3].text, "纯文本 退化");
+        assert_eq!(items[4].mode, DanmakuMode::Scroll);
+        assert_eq!(items[4].text, "普通滚动");
+    }
+
+    #[test]
+    fn mode7_coordinates_follow_historical_player_base_or_normalized_space() {
+        // Date before 2013-11-10: 545x388 is the source space, so the old
+        // viewport reproduces the source coordinates exactly.
+        let old = scale_special_to_viewport(&mode7_special(), 545, 388);
+        assert!((old.x1 - 100.0).abs() < 1e-6);
+        assert!((old.y1 - 100.0).abs() < 1e-6);
+        let doubled = scale_special_to_viewport(&mode7_special(), 1090, 776);
+        assert!((doubled.x1 - 200.0).abs() < 1e-6);
+        assert!((doubled.y1 - 200.0).abs() < 1e-6);
+
+        // Newer comments use the 862x568 base.
+        let newer = DanmakuSpecial {
+            source_date: MODE7_HISTORICAL_CUTOFF_DATE + 1,
+            ..mode7_special()
+        };
+        let scaled = scale_special_to_viewport(&newer, 862, 568);
+        assert!((scaled.x1 - 100.0).abs() < 1e-6);
+        assert!((scaled.y2 - 50.0).abs() < 1e-6);
+
+        // Fractional coordinates are viewport ratios, not tiny pixels.
+        let normalized = DanmakuSpecial {
+            x1: 0.25,
+            y1: 0.5,
+            x2: 0.75,
+            y2: 0.5,
+            ..mode7_special()
+        };
+        let mapped = scale_special_to_viewport(&normalized, 800, 600);
+        assert!((mapped.x1 - 200.0).abs() < 1e-6);
+        assert!((mapped.y1 - 300.0).abs() < 1e-6);
+        assert!((mapped.x2 - 600.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mode7_frame_interpolates_position_alpha_and_lifetime() {
+        let xml = r#"<i><d p="0.0,7,25,16777215,1291190667,0,x,1">["50","245","0.1-1.00","4.50","达成","0","0","350","0"]</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        // 545x388 is the old base, so source coordinates map 1:1.
+        let viewport = DanmakuViewport::new(545, 388);
+        let prepared = engine.prepare(viewport, 1);
+        assert_eq!(prepared.items().len(), 1);
+        assert_eq!(prepared.items()[0].mode, DanmakuMode::Special);
+        assert_eq!(prepared.stats().prepared_special_items, 1);
+
+        let frame_at = |seconds| prepared.frame_layout(Duration::from_secs_f64(seconds), 1);
+        let start = frame_at(0.0);
+        assert_eq!(start.items.len(), 1);
+        assert_eq!(DanmakuFrameStats::from_layout(&start).special_items, 1);
+        assert_close(start.items[0].x, 50.0);
+        assert_close(start.items[0].y, 245.0);
+        assert_close(start.items[0].opacity, 0.1);
+
+        let middle = frame_at(2.25);
+        assert_eq!(middle.items.len(), 1);
+        assert_close(middle.items[0].x, 200.0);
+        assert_close(middle.items[0].y, 122.5);
+        assert_close(middle.items[0].opacity, 0.55);
+
+        // The animation uses [start, end), so its last frame is already gone.
+        assert!(frame_at(4.5).items.is_empty());
+        assert!(frame_at(5.0).items.is_empty());
+    }
+
+    #[test]
+    fn mode7_render_plan_applies_the_frame_alpha_to_glyphs() {
+        let xml = r#"<i><d p="0.0,7,25,16777215,1291190667,0,x,1">["50","245","0-1","5.0","渐变","0","0","50","245"]</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let plan = engine.render_plan(
+            Duration::from_secs_f64(2.5),
+            DanmakuViewport::new(545, 388),
+            1,
+        );
+        assert!(!plan.items.is_empty());
+        for glyph in &plan.items {
+            assert!(
+                (glyph.color_rgba[3] - 0.5).abs() < 0.02,
+                "glyph alpha {} should follow the mode7 ramp",
+                glyph.color_rgba[3]
+            );
+        }
+    }
+
+    #[test]
+    fn mode7_duration_longer_than_scroll_stays_in_the_frame_window() {
+        let xml = r#"<i><d p="0.0,7,25,16777215,1291190667,0,x,1">["10","10","1-1","12","长弹幕","10","10"]</d></i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let viewport = DanmakuViewport::new(545, 388);
+        let prepared = engine.prepare(viewport, 1);
+        let frame = prepared.frame_layout(Duration::from_secs(10), 1);
+        assert_eq!(frame.items.len(), 1);
+        assert_eq!(frame.items[0].mode, DanmakuMode::Special);
+    }
+
+    #[test]
+    fn mode7_parser_rejects_non_finite_values_and_caps_duration() {
+        let xml = r#"<i>
+<d p="1.0,7,25,16777215,1291190667,0,x,1">["10","20","0.1-1","inf","无限时长","0","0","100","200"]</d>
+<d p="2.0,7,25,16777215,1291190667,0,x,2">["NaN","20","0.1-1","4","NaN 坐标","0","0","100","200"]</d>
+<d p="3.0,7,25,16777215,1291190667,0,x,3">["10","20","NaN-1","4","坏 alpha","0","0","100","200"]</d>
+<d p="4.0,7,25,16777215,1291190667,0,x,4">["10","20","0.1-1","999999","超长时长","0","0","100","200"]</d>
+<d p="5.0,7,25,16777215,1291190667,0,x,5">["10","20","0.1-1","4.5","正常","0","0","100","200"]</d>
+</i>"#;
+        let items = parse_bilibili_xml(xml).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "超长时长");
+        assert_eq!(
+            items[0].special.as_ref().unwrap().duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(items[1].text, "正常");
+        assert_eq!(items[1].special.as_ref().unwrap().duration_seconds, 4.5);
+    }
+
+    #[test]
+    fn mode7_sanitizer_rejects_non_finite_and_caps_duration() {
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: f64::INFINITY,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                x1: f64::NAN,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert!(
+            sanitize_mode7_special(DanmakuSpecial {
+                alpha_from: f32::NAN,
+                ..mode7_special()
+            })
+            .is_none()
+        );
+        assert_eq!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: 1e9,
+                ..mode7_special()
+            })
+            .unwrap()
+            .duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            sanitize_mode7_special(DanmakuSpecial {
+                duration_seconds: 0.0,
+                ..mode7_special()
+            })
+            .unwrap()
+            .duration_seconds,
+            MODE7_MIN_DURATION_SECONDS
+        );
+    }
+
+    #[test]
+    fn mode7_layout_caps_the_shared_frame_window() {
+        // Hand-built payloads bypass the parser, so the layout must sanitize
+        // them too before they reach DFM+.
+        let item = DanmakuItem {
+            id: 1,
+            pts: Duration::from_secs(0),
+            text: "外部构造".to_string(),
+            mode: DanmakuMode::Special,
+            font_size: 25.0,
+            color: DanmakuColor::WHITE,
+            opacity: 1.0,
+            is_self: false,
+            special: Some(DanmakuSpecial {
+                duration_seconds: 1e9,
+                ..mode7_special()
+            }),
+        };
+        let timeline = DanmakuTimeline::new(vec![item.clone()]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        let prepared = engine.prepare(DanmakuViewport::new(545, 388), 1);
+        assert_eq!(prepared.items().len(), 1);
+        assert_eq!(
+            prepared.dfm_layout.items[0].duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            prepared.dfm_layout.max_duration_seconds,
+            MODE7_MAX_DURATION_SECONDS
+        );
+        assert_eq!(
+            prepared
+                .frame_layout(Duration::from_secs(59), 1)
+                .items
+                .len(),
+            1
+        );
+        assert!(
+            prepared
+                .frame_layout(Duration::from_secs(61), 1)
+                .items
+                .is_empty()
+        );
+
+        let broken = DanmakuItem {
+            id: 2,
+            special: Some(DanmakuSpecial {
+                x1: f64::NAN,
+                ..mode7_special()
+            }),
+            ..item
+        };
+        let timeline = DanmakuTimeline::new(vec![broken]).unwrap();
+        let mut engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
+        assert!(
+            engine
+                .prepare(DanmakuViewport::new(545, 388), 1)
+                .items()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn json_mode7_payload_becomes_a_special_comment() {
+        let input = r#"{"comments":[{"time":1,"content":"[\"10\",\"20\",\"1-1\",\"3\",\"JSON高级\",\"100\",\"20\"]","type":"7","date":1291190667}]}"#;
+        let timeline = DanmakuTimeline::from_json(input).unwrap();
+        assert_eq!(timeline.items().len(), 1);
+        let item = &timeline.items()[0];
+        assert_eq!(item.mode, DanmakuMode::Special);
+        assert_eq!(item.text, "JSON高级");
+        let special = item.special.as_ref().expect("json mode7 payload");
+        assert_eq!(special.x2, 100.0);
+        assert_eq!(special.source_date, 1_291_190_667);
+    }
+
+    #[test]
+    fn mode7_duplicate_merge_keeps_distinct_animation_paths() {
+        let xml = r#"<i>
+<d p="0.0,7,25,16777215,1291190667,0,x,1">["10","10","1-1","3","同文本","100","10"]</d>
+<d p="0.5,7,25,16777215,1291190667,0,x,2">["10","50","1-1","3","同文本","100","50"]</d>
+</i>"#;
+        let timeline = DanmakuTimeline::from_bilibili_xml(xml).unwrap();
+        let config = DanmakuLayoutConfig {
+            merge_duplicates: true,
+            ..DanmakuLayoutConfig::default()
+        };
+        let mut engine = DfmLayoutEngine::new(timeline, config);
+        let prepared = engine.prepare(DanmakuViewport::new(545, 388), 1);
+        assert_eq!(prepared.items().len(), 2);
+        assert_eq!(prepared.stats().prepared_special_items, 2);
+        let frame = prepared.frame_layout(Duration::from_secs_f64(1.0), 1);
+        assert_eq!(frame.items.len(), 2);
+        assert_eq!(DanmakuFrameStats::from_layout(&frame).special_items, 2);
+    }
+
     #[test]
     fn custom_font_rejects_oversized_file_from_metadata() {
         let path = std::env::temp_dir().join(format!(
@@ -3842,5 +5603,168 @@ mod tests {
         assert_eq!(fonts.len(), 2);
         assert_eq!(fonts[0].font.font_data().as_ptr(), attachment.data.as_ptr());
         assert_eq!(fonts[1].font.font_data().as_ptr(), attachment.data.as_ptr());
+    }
+
+    #[test]
+    fn fallback_miss_loads_no_faces() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        db.load_font_data(NIPAPLAY_FALLBACK_FONT.to_vec());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+
+        assert!(fallback.resolve('\u{1F389}').is_none());
+
+        assert!(
+            fallback.loaded.is_empty(),
+            "a character no face covers must not load any font file"
+        );
+    }
+
+    #[test]
+    fn fallback_hit_loads_only_covering_face() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+
+        let face = fallback.resolve('A').unwrap();
+
+        assert!(face.has_glyph('A'));
+        let loaded = fallback
+            .loaded
+            .values()
+            .filter_map(|face| face.as_ref())
+            .count();
+        assert_eq!(loaded, 1);
+    }
+
+    #[test]
+    fn fallback_lru_evicts_least_recently_used_face() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        db.load_font_data(NIPAPLAY_FALLBACK_FONT.to_vec());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 2;
+        let (a, b, c) = (fallback.faces[0], fallback.faces[1], fallback.faces[2]);
+
+        fallback.load_face(a).unwrap();
+        fallback.load_face(b).unwrap();
+        fallback.load_face(a).unwrap(); // touch: a becomes most recently used
+        fallback.load_face(c).unwrap(); // evicts b, not a
+
+        assert!(!fallback.loaded.contains_key(&b));
+        assert!(fallback.loaded.get(&a).unwrap().is_some());
+        assert!(fallback.loaded.get(&c).unwrap().is_some());
+    }
+
+    #[test]
+    fn fallback_evicted_face_reuses_its_stable_id() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 1;
+        let (a, b) = (fallback.faces[0], fallback.faces[1]);
+
+        let first = fallback.load_face(a).unwrap();
+        let second = fallback.load_face(b).unwrap();
+        assert_ne!(first.id, second.id);
+
+        let reloaded = fallback.load_face(a).unwrap();
+
+        assert_eq!(
+            reloaded.id, first.id,
+            "a reloaded face must reuse its id because glyph caches key on it"
+        );
+    }
+
+    #[test]
+    fn fallback_resolve_recovers_after_eviction() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 1;
+
+        let first = fallback.resolve('A').unwrap();
+        fallback.load_face(fallback.faces[1]).unwrap(); // evicts the resolved face
+
+        let again = fallback.resolve('A').unwrap();
+
+        assert_eq!(again.id, first.id);
+    }
+
+    #[test]
+    fn fallback_keeps_visible_generic_glyphs_ahead_of_emoji_fonts() {
+        // Keep cmap coverage and metrics, but remove the outlines. This models
+        // a color font the outline rasterizer cannot paint, without depending
+        // on any platform's installed fonts.
+        let mut blank_data = NIPAPLAY_FALLBACK_FONT.to_vec();
+        let table_count = u16::from_be_bytes(blank_data[4..6].try_into().unwrap()) as usize;
+        let record = (0..table_count)
+            .map(|index| 12 + index * 16)
+            .find(|&record| &blank_data[record..record + 4] == b"glyf")
+            .unwrap();
+        let offset =
+            u32::from_be_bytes(blank_data[record + 8..record + 12].try_into().unwrap()) as usize;
+        let length =
+            u32::from_be_bytes(blank_data[record + 12..record + 16].try_into().unwrap()) as usize;
+        blank_data[offset..offset + length].fill(0);
+
+        let mut template_db = fontdb::Database::new();
+        template_db.load_font_data(NIPAPLAY_FALLBACK_FONT.to_vec());
+        let template = template_db.faces().next().unwrap().clone();
+        for family in ["Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"] {
+            let mut db = fontdb::Database::new();
+            let mut emoji = template.clone();
+            emoji.id = fontdb::ID::dummy();
+            emoji.families = vec![(family.into(), fontdb::Language::English_UnitedStates)];
+            emoji.source = fontdb::Source::Binary(Arc::new(blank_data.clone()));
+            // Put the blank face first in database order too: the generic
+            // fallback must retain its existing priority over it.
+            let emoji_id = db.push_face_info(emoji);
+            let mut generic = template.clone();
+            generic.id = fontdb::ID::dummy();
+            generic.families = vec![(
+                "Regression Sans".into(),
+                fontdb::Language::English_UnitedStates,
+            )];
+            db.push_face_info(generic);
+            db.set_sans_serif_family("Regression Sans");
+            db.set_serif_family("Regression Sans");
+            let mut fallback = SystemFontFallback::with_database(db, 1);
+
+            assert!(fallback.face_covers(emoji_id, 'A'));
+            let blank = fallback.load_face(emoji_id).unwrap();
+            let key = |face: &DanmakuFontFace| GlyphCacheKey::new(face.id, 'A', 32.0, 1.0, false);
+            assert!(
+                rasterize_font_glyph(blank.font.as_ref(), key(&blank))
+                    .fill_alpha
+                    .iter()
+                    .all(|&pixel| pixel == 0),
+                "the competing emoji fixture must be invisible"
+            );
+
+            let selected = fallback.resolve('A').unwrap();
+            assert!(
+                rasterize_font_glyph(selected.font.as_ref(), key(&selected))
+                    .fill_alpha
+                    .iter()
+                    .any(|&pixel| pixel > 0),
+                "{family} must not hide a visible generic fallback glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_cap_zero_disables_caching() {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(test_ttc());
+        let mut fallback = SystemFontFallback::with_database(db, 1);
+        fallback.resident_cap = 0;
+
+        let first = fallback.resolve('A').unwrap();
+        let again = fallback.resolve('A').unwrap();
+
+        assert_eq!(again.id, first.id);
+        assert!(fallback.loaded.is_empty());
+        assert!(fallback.resident.is_empty());
     }
 }

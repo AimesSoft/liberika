@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "capi_smoke"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika_capi",
 ]
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "coreaudio_smoke"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "crossbeam-channel",
  "erika",
@@ -541,7 +541,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "danmaku_perf_lab"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "cc",
  "erika",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "danmaku_sync_smoke"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
@@ -644,9 +644,10 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "erika"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "ab_glyph",
+ "ab_glyph_rasterizer",
  "aho-corasick",
  "ash",
  "bytemuck",
@@ -656,9 +657,14 @@ dependencies = [
  "crossbeam-channel",
  "encoding_rs",
  "erika_ffmpeg_sys",
+ "erika_plugin",
  "fontdb",
  "glow",
+ "httpdate",
+ "js-sys",
  "libc",
+ "memmap2",
+ "naga",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -667,6 +673,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "pkg-config",
+ "png",
  "pollster",
  "regex",
  "reqwest",
@@ -678,13 +685,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "ttf-parser",
+ "wasm-bindgen",
  "wgpu",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
 name = "erika_capi"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "crossbeam-channel",
  "erika",
@@ -695,11 +705,20 @@ dependencies = [
 
 [[package]]
 name = "erika_ffmpeg_sys"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "bindgen 0.72.1",
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "erika_plugin"
+version = "0.3.8"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -723,42 +742,42 @@ dependencies = [
 
 [[package]]
 name = "ffmpeg_audio_decode"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
 name = "ffmpeg_decode"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
 name = "ffmpeg_demux"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
 name = "ffmpeg_probe"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
 name = "ffmpeg_probe_source"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
 name = "ffmpeg_videotoolbox"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
@@ -848,6 +867,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "frame_export_bench"
+version = "0.3.8"
+dependencies = [
+ "erika",
+ "png",
+ "serde_json",
 ]
 
 [[package]]
@@ -1108,6 +1136,12 @@ name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hyper"
@@ -1390,13 +1424,12 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.99"
+version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "142bc4740e452c1e57ade0cbc129f139c9093e354346f0872ef985f4f5cf5f11"
+checksum = "8dc09d2154098bbf4ef54eab6b117a3c24cbbffe94046b16ee6d6d4510584d3a"
 dependencies = [
  "cfg-if",
  "futures-util",
- "once_cell",
  "wasm-bindgen",
 ]
 
@@ -1465,7 +1498,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "linux_native_demo"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
  "winit",
@@ -1506,7 +1539,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "macos_native_demo"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "cc",
  "crossbeam-channel",
@@ -1530,14 +1563,14 @@ dependencies = [
 
 [[package]]
 name = "metal_import_videotoolbox"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
 name = "metal_overlay_check"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "cc",
  "erika",
@@ -1545,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "metal_presenter_check"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "cc",
  "erika",
@@ -1598,6 +1631,7 @@ dependencies = [
  "log",
  "num-traits",
  "once_cell",
+ "pp-rs",
  "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.18",
@@ -2127,21 +2161,30 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playback_audio_tick"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
+name = "playback_rate_check"
+version = "0.3.8"
+dependencies = [
+ "crossbeam-channel",
+ "erika",
+ "serde_json",
+]
+
+[[package]]
 name = "playback_tick"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
 
 [[package]]
 name = "player_tick"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "crossbeam-channel",
  "erika",
@@ -2202,6 +2245,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "pp-rs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb458bb7f6e250e6eb79d5026badc10a3ebb8f9a15d1fff0f13d17c71f4d6dee"
+dependencies = [
+ "unicode-xid",
 ]
 
 [[package]]
@@ -2438,7 +2490,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "render_pipeline_plan"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
 ]
@@ -3183,6 +3235,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3282,12 +3340,11 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.122"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ed04576f974d2b2fba0f38c51dbc5518011e38c36bf1143164be765528fd409"
+checksum = "a0181c14ddd6c7b8b0b0132a5f1ea2f32be0d893cd3ea97b6e3b28886b8a3d1c"
 dependencies = [
  "cfg-if",
- "once_cell",
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
@@ -3295,19 +3352,20 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.72"
+version = "0.4.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9473dbd2991ae90b6291c3c32c30c6187ac49aa32f9905d1cce280ec1e110b0f"
+checksum = "5e14e0327cb5368ad60ccb22d04a9827a693c95a926d8d125e9fa39e0baec501"
 dependencies = [
  "js-sys",
+ "tokio",
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.122"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "916151b09da36bd82f6615cbf3a419e2f0ba23a03c6160e8e92eb6bd4aa1dec6"
+checksum = "6e931a02a39abdbf66966fc35902b5ed58344750a70885bed4ebb3d8eaf28ed9"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -3315,22 +3373,22 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.122"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "299047362ccbfce148b67ab7e73349f77748e00c8296f9542adfad2ad82c5c5e"
+checksum = "2ca4b54280e455bd831e33a6b8e734baf432fe63fbc35c42ac14ce67a043a53a"
 dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
  "wasm-bindgen-shared",
 ]
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.122"
+version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a929b2c61f11ba3e9bc35b50c1f25cb38e0e892c0c231ae2b8cf78d5dad4437"
+checksum = "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
 dependencies = [
  "unicode-ident",
 ]
@@ -3446,9 +3504,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.99"
+version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d621441cfc37b84979402712047321980c178f299193a3589d05b99e8763436"
+checksum = "d7d179596ff5ec0f6de4db64d54011bde6289cc49603d3a6e4ce3f329207ab88"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -3641,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu_decode_png"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
  "png",
@@ -3649,7 +3707,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu_overlay_png"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
  "png",
@@ -3657,7 +3715,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu_video_png"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
  "png",
@@ -3665,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu_window_check"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "cc",
  "erika",
@@ -3904,7 +3962,7 @@ checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
 
 [[package]]
 name = "windows_native_demo"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "erika",
  "windows-sys 0.61.2",
@@ -4084,7 +4142,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.8"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "serde_json",

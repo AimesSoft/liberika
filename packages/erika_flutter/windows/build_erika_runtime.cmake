@@ -68,7 +68,7 @@ if(NOT "$ENV{ERIKA_FORCE_SOURCE_BUILD}" STREQUAL "1")
     "${ERIKA_CACHE_ROOT}/${ERIKA_CACHE_TAG}-${ERIKA_ASSET_ARCH}")
   set(ERIKA_ZIP "${ERIKA_WORK}/bundle.zip")
   set(ERIKA_URL
-    "https://github.com/AimesSoft/Erika/releases/download/${ERIKA_PREBUILT_TAG}/erika-capi-windows-${ERIKA_ASSET_ARCH}.zip")
+    "https://github.com/AimesSoft/liberika/releases/download/${ERIKA_PREBUILT_TAG}/erika-capi-windows-${ERIKA_ASSET_ARCH}.zip")
 
   if(EXISTS "${ERIKA_ZIP}")
     file(SHA256 "${ERIKA_ZIP}" ERIKA_CACHED_SHA256)

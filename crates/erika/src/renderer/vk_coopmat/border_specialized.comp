@@ -1,0 +1,47 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#define SPECIALIZED_LAYER
+#include "common.glsl"
+layout(local_size_x=128) in;
+layout(constant_id=21) const uint COMMON_KERNEL=0;
+layout(constant_id=23) const uint COMMON_TRANSFORM=0xffffffffu;
+layout(constant_id=29) const uint COMMON_REAL_CHANNELS=0;
+
+// Each layer has constant graph offsets. Walk OIHW directly instead of
+// re-reading a four-word IR descriptor for every scalar multiply-add.
+void main() {
+    uint perimeter=2*p.size.x+2*p.size.y,index=gl_GlobalInvocationID.x;
+    uint channel=index/perimeter,t=index%perimeter;
+    if(channel>=h(1)) return;
+    ivec2 q;
+    if(t<p.size.x) q=ivec2(t,0);
+    else if(t<2*p.size.x) {if(p.size.y==1) return; q=ivec2(t-p.size.x,p.size.y-1);}
+    else {
+        t-=2*p.size.x;
+        q=ivec2(t/p.size.y==0 ? 0 : int(p.size.x)-1,t%p.size.y);
+        if(q.y==0 || q.y==int(p.size.y)-1 || (p.size.x==1 && t/p.size.y!=0)) return;
+    }
+    ivec2 local=q-p.origin.xy;
+    if(any(lessThan(local,ivec2(p.region.xy))) || any(greaterThanEqual(local,ivec2(p.region.xy+p.region.zw)))) return;
+    uint row=q.y==0 ? 0 : q.y==int(p.size.y)-1 ? 2 : 1;
+    uint col=q.x==0 ? 0 : q.x==int(p.size.x)-1 ? 2 : 1;
+    uint variant=1+row*3+col;
+    uint weightBase=h(3)+variant*h(10)+channel*h(2),column=0;
+    float v=0.0;
+    for(uint tap=0;tap<h(14);) {
+        uint d=h(13)+tap*8;
+        uint kernel=COMMON_KERNEL!=0 ? COMMON_KERNEL : uint(1-2*int(data[d+1]));
+        uint channels=COMMON_REAL_CHANNELS!=0 ? COMMON_REAL_CHANNELS : data[d+6];
+        uint baseChannel=data[d],transform=COMMON_TRANSFORM!=0xffffffffu ? COMMON_TRANSFORM : data[d+3];
+        for(uint c=0;c<channels;++c)
+        [[unroll]] for(uint ky=0;ky<kernel;++ky) [[unroll]] for(uint kx=0;kx<kernel;++kx) {
+            float x=fetch(baseChannel+c,q+ivec2(kx,ky)-ivec2(kernel/2));
+            x=transform==1 ? max(x,0.0) : transform==2 ? max(-x,0.0) : x;
+            v+=float(weights[weightBase+column+(c*kernel+ky)*kernel+kx])*x;
+        }
+        column+=channels*kernel*kernel;
+        tap+=kernel*kernel;
+    }
+    epilogue(v,channel,uint(local.y)*p.size.z+uint(local.x),variant);
+}

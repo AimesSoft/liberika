@@ -10,7 +10,7 @@ const WIDTH: u32 = 128;
 const HEIGHT: u32 = 72;
 
 fn retain_test_graphics_runtime() {
-    // These tests construct wgpu directly and bypass Erika's renderer setup.
+    // These tests construct wgpu directly and bypass liberika's renderer setup.
     // WSL D3D12 registers TLS destructors that outlive Vulkan/EGL teardown.
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if std::path::Path::new("/dev/dxg").exists() {

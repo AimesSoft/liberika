@@ -1,0 +1,156 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#define SPECIALIZED_LAYER
+#include "common.glsl"
+
+// A private shared-memory chain. Only the final tensor reaches global memory.
+// This path is restricted to unbranched, same-width, 3x3 Identity convolutions,
+// optionally preceded by a folded 5x5 luma stem with exact border correction.
+layout(constant_id=26) const uint GROUPS=4;
+layout(constant_id=32) const uint CHANNELS=16;
+layout(constant_id=33) const uint STAGES=3;
+layout(constant_id=34) const uint TW=32;
+layout(constant_id=35) const uint TH=8;
+layout(constant_id=36) const uint INPUT_BASE=16;
+layout(constant_id=37) const uint W0=0;
+layout(constant_id=38) const uint W1=0;
+layout(constant_id=39) const uint W2=0;
+layout(constant_id=40) const uint B0=0;
+layout(constant_id=41) const uint B1=0;
+layout(constant_id=42) const uint B2=0;
+layout(constant_id=43) const uint RELUS=7;
+layout(constant_id=44) const uint STEM=0;
+layout(constant_id=45) const uint STEM_K=32;
+layout(constant_id=46) const uint STEM_VARIANT_STRIDE=512;
+layout(constant_id=47) const uint STEM_BIAS_STRIDE=16;
+layout(constant_id=48) const uint STEM_BORDER=0;
+layout(constant_id=49) const uint W3=0;
+layout(constant_id=50) const uint B3=0;
+layout(local_size_x=32,local_size_y_id=26) in;
+const uint SW0=TW+2*(STAGES-1), SH0=TH+2*(STAGES-1);
+const uint SW1=SW0-2, SH1=SH0-2;
+// Full matrix loads may read unused columns after a partial last strip.
+shared float16_t tmp0[(SW0*SH0+16)*CHANNELS];
+shared float16_t tmp1[STAGES>=3 ? (SW1*SH1+16)*CHANNELS : 1];
+const uint LW=SW0+4,LH=SH0+4;
+shared float16_t lumaPatch[STEM!=0 ? LW*LH+16 : 1];
+shared float16_t lumaB[STEM!=0 ? GROUPS*256 : 1];
+#ifdef HALF_ACCUM
+#define ACC float16_t
+#else
+#define ACC float
+#endif
+shared ACC coordinateTable[256];
+
+void main() {
+    uint lane=gl_SubgroupInvocationID,sg=gl_SubgroupID;
+    uvec2 start=p.region.xy+gl_WorkGroupID.xy*uvec2(TW,TH);
+    for(uint i=gl_LocalInvocationIndex;i<256;i+=32*GROUPS) coordinateTable[i]=ACC(i);
+    if(STEM!=0) for(uint i=gl_LocalInvocationIndex;i<LW*LH;i+=32*GROUPS) {
+        ivec2 q=p.origin.xy+ivec2(start)+ivec2(i%LW,i/LW)-ivec2(STAGES+1);
+        lumaPatch[i]=float16_t(inside(q) || p.core.w!=0 ? (raw(q)-p.norm.x)*p.norm.y : 0.0);
+    }
+    barrier();
+    // The component distribution is implementation-defined. Loading a matrix
+    // of coordinates with the exact accumulator type makes element access
+    // portable, and avoids round-tripping every result through shared sums.
+    coopmat<ACC,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator> coordinates;
+    coopMatLoad(coordinates,coordinateTable,0,16,gl_CooperativeMatrixLayoutColumnMajor);
+    [[unroll]] for(uint stage=0;stage<STAGES;++stage) {
+        uint remaining=STAGES-1-stage;
+        uvec2 extent=uvec2(TW,TH)+2*remaining;
+        uvec2 origin=start-remaining;
+        uint strips=(extent.x+15)/16;
+        uint wbase=stage==0 ? W0 : stage==1 ? W1 : stage==2 ? W2 : W3;
+        uint bias=stage==0 ? B0 : stage==1 ? B1 : stage==2 ? B2 : B3;
+        coopmat<float16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA> a[9*(CHANNELS/16)*(CHANNELS/16)];
+        if(STEM!=0 && stage==0) {
+            [[unroll]] for(uint ob=0;ob<CHANNELS/16;++ob) [[unroll]] for(uint ib=0;ib<2;++ib)
+                coopMatLoad(a[ob*2+ib],weights,wbase+ob*16*STEM_K+ib*16,STEM_K,gl_CooperativeMatrixLayoutRowMajor);
+        } else [[unroll]] for(uint t=0;t<9;++t)
+        [[unroll]] for(uint ib=0;ib<CHANNELS/16;++ib)
+        [[unroll]] for(uint ob=0;ob<CHANNELS/16;++ob)
+            coopMatLoad(a[(t*(CHANNELS/16)+ib)*(CHANNELS/16)+ob],weights,
+                wbase+t*CHANNELS*CHANNELS+ob*16*CHANNELS+ib*16,CHANNELS,gl_CooperativeMatrixLayoutRowMajor);
+        for(uint task=sg;task<strips*extent.y;task+=GROUPS) {
+            uvec2 at=uvec2((task%strips)*16,task/strips);
+            coopmat<ACC,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator> acc[CHANNELS/16];
+            [[unroll]] for(uint ob=0;ob<CHANNELS/16;++ob)
+                acc[ob]=coopmat<ACC,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>(0.0);
+            if(STEM!=0 && stage==0) {
+                [[unroll]] for(uint ib=0;ib<2;++ib) {
+                    for(uint i=lane;i<256;i+=32) {
+                        uint r=ib*16+i/16;
+                        lumaB[sg*256+i]=r<25 ? lumaPatch[(at.y+r/5)*LW+at.x+i%16+r%5] : float16_t(0.0);
+                    }
+                    memoryBarrierShared(); subgroupBarrier();
+                    coopmat<float16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB> b;
+                    coopMatLoad(b,lumaB,sg*256,16,gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for(uint ob=0;ob<CHANNELS/16;++ob) acc[ob]=coopMatMulAdd(a[ob*2+ib],b,acc[ob]);
+                    subgroupBarrier();
+                }
+            } else [[unroll]] for(uint ib=0;ib<CHANNELS/16;++ib) {
+                [[unroll]] for(uint ky=0;ky<3;++ky) [[unroll]] for(uint kx=0;kx<3;++kx) {
+                    coopmat<float16_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB> b;
+                    if(stage==0) {
+                        uvec2 q=origin+at+uvec2(kx,ky)-1;
+                        coopMatLoad(b,features,feature_index(INPUT_BASE+ib*16,q.y*p.size.z+q.x),16,gl_CooperativeMatrixLayoutColumnMajor);
+                    } else if((stage&1u)!=0) {
+                        coopMatLoad(b,tmp0,((at.y+ky)*(TW+2*(STAGES-stage))+at.x+kx)*CHANNELS+ib*16,CHANNELS,gl_CooperativeMatrixLayoutColumnMajor);
+                    } else {
+                        coopMatLoad(b,tmp1,((at.y+ky)*(TW+2*(STAGES-stage))+at.x+kx)*CHANNELS+ib*16,CHANNELS,gl_CooperativeMatrixLayoutColumnMajor);
+                    }
+                    [[unroll]] for(uint ob=0;ob<CHANNELS/16;++ob) {
+                        acc[ob]=coopMatMulAdd(a[((ky*3+kx)*(CHANNELS/16)+ib)*(CHANNELS/16)+ob],b,acc[ob]);
+                    }
+                }
+            }
+            [[unroll]] for(uint ob=0;ob<CHANNELS/16;++ob)
+            [[unroll]] for(uint e=0;e<acc[ob].length();++e) {
+                uint i=uint(coordinates[e]);
+                uvec2 pos=at+uvec2(i/16,0);
+                if(pos.x>=extent.x) continue;
+                uint ch=ob*16+i%16;
+                float v=float(acc[ob][e]);
+                if(stage+1==STAGES) {
+                    uvec2 q=origin+pos;
+                    epilogue(v,ch,q.y*p.size.z+q.x,0);
+                } else {
+                    ivec2 q=p.origin.xy+ivec2(origin+pos);
+                    uint variant=0;
+                    if(STEM!=0 && stage==0 && STEM_BORDER!=0 && inside(q)
+                        && (q.x==0 || q.y==0 || q.x==int(p.size.x)-1 || q.y==int(p.size.y)-1)) {
+                        uint ry=q.y==0 ? 0 : q.y==int(p.size.y)-1 ? 2 : 1;
+                        uint rx=q.x==0 ? 0 : q.x==int(p.size.x)-1 ? 2 : 1;
+                        variant=1+ry*3+rx;
+                        v=0.0;
+                        [[unroll]] for(uint k=0;k<25;++k)
+                            v+=float(weights[wbase+variant*STEM_VARIANT_STRIDE+ch*STEM_K+k])
+                                *float(lumaPatch[(pos.y+k/5)*LW+pos.x+k%5]);
+                    }
+                    v+=uintBitsToFloat(data[bias+variant*STEM_BIAS_STRIDE+ch]);
+                    if((RELUS&(1u<<stage))!=0) v=max(v,0.0);
+                    if(!inside(p.origin.xy+ivec2(origin+pos))) v=0.0;
+                    if((stage&1u)==0) tmp0[(pos.y*extent.x+pos.x)*CHANNELS+ch]=float16_t(v);
+                    else tmp1[(pos.y*extent.x+pos.x)*CHANNELS+ch]=float16_t(v);
+                }
+            }
+        }
+        barrier();
+        if(stage+1<STAGES && p.core.w!=0) {
+            for(uint i=gl_LocalInvocationIndex;i<extent.x*extent.y*CHANNELS;i+=32*GROUPS) {
+                uvec2 pos=uvec2((i/CHANNELS)%extent.x,(i/CHANNELS)/extent.x);
+                ivec2 q=p.origin.xy+ivec2(origin+pos);
+                if(inside(q)) continue;
+                ivec2 clamped=clamp(q,ivec2(0),ivec2(p.size.xy)-1)-p.origin.xy-ivec2(origin);
+                uint src=(uint(clamped.y)*extent.x+uint(clamped.x))*CHANNELS+i%CHANNELS;
+                if((stage&1u)==0) tmp0[i]=tmp0[src]; else tmp1[i]=tmp1[src];
+            }
+            barrier();
+        }
+    }
+}

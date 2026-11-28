@@ -253,16 +253,20 @@ struct MediaServer {
 
 impl MediaServer {
     fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let uri = format!("http://{}/fixture.mkv", listener.local_addr().unwrap());
-        let bytes = Arc::new(
+        Self::with_bytes(
             std::fs::read(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/testdata/playback/playback-fixture.mkv"
             ))
             .unwrap(),
-        );
+        )
+    }
+
+    fn with_bytes(bytes: Vec<u8>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let uri = format!("http://{}/fixture.mkv", listener.local_addr().unwrap());
+        let bytes = Arc::new(bytes);
         let stall_next = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (stalled_tx, stalled) = mpsc::channel();
@@ -347,6 +351,7 @@ impl MediaServer {
             http_headers: vec![],
             http_read_ahead_bytes: Some(64 * 1024),
             http_back_buffer_bytes: Some(64 * 1024),
+            start_position: None,
         }
     }
 }
@@ -473,4 +478,131 @@ fn memory_probe_repeated_http_open_stop_close() {
         sample(cycle, "closed");
         assert_eq!(player.state(), PlayerState::Closed);
     }
+}
+
+/// Real loopback HTTP Range transport, FFmpeg, demux worker and playback worker.
+/// The server withholds one 206 body per round until a seek closes the socket;
+/// no MediaSource implementation is substituted.
+/// Generate a longer fixture to avoid keeping the entire media in FFmpeg's
+/// probe/cache buffers:
+/// ffmpeg -stream_loop 19 -i crates/erika/testdata/playback/playback-fixture.mkv \
+///   -map 0 -c copy -t 160 /tmp/erika-http-seek-fixture.mkv
+/// ERIKA_HTTP_SEEK_FIXTURE=/tmp/erika-http-seek-fixture.mkv cargo test -p erika \
+///   --test media_lifecycle http_seek_interruption -- --ignored --nocapture
+#[test]
+#[ignore = "manual HTTP seek stress probe with ERIKA_HTTP_SEEK_FIXTURE"]
+fn http_seek_interruption_recovers_and_reaches_natural_eof() {
+    use erika::PlayerEvent;
+
+    let fixture = std::env::var_os("ERIKA_HTTP_SEEK_FIXTURE")
+        .expect("set ERIKA_HTTP_SEEK_FIXTURE to a generated 160-second fixture");
+    let server = MediaServer::with_bytes(std::fs::read(fixture).unwrap());
+    let mut config = PlayerConfig::default();
+    config.playback.video_decode = VideoDecodePreference::Software;
+    let player = Player::new(config);
+    let events = player.subscribe();
+    let video = player.subscribe_video_frames();
+    let audio = player.subscribe_audio_frames();
+    player.open(server.request()).unwrap();
+    let duration = player.duration().expect("fixture duration");
+    assert!(
+        duration >= Duration::from_secs(60),
+        "use the longer fixture"
+    );
+    player.play().unwrap();
+    let first = video
+        .recv_timeout(WAIT)
+        .expect("HTTP playback did not start");
+    eprintln!("HTTP_SEEK_E2E initial_frame_pts={:?}", first.pts);
+
+    for round in 1..=12 {
+        server.stall_next.store(true, Ordering::Release);
+        player.seek(duration / 2).unwrap();
+        server
+            .stalled
+            .recv_timeout(WAIT)
+            .expect("server did not receive the controlled Range request");
+        // Give the real HTTP client time to enter its response-body wait.
+        thread::sleep(Duration::from_millis(10));
+        let started = Instant::now();
+        player.seek(Duration::from_secs(2)).unwrap();
+        player.seek(Duration::ZERO).unwrap();
+        player.seek(Duration::ZERO).unwrap(); // Duplicate slider release.
+        server
+            .cancelled
+            .recv_timeout(CANCEL_LIMIT)
+            .expect("seek did not cancel the in-flight HTTP response");
+        let cancel_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let generation = player.playback_snapshot().generation;
+        let deadline = Instant::now() + WAIT;
+        let mut recovered_frames = 0;
+        let recovered_pts = loop {
+            for event in events.try_iter() {
+                if let PlayerEvent::Error(error) = event {
+                    panic!("round {round}: playback fatal: {error:?}");
+                }
+            }
+            while audio.try_recv().is_ok() {}
+            for frame in video.try_iter() {
+                if frame.generation == generation {
+                    recovered_frames += 1;
+                    if frame.pts.unwrap_or_default() >= Duration::from_millis(200) {
+                        break;
+                    }
+                }
+            }
+            let position = player.playback_snapshot().media_time();
+            if recovered_frames >= 3 && position >= Duration::from_millis(200) {
+                break position;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: seek did not resume"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_ne!(player.state(), PlayerState::Error);
+        eprintln!(
+            "HTTP_SEEK_E2E round={round} cancelled_ms={cancel_ms:.2} generation={generation} recovered_frames={recovered_frames} position={recovered_pts:?}"
+        );
+    }
+
+    player
+        .seek(duration.saturating_sub(Duration::from_secs(3)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut final_frames = 0;
+    let mut final_pts = Duration::ZERO;
+    loop {
+        while audio.try_recv().is_ok() {}
+        for frame in video.try_iter() {
+            final_frames += 1;
+            final_pts = final_pts.max(frame.pts.unwrap_or_default());
+        }
+        let mut ended = false;
+        for event in events.try_iter() {
+            match event {
+                PlayerEvent::Error(error) => panic!("EOF phase playback fatal: {error:?}"),
+                PlayerEvent::Ended => ended = true,
+                _ => {}
+            }
+        }
+        if ended {
+            assert_eq!(player.state(), PlayerState::Stopped);
+            assert!(
+                final_pts >= duration.saturating_sub(Duration::from_secs(1)),
+                "last frame: {final_pts:?}"
+            );
+            eprintln!(
+                "HTTP_SEEK_E2E natural_eof=true fatal_events=0 final_frames={final_frames} last_pts={final_pts:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "playback did not reach natural EOF"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    player.close().unwrap();
 }

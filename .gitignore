@@ -12,3 +12,5 @@
 /packages/erika_flutter/ios/native/
 /packages/erika_flutter/tvos/native/
 .DS_Store
+__pycache__/
+*.py[cod]

@@ -1,8 +1,8 @@
-# Erika Danmaku Perf Lab
+# liberika Danmaku Perf Lab
 
 [中文](README.zh.md) | [English](README.md) | [日本語](README.ja.md)
 
-Erika 的受控弹幕性能测试工具。它刻意独立于 NipaPlay，这样弹幕密度、viewport 大小、media time、视频解码和 trace 输出都可以在没有 Flutter/UI 干扰的情况下自由变化。
+liberika 的受控弹幕性能测试工具。它刻意独立于 NipaPlay，这样弹幕密度、viewport 大小、media time、视频解码和 trace 输出都可以在没有 Flutter/UI 干扰的情况下自由变化。
 
 ## Synthetic danmaku load
 

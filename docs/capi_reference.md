@@ -1,4 +1,4 @@
-# Erika C ABI Reference
+# liberika C ABI Reference
 
 > Translations: [中文](capi_reference.zh.md) · [日本語](capi_reference.ja.md)
 
@@ -14,12 +14,12 @@ For the embedding walkthrough (surface attach, the render loop, teardown) see
 
 ## Two handle families
 
-Erika exposes two independent entry points. Pick one per integration.
+liberika exposes two independent entry points. Pick one per integration.
 
 | Handle | Model | Who renders | Use when |
 |--------|-------|-------------|----------|
 | `ErikaHandle` | **Pull** | The host | You own the render loop and pull decoded frames / drive your own compositor. |
-| `ErikaPresenterHandle` | **Push** | Erika | You give Erika a native surface and call `render_tick` once per display frame. Erika owns decode, timing, audio, overlays, and presentation. |
+| `ErikaPresenterHandle` | **Push** | liberika | You give liberika a native surface and call `render_tick` once per display frame. liberika owns decode, timing, audio, overlays, and presentation. |
 
 `ErikaPresenterHandle` is the recommended path and what the Flutter plugin and
 the native demos use. It is compiled on **macOS, iOS, tvOS, Windows, Android,
@@ -80,7 +80,90 @@ uses FFmpeg GIF semantics: `-1` disables looping, `0` loops forever, and a
 positive value is the loop count. HTTP inputs accept the same headers and
 read-ahead override as `ErikaOpenOptions`.
 
+## Headless frame export
+
+`erika_export_frame` is independent of both handle families too. It opens a
+private demuxer and a multi-threaded software decoder, seeks to the keyframe
+before `position_millis`, decodes forward and returns the picture shown at that
+media time: the last frame at or before it (the first frame when the position
+precedes it).
+
+```c
+ErikaFrameExportOptions options = {
+    .input_uri = "/path/input.mkv",
+    .position_millis = 60000,
+    .max_width = 640,
+    .max_height = 640,
+    .format = ErikaFrameExportFormat_Png,
+};
+ErikaFrameExportResult result = {0};
+if (erika_export_frame(&options, &result) == ErikaStatus_Ok) {
+    /* result.data holds result.data_len bytes of a PNG file. */
+    erika_frame_export_result_free(&result);
+}
+```
+
+The call is synchronous; UI hosts must run it on a worker thread or isolate.
+`max_width` and `max_height` bound the picture (0 leaves a side unbounded): the
+display aspect ratio is kept and the picture is never larger than the video, so
+two zeros return the video's own size. `ErikaFrameExportFormat_Rgba` returns
+rows of exactly `width * 4` bytes with alpha 255; `ErikaFrameExportFormat_Png`
+returns an 8-bit RGB PNG file. Colour conversion follows the frame's colour
+space and range; an unlabelled YUV source is taken as BT.709 when it is HD or
+larger and BT.601 otherwise. HDR sources (PQ, HLG, Dolby Vision) are tone
+mapped to SDR with the arithmetic Erika's renderer uses for an SDR display
+(ITU-R BT.2390 EETF against a 203-nit target, BT.2020 to BT.709 gamut mapping,
+gamma 2.2), and `ERIKA_FRAME_EXPORT_TONE_MAPPED` is set in
+`result.reserved_flags`; SDR sources keep the plain colour conversion.
+The result reports where the picture is (`timestamp_micros`), the decoded video
+size and the media duration (0 when unknown). A position at or past a known
+duration fails with `ErikaStatus_PlayerError`. HTTP inputs accept the same
+headers and read-ahead override as `ErikaOpenOptions`. `data` stays owned by
+liberika until `erika_frame_export_result_free`, which clears the result and
+may be called again.
+
+### Taking many pictures
+
+`erika_export_frame` opens the media and seeks for every picture. For several
+pictures of one media, open an `ErikaFrameExportSession` once and ask it for
+each picture; the demuxer and decoder stay open.
+
+```c
+ErikaFrameExportSessionOptions open = { .input_uri = "/path/input.mkv" };
+ErikaFrameExportSession *session = NULL;
+if (erika_frame_export_session_open(&open, &session) == ErikaStatus_Ok) {
+    for (uint64_t ms = 60000; ms < 66000; ms += 100) {
+        ErikaFrameExportRequest request = {
+            .position_millis = ms, .max_width = 640, .max_height = 640,
+            .format = ErikaFrameExportFormat_Png,
+        };
+        ErikaFrameExportResult result = {0};
+        if (erika_frame_export_session_frame(session, &request, &result) == ErikaStatus_Ok) {
+            erika_frame_export_result_free(&result);
+        }
+    }
+    erika_frame_export_session_close(session);
+}
+```
+
+A request after the previous one continues decoding from where the decoder
+stopped when no keyframe lies between that point and the request (the demuxer's
+seek index tells; without an index, when the request is within two seconds or
+half the longest keyframe interval seen), and seeks to the keyframe before it
+otherwise. Requests may come in any order; ascending order is the cheapest.
+Results, sizing, formats and tone mapping are those of `erika_export_frame`.
+A failed request leaves the session usable. Calls on one session are
+serialised; all calls are synchronous. `erika_frame_export_session_close`
+accepts `NULL`; no call on the session may be running or follow it.
+
 ## Conventions
+
+### Embedded font
+
+`erika_embedded_fallback_font(uintptr_t *out_length)` returns the font built into the
+library and its length, or `NULL` without one. The bytes live as long as the process
+and are not freed. A host serving a browser page can pass them to it, so that the
+page needs no font of its own.
 
 ### Status codes
 
@@ -88,11 +171,11 @@ Every fallible call returns `ErikaStatus`:
 
 | Value | Code | Meaning |
 |-------|------|---------|
-| `ErikaStatus_Ok` | 0 | Success. The thread-local error is cleared. |
+| `ErikaStatus_Ok` | 0 | Success. Most status-returning calls clear the thread-local error; see event handling below. |
 | `ErikaStatus_NullPointer` | 1 | A required handle or out-pointer was `NULL` (or a surface pointer was 0). |
 | `ErikaStatus_InvalidUtf8` | 2 | A `const char*` argument was not valid UTF-8. |
 | `ErikaStatus_PlayerError` | 3 | The engine rejected the call; read the message (see below). |
-| `ErikaStatus_Panic` | 4 | A Rust panic was caught at the boundary. The call had no effect beyond what completed before the panic; the handle should be considered suspect. |
+| `ErikaStatus_Panic` | 4 | A Rust panic was caught. The call may have partially changed state; consider the handle suspect. |
 | `ErikaStatus_NoEvent` | 5 | `*_poll_event` only: the queue is empty (not an error). |
 
 Always check the return value. `Ok` and `NoEvent` are the only non-error
@@ -100,14 +183,18 @@ results.
 
 ### Panic safety
 
-The ABI never unwinds across the FFI boundary. Every entry point wraps its body
-in `catch_unwind`; a panic becomes `ErikaStatus_Panic` with an error message
-set. You can call across the boundary without C++ `noexcept`/SEH concerns.
+Many status-returning operations catch Rust panics and return `ErikaStatus_Panic`
+with a message. This is not a guarantee for every entry point: for example,
+`erika_create`, `erika_destroy` and string helpers are not wrapped. A panic
+outside a catch boundary, or a build configured to abort on panic, can terminate
+the process. Do not rely on panic recovery as a substitute for valid arguments.
 
 ### Error messages (thread-local)
 
-On any non-`Ok`/`NoEvent` result, Erika stores a human-readable message in a
-**thread-local** slot. Retrieve it with:
+Many failing calls store a human-readable message in a **thread-local** slot,
+but not every error updates it. For example, some null output pointers return
+`NullPointer` directly, so the message can be empty or left over from an earlier call.
+Read it on the same thread:
 
 ```c
 char *msg = erika_last_error_message();   // heap-allocated, may be NULL
@@ -115,13 +202,15 @@ if (msg) { fprintf(stderr, "erika: %s\n", msg); erika_string_free(msg); }
 ```
 
 Because the slot is thread-local, read it **on the same thread** that made the
-failing call, before making another call on that thread (a subsequent `Ok`
-clears it). `erika_last_error_message` returns a copy you own — free it with
+failing call, before making another call on that thread (many subsequent successful calls
+clear it). When polling an `Error`, `VideoDecoderChanged` or `AudioOutputChanged`
+event, read the message immediately on the polling thread; other events may clear
+it. `erika_last_error_message` returns a copy you own — free it with
 `erika_string_free`.
 
 ### String ownership
 
-Any `char*` Erika hands back is heap-allocated and owned by the caller:
+Any `char*` liberika hands back is heap-allocated and owned by the caller:
 
 - Standalone strings (e.g. `erika_last_error_message`) → free with
   `erika_string_free`.
@@ -130,11 +219,11 @@ Any `char*` Erika hands back is heap-allocated and owned by the caller:
 - Strings embedded in `ErikaDanmakuTrackInfo` → free with
   `erika_danmaku_track_info_free(&track)`.
 
-Never `free()` these with libc; always use the matching Erika free function so
+Never `free()` these with libc; always use the matching liberika free function so
 allocation crosses the ABI on the same allocator.
 
 `const char*` arguments you pass in are borrowed for the duration of the call
-only; Erika copies what it needs. They must be NUL-terminated UTF-8.
+only; liberika copies what it needs. They must be NUL-terminated UTF-8.
 
 ### Counted-array idiom
 
@@ -205,7 +294,7 @@ ErikaStatus erika_seek(ErikaHandle *handle, uint64_t position_micros);
 sets headers for HTTP(S) playback; `headers` is read only during the call and
 may be released after it returns. When `header_count` is nonzero, `headers`
 must not be `NULL`. Headers are used for HEAD, Range GET, and prefetch requests.
-Authentication information and cookies are not written to Erika logs. `seek`
+Authentication information and cookies are not written to liberika logs. `seek`
 takes microseconds.
 
 `erika_open_with_options` supersedes `erika_open_with_headers`: it takes an
@@ -223,13 +312,22 @@ Non-zero values in `reserved` are rejected so future fields can be added
 without silently changing behavior for older hosts. Both knobs only affect
 HTTP(S) playback; local files ignore them.
 
+`start_position_micros` opens the media there instead of at its start: the
+engine seeks before presenting, so the first frame shown is the one at that
+position, `Ready` reports it as the position, and no frame of the media's start
+is decoded for display. `0` opens at the start (the field was the first
+`reserved` slot, so hosts that zero the struct are unaffected). Hosts whose open
+path cannot carry it call `erika_presenter_set_open_start_position` first; the
+next open takes it.
+
 ```c
 typedef struct ErikaOpenOptions {
   const ErikaHttpHeader *headers;
   uintptr_t header_count;
   uint64_t http_read_ahead_bytes;   /* 0 = environment override, then 2 MiB */
   uint64_t http_back_buffer_bytes;  /* 0 = 16 MiB rewind budget */
-  uint64_t reserved[2];             /* must be zero */
+  uint64_t start_position_micros;   /* 0 = open at the start */
+  uint64_t reserved[1];             /* must be zero */
 } ErikaOpenOptions;
 ```
 
@@ -303,7 +401,7 @@ capabilities and therefore cannot activate Android extended-linear output.
 
 ## `ErikaPresenterHandle` — push model
 
-Erika owns the full stack; the host supplies a surface and calls `render_tick`.
+liberika owns the full stack; the host supplies a surface and calls `render_tick`.
 **macOS / iOS / tvOS / Windows / Android / HarmonyOS.**
 
 ### Lifecycle and configuration
@@ -348,8 +446,14 @@ ErikaStatus erika_presenter_close(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_seek(ErikaPresenterHandle *, uint64_t position_micros);
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *, double volume);   // 0.0–1.0
+ErikaStatus erika_presenter_set_muted(ErikaPresenterHandle *, bool muted);       // keeps the volume
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *, int32_t mode);  // ErikaLumaUpscalerMode
+ErikaStatus erika_presenter_load_upscaler_model(ErikaPresenterHandle *, const char *name,
+                                               const uint8_t *data, uintptr_t len);
+ErikaStatus erika_presenter_clear_upscaler_model(ErikaPresenterHandle *);
 ErikaStatus erika_presenter_set_subtitle_scale(ErikaPresenterHandle *, double scale);
+ErikaStatus erika_presenter_set_subtitle_delay(ErikaPresenterHandle *, int64_t delay_micros); // later when positive
+ErikaStatus erika_presenter_set_open_start_position(ErikaPresenterHandle *, uint64_t position_micros);
 ErikaStatus erika_presenter_set_subtitle_font(ErikaPresenterHandle *, const char *family, const char *file_path);
 ErikaStatus erika_presenter_set_subtitle_style(ErikaPresenterHandle *, ErikaSubtitleStyle style);
 ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float headroom, bool known);
@@ -359,11 +463,29 @@ ErikaStatus erika_presenter_set_output_headroom(ErikaPresenterHandle *, float he
 is the push-model counterpart of `erika_open_with_options` and accepts the same
 `ErikaOpenOptions` (headers plus `http_read_ahead_bytes` /
 `http_back_buffer_bytes`; see
-[`erika_open_with_options`](#erikahandle--pull-model)). `set_upscaler` switches the neural
-luma upscaler at runtime (see [`erika_presenter_get_upscaler_status`](#diagnostics-and-capture));
-Metal, D3D11 feature level 11+, and compute-capable wgpu renderers execute
-ArtCNN, while backends without compute retain native luma sampling and report
-an explicit `Inactive` fallback.
+[`erika_open_with_options`](#erikahandle--pull-model)). `set_upscaler` switches the luma
+upscaler at runtime (see [`erika_presenter_get_upscaler_status`](#diagnostics-and-capture)).
+Mode values are grouped: 1-15 ArtCNN, 16-31 Anime4K, 32-47 spatial shaders
+(`Fsr1`), 48-63 platform scalers (`PlatformVideo`, `MetalFxSpatial`), 64 `Custom`.
+Network modes upscale the decoded luma plane 2x; `Fsr1` and `MetalFxSpatial`
+scale luma to the presented size; `PlatformVideo` scales the whole frame.
+Metal and D3D11 run every mode they support; the wgpu renderers (Linux,
+Android, OpenHarmony, the Windows wgpu fallback) run every network mode
+(ArtCNN 1-7, Anime4K, `Custom`) and `Fsr1`, while `PlatformVideo` and
+`MetalFxSpatial` report `Inactive` there. A mode that cannot run on the current backend keeps native luma
+sampling and reports `Inactive` with the reason in the diagnostics `upscaler`
+object. Web has no upscaler. See [Integration](integration.md#upscaler) for the
+platform matrix.
+
+`erika_presenter_load_upscaler_model` loads the network used by
+`ErikaLumaUpscalerMode_Custom` from memory (`name` is a label, `data`/`len` the
+file contents); `erika_presenter_clear_upscaler_model` drops it. Select it
+afterwards with `set_upscaler(handle, ErikaLumaUpscalerMode_Custom)`. The data
+is an Erika `.esr` network (export ArtCNN ONNX with
+`crates/erika/assets/artcnn/export_artcnn_esr.py`) or an mpv hook shader of the
+FSRCNNX or Anime4K CNN dialect. Only weights are parsed; shader code is never
+executed. liberika does not bundle FSRCNNX or RAVU/NNEDI3 (GPL/LGPL), so the host
+supplies such files.
 
 `set_subtitle_font` and `set_subtitle_style` set the subtitle *fallback* look.
 An empty family or path clears that half of the selection. Colours are
@@ -421,7 +543,7 @@ resolution-independent when overridden — a `font_size` of `48` lands on the sa
 pixels whatever `PlayResY` a script declares. Margins do not: libass leaves
 override margins in the script's own units, so on a container ASS track they
 scale with that script's `PlayResY`, while on plain-text subtitles (whose script
-Erika generates at the frame size) they are pixels.
+liberika generates at the frame size) they are pixels.
 
 `ErikaHttpHeader` is defined as:
 
@@ -547,7 +669,7 @@ parentheses):
 - `font_size` (`fontSize`, `size`, `s`), `opacity` (`alpha`, `a`), and `is_me`
   (`isMe`, `self`, `mine`): optional style and self-danmaku metadata.
 - `id`: an optional unsigned 64-bit integer or decimal string. When omitted,
-  Erika assigns the item's position in the complete input. The session creates
+  liberika assigns the item's position in the complete input. The session creates
   a separate internal layout identity, so hosts do not need to synthesize a
   business ID to keep tracks stable across planner windows.
 
@@ -586,7 +708,7 @@ function. Set `extended_linear` only after the display/surface HDR probe, set
 `direct_composition = true` only for the direct `SurfaceView`, and preserve any
 host probe failure in `fallback_reason`. `desired_headroom = 0` means system
 auto; a positive value is a surface ceiling and is suitable for API 35
-per-`SurfaceView` `setDesiredHdrHeadroom`. Erika still verifies Vulkan,
+per-`SurfaceView` `setDesiredHdrHeadroom`. liberika still verifies Vulkan,
 `Rgba16Float`, and `ADATASPACE_SCRGB_LINEAR` itself; failure of any condition
 falls back to SDR and remains queryable.
 
@@ -618,10 +740,10 @@ ErikaStatus erika_presenter_windows_composition_swapchain_iunknown(ErikaPresente
 Windows only. When the presenter was attached through
 `attach_wgpu_surface_with_output_capabilities` with `direct_composition = true`
 (and the presenter plays with a transparent video alpha mode or an overlay
-blend), Erika creates a premultiplied-alpha composition swap chain for the
+blend), liberika creates a premultiplied-alpha composition swap chain for the
 target HWND. This getter returns it as an **AddRef'd `IUnknown*`**: the caller
 owns the returned COM reference and must `Release` it. Re-fetch it after
-decoder/device loss — Erika recreates the swap chain and exposes the new
+decoder/device loss — liberika recreates the swap chain and exposes the new
 object; the same pointer means nothing was rebuilt.
 
 ### Windows Flutter texture
@@ -679,7 +801,7 @@ char *erika_presenter_render_tick_json(ErikaPresenterHandle *, double time_secon
 char *erika_presenter_poll_event_json(ErikaPresenterHandle *);
 ```
 
-Every returned string is owned by Erika and must be released with
+Every returned string is owned by liberika and must be released with
 `erika_string_free`. `poll_event_json` returns `NULL` — not an envelope — when
 no event is pending, so a `NULL` return is the idle case, not an error.
 
@@ -690,24 +812,49 @@ All three wrap their result in an envelope:
 { "ok": false, "status": 3, "error": "<message>" }
 ```
 
-`arguments_json` must be a JSON object. `method` selects the operation and
-mirrors the C entry points: `open`, `play`, `pause`, `stop`, `close`, `seek`,
-`setPlaybackRate`, `setVolume`, `setUpscaler`, `setSubtitleScale`,
-`getUpscalerStatus`, `getOutputStatus`, `getPresenterStats`, `tracks`,
-`addExternalSubtitle`, `removeSubtitleTrack`, `selectAudioTrack`,
-`selectSubtitleTrack`, and the danmaku family (`loadDanmakuFile`,
-`loadDanmakuJson`, `addDanmakuTrackFile`, `addDanmakuTrackJson`,
-`removeDanmakuTrack`, `setDanmakuTrackEnabled`, `setDanmakuTrackOffset`,
-`setDanmakuGlobalOffset`, `danmakuTracks`, `clearDanmaku`, `setDanmakuEnabled`,
-`setDanmakuConfig`), plus `selectSubtitleMemoryFonts`,
-`clearSubtitleMemoryFonts`, `getSubtitleMemoryFontStatus`, and
-`getResourceStatus`. An unknown method fails with `ok: false` rather than
-aborting. The authoritative dispatch table is
-`crates/erika_capi/src/presenter_json.rs`.
+`arguments_json` must be a JSON object. `method` selects an entry of the
+dispatch table in `crates/erika_capi/src/presenter_json.rs` (`JSON_METHODS`).
+The table mirrors the C entry points — playback (`open`, `play`, `pause`,
+`stop`, `close`, `seek`, `setPlaybackRate`, `setVolume`, `setMuted`, `volume`), tracks and subtitles
+(`tracks`, `chapters`, `container`, `trackSelection`, `selectAudioTrack`, `selectSubtitleTrack`,
+`addExternalSubtitle`, `removeSubtitleTrack`, `setSubtitleScale`,
+`setSubtitleDelay`, `subtitleDelay`, `subtitleText`, `setSubtitleFont`,
+`setSubtitleStyle`, the subtitle memory-font calls), the
+danmaku family (including `getDanmakuConfig`), output and upscaler
+(`setUpscaler`, `getUpscalerStatus`, `loadUpscalerModelFile`, `clearUpscalerModel`, `setOutputHeadroom`, `getOutputStatus`,
+`setDebugHudEnabled`), counters (`getPresenterStats`, `getResourceStatus`), and
+the diagnostics below (`getDiagnosticsSnapshot`, `getLogs`).
 
-The bridge is a convenience layer, not a second API: it calls the same
-functions documented above and carries no extra capability. Hosts that can pass
-structs across their platform channel should prefer the typed entry points.
+`erika_presenter_invoke_json` doubles as the generic pass-through into the
+engine:
+
+- `listMethods` returns the table itself — `{schema: 1, fields, methods: [{name, scope,
+  summary, arguments: [{name, type, required}], returns, blocking, writesFiles}]}` — so a host (or an
+  agent behind it) can discover and forward capabilities without code changes.
+  Registering a capability means adding a `match` arm in `invoke` and an entry
+  in `JSON_METHODS`; a unit test fails if the two disagree.
+- Each entry also carries `blocking` (the call returns when the work is done,
+  on the calling thread, and the work grows with its input: media length, file
+  size) and `writesFiles` (the call creates files on disk and its result lists
+  their paths); `fields` at the top level states both. `exportFrame` and
+  `exportFrames` take pictures from a media with the frame export above: with
+  `outputPath` / `outputDir` they write PNG or RGBA files and return the paths,
+  and `exportFrame` without `outputPath` returns the bytes base64 encoded.
+- Methods whose `scope` is `global` (`listMethods`, `getLogs`, `exportFrame`,
+  `exportFrames`) accept a `NULL`
+  handle.
+- `invokeJson` (`{method, arguments}`) calls another table method and returns
+  its full envelope as `value`. Platform plugins that unwrap envelopes
+  natively (Linux, HarmonyOS, Android) use it to forward Dart's
+  `ErikaPlayer.invokeJson` unchanged.
+- An unknown method returns `{"ok": false, "status": 3, "code":
+  "unknown_method", "method": "<name>", "error": "unsupported Erika presenter
+  method: <name>"}`; malformed `arguments_json` adds `"code":
+  "invalid_arguments"`. Neither aborts.
+
+The bridge calls the same functions documented above and carries no extra
+capability. Hosts that can pass structs across their platform channel may
+prefer the typed entry points.
 
 ### Diagnostics and capture
 
@@ -717,11 +864,25 @@ ErikaStatus erika_presenter_get_output_status(ErikaPresenterHandle *, ErikaOutpu
 ErikaStatus erika_presenter_get_resource_status(ErikaPresenterHandle *, ErikaPresenterResourceStatus *out_status);
 ErikaStatus erika_presenter_capture_frame_rgba(ErikaPresenterHandle *, uint32_t width, uint32_t height,
                                                uint8_t *out_rgba, uintptr_t out_capacity);
+ErikaStatus erika_presenter_capture_frame_rgba_with_danmaku(ErikaPresenterHandle *, uint32_t width, uint32_t height,
+                                                         uint8_t *out_rgba, uintptr_t out_capacity);
 ```
 
 `get_upscaler_status` reports the requested upscaler mode, the active backend
-(off / inactive / building / scalar / simdgroup-matrix), the fallback count,
-upscaled frame count, and recent encode/GPU timings in microseconds.
+(`Off`, `Inactive`, `Building`, `Scalar`, `SimdgroupMatrix`, `CooperativeMatrix`,
+`LinalgMatrix`, `VideoProcessor`, `VideoToolbox`, `MetalFx`, `TensorOps`), the
+fallback count, upscaled frame count, and recent encode/GPU timings in
+microseconds. `Inactive` means the mode cannot run here and native sampling is
+used (the reason is in diagnostics); `Building` means kernels are compiling in
+the background and native sampling is used meanwhile. `CooperativeMatrix` is
+Vulkan `VK_KHR_cooperative_matrix` next to D3D11; `LinalgMatrix` is the opt-in
+D3D12 SM 6.10 preview; `VideoProcessor` is the D3D11 video processor vendor
+extension (NVIDIA RTX Video / Intel VSR); `TensorOps` is Metal 4 tensor ops
+(M5/A19). D3D11 now also reports GPU time (timestamp queries) in
+`last_gpu_micros`.
+
+`loadUpscalerModelFile` (`{path, name?}`) and `clearUpscalerModel` are the JSON
+bridge counterparts of the load/clear functions above.
 
 `get_output_status` returns the actual negotiated output, not merely the
 request. The 13 fields are:
@@ -762,11 +923,20 @@ requested `width`×`height` (independent of the display surface size). Danmaku
 is deliberately not included — screenshots represent the video rather than
 transient on-screen comments. `out_capacity` must be at least `width*height*4`.
 It returns `PlayerError` when no frame is available yet. Metal and wgpu
-(including Android) implement capture; the current D3D11 backend does not.
+(including Android) implement capture, and so does Windows D3D11 since 0.3.8.
 Capture always uses an SDR RGBA8 offscreen target and tone-maps
 HDR/extended-linear content, so the returned
 bytes are SDR even when the display output is Apple EDR, HDR10, or Android
 extended-linear scRGB.
+
+D3D11 captures use straight RGBA, preserving packed-alpha colors for PNG encoding,
+and do not change the live surface, output mode or published Flutter texture.
+They use the standard video scaler without ArtCNN/FSR/VSR enhancement. GPU
+readback has a bounded wait; a timeout returns an error without prematurely
+returning a sampled frame to the decoder pool. If destruction also times out
+on a valid device, that frame and its associated pool resources are retained
+until process exit, with a warning.
+
 
 ```c
 uint32_t w = 1920, h = 1080;
@@ -777,6 +947,38 @@ if (erika_presenter_capture_frame_rgba(p, w, h, rgba, (uintptr_t)w * h * 4) == E
 free(rgba);
 ```
 
+For hosts that composite their own UI (for example Dioxus on Wayland), use
+`erika_presenter_capture_frame_rgba_with_danmaku` with the same arguments to
+include enabled danmaku. It uses the current playback clock, track selection,
+offsets, font and paint settings. Danmaku is laid out independently at the
+requested pixel size with scale factor 1; no surface or preceding `render_tick`
+is required for capture. It excludes the debug HUD and has the same SDR RGBA8,
+buffer and error contract as the screenshot API. Capture prepares and caches
+short timeline windows synchronously; resizing, seeking or changing danmaku
+settings may require preparation on the next call. Audio output still needs
+regular `render_tick` calls; `audio_only_tick` suspends video decoding.
+
+The Rust equivalent is
+`PresenterRuntime::capture_frame_rgba_with_danmaku(width, height)`:
+
+```rust,ignore
+if let Some(rgba) = presenter.capture_frame_rgba_with_danmaku(960, 540)? {
+    // Upload tightly packed RGBA8 pixels to the host's own texture.
+}
+```
+
+This path reads pixels back to the CPU. It does not export a shared GPU texture
+or require matching wgpu versions between liberika and the host.
+
+For native GPU output use `erika_presenter_create_for_texture_export(config)`,
+then `erika_presenter_export_frame_texture(p, w, h, scale, &frame)` once per host frame.
+Read borrowed native handles with `erika_texture_frame_get_info` and release
+with `erika_texture_frame_release` after consumer GPU completion and alias
+destruction. This loop also pumps audio. Linux Vulkan OPAQUE_FD and Apple
+Metal are implemented; the interface contains no wgpu types. See
+[native texture output](external_textures.md) for formats, synchronization,
+ownership and the native host importer.
+
 `get_resource_status` reports memory budgeting for diagnostics: current device
 allocation, recommended working set, per-bucket GPU byte estimates (video
 frames, overlay and danmaku atlases, danmaku vertex buffers, upscaler), the
@@ -784,12 +986,121 @@ renderer-tracked total, presenter CPU-side danmaku atlas bytes, the drawable
 count, and how many times the output mode was switched. All values are
 snapshots from the same runtime state as `get_output_status`.
 
+### Agent diagnostics (JSON)
+
+```c
+ErikaStatus erika_presenter_get_diagnostics_json(ErikaPresenterHandle *, char **out_json);
+ErikaStatus erika_log_read_json(uint32_t limit, int32_t min_level, uint64_t since_seq,
+                                char **out_json);
+```
+
+New diagnostic data is returned as JSON documents, never as new fields on the
+structs above (Apple plugins mirror those structs by hand, so growing them would
+force a lock-step library/plugin upgrade). Resolve both symbols optionally and
+treat a missing symbol as "not supported". On `Ok`, `*out_json` holds a
+caller-owned UTF-8 document to free with `erika_string_free`; it is `NULL` on
+any other status. Each document has a `schema` number (currently `1`); fields
+are only added within a schema. Values that are not known are `null`, never a
+made-up zero. Durations are milliseconds with microsecond precision.
+
+#### Diagnostics snapshot
+
+`erika_presenter_get_diagnostics_json` gathers everything in one call. It only
+reads presenter fields, renderer/audio counters and lock-free playback
+counters: it neither decodes nor renders and never waits on the playback
+worker (on macOS, a release build measured a median of 0.3 ms per call
+including JSON encoding during playback). Same threading rule as every other
+handle call.
+
+| Section | Contents |
+|---------|----------|
+| `schema`, `capturedAtUnixMs` | Document version and wall-clock capture time. |
+| `playback` | `state`, `playing`, `mediaTimeSeconds`, `durationSeconds`, `playbackRate`, `generation`, `audioOnly` (background video suspension), `buffering` `{active, events, currentMs, totalMs}`. |
+| `media` | The `container` (`format`, the demuxer's short name such as `matroska,webm`; `bitRate`, the overall bit rate), selected `video` (`codec`, `profile`, `level`, `width`, `height`, `pixelFormat`, `frameRate`, `bitRate`, `dolbyVisionProfile`), `audio` (`codec`, `sampleRate`, `channels`, `sampleFormat`, `bitRate`) and `subtitle` tracks, each `null` when unknown or absent. |
+| `decoder` | Latest decoder transition, queryable instead of event-only: `requestedBackend`, `activeBackend`, `previousBackend`, `hardware`, `fellBack`, `fallbackCount`, `stage`, `reason`, `codec`, `pixelFormat`, `lineSizes`. `null` before the first transition. |
+| `video` | Decoded/rendered frames, hardware/software/zero-copy/direct-zero-copy/shared-handle frames, `cpuFallbackFrames`, `importFailures`, `renderFailures`, `backpressureDrops`, `rejectedImportRoute`. |
+| `presenter` | Surface attachment and size, last tick/pump/audio/subtitle/video/clock/danmaku-plan/render/GPU durations, test/overlay/subtitle/danmaku counters. |
+| `output` | Requested mode, active encoding, surface format, dataspace, requested/active headroom (`null` when unknown), fallback reason label and counters. |
+| `hdr` | HDR source frames, HDR10 output frames, SDR tone-mapped frames, metadata updates/failures, output failures, `outputActive`. |
+| `resources` | Same fields as `ErikaPresenterResourceStatus`. |
+| `upscaler` | Requested mode and active backend as labels, `engine` (for example `scalar_compute`, `cooperative_matrix`, `linalg_matrix`, `metal4_tensor_ops`, `simdgroup_matrix`, `fsr1`, `metalfx_spatial`, `vt_low_latency_super_resolution`, `nvidia_rtx_video`, `intel_vsr`), `reason` (why the mode is `Inactive` or degraded), fallbacks, upscaled frames, last encode time, `lastGpuMs`. |
+| `audio` | Output state, configured/started, volume, pushed frames, failures, queued frames and `queuedMs`, read/written/underflow frames, ring `ringDroppedFrames`, device `recovery` state and counts. |
+| `buffers` | `playback` queue depths published by the worker (`demuxPackets`, `pendingVideoPackets`, `decodedVideoFrames`, `decodedAudioFrames`, `decodedSubtitleFrames` as `{queued, capacity}`, `demuxEof`, `updatedAgoMs`; `null` before open), presenter frame channels, `audioOutputQueuedMs`. |
+| `timing.scheduler` | `leadTimeMs`, `dropToleranceMs`, `maxConsecutiveDrops`; `presentedFrames`; `lateDroppedFrames` (discarded for being later than the drop tolerance — previously uncounted); `forcedLatePresents` (late beyond tolerance but shown because the consecutive-drop budget was spent); `maxDropBurst`, `maxDroppedLateMs`, `lastDropAgoMs`, `seekPrerollDroppedFrames`; `lateByMs` window `{samples, meanMs, p50Ms, p95Ms, maxMs}` over the last 128 presented frames; `lateHistogram` (`le10ms` … `gt120ms`). |
+| `timing.presentation` | Measured where liberika renders, not at the display's vsync: `ticks` and `tickIntervalMs`; `uploadedFrames`, `newFramesPresented`, `supersededBeforePresent`; `frameIntervalMs` and `jitterMs` (absolute deviation from the source frame interval divided by the playback rate); `longFrames` (on screen longer than `longFrameFactor` = 1.5 source intervals); `lastPresentAgoMs`. |
+| `timing.clock` | Audio-master discipline, previously trace-only: mode, sync config (`deadbandMs`, `maxCorrectionPerFrameMs`, `snapThresholdMs`, `audioLeadTimeMs`), `observations`, `corrections`, `snaps`, `forwardCorrections`, `backwardCorrections`, `lastDriftMs` (positive: audio ahead of the playback clock), `maxAbsDriftMs`, `appliedTotalMs`, `lastCorrectionAgoMs`, `lastSnapAgoMs`, `absDriftMs` window. |
+
+Counters in `timing` and `buffers.playback` restart when the presenter opens
+new media.
+
+#### Log ring
+
+`erika_log_read_json` exports a process-wide in-memory ring (at most 2000
+entries / 512 KiB, entry text capped at 4 KiB). It needs no handle and may be
+called from any thread. It collects:
+
+- every operational diagnostic liberika already wrote to stderr / logcat /
+  hilog (those outputs are unchanged);
+- operational failures that used to be bare `eprintln!` (audio
+  configure/push/start/pause/reset, renderer clear, subtitle render and
+  decoder open, WASAPI, D3D11 device removal, upscaler disablement);
+- FFmpeg `av_log` messages at warning level and above. The callback is
+  process-wide and shared by every player: it formats into a stack buffer,
+  never blocks (contended messages are counted as `droppedContended`), folds
+  consecutive repeats that differ only in numbers or addresses into one entry
+  with `count`, and admits at most 50 new FFmpeg entries per second (the rest
+  are `rateLimited`). FFmpeg's own stderr output is still produced.
+  `ERIKA_FFMPEG_LOG_CAPTURE=0` disables capture; with a shared distro FFmpeg
+  (Linux system libraries) capture is off unless `ERIKA_FFMPEG_LOG_CAPTURE=1`,
+  because other libraries in the process may own the callback.
+
+Arguments: `limit` newest entries after filtering (`0` = every retained
+entry); `min_level` an `ErikaLogLevel` (`Trace` 0 … `Error` 4) or `-1` for all;
+`since_seq` only entries with `seq >= since_seq` (pass the previous `nextSeq`
+to read incrementally).
+
+```json
+{
+  "schema": 1,
+  "capacity": { "entries": 2000, "bytes": 524288, "entryTextBytes": 4096 },
+  "retained": 15, "retainedBytes": 6011, "oldestSeq": 1, "nextSeq": 16,
+  "evicted": 0, "rateLimited": 0, "droppedContended": 0,
+  "ffmpegCapture": "active", "redacted": true,
+  "entries": [
+    { "seq": 3, "unixMs": 1761134400123, "level": "error", "source": "ffmpeg",
+      "event": null, "count": 1,
+      "message": "[mpeg4 @ 0x…] Failed setup for format videotoolbox_vld: hwaccel initialisation returned error." },
+    { "seq": 4, "unixMs": 1761134400140, "level": "warn", "source": "erika",
+      "event": "video_decoder", "count": 2, "lastUnixMs": 1761134400410,
+      "data": { "event": "video_decoder", "stage": "open_avcodec_to_software" } }
+  ]
+}
+```
+
+Entries are oldest first. Structured diagnostics come back parsed as `data`,
+other lines as `message`. `ffmpegCapture` is `not_installed` (FFmpeg not used
+yet), `active`, `disabled`, or `shared_library_opt_in_required`.
+
+Levels: call sites that know the severity pass it; FFmpeg levels map
+PANIC/FATAL/ERROR → `error`, WARNING → `warn`; libass maps 0–1 → `error`,
+2 → `warn`. Other structured diagnostics get a default from their `event` and
+`stage` names: `error` for fatal/panic, `warn` for failures, timeouts,
+unavailable/lost/rejected/missing resources, stalls and fallbacks (including
+`*_to_software` and `*_to_bytebuffer` routes), `info` otherwise.
+
+Redaction happens on export: URL user info and everything after `?`/`#`,
+credential-like `key=value`/`key: value` pairs and JSON keys (`token`,
+`api_key`, `access_token`, `authorization`, `cookie`, `X-Emby-Token`, …),
+`Bearer`/`Basic` credentials, the current user's home directory (`~`), and
+other `/Users/<user>`, `/home/<user>`, `C:\Users\<user>` path segments. The
+ring lives only in process memory and is read on demand.
+
 ## Enums
 
 | Enum | Values |
 |------|--------|
 | `ErikaState` | `Idle` `Opening` `Ready` `Playing` `Paused` `Stopped` `Closed` `Error` |
-| `ErikaEventKind` | `None` `StateChanged` `DurationChanged` `PositionChanged` `TracksChanged` `BufferingChanged` `VideoParamsChanged` `SurfaceAttached` `SurfaceDetached` `Error` `TrackSelectionChanged` `VideoDecoderChanged` `AudioOutputChanged` |
+| `ErikaEventKind` | `None` `StateChanged` `DurationChanged` `PositionChanged` `TracksChanged` `BufferingChanged` `VideoParamsChanged` `SurfaceAttached` `SurfaceDetached` `Error` `TrackSelectionChanged` `VideoDecoderChanged` `AudioOutputChanged` `Ended` (14; 13 is left to hosts) |
 | `ErikaTrackKind` | `Video` `Audio` `Subtitle` |
 | `ErikaTrackSource` | `Embedded` `External` |
 | `ErikaWgpuSurfaceKind` | `Unknown` `MacOsNsView` `MacOsCaMetalLayer` `IosUiView` `WindowsHwnd` `XlibWindow` `WaylandSurface` `AndroidNativeWindow` `OhosNativeWindow` |
@@ -799,8 +1110,8 @@ snapshots from the same runtime state as `get_output_status`.
 | `ErikaActiveOutputEncoding` | `SdrSrgb` `AppleEdr` `AndroidExtendedLinearScRgb` `Hdr10Pq` `LinuxExtendedLinearScRgb` |
 | `ErikaOutputSurfaceFormat` | `EightBitUnorm` `TenBitUnorm` `SixteenBitFloat` |
 | `ErikaOutputFallbackReason` | `None` `DisplayHdrUnsupported` `HybridCompositionRequired` `WgpuBackendNotVulkan` `Rgba16FloatSurfaceFormatUnavailable` `NativeWindowDataSpaceApiUnavailable` `ScrgbDataSpaceVerificationFailed` `SurfaceConfigureFailed` `LegacyAppleEdrUnsupported` |
-| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` |
-| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` |
+| `ErikaLumaUpscalerMode` | `Off` `ArtCnnC4F16` `ArtCnnC4F32` `ArtCnnC4F16Ds` `ArtCnnC4F16Dn` `ArtCnnC4F32Ds` `ArtCnnC4F32Dn` `ArtCnnR8F64` `Anime4kS` `Anime4kM` `Anime4kL` `Anime4kVl` `Anime4kUl` `Anime4kDenoiseS` `Anime4kDenoiseM` `Anime4kDenoiseL` `Anime4kDenoiseVl` `Anime4kDenoiseUl` `Fsr1` `PlatformVideo` `MetalFxSpatial` `Custom` |
+| `ErikaUpscalerBackendStatus` | `Off` `Inactive` `Building` `Scalar` `SimdgroupMatrix` `CooperativeMatrix` `LinalgMatrix` `VideoProcessor` `VideoToolbox` `MetalFx` `TensorOps` |
 
 ## Structs
 
@@ -824,7 +1135,7 @@ snapshots from the same runtime state as `get_output_status`.
   `erika_subtitle_memory_font_info_free`.
 - **`ErikaDanmakuConfig`** — full danmaku layout/appearance config (font size,
   opacity, display area, scroll timing, collision/stacking flags, blocked modes,
-  shadow style). `font_size` is a NipaPlay/Flutter *logical* size; Erika
+  shadow style). `font_size` is a NipaPlay/Flutter *logical* size; liberika
   multiplies by the surface scale for glyph pixels.
 - **`ErikaDanmakuTrackInfo`** `{ id, enabled, offset_micros, item_count, char *name, char *source }` —
   free with `erika_danmaku_track_info_free`.

@@ -1,7 +1,7 @@
 //! DFM+ core adapted from the MIT-licensed NipaPlay-Reload Rust implementation.
 //!
 //! Copyright (c) 2025 MCDFsteve.
-//! Erika keeps this module as the layout/filter/retainer core and wraps it in
+//! liberika keeps this module as the layout/filter/retainer core and wraps it in
 //! a native renderer-facing adapter instead of carrying NipaPlay's FRB/Flutter
 //! presentation layer.
 

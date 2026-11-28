@@ -1,8 +1,8 @@
-# Erika Danmaku Subsystem Architecture
+# liberika Danmaku Subsystem Architecture
 
 [中文](danmaku_architecture.md) | [English](danmaku_architecture.en.md) | [日本語](danmaku_architecture.ja.md)
 
-This document describes the current Erika danmaku subsystem, how it maps to NipaPlay's DFM+ danmaku system, and which boundaries should be replaced or preserved. The core idea is simple: Erika should treat itself as a native host for a NipaPlay-style danmaku system. Inputs remain danmaku files and user configuration; the layout core should preserve DFM+ input/output semantics; the final result is rendered together with the video frame inside Erika's native renderer.
+This document describes the current liberika danmaku subsystem, how it maps to NipaPlay's DFM+ danmaku system, and which boundaries should be replaced or preserved. The core idea is simple: liberika should treat itself as a native host for a NipaPlay-style danmaku system. Inputs remain danmaku files and user configuration; the layout core should preserve DFM+ input/output semantics; the final result is rendered together with the video frame inside liberika's native renderer.
 
 ## Current Goal
 
@@ -20,7 +20,7 @@ Danmaku file / JSON / XML / user config
   -> Metal / WGPU native danmaku pass
 ```
 
-DFM+ owns layout and filtering. Erika owns session management, timing, lifecycle, C ABI, font/glyph resources, and native GPU composition. The boundary should not blur: Erika should not reinvent a “DFM-like algorithm”; it should make DFM+ semantics hold inside Erika's core.
+DFM+ owns layout and filtering. liberika owns session management, timing, lifecycle, C ABI, font/glyph resources, and native GPU composition. The boundary should not blur: liberika should not reinvent a “DFM-like algorithm”; it should make DFM+ semantics hold inside liberika's core.
 
 ## NipaPlay Danmaku Structure
 
@@ -32,7 +32,7 @@ The second layer is DFM+ preparation. `DfmPlusLayoutBridge.configure` calls Rust
 
 The third layer is per-frame querying. During playback, only the current playback time is passed to the prepared layout. NipaPlay performs the same logic on the Dart side as Rust's `build_dfm_plus_frame`: binary-search the visible window, then compute x for scrolling items from elapsed time, while fixed items use the centered x/y computed during preparation.
 
-The fourth layer is presentation. NipaPlay currently uses its own Flutter/Texture path to draw positioned danmaku; that is not the DFM+ layout core. Erika replaces that presentation layer: keep DFM+ layout input/output, convert positioned danmaku into Erika glyph atlas / quad instances, and composite them in Metal/WGPU together with video.
+The fourth layer is presentation. NipaPlay currently uses its own Flutter/Texture path to draw positioned danmaku; that is not the DFM+ layout core. liberika replaces that presentation layer: keep DFM+ layout input/output, convert positioned danmaku into liberika glyph atlas / quad instances, and composite them in Metal/WGPU together with video.
 
 ## NipaPlay DFM+ I/O Contract
 
@@ -44,20 +44,20 @@ Prepare returns a prepared layout. It stores viewport, scroll/fixed durations, s
 
 Frame query takes only the prepared layout handle and `current_time_seconds`. It returns positioned items for the current frame, each with `item_index`, `x`, `y`, and `offstage_x`. Text, colors, and other style data are not repeated in the frame item; they are resolved through `item_index` back into the prepared item.
 
-This contract matters because DFM+'s power comes from preparing the full track once, not deciding every item position on every frame. Erika should keep this model, but move the handle store into Erika's internal object lifetime and turn the output into an Erika render plan.
+This contract matters because DFM+'s power comes from preparing the full track once, not deciding every item position on every frame. liberika should keep this model, but move the handle store into liberika's internal object lifetime and turn the output into a liberika render plan.
 
-## Current Erika Danmaku Path
+## Current liberika Danmaku Path
 
-Erika already has a native danmaku path in these files:
+liberika already has a native danmaku path in these files:
 
 - `crates/erika/src/danmaku.rs`: public data model, parser, timeline, DFM adapter, frame layout, render plan, text rasterizer, glyph atlas.
-- `crates/erika/src/danmaku/dfm.rs`: adapter between Erika and the NipaPlay DFM+ prepare/frame-query contract.
+- `crates/erika/src/danmaku/dfm.rs`: adapter between liberika and the NipaPlay DFM+ prepare/frame-query contract.
 - `crates/erika/src/danmaku/dfm_core/*`: model, retainer, filters, measure, factory, timer, types migrated from NipaPlay DFM+.
 - `crates/erika/src/presenter.rs`: connects player media time, generation, viewport, and the danmaku engine.
 - `crates/erika/src/core.rs`: `RenderFrameContext` merges video frames, subtitle overlay, and danmaku render plan into one renderer call.
 - `crates/erika/src/renderer/metal/*` and `crates/erika/src/renderer/wgpu.rs`: native danmaku passes.
 - `crates/erika_capi/include/erika.h` / `crates/erika_capi/src/lib.rs`: C ABI for loading, clearing, enabling, configuring, and blocking danmaku.
-- `packages/erika_flutter/lib/src/erika_player.dart` and `packages/erika_flutter/macos/Classes/ErikaFlutterPlugin.swift`: the Flutter wrapper only talks to the Erika C API.
+- `packages/erika_flutter/lib/src/erika_player.dart` and `packages/erika_flutter/macos/Classes/ErikaFlutterPlugin.swift`: the Flutter wrapper only talks to the liberika C API.
 
 The current data flow is:
 
@@ -76,19 +76,45 @@ flowchart LR
   K --> L["Metal / WGPU video + subtitle + danmaku composition"]
 ```
 
-`dfm_core` is already a migrated version of NipaPlay DFM+ core, not a new algorithm written from scratch. The important boundary is that `DanmakuSession` is Erika's input session layer, while `dfm.rs` is the adapter that maps active timelines and `DanmakuLayoutConfig` into a DFM+ prepare request and back into Erika's `DanmakuFrameLayout`.
+`dfm_core` is already a migrated version of NipaPlay DFM+ core, not a new algorithm written from scratch. The important boundary is that `DanmakuSession` is liberika's input session layer, while `dfm.rs` is the adapter that maps active timelines and `DanmakuLayoutConfig` into a DFM+ prepare request and back into liberika's `DanmakuFrameLayout`.
+
+### Mode 7 (advanced) comments
+
+Bilibili mode 7 comments store a JSON array instead of plain text in `<d>`.
+`parse_bilibili_xml` extracts the display text, a linear path from `(x1,y1)` to
+`(x2,y2)`, a duration and an alpha ramp; both the 14-element new format and the
+7/5-element legacy formats are accepted. Plain-text mode 7 degrades to a fixed
+top comment, while code (8) and BAS (9) entries are dropped. JSON timelines
+accept the same payload in `content` when `type` is `"7"`.
+
+`DanmakuItem.special` carries the animation into the DFM+ adapter. The layout
+scales coordinates to the viewport: fractions in `[0,1]` are treated as
+viewport ratios; absolute pixels use the historical player base selected by the
+comment's `date` (545x388 before 2013-11-10, 862x568 afterwards). Mode 7
+comments bypass collision tracks: `for_each_frame_item` interpolates their
+position over their own `[start,end)` lifetime and multiplies the alpha ramp
+into `DanmakuPlacedItem.opacity`, so no shader change is needed on any GPU
+backend. The frame look-behind window (`PreparedLayout.max_duration_seconds`)
+includes those custom durations. `zRotate` is parsed but not applied because
+the instanced renderers draw axis-aligned quads; source `/n` escapes are folded
+into spaces for the single-line glyph layout.
+
+Payloads with non-finite numbers are dropped, and durations are clamped to
+`[0.1, 60]` seconds. The look-behind window is shared by every item, so one
+malformed comment must not be able to widen it without bound; the same check
+runs again at layout time for hand-built `DanmakuSpecial` values.
 
 ## Replacement Boundary
 
 The part that should be replaced “as close as possible to the original DFM+ core” is `crates/erika/src/danmaku/dfm.rs` plus `crates/erika/src/danmaku/dfm_core/*`.
 
-Its input should stay aligned with NipaPlay DFM+: normalized items, viewport, font metrics, and user config. Erika may use its own Rust types, but field semantics should match NipaPlay: time, text, type_code, color, is_me, paint_width/paint_height, display_area, scroll_duration, allow_stacking, merge, max_quantity, max_lines, track_gap, outline, block_words, and so on.
+Its input should stay aligned with NipaPlay DFM+: normalized items, viewport, font metrics, and user config. liberika may use its own Rust types, but field semantics should match NipaPlay: time, text, type_code, color, is_me, paint_width/paint_height, display_area, scroll_duration, allow_stacking, merge, max_quantity, max_lines, track_gap, outline, block_words, and so on.
 
-Before DFM+, Erika adds `DanmakuSession`. It does not participate in layout; it only prepares an active timeline that DFM+ can consume. Multiple tracks may be enabled at once, and per-track and global offsets are applied when building the active timeline. After merging, the session allocates unique layout item IDs for that content revision instead of packing host business IDs into layout identity. Consecutive planner windows carry both completed track assignments and rejection decisions forward; timeline/session content, viewport, or layout-config changes rebuild that planning history. Generation only gates current-frame output for the renderer.
+Before DFM+, liberika adds `DanmakuSession`. It does not participate in layout; it only prepares an active timeline that DFM+ can consume. Multiple tracks may be enabled at once, and per-track and global offsets are applied when building the active timeline. After merging, the session allocates unique layout item IDs for that content revision instead of packing host business IDs into layout identity. Consecutive planner windows carry both completed track assignments and rejection decisions forward; timeline/session content, viewport, or layout-config changes rebuild that planning history. Generation only gates current-frame output for the renderer.
 
-The output should also stay close to NipaPlay DFM+: prepared layout stores stable results, and frame query returns only the visible items and their positions for the current media time. Erika can then map `item_index` to text, colors, font size, outline, and so on to build `DanmakuFrameLayout` and `DanmakuRenderPlan`.
+The output should also stay close to NipaPlay DFM+: prepared layout stores stable results, and frame query returns only the visible items and their positions for the current media time. liberika can then map `item_index` to text, colors, font size, outline, and so on to build `DanmakuFrameLayout` and `DanmakuRenderPlan`.
 
-In other words, Erika may change the shell and the final drawing path, but not the semantic behavior of the DFM+ core. The C ABI exposed to player/Flutter should cover the NipaPlay-style input surface: danmaku files, JSON/JSONL/XML, display area, font size, scroll duration, density, max lines, duplicate merge, block words, outline/shadow, enable state, and track switching.
+In other words, liberika may change the shell and the final drawing path, but not the semantic behavior of the DFM+ core. The C ABI exposed to player/Flutter should cover the NipaPlay-style input surface: danmaku files, JSON/JSONL/XML, display area, font size, scroll duration, density, max lines, duplicate merge, block words, outline/shadow, enable state, and track switching.
 
 ## Public API Today
 
@@ -117,13 +143,13 @@ ErikaStatus erika_presenter_set_danmaku_block_words_json(ErikaPresenterHandle *h
 
 The Flutter wrapper exposes `addDanmakuTrackFile`, `addDanmakuTrackJson`, `removeDanmakuTrack`, `setDanmakuTrackEnabled`, `setDanmakuTrackOffset`, `setDanmakuGlobalOffset`, `danmakuTracks`, and the older `loadDanmakuFile` / `loadDanmakuJson` / `clearDanmaku` / `setDanmakuConfig`. `setDanmakuConfig` now also carries `customFontFamily`, `customFontFilePath`, and the DFM+ texture-path semantics of `shadowStyle`.
 
-That means the player side can now push NipaPlay-style “danmaku file + user config + track control” into Erika, while the output continues to flow with the video frame into the native view.
+That means the player side can now push NipaPlay-style “danmaku file + user config + track control” into liberika, while the output continues to flow with the video frame into the native view.
 
 The remaining work is to keep aligning remote/cache sources, structured block rules, config persistence, the NipaPlay multi-kernel selection abstraction, and a few behavior switches that are not fully forwarded yet in the DFM+ adapter.
 
 ## Timing Contract
 
-Danmaku timing is owned by Erika's playback core, not by a separate danmaku timer.
+Danmaku timing is owned by liberika's playback core, not by a separate danmaku timer.
 
 `PlayerVideoFrame` carries `pts`, `media_time`, and `generation`. After the presenter uploads a frame in `pump_video`, it uses `frame.pts.unwrap_or(frame.media_time)` as the current danmaku query time. `update_overlay` then uses the same PTS to generate subtitle overlay and danmaku render plan. The renderer receives `RenderFrameContext { media_time, generation, overlay, danmaku }`.
 
@@ -133,13 +159,15 @@ This means danmaku position is not just “frozen while paused.” At any moment
 
 ## Fonts, Measurement, and Glyph Atlas
 
-DFM+ collision results depend on text width and height. If measurement and actual drawing use different font metrics, lane allocation will diverge from the final image. For that reason Erika keeps `DanmakuTextRasterizer` inside the layout engine: prepare measures text with the same font set, and render-plan generation uses the same glyph rasterization / atlas data.
+DFM+ collision results depend on text width and height. If measurement and actual drawing use different font metrics, lane allocation will diverge from the final image. For that reason liberika keeps `DanmakuTextRasterizer` inside the layout engine: prepare measures text with the same font set, and render-plan generation uses the same glyph rasterization / atlas data.
 
-Font size semantics are split into two layers. `size` in source files and the third field in Bilibili XML still follow the default Bilibili base of `25`; `ErikaDanmakuConfig.font_size` from the player and Flutter wrapper follows NipaPlay/Flutter logic-size semantics, with desktop defaulting to `30`. Erika embeds and prefers NipaPlay's `Droid Sans Fallback` danmaku font first, and converts only from logical size to glyph-atlas physical pixels using the surface backing scale. Callers do not need to multiply by any extra renderer compensation ratio.
+Font size semantics are split into two layers. `size` in source files and the third field in Bilibili XML still follow the default Bilibili base of `25`; `ErikaDanmakuConfig.font_size` from the player and Flutter wrapper follows NipaPlay/Flutter logic-size semantics, with desktop defaulting to `30`. liberika embeds and prefers NipaPlay's `Droid Sans Fallback` danmaku font first, and converts only from logical size to glyph-atlas physical pixels using the surface backing scale. Callers do not need to multiply by any extra renderer compensation ratio.
 
-Erika's render plan does not pack the whole danmaku line into a single bitmap. It caches glyphs into a persistent atlas and emits `DanmakuGlyphInstance` records. Each instance contains screen rect, atlas tex rect, fill color, outline color, shadow color, and offset. Metal/WGPU only needs to bind the atlas texture and draw alpha-mask quads.
+liberika's render plan does not pack the whole danmaku line into a single bitmap. It caches glyphs into a persistent atlas and emits `DanmakuGlyphInstance` records. Each instance contains screen rect, atlas tex rect, fill color, outline color, shadow color, and offset. Metal/WGPU only needs to bind the atlas texture and draw alpha-mask quads.
 
-The current atlas has fill alpha and outline alpha masks so shadow/outline/fill can be drawn in that order. The atlas carries a version, and the renderer uses version, size, and stride to decide whether a GPU texture can be reused, avoiding needless full-ատlas uploads every frame.
+The atlas contains separate fill and outline alpha masks; the outline includes the dilated glyph interior. Its version, size, and stride determine GPU texture reuse, avoiding needless full-atlas uploads.
+
+Metal, D3D11, and WGPU share `renderer/danmaku_batch.rs` to partition each comment into disjoint vertical strips. Each fragment accumulates the neighboring glyphs into separate premultiplied fill, outline, and shadow layers, composites them, and applies comment opacity once. Adjacent glyphs share this composition; different comments still overlap in their original order. This prevents translucent white text from showing its own black outline, without per-comment render targets or extra passes. Existing SDR and linear HDR/EDR color conversions remain unchanged. Shared GPU pixel assertions cover SDR/floating-point targets, 1×/2× glyphs, opacity, outlines, shadows, antialiasing, transparent targets, and moving overlap boundaries. D3D11/WGPU use instanced vertices and an RGBA32Float glyph-data texture, without fragment storage buffers, float filtering, or Shader Model 5 requirements. Color emoji retain their separate picture path.
 
 ## Renderer Composition Point
 
@@ -149,24 +177,24 @@ On Metal, `render_video_frame_inner` draws the video texture first, then the sub
 
 ## Current Differences from NipaPlay
 
-Erika already keeps the main DFM+ advantages: prepare/frame-query separation, binary search over the time window, track retainer, scrolling collision avoidance, top/bottom fixed lanes, display area, track gap, density control, max lines, duplicate merge, block words, and the basic regex block structure. It also now has the danmaku session layer, which can normalize multiple tracks, per-track offsets, and a global offset into one active timeline before handing it to DFM+.
+liberika already keeps the main DFM+ advantages: prepare/frame-query separation, binary search over the time window, track retainer, scrolling collision avoidance, top/bottom fixed lanes, display area, track gap, density control, max lines, duplicate merge, block words, and the basic regex block structure. It also now has the danmaku session layer, which can normalize multiple tracks, per-track offsets, and a global offset into one active timeline before handing it to DFM+.
 
 It is still not a complete “drop-in NipaPlay danmaku system.” Main differences:
 
-- NipaPlay DFM+ API uses `DfmPlusPreparedLayout.handle` and `DfmPlusFrameRequest.layout_handle`; Erika uses an internal `DfmPreparedLayout` object instead of a global handle store. This is a lifecycle-shell difference and should not affect behavior.
-- NipaPlay prepared/frame output keeps `frame item -> item_index -> prepared item` very explicit; Erika currently maps further into `DanmakuPlacedItem` and carries text/style earlier. That works, but Erika must keep the `item_index` / source-ID semantics intact for behavior matching and tests.
-- NipaPlay's full settings surface comes from Flutter state, including tracks, offsets, custom font, display settings, and block configuration; Erika C ABI already covers tracks, offset control, custom font family/path, and DFM+ shadowStyle, but remote/cache sources, structured block rules, and config persistence still need to be filled in.
-- Erika's renderer output is already native, which is intentional and should not be compared against NipaPlay's final presentation form.
+- NipaPlay DFM+ API uses `DfmPlusPreparedLayout.handle` and `DfmPlusFrameRequest.layout_handle`; liberika uses an internal `DfmPreparedLayout` object instead of a global handle store. This is a lifecycle-shell difference and should not affect behavior.
+- NipaPlay prepared/frame output keeps `frame item -> item_index -> prepared item` very explicit; liberika currently maps further into `DanmakuPlacedItem` and carries text/style earlier. That works, but liberika must keep the `item_index` / source-ID semantics intact for behavior matching and tests.
+- NipaPlay's full settings surface comes from Flutter state, including tracks, offsets, custom font, display settings, and block configuration; liberika C ABI already covers tracks, offset control, custom font family/path, and DFM+ shadowStyle, but remote/cache sources, structured block rules, and config persistence still need to be filled in.
+- liberika's renderer output is already native, which is intentional and should not be compared against NipaPlay's final presentation form.
 - The current `dfm_core` is migrated, but the adapter still has Erika-specific mapping and config interpretation. Future work should compare against the NipaPlay DFM+ API field-by-field rather than continuing to hand-write “similar-looking” behavior.
 
 ## Future Implementation Principles
 
-The future work is to make Erika's compute layer more like NipaPlay DFM+, and Erika's render layer more like Erika itself.
+The future work is to make liberika's compute layer more like NipaPlay DFM+, and liberika's render layer more like liberika itself.
 
-The compute layer should preserve NipaPlay's inputs, outputs, and core behavior. The FRB generator layer, global handle store, and Flutter widget dependencies may be removed, but the DFM+ configuration fields and intermediate state should stay. Erika's adapter should do type conversion, lifecycle management, and renderer-facing projection only.
+The compute layer should preserve NipaPlay's inputs, outputs, and core behavior. The FRB generator layer, global handle store, and Flutter widget dependencies may be removed, but the DFM+ configuration fields and intermediate state should stay. liberika's adapter should do type conversion, lifecycle management, and renderer-facing projection only.
 
-The API layer should expose the NipaPlay danmaku input surface to the player and Flutter wrapper. The Flutter wrapper should only pass user settings, danmaku files, and track selection to Erika, not perform danmaku layout or drawing itself.
+The API layer should expose the NipaPlay danmaku input surface to the player and Flutter wrapper. The Flutter wrapper should only pass user settings, danmaku files, and track selection to liberika, not perform danmaku layout or drawing itself.
 
-The render layer should stay native to Erika. DFM+ outputs “where each danmaku item is at the current media time, and what style it has,” not GPU textures or Flutter resources. Erika's renderer turns that output into glyph atlases, quad instances, and Metal/WGPU composition together with video.
+The render layer should stay native to Erika. DFM+ outputs “where each danmaku item is at the current media time, and what style it has,” not GPU textures or Flutter resources. liberika's renderer turns that output into glyph atlases, quad instances, and Metal/WGPU composition together with video.
 
 The synchronization layer must keep the current generation + media_time contract. Seek, stop, close, track switch, and config change all invalidate the old plan; each frame query only looks at the video timeline; danmaku do not own a separate wall-clock timer. That contract is the real fix for “the video jumped but the danmaku didn't.”

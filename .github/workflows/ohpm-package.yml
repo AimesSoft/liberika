@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Erika version to package
+        description: liberika version to package
         required: true
         default: "0.1.8"
         type: string
@@ -39,7 +39,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Erika version to package
+        description: liberika version to package
         required: true
         type: string
       ref:

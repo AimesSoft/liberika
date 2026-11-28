@@ -1,0 +1,17 @@
+--- a/libass/ass_fontselect.c
++++ b/libass/ass_fontselect.c
+@@ -1114,6 +1114,14 @@
+         goto fail;
+     if (path && !priv->path_default)
+         goto fail;
++
++    /* Erika names the face of a font collection after an ASCII unit separator:
++     * the public libass ABI has no room for it. */
++    char *face = priv->path_default ? strchr(priv->path_default, '\x1f') : NULL;
++    if (face) {
++        *face = '\0';
++        priv->index_default = atoi(face + 1);
++    }
+ 
+     priv->embedded_provider = ass_embedded_fonts_add_provider(priv, num_emfonts);
+ 

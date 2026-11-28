@@ -1,0 +1,124 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#define SPECIALIZED_LAYER
+#include "common.glsl"
+
+layout(constant_id=0) const uint M=16;
+layout(constant_id=1) const uint N=16;
+layout(constant_id=2) const uint K=16;
+layout(constant_id=3) const uint LANES=32;
+layout(constant_id=4) const uint MAX_KERNEL=3;
+layout(constant_id=21) const uint COMMON_KERNEL=3;
+layout(constant_id=22) const uint COMMON_CHANNELS=16;
+layout(constant_id=23) const uint COMMON_TRANSFORM=0xffffffffu;
+layout(constant_id=25) const uint FIRST_INPUT=0;
+layout(constant_id=26) const uint GROUPS=2;
+layout(constant_id=27) const uint BLOCKS=1;
+layout(constant_id=30) const uint STRIPS=4;
+#ifdef ELEMENT_EPILOGUE
+layout(constant_id=32) const uint COORDINATES=0;
+layout(set=0,binding=2,std430) readonly buffer FloatMetadata { float floatData[]; };
+#endif
+layout(local_size_x_id=3,local_size_y_id=26) in;
+const uint SPAN=N*GROUPS*STRIPS;
+const uint SIDE=SPAN+MAX_KERNEL-1;
+#ifndef DIRECT_LOAD
+shared float16_t slab[MAX_KERNEL*SIDE*(K+8)];
+#endif
+#ifdef HALF_ACCUM
+#define ACC float16_t
+#ifndef ELEMENT_EPILOGUE
+shared float16_t sums[M*N*GROUPS*STRIPS*BLOCKS];
+#endif
+#else
+#define ACC float
+#ifndef ELEMENT_EPILOGUE
+shared float sums[M*N*GROUPS*STRIPS*BLOCKS];
+#endif
+#endif
+
+void main() {
+    uint lane=gl_LocalInvocationIndex,sg=gl_SubgroupID;
+    uint firstX=p.region.x+gl_WorkGroupID.x*SPAN,row=p.region.y+gl_WorkGroupID.z;
+    uint firstChannel=gl_WorkGroupID.y*M*BLOCKS;
+#ifdef ELEMENT_EPILOGUE
+    coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator> coordinates;
+#ifdef HALF_ACCUM
+    coopMatLoad(coordinates,weights,COORDINATES,M,gl_CooperativeMatrixLayoutColumnMajor);
+#else
+    coopMatLoad(coordinates,floatData,COORDINATES,M,gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+#endif
+    coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator> acc[BLOCKS*STRIPS];
+    [[unroll]] for(uint i=0;i<BLOCKS*STRIPS;++i)
+        acc[i]=coopmat<ACC,gl_ScopeSubgroup,M,N,gl_MatrixUseAccumulator>(0.0);
+    for(uint tap=0;tap<h(14);tap+=MAX_KERNEL*MAX_KERNEL) {
+        uint d=h(13)+tap*8;
+        uint channels=COMMON_CHANNELS!=0 ? COMMON_CHANNELS : data[d+4];
+        uint inputChannel=h(14)==MAX_KERNEL*MAX_KERNEL ? FIRST_INPUT : data[d];
+        for(uint c=0;c<channels;c+=K) {
+            // Nine A fragments per output-channel block stay in subgroup
+            // registers and are reused by every strip below.
+            coopmat<float16_t,gl_ScopeSubgroup,M,K,gl_MatrixUseA> a[MAX_KERNEL*MAX_KERNEL*BLOCKS];
+            [[unroll]] for(uint t=0;t<MAX_KERNEL*MAX_KERNEL;++t)
+                [[unroll]] for(uint ob=0;ob<BLOCKS;++ob)
+                    coopMatLoad(a[t*BLOCKS+ob],weights,data[d+t*8+5]+(firstChannel+ob*M)*channels+c,
+                        channels,gl_CooperativeMatrixLayoutRowMajor);
+#ifndef DIRECT_LOAD
+            for(uint i=lane;i<MAX_KERNEL*SIDE*K;i+=LANES*GROUPS) {
+                uint pixel=i/K,ch=i%K;
+                ivec2 at=ivec2(firstX+pixel%SIDE,row+pixel/SIDE)-ivec2(MAX_KERNEL/2);
+                float16_t v=float16_t(0.0);
+                if(all(greaterThanEqual(at,ivec2(0))) && all(lessThan(at,ivec2(p.size.zw))))
+                    v=features[feature_index(inputChannel+c+ch,uint(at.y)*p.size.z+uint(at.x))];
+                uint transform=COMMON_TRANSFORM!=0xffffffffu ? COMMON_TRANSFORM : data[d+3];
+                slab[pixel*(K+8)+ch]=transform==1 ? max(v,float16_t(0.0)) : transform==2 ? max(-v,float16_t(0.0)) : v;
+            }
+            barrier();
+#endif
+            [[unroll]] for(uint strip=0;strip<STRIPS;++strip) {
+                [[unroll]] for(uint ky=0;ky<MAX_KERNEL;++ky) [[unroll]] for(uint kx=0;kx<MAX_KERNEL;++kx) {
+                    coopmat<float16_t,gl_ScopeSubgroup,K,N,gl_MatrixUseB> b;
+#ifdef DIRECT_LOAD
+                    uint pixel=(row+ky-MAX_KERNEL/2)*p.size.z+firstX+(sg*STRIPS+strip)*N+kx-MAX_KERNEL/2;
+                    coopMatLoad(b,features,feature_index(inputChannel+c,pixel),16,gl_CooperativeMatrixLayoutColumnMajor);
+                    uint transform=COMMON_TRANSFORM!=0xffffffffu ? COMMON_TRANSFORM : data[d+3];
+                    if(transform!=0) [[unroll]] for(uint e=0;e<b.length();++e)
+                        b[e]=transform==1 ? max(b[e],float16_t(0.0)) : max(-b[e],float16_t(0.0));
+#else
+                    coopMatLoad(b,slab,(ky*SIDE+kx+(sg*STRIPS+strip)*N)*(K+8),K+8,gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+                    [[unroll]] for(uint ob=0;ob<BLOCKS;++ob)
+                        acc[ob*STRIPS+strip]=coopMatMulAdd(a[(ky*MAX_KERNEL+kx)*BLOCKS+ob],b,acc[ob*STRIPS+strip]);
+                }
+            }
+#ifndef DIRECT_LOAD
+            barrier();
+#endif
+        }
+    }
+#ifdef ELEMENT_EPILOGUE
+    [[unroll]] for(uint ob=0;ob<BLOCKS;++ob) [[unroll]] for(uint s=0;s<STRIPS;++s)
+    [[unroll]] for(uint e=0;e<coordinates.length();++e) {
+        uint rc=uint(coordinates[e]);
+        uint x=firstX+(sg*STRIPS+s)*N+rc/M;
+        if(x<p.region.x+p.region.z && x<p.size.z)
+            epilogue(float(acc[ob*STRIPS+s][e]),firstChannel+ob*M+rc%M,row*p.size.z+x,0);
+    }
+#else
+    [[unroll]] for(uint ob=0;ob<BLOCKS;++ob) [[unroll]] for(uint s=0;s<STRIPS;++s)
+        coopMatStore(acc[ob*STRIPS+s],sums,((ob*GROUPS+sg)*STRIPS+s)*M*N,M,gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+    for(uint i=lane;i<M*N*GROUPS*STRIPS*BLOCKS;i+=LANES*GROUPS) {
+        uint ob=i/(M*N*GROUPS*STRIPS),sg=(i/(M*N*STRIPS))%GROUPS;
+        uint s=(i/(M*N))%STRIPS,rc=i%(M*N);
+        uint x=firstX+(sg*STRIPS+s)*N+rc/M;
+        if(x<p.region.x+p.region.z && x<p.size.z)
+            epilogue(float(sums[i]),firstChannel+ob*M+rc%M,row*p.size.z+x,0);
+    }
+#endif
+}

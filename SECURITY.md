@@ -1,3 +1,5 @@
+[中文](SECURITY.zh.md) | English | [日本語](SECURITY.ja.md)
+
 # Security Policy
 
 Please report vulnerabilities through GitHub Security Advisories or a private maintainer channel. Do not publish credentials, real media-server URLs, private video samples, or exploit details in public issues.

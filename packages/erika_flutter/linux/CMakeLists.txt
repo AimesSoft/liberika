@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 project(erika_flutter LANGUAGES CXX)
+find_package(Threads REQUIRED)
 set(PLUGIN_NAME erika_flutter_plugin)
 set(ERIKA_LIBRARY_DIR "$ENV{ERIKA_LIBRARY_DIR}" CACHE PATH "Directory containing liberika_capi.so")
 if(DEFINED ENV{ERIKA_LIBRARY_DIR})
@@ -21,7 +22,7 @@ set_target_properties(${PLUGIN_NAME} PROPERTIES
 target_compile_features(${PLUGIN_NAME} PRIVATE cxx_std_17)
 target_include_directories(${PLUGIN_NAME} INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(${PLUGIN_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../native/include")
-target_link_libraries(${PLUGIN_NAME} PRIVATE flutter PkgConfig::GTK PkgConfig::EPOXY PkgConfig::WAYLAND "${ERIKA_CAPI}")
+target_link_libraries(${PLUGIN_NAME} PRIVATE flutter PkgConfig::GTK PkgConfig::EPOXY PkgConfig::WAYLAND Threads::Threads "${ERIKA_CAPI}")
 # The bundle is populated after the executable link. Help ld resolve the
 # plugin's native dependency at that stage without embedding a build-host path.
 target_link_options(${PLUGIN_NAME} INTERFACE "LINKER:-rpath-link,${ERIKA_LIBRARY_DIR}")

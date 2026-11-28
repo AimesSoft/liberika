@@ -44,3 +44,14 @@ ffmpeg -hide_banner -loglevel error -nostdin \
   -threads 1 -row-mt 0 -crf 40 -b:v 0 \
   -fflags +bitexact -flags:v +bitexact -y av1-10bit.ivf
 ```
+
+`av1-subnit.ivf` contains one synthetic 10-bit BT.2020/PQ frame with a
+0.5 nit mastering peak. SVT-AV1 encodes the minimum luminance as 2/16384
+nit. The software decoder exposes both values to the HDR pipeline.
+
+```sh
+ffmpeg -f lavfi -i 'color=c=gray:s=64x64:r=1,format=yuv420p10le,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc' \
+  -frames:v 1 -c:v libsvtav1 -preset 12 \
+  -svtav1-params 'lp=1:color-primaries=9:transfer-characteristics=16:matrix-coefficients=9:mastering-display=G(0.170,0.797)B(0.131,0.046)R(0.708,0.292)WP(0.3127,0.3290)L(0.50,0.0001)' \
+  -f ivf av1-subnit.ivf
+```

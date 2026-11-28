@@ -1,0 +1,13 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=128) in;
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    if(index>=plane()*p.core.z) return;
+    uint channel=index/(plane()*16)*16+index%16;
+    if(channel!=0) {features[index]=float16_t(0.0);return;}
+    uint pixel=(index%(plane()*16))/16;
+    ivec2 q=p.origin.xy+ivec2(pixel%p.size.z,pixel/p.size.z);
+    features[index]=float16_t((inside(q) || p.core.w!=0) ? (raw(q)-p.norm.x)*p.norm.y : 0.0);
+}

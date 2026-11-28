@@ -30,7 +30,7 @@ impl AndroidNativeWindow {
 
     /// Verifies the dataspace installed by Android Vulkan WSI for an FP16
     /// extended-linear swapchain. API 28 symbols are resolved dynamically so
-    /// Erika still loads on its API 26 minimum; callers must fall back to SDR
+    /// liberika still loads on its API 26 minimum; callers must fall back to SDR
     /// when this verification is unavailable or fails.
     pub(crate) fn ensure_scrgb_linear_data_space(
         &self,

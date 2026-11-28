@@ -36,10 +36,11 @@ use crate::core::{
     VideoDecoderEvent, VideoFrameImportFailure,
 };
 use crate::danmaku::{
-    DANMAKU_DEBUG_BUCKETS, DanmakuConfigChange, DanmakuDebugBucket, DanmakuFontSelection,
-    DanmakuLayoutConfig, DanmakuMode, DanmakuPreparedStats, DanmakuRenderPlan, DanmakuSession,
-    DanmakuTextRasterizer, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource, DanmakuViewport,
-    DfmLayoutEngine, DfmPreparedLayout, scroll_duration_for_viewport,
+    DANMAKU_DEBUG_BUCKETS, DanmakuColor, DanmakuConfigChange, DanmakuDebugBucket,
+    DanmakuFontSelection, DanmakuItem, DanmakuLayoutConfig, DanmakuMode, DanmakuPreparedStats,
+    DanmakuRenderPlan, DanmakuSession, DanmakuTextRasterizer, DanmakuTimeline, DanmakuTrackInfo,
+    DanmakuTrackSource, DanmakuViewport, DfmLayoutEngine, DfmPreparedLayout,
+    scroll_duration_for_viewport,
 };
 use crate::debug_hud::{DebugHud, DebugHudSnapshot};
 use crate::ffmpeg::DecoderBackend;
@@ -87,6 +88,11 @@ const VIDEO_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
 const MAX_VIDEO_DECODE_RESUME_ATTEMPTS: u32 = 5;
 const DANMAKU_PLAN_REQUEST_QUANTUM: Duration = Duration::from_millis(250);
 const DANMAKU_PREPARE_REFRESH_MARGIN: Duration = Duration::from_secs(4);
+// Geometry previews are immediate. Rasterize the final value after idle,
+// with a bounded wait so a long drag still refreshes its timeline window.
+const DANMAKU_FONT_SIZE_SETTLE: Duration = Duration::from_millis(120);
+const DANMAKU_FONT_SIZE_MAX_WAIT: Duration = Duration::from_millis(500);
+const DANMAKU_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const DANMAKU_PLAN_LOOKAHEAD: Duration = Duration::from_secs(8);
 const DANMAKU_PLAN_LOOKBACK_PADDING: Duration = Duration::from_secs(2);
 const DANMAKU_MOTION_TRACE_INTERVAL: Duration = Duration::from_millis(500);
@@ -286,6 +292,45 @@ pub struct PresenterRuntimeSnapshot {
     pub last_render_test_duration: Duration,
 }
 
+mod subtitle_resolution;
+use subtitle_resolution::SubtitleResolution;
+
+// Only renderers that use immutable ownership pay for an Arc allocation.
+// Public overlay/context APIs keep their borrowed Vec-based representation.
+#[derive(Debug)]
+enum CurrentOverlay {
+    Owned(OverlayFrame),
+    Shared(Arc<OverlayFrame>),
+}
+
+impl CurrentOverlay {
+    fn new(frame: OverlayFrame, share: bool) -> Self {
+        if share && frame.subtitle_planes.is_empty() && !frame.subtitle_alpha_planes.is_empty() {
+            Self::Shared(Arc::new(frame))
+        } else {
+            Self::Owned(frame)
+        }
+    }
+
+    fn shared_owner(&self) -> Option<&Arc<OverlayFrame>> {
+        match self {
+            Self::Shared(owner) => Some(owner),
+            Self::Owned(_) => None,
+        }
+    }
+}
+
+impl std::ops::Deref for CurrentOverlay {
+    type Target = OverlayFrame;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(frame) => frame,
+            Self::Shared(owner) => owner,
+        }
+    }
+}
+
 pub struct PresenterRuntime {
     player: Player,
     renderer: Box<dyn RendererBackend>,
@@ -304,11 +349,17 @@ pub struct PresenterRuntime {
     resume_pending: bool,
     video_decode_resume_attempts: u32,
     latest_video_decoder: Option<VideoDecoderEvent>,
-    current_overlay: Option<OverlayFrame>,
+    current_overlay: Option<CurrentOverlay>,
     debug_hud: DebugHud,
     current_danmaku: Option<DanmakuRenderPlan>,
     current_danmaku_prepared: Option<CurrentDanmakuPrepared>,
+    capture_danmaku: Option<CaptureDanmakuState>,
+    /// Danmaku viewport of the latest native texture export, used for
+    /// planning when no display surface is attached.
+    export_danmaku_viewport: Option<DanmakuViewport>,
     danmaku_plan_replacement_pending: bool,
+    danmaku_resize_settle_at: Option<Instant>,
+    danmaku_font_size_update: Option<DanmakuFontSizeUpdate>,
     rejected_video_import_route: Option<RejectedVideoImportRoute>,
     /// Rolling scene-average luminance (HDR10 without DoVi L1), injected
     /// into each software frame's `scene_avg_nits` to drive the tone-map
@@ -320,6 +371,12 @@ pub struct PresenterRuntime {
     current_surface_metrics: Option<SurfaceMetrics>,
     current_danmaku_viewport: Option<DanmakuViewport>,
     subtitle_font_scale: f64,
+    /// Microseconds subtitles show later than their timestamps (earlier when
+    /// negative).
+    subtitle_delay_micros: i64,
+    volume: f32,
+    muted: bool,
+    subtitle_resolution: SubtitleResolution,
     subtitle_style: SubtitleStyleConfig,
     subtitle_memory_fonts: SubtitleMemoryFonts,
     subtitles: SubtitleFrameState,
@@ -341,6 +398,7 @@ pub struct PresenterRuntime {
     last_render_duration: Duration,
     last_render_current_duration: Duration,
     last_render_test_duration: Duration,
+    presentation: crate::diagnostics::PresentationStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +521,33 @@ struct CurrentDanmakuPrepared {
     window_end: Duration,
 }
 
+struct CaptureDanmakuState {
+    engine: DfmLayoutEngine,
+    viewport: Option<DanmakuViewport>,
+    window_start: Duration,
+    window_end: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DanmakuFontSizeUpdate {
+    settle_at: Instant,
+    deadline: Instant,
+}
+
+impl DanmakuFontSizeUpdate {
+    fn retarget(pending: &mut Option<Self>, now: Instant) {
+        let deadline = pending.map_or(now + DANMAKU_FONT_SIZE_MAX_WAIT, |p| p.deadline);
+        *pending = Some(Self {
+            settle_at: now + DANMAKU_FONT_SIZE_SETTLE,
+            deadline,
+        });
+    }
+
+    fn ready(self, now: Instant) -> bool {
+        now >= self.settle_at || now >= self.deadline
+    }
+}
+
 impl AsyncDanmakuPlanner {
     fn new(
         engine: DfmLayoutEngine,
@@ -519,7 +604,11 @@ impl AsyncDanmakuPlanner {
     fn set_paint_config(&mut self, config: DanmakuLayoutConfig) {
         let (lock, _) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.config = config;
+        state.config.opacity = config.opacity;
+        state.config.shadow_offset = config.shadow_offset;
+        state.config.shadow_style = config.shadow_style;
+        state.config.enabled = config.enabled;
+        // Do not leak a pending font-size preview into background preparation.
         // Do not wake or invalidate an in-flight layout for a renderer-only
         // change. The worker will adopt this revision before its next request.
         state.config_revision = state.config_revision.saturating_add(1);
@@ -700,6 +789,26 @@ impl DanmakuTimeTrace {
     }
 }
 
+/// Keep the clock epoch as well as the sample instant: audio pumping can
+/// re-anchor the live clock after this instant, which cannot be extrapolated
+/// backwards by PlaybackClock. Commands still take precedence over this sample.
+struct RenderTickClockSample {
+    snapshot: PlaybackSnapshot,
+    sampled_at: Instant,
+}
+
+impl RenderTickClockSample {
+    fn after_pump(mut self, latest: PlaybackSnapshot) -> Self {
+        if self.snapshot.generation != latest.generation
+            || self.snapshot.state != latest.state
+            || self.snapshot.clock.rate() != latest.clock.rate()
+        {
+            self.snapshot = latest;
+        }
+        self
+    }
+}
+
 impl PresenterRuntime {
     pub fn new(mut config: PresenterConfig) -> Result<Self> {
         let renderer_preference = config.player.renderer;
@@ -751,7 +860,11 @@ impl PresenterRuntime {
             debug_hud: DebugHud::new(),
             current_danmaku: None,
             current_danmaku_prepared: None,
+            capture_danmaku: None,
+            export_danmaku_viewport: None,
             danmaku_plan_replacement_pending: false,
+            danmaku_resize_settle_at: None,
+            danmaku_font_size_update: None,
             rejected_video_import_route: None,
             scene_luma_smoother: LumaSmoother::new(),
             last_scene_luma_generation: 0,
@@ -760,6 +873,10 @@ impl PresenterRuntime {
             current_surface_metrics: None,
             current_danmaku_viewport: None,
             subtitle_font_scale: DEFAULT_SUBTITLE_FONT_SCALE,
+            subtitle_delay_micros: 0,
+            volume: 1.0,
+            muted: false,
+            subtitle_resolution: SubtitleResolution::default(),
             subtitle_style: SubtitleStyleConfig::default(),
             subtitle_memory_fonts: SubtitleMemoryFonts::default(),
             subtitles: SubtitleFrameState::default(),
@@ -781,6 +898,7 @@ impl PresenterRuntime {
             last_render_duration: Duration::ZERO,
             last_render_current_duration: Duration::ZERO,
             last_render_test_duration: Duration::ZERO,
+            presentation: Default::default(),
         })
     }
 
@@ -796,12 +914,14 @@ impl PresenterRuntime {
             return Err(error);
         }
         self.current_surface_metrics = Some(metrics);
+        self.refresh_current_overlay();
         self.clear_current_danmaku_state();
         Ok(())
     }
 
     pub fn detach_surface(&mut self) -> Result<()> {
         self.current_surface_metrics = None;
+        self.current_overlay = None;
         self.clear_current_danmaku_state();
         self.player.detach_surface()?;
         self.renderer.detach_surface()
@@ -830,6 +950,18 @@ impl PresenterRuntime {
         self.renderer.windows_flutter_texture_iunknown()
     }
 
+    /// Enables or disables GPU snapshot copies for alpha-blended composition
+    /// surfaces (used on Windows while a video view has `0 < Opacity < 1`).
+    pub fn set_composition_blended(&mut self, enabled: bool) {
+        self.renderer.set_composition_blended(enabled);
+    }
+
+    /// Borrowed `ID3D11Texture2D` pointer and monotonic generation of the
+    /// latest blended composition snapshot. No `AddRef`.
+    pub fn composition_blended_texture(&self) -> Option<(*mut std::ffi::c_void, u64)> {
+        self.renderer.composition_blended_texture()
+    }
+
     pub fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
         let metrics = SurfaceMetrics::new(width, height, scale);
         let previous_metrics = self.current_surface_metrics;
@@ -845,12 +977,7 @@ impl PresenterRuntime {
         self.renderer.resize_surface(metrics)?;
         self.current_surface_metrics = Some(metrics);
         let next_viewport = surface_metrics_to_viewport(metrics);
-        let requires_relayout = self
-            .current_danmaku_viewport
-            .is_none_or(|current| danmaku_viewport_requires_relayout(current, next_viewport));
-        if requires_relayout {
-            self.clear_current_danmaku_state();
-        }
+        let requires_relayout = self.move_danmaku_viewport(next_viewport);
         if self.danmaku_trace.enabled {
             let now = Instant::now();
             let periodic_sample_due = self
@@ -878,7 +1005,42 @@ impl PresenterRuntime {
         Ok(())
     }
 
+    /// Moves danmaku to a new output viewport and returns whether the layout
+    /// has to be prepared again.
+    fn move_danmaku_viewport(&mut self, next_viewport: DanmakuViewport) -> bool {
+        let requires_relayout = self
+            .current_danmaku_viewport
+            .is_none_or(|current| danmaku_viewport_requires_relayout(current, next_viewport));
+        if requires_relayout {
+            // The menu animates this surface every display tick. Clearing the
+            // prepared layout here blanks comments until the async worker can
+            // catch up. Keep it moving, remap to the new surface, and prepare
+            // only after the animation settles (also when playback is paused).
+            self.danmaku_planner.invalidate_requests();
+            self.danmaku_plan_replacement_pending =
+                self.current_danmaku_prepared.is_some() || self.current_danmaku.is_some();
+            self.danmaku_resize_settle_at = self
+                .danmaku_plan_replacement_pending
+                .then(|| Instant::now() + DANMAKU_RESIZE_SETTLE);
+        }
+        self.current_danmaku_viewport = Some(next_viewport);
+        if let Some(plan) = self.current_danmaku.as_mut() {
+            plan.retarget(next_viewport);
+        }
+        self.request_current_danmaku_plan_for_current_time();
+        requires_relayout
+    }
+
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {
+        self.open_with_cold_open_cancellation(media, None)
+    }
+
+    pub fn open_with_cold_open_cancellation(
+        &mut self,
+        media: MediaRequest,
+        cancellation: Option<crate::source::ClaimedColdOpenCancellation>,
+    ) -> Result<()> {
+        self.subtitle_resolution.reset_budget();
         self.quiesce_frame_output("open")?;
         self.reset_video_decode_resume_state();
         self.reset_audio_output_with_committed_rate();
@@ -886,7 +1048,10 @@ impl PresenterRuntime {
         self.drain_pending_player_frames();
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;
-        let result = self.player.open(media);
+        self.presentation.reset();
+        let result = self
+            .player
+            .open_with_cold_open_cancellation(media, cancellation);
         let rate_result = if result.is_ok() && !playback_rate_matches(self.playback_rate, 1.0) {
             self.player.set_playback_rate(self.playback_rate)
         } else {
@@ -924,7 +1089,10 @@ impl PresenterRuntime {
         }
         if let Err(error) = self.audio_output.pause() {
             self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio pause failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio pause failed: {error}"),
+            );
         }
         self.audio_started = false;
         self.last_audio_clock_report = None;
@@ -1021,12 +1189,31 @@ impl PresenterRuntime {
         Ok(())
     }
 
+    /// The volume the host chose. While muted it is kept, and applied on
+    /// unmute.
     pub fn set_volume(&mut self, volume: f64) {
-        self.audio_output.set_volume(volume as f32);
+        self.volume = crate::audio::normalize_volume(volume as f32);
+        self.apply_volume();
     }
 
+    /// The volume the host chose, muted or not.
     pub fn volume(&self) -> f64 {
-        self.audio_output.volume() as f64
+        self.volume as f64
+    }
+
+    /// Silences the output without losing the volume.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        self.apply_volume();
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    fn apply_volume(&mut self) {
+        self.audio_output
+            .set_volume(if self.muted { 0.0 } else { self.volume });
     }
 
     pub fn set_debug_hud_enabled(&mut self, enabled: bool) {
@@ -1043,6 +1230,49 @@ impl PresenterRuntime {
             return;
         }
         self.subtitle_font_scale = scale;
+        self.refresh_current_overlay();
+    }
+
+    /// Shows subtitles later (positive) or earlier (negative) than their
+    /// timestamps, embedded and external alike. Frames stay kept that much
+    /// past their end, so a later subtitle is not dropped before it shows.
+    pub fn set_subtitle_delay(&mut self, delay_micros: i64) {
+        let delay_micros =
+            delay_micros.clamp(-MAX_SUBTITLE_DELAY_MICROS, MAX_SUBTITLE_DELAY_MICROS);
+        if self.subtitle_delay_micros == delay_micros {
+            return;
+        }
+        self.subtitle_delay_micros = delay_micros;
+        self.subtitles.lead = Duration::from_micros(delay_micros.max(0) as u64);
+        self.refresh_current_overlay();
+    }
+
+    pub fn subtitle_delay_micros(&self) -> i64 {
+        self.subtitle_delay_micros
+    }
+
+    /// The subtitle timeline's time at media time [pts]: the delay taken out.
+    fn subtitle_time(&self, pts: Duration) -> Duration {
+        let delay = self.subtitle_delay_micros;
+        if delay >= 0 {
+            pts.saturating_sub(Duration::from_micros(delay as u64))
+        } else {
+            pts.saturating_add(Duration::from_micros(delay.unsigned_abs()))
+        }
+    }
+
+    /// What the subtitles say at the current media time, the delay applied:
+    /// each text cue showing, in start order (bitmap subtitles have no text).
+    pub fn subtitle_text_now(&self) -> Vec<SubtitleTextNow> {
+        self.subtitles
+            .spoken_at(self.subtitle_time(self.current_media_time))
+    }
+
+    /// Rasterize text subtitles at 2x precision without resizing the video or
+    /// the displayed text. Enabled by default. Sustained subtitle CPU cost
+    /// falls back to native resolution; large canvases also stay at native resolution.
+    pub fn set_subtitle_supersampling(&mut self, enabled: bool) {
+        self.subtitle_resolution.set_enabled(enabled);
         self.refresh_current_overlay();
     }
 
@@ -1239,7 +1469,6 @@ impl PresenterRuntime {
             DanmakuTrackSource::Unknown,
         );
         self.sync_danmaku_engine_timeline();
-        self.bump_danmaku_generation();
     }
 
     pub fn add_danmaku_track(
@@ -1253,15 +1482,55 @@ impl PresenterRuntime {
             self.danmaku_session
                 .add_track_with_offset(timeline, name, source, offset_micros);
         self.sync_danmaku_engine_timeline();
-        self.bump_danmaku_generation();
         track_id
+    }
+
+    /// Inserts a viewer-sent live comment into the manual danmaku track,
+    /// bordered to mark it as the viewer's own comment. `color_rgb` is
+    /// `0xRRGGBB` (white when `None`); `position` defaults to the current
+    /// playback time.
+    pub fn send_danmaku(
+        &mut self,
+        text: impl Into<String>,
+        color_rgb: Option<u32>,
+        mode: DanmakuMode,
+        position: Option<Duration>,
+    ) -> Result<u64> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(PlayerError::Playback(
+                "danmaku text must not be empty".to_string(),
+            ));
+        }
+        let color = color_rgb.map_or(DanmakuColor::WHITE, |rgb| {
+            DanmakuColor::rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+        });
+        let pts = position.unwrap_or(self.current_media_time);
+        let item = DanmakuItem {
+            id: 0,
+            pts,
+            text,
+            mode,
+            // A source size, scaled by the configured size like every other
+            // comment; the configured size itself would be applied twice.
+            font_size: crate::danmaku::LIVE_SOURCE_FONT_SIZE,
+            color,
+            opacity: 1.0,
+            is_self: true,
+            special: None,
+        };
+        let track_id = self
+            .danmaku_session
+            .push_live_item(item)
+            .map_err(|error| PlayerError::Playback(error.to_string()))?;
+        self.sync_danmaku_engine_timeline();
+        Ok(track_id)
     }
 
     pub fn remove_danmaku_track(&mut self, track_id: u64) -> bool {
         let removed = self.danmaku_session.remove_track(track_id);
         if removed {
             self.sync_danmaku_engine_timeline();
-            self.bump_danmaku_generation();
         }
         removed
     }
@@ -1270,7 +1539,6 @@ impl PresenterRuntime {
         let updated = self.danmaku_session.set_track_enabled(track_id, enabled);
         if updated {
             self.sync_danmaku_engine_timeline();
-            self.bump_danmaku_generation();
         }
         updated
     }
@@ -1281,15 +1549,16 @@ impl PresenterRuntime {
             .set_track_offset(track_id, offset_micros);
         if updated {
             self.sync_danmaku_engine_timeline();
-            self.bump_danmaku_generation();
         }
         updated
     }
 
     pub fn set_danmaku_global_offset(&mut self, offset_micros: i64) {
+        if self.danmaku_session.global_offset() == offset_micros {
+            return;
+        }
         self.danmaku_session.set_global_offset(offset_micros);
         self.sync_danmaku_engine_timeline();
-        self.bump_danmaku_generation();
     }
 
     pub fn danmaku_tracks(&self) -> Vec<DanmakuTrackInfo> {
@@ -1318,6 +1587,10 @@ impl PresenterRuntime {
     }
 
     pub fn set_danmaku_config(&mut self, config: DanmakuLayoutConfig) {
+        let config = config.sanitized();
+        let mut previous_with_size = self.danmaku.config().clone();
+        previous_with_size.font_size = config.font_size;
+        let size_only = previous_with_size == config && self.current_danmaku_prepared.is_some();
         match self.danmaku.apply_config(config.clone()) {
             DanmakuConfigChange::Unchanged => {}
             DanmakuConfigChange::PaintOnly => {
@@ -1340,9 +1613,23 @@ impl PresenterRuntime {
                 if let Some(prepared) = &mut self.current_danmaku_prepared {
                     prepared.prepared.apply_paint_config(&config);
                 }
+                if size_only {
+                    // Size-only results remain usable while dragging: scale them
+                    // to the latest desired size. Keeping this generation also
+                    // prevents continuous input from starving a long-running plan.
+                    DanmakuFontSizeUpdate::retarget(
+                        &mut self.danmaku_font_size_update,
+                        Instant::now(),
+                    );
+                    self.refresh_current_danmaku_plan_from_prepared();
+                    self.request_current_danmaku_plan_for_current_time();
+                    return;
+                }
+                self.danmaku_font_size_update = None;
                 self.danmaku_planner
                     .set_config(config, self.danmaku.rasterizer_clone());
                 self.bump_danmaku_generation_for_config_change();
+                self.refresh_current_danmaku_plan_from_prepared();
                 // A paused player may not produce another video frame. Keep the
                 // existing surface viewport and enqueue the replacement plan now so
                 // display ticks can redraw the retained frame with the new settings.
@@ -1359,6 +1646,57 @@ impl PresenterRuntime {
     /// upscaler implementation ignore the request.
     pub fn set_luma_upscaler(&mut self, mode: crate::renderer::pipeline::LumaUpscalerMode) {
         self.renderer.set_luma_upscaler(mode);
+    }
+
+    /// Reports the upscaler modes and shader capabilities supported by the
+    /// active renderer and GPU device.
+    pub fn supported_upscalers(&self) -> crate::renderer::pipeline::UpscalerCapabilities {
+        self.renderer.supported_upscalers()
+    }
+
+    /// Diagnostics detail for the active luma upscaler: `(inactive_or_degraded_reason, engine_label)`.
+    pub fn upscaler_status_detail(&self) -> (Option<String>, Option<&'static str>) {
+        self.renderer.upscaler_status_detail()
+    }
+
+    /// Snapshot of renderer runtime counters including active upscaler backend
+    /// status and GPU duration.
+    pub fn renderer_runtime_stats(&self) -> crate::core::RendererRuntimeStats {
+        self.renderer.runtime_stats()
+    }
+
+    /// Parses `bytes` (an Erika `.esr` network or an mpv hook shader such as
+    /// FSRCNNX) and installs it for `LumaUpscalerMode::Custom`.
+    pub fn load_custom_upscaler_model(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let model = crate::renderer::sr::catalog::load_custom(name, bytes)?;
+        let optimized = crate::renderer::sr::fold::optimize(&model);
+        self.renderer
+            .set_custom_upscaler_model(Some(std::sync::Arc::new(optimized)));
+        Ok(())
+    }
+
+    pub fn clear_custom_upscaler_model(&mut self) {
+        self.renderer.set_custom_upscaler_model(None);
+    }
+
+    /// Parses `bytes` (mpv `//!HOOK MAIN` GLSL or WGSL) and installs it as the
+    /// active RGB post-processing filter applied to the video picture before
+    /// subtitle and danmaku overlays.
+    pub fn load_post_process_shader(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let shader = crate::renderer::post_process::PostProcessShader::parse(name, bytes)?;
+        self.renderer
+            .set_post_process_shader(Some(std::sync::Arc::new(shader)));
+        Ok(())
+    }
+
+    /// Disables the active RGB post-processing filter.
+    pub fn clear_post_process_shader(&mut self) {
+        self.renderer.set_post_process_shader(None);
+    }
+
+    /// Runtime status of the active RGB post-processing filter.
+    pub fn post_process_status(&self) -> crate::renderer::post_process::PostProcessRuntimeInfo {
+        self.renderer.post_process_status()
     }
 
     pub fn set_output_headroom(&mut self, headroom: f32, known: bool) {
@@ -1391,6 +1729,10 @@ impl PresenterRuntime {
         if !self.player.tracks().is_empty() && self.player.track_selection().subtitle == track_id {
             return Ok(());
         }
+        if track_id.is_none() && !self.player.has_open_media() {
+            // Nothing is open, so no subtitle is shown: nothing to quiesce.
+            return self.player.select_subtitle_track(None);
+        }
         let quiesced = self.quiesce_frame_output("select_subtitle_track")?;
         let result = self.player.select_subtitle_track(track_id);
         let rate_result = self.commit_pending_playback_rate_now();
@@ -1416,6 +1758,9 @@ impl PresenterRuntime {
         self.player.track_selection()
     }
 
+    /// Render with a clock sample captured before pumping audio/video. Hosts
+    /// with a display target should prefer `render_tick_at` to account for
+    /// callback/queue latency and the time until the frame is displayed.
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
         self.render_tick_with_presentation_time(time_seconds, None)
     }
@@ -1436,6 +1781,14 @@ impl PresenterRuntime {
         time_seconds: f64,
         presentation_time: Option<Instant>,
     ) -> Result<PresenterStats> {
+        let tick_started = Instant::now();
+        let untimed_sample = presentation_time.is_none().then(|| {
+            let snapshot = self.player.playback_snapshot();
+            RenderTickClockSample {
+                snapshot,
+                sampled_at: Instant::now(),
+            }
+        });
         if self.audio_only_tick_active {
             if self.resume_pending {
                 self.try_resume_video_decode();
@@ -1461,30 +1814,16 @@ impl PresenterRuntime {
             self.resume_pending = false;
             self.video_decode_resume_attempts = 0;
         }
-        let tick_started = Instant::now();
+        let frame_time = presentation_time.unwrap_or_else(|| {
+            untimed_sample
+                .as_ref()
+                .expect("untimed tick sample")
+                .sampled_at
+        });
+        self.presentation.on_tick(frame_time);
         self.commit_pending_playback_rate()?;
         let pump_started = Instant::now();
-        self.refresh_video_decoder_status();
-
-        let subtitle_started = Instant::now();
-        self.pump_subtitles();
-        self.last_subtitle_pump_duration = subtitle_started.elapsed();
-
-        let video_started = Instant::now();
-        self.pump_video();
-        self.last_video_pump_duration = video_started.elapsed();
-
-        let audio_started = Instant::now();
-        // Publish a callback-observed disconnection before clock/push recovery
-        // advances the backend to recovering or stable during this tick.
-        self.report_audio_output_runtime_stats();
-        self.pump_audio();
-        self.report_audio_output_runtime_stats();
-        self.last_audio_pump_duration = audio_started.elapsed();
-
-        let sync_started = Instant::now();
-        let _snapshot = self.sync_media_time_from_player_at(presentation_time);
-        self.last_clock_sync_duration = sync_started.elapsed();
+        self.pump_frame_inputs(Some(frame_time), untimed_sample);
 
         let plan_started = Instant::now();
         self.refresh_stale_danmaku_plan();
@@ -1534,23 +1873,31 @@ impl PresenterRuntime {
             });
             hud_plane.map(|plane| {
                 let viewport = hud_viewport.expect("HUD requires a viewport");
-                let mut overlay = self
-                    .current_overlay
-                    .clone()
-                    .unwrap_or_else(|| OverlayFrame {
-                        pts: self.current_media_time,
-                        viewport,
-                        subtitle_planes: Vec::new(),
-                        subtitle_alpha_planes: Vec::new(),
-                        subtitle_changed: false,
-                    });
+                let mut overlay =
+                    self.current_overlay
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_else(|| OverlayFrame {
+                            pts: self.current_media_time,
+                            viewport,
+                            subtitle_planes: Vec::new(),
+                            subtitle_alpha_planes: Vec::new(),
+                            subtitle_changed: false,
+                        });
                 overlay.subtitle_planes.push(plane);
                 overlay
             })
         } else {
             None
         };
-        let render_overlay = hud_overlay.as_ref().or(self.current_overlay.as_ref());
+        let render_overlay = hud_overlay.as_ref().or(self.current_overlay.as_deref());
+        let overlay_owner = if hud_overlay.is_none() {
+            self.current_overlay
+                .as_ref()
+                .and_then(CurrentOverlay::shared_owner)
+        } else {
+            None
+        };
         let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
             .overlay(render_overlay)
             .danmaku(self.current_danmaku.as_ref())
@@ -1568,12 +1915,24 @@ impl PresenterRuntime {
             return Ok(self.stats);
         }
         let render_started = Instant::now();
-        let render_result = self.renderer.render_current_frame(context);
+        let render_result = if let Some(owner) = overlay_owner {
+            self.renderer.render_current_frame_shared(context, owner)
+        } else {
+            self.renderer.render_current_frame(context)
+        };
         self.last_render_current_duration = render_started.elapsed();
         self.last_render_duration = self.last_render_current_duration;
         self.last_render_test_duration = Duration::ZERO;
         match render_result {
-            Ok(true) => self.stats.rendered_video_frames += 1,
+            Ok(true) => {
+                self.stats.rendered_video_frames += 1;
+                self.presentation.on_render(
+                    frame_time,
+                    true,
+                    self.is_playing(),
+                    self.playback_rate,
+                );
+            }
             Ok(false) => {
                 if self.render_test_pattern_when_idle {
                     let render_started = Instant::now();
@@ -1638,6 +1997,44 @@ impl PresenterRuntime {
             ));
         }
         Ok(self.stats)
+    }
+
+    /// Pumps subtitles, video and audio, then applies one clock sample. Plain
+    /// render ticks retain their pre-pump clock epoch; captures can sample now.
+    fn pump_frame_inputs(
+        &mut self,
+        presentation_time: Option<Instant>,
+        untimed_sample: Option<RenderTickClockSample>,
+    ) {
+        self.refresh_video_decoder_status();
+
+        let subtitle_started = Instant::now();
+        self.pump_subtitles();
+        self.last_subtitle_pump_duration = subtitle_started.elapsed();
+
+        let video_started = Instant::now();
+        self.pump_video();
+        self.last_video_pump_duration = video_started.elapsed();
+
+        let audio_started = Instant::now();
+        // Publish a callback-observed disconnection before clock/push recovery
+        // advances the backend to recovering or stable during this tick.
+        self.report_audio_output_runtime_stats();
+        self.pump_audio();
+        self.report_audio_output_runtime_stats();
+        self.last_audio_pump_duration = audio_started.elapsed();
+
+        let sync_started = Instant::now();
+        let latest = self.player.playback_snapshot();
+        let sample = match untimed_sample {
+            Some(sample) => sample.after_pump(latest),
+            None => RenderTickClockSample {
+                snapshot: latest,
+                sampled_at: presentation_time.unwrap_or_else(Instant::now),
+            },
+        };
+        self.apply_playback_snapshot(&sample.snapshot, Some(sample.sampled_at));
+        self.last_clock_sync_duration = sync_started.elapsed();
     }
 
     pub fn audio_only_tick(&mut self) -> Result<PresenterStats> {
@@ -1720,7 +2117,10 @@ impl PresenterRuntime {
         if !self.surface_is_ready() {
             return;
         }
+        self.resume_video_decode_now();
+    }
 
+    fn resume_video_decode_now(&mut self) {
         self.discard_pending_video_frames();
         match self.player.set_video_decode_suspended(false) {
             Ok(_) => {
@@ -1862,7 +2262,35 @@ impl PresenterRuntime {
         }
     }
 
+    /// Captures video and subtitles as tightly packed SDR RGBA8 pixels.
+    ///
+    /// Danmaku and the debug HUD are excluded. Returns `None` until a video
+    /// frame is available; no display surface is required.
     pub fn capture_frame_rgba(&mut self, width: u32, height: u32) -> Result<Option<Vec<u8>>> {
+        self.capture_frame_rgba_impl(width, height, false)
+    }
+
+    /// Captures video, subtitles and enabled danmaku as SDR RGBA8 pixels.
+    ///
+    /// Danmaku uses the current playback time and the requested pixel viewport
+    /// (scale factor 1), independently of any display surface or render ticks.
+    /// Layout is prepared synchronously in cached timeline windows. The debug
+    /// HUD is excluded. Audio output still needs the regular render ticks.
+    /// See [`Self::capture_frame_rgba`] for pixel layout and return semantics.
+    pub fn capture_frame_rgba_with_danmaku(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.capture_frame_rgba_impl(width, height, true)
+    }
+
+    fn capture_frame_rgba_impl(
+        &mut self,
+        width: u32,
+        height: u32,
+        include_danmaku: bool,
+    ) -> Result<Option<Vec<u8>>> {
         if width == 0 || height == 0 {
             return Err(PlayerError::Renderer(
                 "capture size must be non-zero".to_string(),
@@ -1876,19 +2304,257 @@ impl PresenterRuntime {
         // Capture is a real render target with its own pixel viewport. Reusing
         // the surface-sized overlay here would scale a stale subtitle atlas, so
         // rebuild the regular subtitle overlay for the requested target.
-        //
-        // Danmaku is deliberately not attached to this offscreen context:
-        // screenshots are used as watch-history thumbnails and must represent
-        // the video rather than transient on-screen comments. The presentation
-        // context in `render_current` still attaches `current_danmaku`.
         let capture_overlay = self.capture_overlay(width, height);
+        // Use the capture engine's cached layout, not the surface's async plan:
+        // a headless host may never render a tick, and capture dimensions can
+        // differ from the surface. This leaves on-screen preparation untouched.
+        let capture_danmaku = if include_danmaku {
+            self.capture_danmaku_plan(DanmakuViewport::new(width, height))
+        } else {
+            None
+        };
 
         let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
             .overlay(Some(&capture_overlay))
+            .danmaku(capture_danmaku.as_ref())
             .output_size(width, height);
         self.renderer
             .capture_current_frame(context, width, height)
             .map(|capture| capture.map(|capture| capture.rgba))
+    }
+
+    /// Lays out danmaku for an RGBA capture synchronously, so the first
+    /// capture already contains its comments. Placement history survives
+    /// layout-setting changes and sub-2px size changes, as on screen; timeline,
+    /// font, seek and track changes drop the whole state.
+    fn capture_danmaku_plan(&mut self, viewport: DanmakuViewport) -> Option<DanmakuRenderPlan> {
+        if !self.danmaku.config().enabled {
+            return None;
+        }
+        let media_time = self.current_media_time;
+        let generation = self.current_generation;
+        let capture = self
+            .capture_danmaku
+            .get_or_insert_with(|| CaptureDanmakuState {
+                engine: self.danmaku.detached(),
+                viewport: None,
+                window_start: Duration::ZERO,
+                window_end: Duration::ZERO,
+            });
+        let config_change = if capture.engine.config() == self.danmaku.config() {
+            DanmakuConfigChange::Unchanged
+        } else {
+            capture.engine.set_config_with_rasterizer(
+                self.danmaku.config().clone(),
+                self.danmaku.rasterizer_clone(),
+            )
+        };
+        let needs_prepare = config_change == DanmakuConfigChange::Layout
+            || capture
+                .viewport
+                .is_none_or(|prepared| danmaku_viewport_requires_relayout(prepared, viewport))
+            || media_time < capture.window_start
+            || capture.window_end.saturating_sub(media_time) <= DANMAKU_PREPARE_REFRESH_MARGIN;
+        if needs_prepare {
+            let (window, window_start, window_end) = danmaku_plan_window(
+                self.danmaku_session.active_timeline(),
+                media_time,
+                self.danmaku.config(),
+                viewport,
+            );
+            capture.engine.sync_timeline(&window);
+            capture.engine.recycle_raster_caches_if_needed();
+            capture.engine.prepare(viewport, generation);
+            capture.viewport = Some(viewport);
+            capture.window_start = window_start;
+            capture.window_end = window_end;
+        }
+        let prepared_viewport = capture.viewport?;
+        let mut plan = capture
+            .engine
+            .render_plan(media_time, prepared_viewport, generation);
+        plan.retarget(viewport);
+        Some(plan)
+    }
+
+    /// Composites video, subtitles and enabled danmaku into a native GPU texture.
+    ///
+    /// No surface or pixel readback is involved. Returns `None` before the
+    /// first video frame. Select `WgpuFallback`; currently implemented for
+    /// Linux Vulkan OPAQUE_FD and Apple Metal. Native handles and synchronization
+    /// rules are documented on [`crate::ExternalTextureFrame`].
+    ///
+    /// Call once per host frame instead of `render_tick`: each call pumps
+    /// subtitles, video and audio. `content_scale` is the host's physical
+    /// pixels per logical point, as for `resize_surface`. Danmaku uses the same
+    /// background planner as on-screen playback, so after a seek, track or size
+    /// change comments can appear a few frames later. Without an attached
+    /// surface, danmaku is planned for the export size.
+    pub fn export_frame_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        content_scale: f64,
+    ) -> Result<Option<crate::core::ExternalTextureFrame>> {
+        // Before any playback work: an export that cannot be rendered must
+        // not pump media or move the danmaku viewport.
+        self.renderer.validate_export_texture_size(width, height)?;
+        if self.audio_only_tick_active {
+            // An export target is a foreground video sink even without a
+            // window surface, so resume at once, with the same attempt budget
+            // as foreground display ticks.
+            if self.video_decode_resume_attempts < MAX_VIDEO_DECODE_RESUME_ATTEMPTS {
+                self.resume_video_decode_now();
+            }
+        } else {
+            self.resume_pending = false;
+            self.video_decode_resume_attempts = 0;
+        }
+        let tick_started = Instant::now();
+        self.presentation.on_tick(tick_started);
+        self.commit_pending_playback_rate()?;
+        // Set before pumping, so a new video frame already plans for it.
+        let viewport =
+            surface_metrics_to_viewport(SurfaceMetrics::new(width, height, content_scale));
+        self.export_danmaku_viewport = Some(viewport);
+        let pump_started = Instant::now();
+        self.pump_frame_inputs(None, None);
+
+        let plan_started = Instant::now();
+        if self.current_surface_metrics.is_none() && self.current_danmaku_viewport != Some(viewport)
+        {
+            // Paused playback produces no new frame; move the layout here.
+            self.move_danmaku_viewport(viewport);
+        }
+        self.refresh_stale_danmaku_plan();
+        self.last_danmaku_plan_duration = plan_started.elapsed();
+        self.last_pump_duration = pump_started.elapsed();
+
+        let overlay = self.capture_overlay(width, height);
+        let retargeted;
+        let danmaku = match self.current_danmaku.as_ref() {
+            Some(plan) if plan.viewport != viewport => {
+                let mut plan = plan.clone();
+                plan.retarget(viewport);
+                retargeted = plan;
+                Some(&retargeted)
+            }
+            plan => plan,
+        };
+        let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
+            .overlay(Some(&overlay))
+            .danmaku(danmaku)
+            .output_size(width, height);
+        let render_started = Instant::now();
+        let result = self
+            .renderer
+            .export_current_frame_texture(context, width, height);
+        self.last_render_current_duration = render_started.elapsed();
+        self.last_render_duration = self.last_render_current_duration;
+        self.last_render_test_duration = Duration::ZERO;
+        self.last_tick_duration = tick_started.elapsed();
+        let frame = result.inspect_err(|_| self.stats.render_failures += 1)?;
+        if frame.is_some() {
+            self.stats.rendered_video_frames += 1;
+            self.presentation.on_render(
+                Instant::now(),
+                true,
+                self.is_playing(),
+                self.playback_rate,
+            );
+        }
+        Ok(frame)
+    }
+
+    /// The same composite as [`Self::export_frame_texture`], delivered as a
+    /// linear dma-buf (Linux).
+    ///
+    /// The host imports the descriptor with its own graphics API (GTK's
+    /// `GdkDmabufTexture`, EGL, a compositor) instead of importing a Vulkan
+    /// image into a second device: nothing to duplicate, no device to match.
+    /// Call once per host frame instead of `render_tick`, as
+    /// `export_frame_texture`; it drives subtitles, video and audio alike.
+    ///
+    /// ```no_run
+    /// # use erika::presenter::PresenterRuntime;
+    /// # fn tick(presenter: &mut PresenterRuntime) -> Result<(), Box<dyn std::error::Error>> {
+    /// if let Some(frame) = presenter.export_frame_dmabuf(1280, 720, 1.0)? {
+    ///     // fourcc = ABGR8888, modifier = 0, one plane, frame.stride() apart.
+    ///     let fd = frame.into_fd();
+    ///     # let _ = fd;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    pub fn export_frame_dmabuf(
+        &mut self,
+        width: u32,
+        height: u32,
+        content_scale: f64,
+    ) -> Result<Option<crate::core::DmabufFrame>> {
+        // As `export_frame_texture`: validate before doing playback work.
+        self.renderer.validate_export_texture_size(width, height)?;
+        if self.audio_only_tick_active {
+            if self.video_decode_resume_attempts < MAX_VIDEO_DECODE_RESUME_ATTEMPTS {
+                self.resume_video_decode_now();
+            }
+        } else {
+            self.resume_pending = false;
+            self.video_decode_resume_attempts = 0;
+        }
+        let tick_started = Instant::now();
+        self.presentation.on_tick(tick_started);
+        self.commit_pending_playback_rate()?;
+        let viewport =
+            surface_metrics_to_viewport(SurfaceMetrics::new(width, height, content_scale));
+        self.export_danmaku_viewport = Some(viewport);
+        let pump_started = Instant::now();
+        self.pump_frame_inputs(None, None);
+
+        let plan_started = Instant::now();
+        if self.current_surface_metrics.is_none() && self.current_danmaku_viewport != Some(viewport)
+        {
+            self.move_danmaku_viewport(viewport);
+        }
+        self.refresh_stale_danmaku_plan();
+        self.last_danmaku_plan_duration = plan_started.elapsed();
+        self.last_pump_duration = pump_started.elapsed();
+
+        let overlay = self.capture_overlay(width, height);
+        let retargeted;
+        let danmaku = match self.current_danmaku.as_ref() {
+            Some(plan) if plan.viewport != viewport => {
+                let mut plan = plan.clone();
+                plan.retarget(viewport);
+                retargeted = plan;
+                Some(&retargeted)
+            }
+            plan => plan,
+        };
+        let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
+            .overlay(Some(&overlay))
+            .danmaku(danmaku)
+            .output_size(width, height);
+        let render_started = Instant::now();
+        let result = self
+            .renderer
+            .export_current_frame_dmabuf(context, width, height);
+        self.last_render_current_duration = render_started.elapsed();
+        self.last_render_duration = self.last_render_current_duration;
+        self.last_render_test_duration = Duration::ZERO;
+        self.last_tick_duration = tick_started.elapsed();
+        let frame = result.inspect_err(|_| self.stats.render_failures += 1)?;
+        if frame.is_some() {
+            self.stats.rendered_video_frames += 1;
+            self.presentation.on_render(
+                Instant::now(),
+                true,
+                self.is_playing(),
+                self.playback_rate,
+            );
+        }
+        Ok(frame)
     }
 
     pub fn take_flutter_frame(&mut self) -> Option<crate::core::RendererFrameCapture> {
@@ -1921,11 +2587,9 @@ impl PresenterRuntime {
             .overlay
             .render(self.current_media_time, capture_overlay_viewport);
         let subtitle_style = self.subtitle_ass_style(capture_overlay.viewport);
-        self.subtitles.append_to_overlay(
-            self.current_media_time,
-            &mut capture_overlay,
-            &subtitle_style,
-        );
+        let subtitle_time = self.subtitle_time(self.current_media_time);
+        self.subtitles
+            .append_to_overlay(subtitle_time, &mut capture_overlay, &subtitle_style);
         capture_overlay
     }
 
@@ -2002,6 +2666,161 @@ impl PresenterRuntime {
         }
     }
 
+    /// One-call diagnostics document for hosts and agents, schema
+    /// [`crate::diagnostics::DIAGNOSTICS_SCHEMA`].
+    ///
+    /// It reads presenter fields, renderer/audio counters and the player's
+    /// lock-free timing counters; it never decodes, renders or waits on the
+    /// playback worker. Unknown values are `null`.
+    pub fn diagnostics_snapshot(&mut self) -> serde_json::Value {
+        use crate::diagnostics as diag;
+        use serde_json::json;
+
+        self.refresh_video_decoder_status();
+        let now = Instant::now();
+        let snapshot = self.runtime_snapshot();
+        let renderer = &snapshot.renderer;
+        let tracks = self.player.tracks();
+        let selection = self.player.track_selection();
+        let find_track =
+            |id: Option<i64>| id.and_then(|id| tracks.iter().find(|track| track.id == id));
+        let video_track = find_track(selection.video).map(|track| {
+            json!({
+                "trackId": track.id,
+                "codec": track.codec,
+                "profile": track.profile,
+                "level": track.level,
+                "width": track.width,
+                "height": track.height,
+                "pixelFormat": track.pixel_format,
+                "frameRate": track.frame_rate.as_ref().map(|rate| rate.frames_per_second()),
+                "bitRate": track.bit_rate,
+                "dolbyVisionProfile": track.dolby_vision_profile,
+            })
+        });
+        let audio_track = find_track(selection.audio).map(|track| {
+            json!({
+                "trackId": track.id,
+                "codec": track.codec,
+                "profile": track.profile,
+                "sampleRate": track.sample_rate,
+                "channels": track.channels,
+                "sampleFormat": track.sample_format,
+                "bitRate": track.bit_rate,
+            })
+        });
+        let container = {
+            let container = self.player.container();
+            (container.format.is_some() || container.bit_rate.is_some())
+                .then(|| json!({ "format": container.format, "bitRate": container.bit_rate }))
+        };
+        let subtitle_track = find_track(selection.subtitle).map(|track| {
+            json!({ "trackId": track.id, "codec": track.codec, "language": track.language })
+        });
+        let timing = self.player.timing_counters();
+        let audio_ring = self.audio_output.stats();
+        let audio_runtime = snapshot.audio_output_runtime_stats;
+        let queues = timing.queues_json();
+        let channel = |queued: usize, capacity: Option<usize>| json!({ "queued": queued, "capacity": capacity });
+        let surface = self.current_surface_metrics;
+        json!({
+            "schema": diag::DIAGNOSTICS_SCHEMA,
+            "capturedAtUnixMs": diag::unix_ms_now(),
+            "playback": {
+                "state": format!("{:?}", self.player.state()).to_lowercase(),
+                "playing": snapshot.playing,
+                "mediaTimeSeconds": snapshot.media_time.as_secs_f64(),
+                "durationSeconds": self.player.duration().map(|duration| duration.as_secs_f64()),
+                "playbackRate": self.playback_rate,
+                "generation": snapshot.generation,
+                "audioOnly": self.audio_only_tick_active,
+                "buffering": timing.buffering_json(),
+            },
+            "media": {
+                "container": container,
+                "video": video_track,
+                "audio": audio_track,
+                "subtitle": subtitle_track,
+            },
+            "decoder": diag::decoder_json(self.latest_video_decoder.as_ref()),
+            "video": {
+                "decodedFrames": snapshot.stats.decoded_video_frames,
+                "renderedFrames": snapshot.stats.rendered_video_frames,
+                "hardwareFrames": renderer.hardware_video_frames,
+                "softwareFrames": renderer.software_video_frames,
+                "zeroCopyFrames": renderer.zero_copy_video_frames,
+                "directZeroCopyFrames": renderer.direct_zero_copy_video_frames,
+                "sharedHandleFrames": renderer.shared_handle_video_frames,
+                "cpuFallbackFrames": renderer.cpu_video_frame_fallbacks,
+                "importFailures": snapshot.stats.import_failures,
+                "renderFailures": snapshot.stats.render_failures,
+                "backpressureDrops": snapshot.stats.video_frame_backpressure_drops,
+                "rejectedImportRoute": self.rejected_video_import_route.map(|route| json!({
+                    "backend": route.backend.as_str(),
+                    "mediaCodecSurface": route.mediacodec_surface,
+                    "generation": route.generation,
+                })),
+            },
+            "presenter": {
+                "surfaceAttached": renderer.attached,
+                "surfaceWidth": surface.map(|metrics| metrics.physical_extent.width),
+                "surfaceHeight": surface.map(|metrics| metrics.physical_extent.height),
+                "lastTickMs": diag::duration_ms_value(snapshot.last_tick_duration),
+                "lastPumpMs": diag::duration_ms_value(snapshot.last_pump_duration),
+                "lastAudioPumpMs": diag::duration_ms_value(snapshot.last_audio_pump_duration),
+                "lastSubtitlePumpMs": diag::duration_ms_value(snapshot.last_subtitle_pump_duration),
+                "lastVideoPumpMs": diag::duration_ms_value(snapshot.last_video_pump_duration),
+                "lastClockSyncMs": diag::duration_ms_value(snapshot.last_clock_sync_duration),
+                "lastDanmakuPlanMs": diag::duration_ms_value(snapshot.last_danmaku_plan_duration),
+                "lastRenderMs": diag::duration_ms_value(snapshot.last_render_duration),
+                "lastGpuMs": diag::duration_ms_value(renderer.last_gpu_duration),
+                "renderedTestFrames": snapshot.stats.rendered_test_frames,
+                "overlayFrames": snapshot.stats.overlay_frames,
+                "decodedSubtitleFrames": snapshot.stats.decoded_subtitle_frames,
+                "danmakuFrames": snapshot.stats.danmaku_frames,
+                "danmakuItems": snapshot.stats.danmaku_items,
+                "currentDanmakuItems": snapshot.current_danmaku_items,
+            },
+            "output": diag::output_json(&snapshot.output),
+            "hdr": diag::hdr_json(renderer),
+            "resources": diag::resources_json(&snapshot.resources, snapshot.current_danmaku_atlas_bytes),
+            "upscaler": diag::upscaler_json(renderer, self.renderer.upscaler_status_detail()),
+            "audio": {
+                "outputState": format!("{:?}", self.audio_output.state()).to_lowercase(),
+                "configured": self.audio_configured,
+                "started": self.audio_started,
+                "volume": self.audio_output.volume(),
+                "pushedFrames": snapshot.stats.pushed_audio_frames,
+                "failures": snapshot.stats.audio_failures,
+                "queuedFrames": snapshot.audio_output_queued_frames,
+                "queuedMs": diag::optional_duration_ms(snapshot.audio_output_queued_duration),
+                "readFrames": snapshot.audio_output_read_frames,
+                "writtenFrames": snapshot.audio_output_written_frames,
+                "underflowFrames": snapshot.audio_output_underflow_frames,
+                "ringDroppedFrames": audio_ring.dropped_frames,
+                "recovery": {
+                    "state": audio_runtime.recovery_state.as_str(),
+                    "lastErrorCode": audio_runtime.last_error_code,
+                    "attempts": audio_runtime.recovery_attempts,
+                    "count": audio_runtime.recovery_count,
+                    "failures": audio_runtime.recovery_failures,
+                },
+            },
+            "buffers": {
+                "playback": queues,
+                "presenterVideoFrames": channel(self.video_frames.len(), self.video_frames.capacity()),
+                "presenterAudioFrames": channel(self.audio_frames.len(), self.audio_frames.capacity()),
+                "presenterSubtitleFrames": channel(self.subtitle_frames.len(), self.subtitle_frames.capacity()),
+                "audioOutputQueuedMs": diag::optional_duration_ms(snapshot.audio_output_queued_duration),
+            },
+            "timing": {
+                "scheduler": timing.scheduler_json(),
+                "presentation": self.presentation.to_json(now),
+                "clock": timing.clock_json(),
+            },
+        })
+    }
+
     fn pump_video(&mut self) {
         let started = Instant::now();
         let mut pumped = 0usize;
@@ -2044,12 +2863,13 @@ impl PresenterRuntime {
                                 self.rejected_video_import_route = None;
                             }
                             let pts = frame.pts.unwrap_or(frame.media_time);
+                            self.presentation.on_upload(pts, frame.generation);
                             self.current_media_time = pts;
                             self.current_generation =
-                                frame.generation.max(self.danmaku_generation).max(1);
+                                generation_after_upload(self.current_generation, frame.generation);
                             self.update_overlay(
                                 pts,
-                                frame.generation,
+                                self.current_generation,
                                 frame.frame.width() as usize,
                                 frame.frame.height() as usize,
                             );
@@ -2191,30 +3011,35 @@ impl PresenterRuntime {
             width.min(u32::MAX as usize) as u32,
             height.min(u32::MAX as usize) as u32,
         );
-        let mut overlay = self
-            .overlay
-            .render(pts, OverlayViewport::new(viewport.width, viewport.height));
-        let subtitle_style = self.subtitle_ass_style(overlay.viewport);
-        self.subtitles
-            .append_to_overlay(pts, &mut overlay, &subtitle_style);
-        if subtitle_diag_enabled() {
-            eprintln!(
-                "[erika-subtitle-diag] stage=update_overlay pts={} gen={} video={}x{} overlay={}",
-                duration_label(Some(pts)),
-                generation,
-                viewport.width,
-                viewport.height,
-                overlay_debug_summary(&overlay),
-            );
+        let source = OverlayViewport::new(viewport.width, viewport.height);
+        self.subtitle_resolution.source = Some(source);
+        // Export-only hosts rasterize through capture_overlay at the export
+        // size. Keep the source size for a later surface attachment, but do
+        // not render an unused playback overlay or disturb libass's viewport.
+        if self.current_surface_metrics.is_some() {
+            let overlay = self.render_playback_overlay(pts, source);
+            if subtitle_diag_enabled() {
+                eprintln!(
+                    "[erika-subtitle-diag] stage=update_overlay pts={} gen={} video={}x{} overlay={}",
+                    duration_label(Some(pts)),
+                    generation,
+                    viewport.width,
+                    viewport.height,
+                    overlay_debug_summary(&overlay),
+                );
+            }
+            if !overlay.is_empty() {
+                self.stats.overlay_frames += 1;
+            }
+            self.current_overlay = Some(self.retain_overlay(overlay));
+        } else {
+            self.current_overlay = None;
         }
-        if !overlay.is_empty() {
-            self.stats.overlay_frames += 1;
-        }
-        self.current_overlay = Some(overlay);
         let generation = generation.max(self.danmaku_generation).max(1);
         let candidate_viewport = self
             .current_surface_metrics
             .map(surface_metrics_to_viewport)
+            .or(self.export_danmaku_viewport)
             .unwrap_or(viewport);
         let danmaku_viewport = self
             .current_danmaku_viewport
@@ -2245,7 +3070,9 @@ impl PresenterRuntime {
             let prepared_items = result.prepared.items().len();
             if accepted {
                 result.prepared.apply_paint_config(self.danmaku.config());
-                self.danmaku_plan_replacement_pending = false;
+                self.danmaku_plan_replacement_pending =
+                    result.prepared.font_size() != self.danmaku.config().font_size;
+                self.danmaku_resize_settle_at = None;
                 self.current_danmaku_prepared = Some(CurrentDanmakuPrepared {
                     request: result.request,
                     prepared: result.prepared,
@@ -2286,16 +3113,21 @@ impl PresenterRuntime {
             }
             return;
         };
-        if !self.danmaku_prepared_covers_current_time(prepared) {
-            if !self.danmaku_plan_replacement_pending {
-                self.current_danmaku = None;
-            }
+        if !self.danmaku_prepared_time_is_current(prepared) {
+            self.current_danmaku = None;
             return;
         }
         let layout = prepared
             .prepared
             .frame_layout(self.current_media_time, self.current_generation);
-        let plan = prepared.rasterizer.render_plan(&layout);
+        let scale = self.danmaku.config().font_size / prepared.prepared.font_size();
+        let mut plan =
+            prepared
+                .rasterizer
+                .render_plan_scaled(&layout, scale, prepared.prepared.atlas());
+        if let Some(viewport) = self.current_danmaku_viewport {
+            plan.retarget(viewport);
+        }
         self.current_danmaku = Some(plan);
         self.record_current_danmaku_stats();
     }
@@ -2320,7 +3152,24 @@ impl PresenterRuntime {
         if !self.danmaku.config().enabled {
             return;
         }
-        if !self.danmaku_plan_replacement_pending
+        if self
+            .danmaku_resize_settle_at
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        let size_waiting = self
+            .danmaku_font_size_update
+            .is_some_and(|pending| !pending.ready(Instant::now()));
+        if self.danmaku_font_size_update.is_some() && !size_waiting {
+            self.danmaku_font_size_update = None;
+            self.danmaku_planner.set_config(
+                self.danmaku.config().clone(),
+                self.danmaku.rasterizer_clone(),
+            );
+            self.danmaku_plan_replacement_pending = true;
+        }
+        if (!self.danmaku_plan_replacement_pending || size_waiting)
             && self
                 .current_danmaku_prepared
                 .as_ref()
@@ -2350,8 +3199,13 @@ impl PresenterRuntime {
     }
 
     fn danmaku_prepared_covers_current_time(&self, prepared: &CurrentDanmakuPrepared) -> bool {
+        self.current_danmaku_viewport.is_some_and(|viewport| {
+            !danmaku_viewport_requires_relayout(prepared.request.key.viewport, viewport)
+        }) && self.danmaku_prepared_time_is_current(prepared)
+    }
+
+    fn danmaku_prepared_time_is_current(&self, prepared: &CurrentDanmakuPrepared) -> bool {
         prepared.request.key.generation == self.current_generation
-            && Some(prepared.request.key.viewport) == self.current_danmaku_viewport
             && prepared.window_start <= self.current_media_time
             && self.current_media_time <= prepared.window_end
     }
@@ -2385,29 +3239,23 @@ impl PresenterRuntime {
             .max(1);
         if player_time != self.current_media_time {
             self.current_media_time = player_time;
-            if let Some(viewport) = self
-                .current_overlay
-                .as_ref()
-                .map(|overlay| overlay.viewport)
+            if self.current_surface_metrics.is_some()
+                && let Some(source) = self.subtitle_resolution.source
             {
-                let mut overlay = self.overlay.render(
-                    player_time,
-                    OverlayViewport::new(viewport.width, viewport.height),
-                );
-                let subtitle_style = self.subtitle_ass_style(overlay.viewport);
-                self.subtitles
-                    .append_to_overlay(player_time, &mut overlay, &subtitle_style);
+                // Release the superseded overlay before allocating its replacement.
+                self.current_overlay = None;
+                let overlay = self.render_playback_overlay(player_time, source);
                 if subtitle_diag_enabled() {
                     eprintln!(
                         "[erika-subtitle-diag] stage=clock_overlay player={} gen={} overlay_viewport={}x{} overlay={}",
                         duration_label(Some(player_time)),
                         self.current_generation,
-                        viewport.width,
-                        viewport.height,
+                        overlay.viewport.width,
+                        overlay.viewport.height,
                         overlay_debug_summary(&overlay),
                     );
                 }
-                self.current_overlay = Some(overlay);
+                self.current_overlay = Some(self.retain_overlay(overlay));
             }
         }
         self.trace_danmaku_time(
@@ -2423,21 +3271,46 @@ impl PresenterRuntime {
     }
 
     fn refresh_current_overlay(&mut self) {
-        let Some(viewport) = self
-            .current_overlay
-            .as_ref()
-            .map(|overlay| overlay.viewport)
-        else {
+        if self.current_surface_metrics.is_none() {
+            self.current_overlay = None;
+            return;
+        }
+        let Some(source) = self.subtitle_resolution.source else {
             return;
         };
-        let mut overlay = self.overlay.render(
-            self.current_media_time,
-            OverlayViewport::new(viewport.width, viewport.height),
-        );
-        let subtitle_style = self.subtitle_ass_style(overlay.viewport);
+        let overlay = self.render_playback_overlay(self.current_media_time, source);
+        self.current_overlay = Some(self.retain_overlay(overlay));
+    }
+
+    fn retain_overlay(&self, overlay: OverlayFrame) -> CurrentOverlay {
+        CurrentOverlay::new(overlay, self.renderer.prefers_shared_overlay())
+    }
+
+    fn render_playback_overlay(&mut self, pts: Duration, source: OverlayViewport) -> OverlayFrame {
+        let viewport = self.subtitle_resolution.viewport(source);
+        let started = Instant::now();
+        let mut overlay = self.overlay.render(pts, viewport);
+        // Script coordinates and user font sizes stay in the original video
+        // space. Only libass's raster canvas has a higher resolution.
+        let subtitle_style = self.subtitle_ass_style(source);
+        let subtitle_time = self.subtitle_time(pts);
         self.subtitles
-            .append_to_overlay(self.current_media_time, &mut overlay, &subtitle_style);
-        self.current_overlay = Some(overlay);
+            .append_to_overlay(subtitle_time, &mut overlay, &subtitle_style);
+        if viewport != source
+            && !overlay.subtitle_alpha_planes.is_empty()
+            && self.subtitle_resolution.record(started.elapsed())
+        {
+            trace::diagnostic(
+                serde_json::json!({
+                    "event": "subtitle_resolution",
+                    "stage": "budget_fallback",
+                    "width": source.width,
+                    "height": source.height,
+                })
+                .to_string(),
+            );
+        }
+        overlay
     }
 
     fn subtitle_ass_style(&self, viewport: OverlayViewport) -> SubtitleAssStyle {
@@ -2781,8 +3654,21 @@ impl PresenterRuntime {
         self.invalidate_current_danmaku_plan();
     }
 
-    fn bump_danmaku_generation_for_config_change(&mut self) {
+    // Layout edits do not change the video timeline. A backend can keep an
+    // already displayed image until the replacement layout has visible content.
+    fn advance_danmaku_layout_generation(&mut self) {
+        #[cfg(target_os = "windows")]
+        let previous = self.current_generation;
         bump_generation(&mut self.current_generation, &mut self.danmaku_generation);
+        #[cfg(target_os = "windows")]
+        if self.current_danmaku.is_none() {
+            self.renderer
+                .advance_empty_danmaku_scene(previous, self.current_generation);
+        }
+    }
+
+    fn bump_danmaku_generation_for_config_change(&mut self) {
+        self.advance_danmaku_layout_generation();
         self.danmaku_planner.invalidate_requests();
 
         // Style/layout preparation runs on the async planner. Keep the last
@@ -2799,13 +3685,21 @@ impl PresenterRuntime {
     }
 
     fn invalidate_current_danmaku_plan(&mut self) {
+        if self.danmaku_font_size_update.take().is_some() {
+            self.danmaku_planner.set_config(
+                self.danmaku.config().clone(),
+                self.danmaku.rasterizer_clone(),
+            );
+        }
         self.current_danmaku = None;
         self.current_danmaku_prepared = None;
         self.danmaku_plan_replacement_pending = false;
+        self.danmaku_resize_settle_at = None;
     }
 
     fn clear_current_danmaku_state(&mut self) {
         self.invalidate_current_danmaku_plan();
+        self.capture_danmaku = None;
         self.current_danmaku_viewport = None;
     }
 
@@ -2816,6 +3710,7 @@ impl PresenterRuntime {
     ) {
         self.rejected_video_import_route = None;
         self.current_overlay = None;
+        self.subtitle_resolution.source = None;
         self.subtitles.clear();
         self.clear_current_danmaku_state();
         self.current_media_time = media_time;
@@ -2834,7 +3729,10 @@ impl PresenterRuntime {
     fn release_current_video_frame(&mut self) {
         if let Err(error) = self.renderer.clear_current_frame() {
             self.stats.render_failures += 1;
-            eprintln!("Erika presenter renderer clear failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter renderer clear failed: {error}"),
+            );
         }
     }
 
@@ -3029,6 +3927,9 @@ impl PresenterRuntime {
         self.danmaku.sync_timeline(&timeline);
         self.danmaku_planner.set_timeline(timeline);
         self.invalidate_current_danmaku_plan();
+        self.advance_danmaku_layout_generation();
+        // The planner forgets placement history for a new timeline; so does capture.
+        self.capture_danmaku = None;
     }
 
     fn pump_subtitles(&mut self) {
@@ -3155,7 +4056,10 @@ impl PresenterRuntime {
             self.player.invalidate_audio_clock();
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
-                eprintln!("Erika presenter audio configure failed: {error}");
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!("Erika presenter audio configure failed: {error}"),
+                );
                 return;
             }
             self.audio_configured = true;
@@ -3165,7 +4069,10 @@ impl PresenterRuntime {
             Ok(_) => self.stats.pushed_audio_frames += 1,
             Err(error) => {
                 self.stats.audio_failures += 1;
-                eprintln!("Erika presenter audio push failed: {error}");
+                trace::diagnostic_at(
+                    trace::LogLevel::Warn,
+                    format!("Erika presenter audio push failed: {error}"),
+                );
                 return;
             }
         }
@@ -3183,7 +4090,10 @@ impl PresenterRuntime {
         }
         if let Err(error) = self.audio_output.start() {
             self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio start failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio start failed: {error}"),
+            );
             return;
         }
         self.audio_started = true;
@@ -3205,7 +4115,10 @@ impl PresenterRuntime {
         self.player.invalidate_audio_clock();
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio reset failed: {error}");
+            trace::diagnostic_at(
+                trace::LogLevel::Warn,
+                format!("Erika presenter audio reset failed: {error}"),
+            );
         }
         self.audio_configured = false;
         self.audio_started = false;
@@ -3392,6 +4305,7 @@ fn run_async_danmaku_planner(
                 request.key.viewport,
             );
             engine.sync_timeline(&window);
+            engine.recycle_raster_caches_if_needed();
             let prepared = engine.prepare(request.key.viewport, request.key.generation);
             let rasterizer = engine.rasterizer_clone();
             let elapsed = started.elapsed();
@@ -3470,6 +4384,14 @@ fn normalize_subtitle_font_scale(scale: f64) -> f64 {
     } else {
         DEFAULT_SUBTITLE_FONT_SCALE
     }
+}
+
+/// The presenter generation after uploading a decoded frame. Danmaku edits can
+/// advance the presenter while decoded frames still belong to the same playback
+/// generation, so an upload may raise the generation but never lower it: going
+/// back would reject a layout already prepared for the newer generation.
+fn generation_after_upload(current_generation: u64, frame_generation: u64) -> u64 {
+    current_generation.max(frame_generation)
 }
 
 fn bump_generation(current_generation: &mut u64, danmaku_generation: &mut u64) {
@@ -3756,9 +4678,26 @@ fn subtitle_start(frame: &PlayerSubtitleFrame) -> Option<Duration> {
     frame.frame.start.or(frame.pts)
 }
 
+/// Longest subtitle delay either way: ten minutes.
+const MAX_SUBTITLE_DELAY_MICROS: i64 = 600_000_000;
+
+/// A subtitle cue's words, as `subtitleText` reports what is said now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTextNow {
+    pub track_id: i64,
+    pub start: Duration,
+    pub end: Option<Duration>,
+    pub text: String,
+}
+
 #[derive(Debug, Default)]
 struct SubtitleFrameState {
     frames: Vec<PlayerSubtitleFrame>,
+    /// The words of the text frames still current (ASS dialogue included,
+    /// which the libass track takes out of [frames]).
+    spoken: Vec<SubtitleTextNow>,
+    /// A positive subtitle delay: frames are kept that much past their end.
+    lead: Duration,
     #[cfg(feature = "libass")]
     ass_renderer: CachedAssTrackRenderer,
     #[cfg(feature = "libass")]
@@ -3768,6 +4707,7 @@ struct SubtitleFrameState {
 impl SubtitleFrameState {
     fn clear(&mut self) {
         self.frames.clear();
+        self.spoken.clear();
         #[cfg(feature = "libass")]
         {
             self.ass_renderer.clear();
@@ -3776,7 +4716,9 @@ impl SubtitleFrameState {
     }
 
     fn push(&mut self, mut frame: PlayerSubtitleFrame) {
-        self.retain_at(subtitle_start(&frame).unwrap_or(frame.media_time));
+        let start = subtitle_start(&frame).unwrap_or(frame.media_time);
+        self.retain_at(start.saturating_sub(self.lead));
+        self.remember_words(&frame, start);
         if frame.frame.is_empty() {
             #[cfg(feature = "libass")]
             {
@@ -3825,6 +4767,48 @@ impl SubtitleFrameState {
     fn retain_at(&mut self, pts: Duration) {
         self.frames
             .retain(|frame| !frame.frame.is_empty() && frame.frame.end.is_none_or(|end| pts < end));
+        self.spoken
+            .retain(|cue| cue.end.is_none_or(|end| pts < end));
+    }
+
+    /// Keeps what [frame] says for `subtitleText`; an empty frame or an
+    /// open-ended one ends what its track said before.
+    fn remember_words(&mut self, frame: &PlayerSubtitleFrame, start: Duration) {
+        let track_id = frame.frame.track_id;
+        if frame.frame.is_empty() || frame.frame.end.is_none() {
+            self.spoken.retain(|cue| cue.track_id != track_id);
+        }
+        let text = frame
+            .frame
+            .text
+            .iter()
+            .map(|segment| segment.display_text())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            return;
+        }
+        self.spoken.push(SubtitleTextNow {
+            track_id,
+            start,
+            end: frame.frame.end,
+            text,
+        });
+        self.spoken.sort_by_key(|cue| cue.start);
+        // Bounded: a track that never ends its cues cannot grow this.
+        if self.spoken.len() > 64 {
+            let excess = self.spoken.len() - 64;
+            self.spoken.drain(..excess);
+        }
+    }
+
+    fn spoken_at(&self, pts: Duration) -> Vec<SubtitleTextNow> {
+        self.spoken
+            .iter()
+            .filter(|cue| cue.start <= pts && cue.end.is_none_or(|end| pts < end))
+            .cloned()
+            .collect()
     }
 
     fn append_to_overlay(
@@ -3837,14 +4821,7 @@ impl SubtitleFrameState {
         let mut subtitle_changed = false;
 
         #[cfg(feature = "libass")]
-        match self.ass_renderer.render(
-            pts,
-            overlay.viewport,
-            style.font_scale,
-            &style.style,
-            &style.memory_fonts,
-            style.memory_font_revision,
-        ) {
+        match self.ass_renderer.render(pts, overlay.viewport, style) {
             Ok(Some(bitmaps)) => {
                 subtitle_changed |= bitmaps.changed;
                 overlay.subtitle_alpha_planes.extend(bitmaps.parts);
@@ -3869,7 +4846,13 @@ impl SubtitleFrameState {
             if !frame.frame.bitmap.planes.is_empty() {
                 overlay
                     .subtitle_planes
-                    .extend(frame.frame.bitmap.planes.iter().cloned());
+                    .extend(frame.frame.bitmap.planes.iter().cloned().map(|plane| {
+                        if plane.canvas_width == 0 || plane.canvas_height == 0 {
+                            plane.with_canvas(style.play_res_width, style.play_res_height)
+                        } else {
+                            plane
+                        }
+                    }));
                 subtitle_changed = true;
             }
         }
@@ -3941,7 +4924,6 @@ struct CachedAssTrackRenderer {
     renderer: Option<LibassSubtitleRenderer>,
     style: SubtitleStyleConfig,
     memory_font_revision: u64,
-    chunks: Vec<(String, Duration, Option<Duration>)>,
 }
 
 #[cfg(feature = "libass")]
@@ -3955,7 +4937,6 @@ impl CachedAssTrackRenderer {
         self.resources = None;
         self.renderer = None;
         self.memory_font_revision = 0;
-        self.chunks.clear();
     }
 
     fn clear_track(&mut self, track_id: i64) {
@@ -4005,7 +4986,6 @@ impl CachedAssTrackRenderer {
             .filter(|segment| segment.format == crate::subtitle::SubtitleTextFormat::Ass)
         {
             renderer.process_chunk(&segment.text, start, frame.end)?;
-            self.chunks.push((segment.text.clone(), start, frame.end));
         }
         Ok(true)
     }
@@ -4014,36 +4994,33 @@ impl CachedAssTrackRenderer {
         &mut self,
         pts: Duration,
         viewport: OverlayViewport,
-        font_scale: f64,
-        style: &SubtitleStyleConfig,
-        memory_fonts: &Arc<[SubtitleFontAttachment]>,
-        memory_font_revision: u64,
+        style: &SubtitleAssStyle,
     ) -> crate::subtitle::Result<Option<SubtitleBitmapSet>> {
-        if self.memory_font_revision != memory_font_revision {
+        if self.memory_font_revision != style.memory_font_revision {
             if let (Some(track_id), Some(resources)) = (self.track_id, self.resources.as_ref()) {
                 let mut renderer = LibassSubtitleRenderer::from_ass_track_with_style_and_fonts(
                     track_id,
                     resources,
                     LibassRenderConfig::default(),
-                    style,
-                    memory_fonts.clone(),
+                    &style.style,
+                    style.memory_fonts.clone(),
                 )?;
-                for (chunk, start, end) in &self.chunks {
-                    renderer.process_chunk(chunk, *start, *end)?;
+                if let Some(current) = self.renderer.as_mut() {
+                    current.transfer_chunks_to(&mut renderer)?;
                 }
                 self.renderer = Some(renderer);
             }
-            self.memory_font_revision = memory_font_revision;
+            self.memory_font_revision = style.memory_font_revision;
         }
-        if &self.style != style {
-            self.style = style.clone();
+        if self.style != style.style {
+            self.style = style.style.clone();
         }
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(None);
         };
-        renderer.set_play_res_height(viewport.height);
-        renderer.set_style(style);
-        renderer.set_font_scale(font_scale);
+        renderer.set_play_res_height(style.play_res_height);
+        renderer.set_style(&style.style);
+        renderer.set_font_scale(style.font_scale);
         match renderer.render(SubtitleRenderRequest::new(
             pts,
             viewport.width,
@@ -4140,10 +5117,200 @@ fn append_text_subtitles_debug(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "ios")]
     #[test]
-    fn ios_display_target_samples_one_clock_for_visuals_and_preserves_commands() {
+    fn sent_danmaku_uses_the_source_size_of_an_ordinary_comment() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter
+            .send_danmaku(
+                "sent",
+                None,
+                DanmakuMode::Scroll,
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap();
+        let sent = presenter
+            .danmaku_session
+            .active_timeline()
+            .items()
+            .iter()
+            .find(|item| item.text == "sent")
+            .cloned()
+            .unwrap();
+        // The configured size scales this source size; it is not the source size.
+        assert_eq!(sent.font_size, crate::danmaku::LIVE_SOURCE_FONT_SIZE);
+        assert!(sent.is_self);
+    }
+
+    #[test]
+    fn untimed_clock_sample_survives_pump_reanchors() {
+        use crate::core::PlayerState;
+        use crate::playback::{PlaybackClock, PlaybackClockSource};
+        let origin = Instant::now();
+        for delay_ms in [1, 9, 30] {
+            let snapshot = PlaybackSnapshot {
+                clock: PlaybackClock::running_at(Duration::from_secs(10), origin),
+                generation: 2,
+                state: PlayerState::Playing,
+            };
+            let target = origin + Duration::from_millis(16);
+            let mut latest = snapshot.clone();
+            latest.clock.sync_to(
+                Duration::from_secs(10) + Duration::from_millis(16 + delay_ms),
+                target + Duration::from_millis(delay_ms),
+                PlaybackClockSource::Wall,
+            );
+            let sample = RenderTickClockSample {
+                snapshot,
+                sampled_at: target,
+            }
+            .after_pump(latest);
+            assert_eq!(
+                sample.snapshot.media_time_at(sample.sampled_at),
+                Duration::from_millis(10016)
+            );
+        }
+    }
+
+    #[test]
+    fn untimed_clock_sample_observes_commands_during_pump() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+        let origin = Instant::now();
+        let initial = PlaybackSnapshot {
+            clock: PlaybackClock::running_at(Duration::from_secs(10), origin),
+            generation: 2,
+            state: PlayerState::Playing,
+        };
+        let mut paused = initial.clone();
+        paused.clock.pause(origin + Duration::from_millis(9));
+        paused.state = PlayerState::Paused;
+        let mut sought = initial.clone();
+        sought.generation += 1;
+        sought
+            .clock
+            .seek(Duration::from_secs(20), origin + Duration::from_millis(9));
+        let mut rated = initial.clone();
+        rated.clock.set_rate(2.0, origin + Duration::from_millis(9));
+        for latest in [paused, sought, rated] {
+            let sample = RenderTickClockSample {
+                snapshot: initial.clone(),
+                sampled_at: origin,
+            }
+            .after_pump(latest.clone());
+            assert_eq!(sample.snapshot, latest);
+        }
+    }
+
+    struct ClockReanchoringAudioProbe {
+        output: crate::audio::BufferedAudioOutput,
+        player: Player,
+        origin: Instant,
+        pump_interval: Arc<Mutex<Option<(Instant, Instant)>>>,
+    }
+
+    impl AudioOutputBackend for ClockReanchoringAudioProbe {
+        fn configure(&mut self, f: crate::ffmpeg::PcmFormat) -> crate::audio::Result<()> {
+            self.output.configure(f)
+        }
+        fn start(&mut self) -> crate::audio::Result<()> {
+            self.output.start()
+        }
+        fn pause(&mut self) -> crate::audio::Result<()> {
+            self.output.pause()
+        }
+        fn stop(&mut self) -> crate::audio::Result<()> {
+            self.output.stop()
+        }
+        fn set_volume(&mut self, v: f32) {
+            self.output.set_volume(v);
+        }
+        fn volume(&self) -> f32 {
+            self.output.volume()
+        }
+        fn push(
+            &mut self,
+            f: crate::ffmpeg::PcmAudioFrame,
+        ) -> crate::audio::Result<crate::audio::AudioPushResult> {
+            self.output.push(f)
+        }
+        fn state(&self) -> crate::audio::AudioOutputState {
+            self.output.state()
+        }
+        fn stats(&self) -> crate::audio::AudioRingBufferStats {
+            self.output.stats()
+        }
+        fn can_accept_audio_frame(&self) -> bool {
+            let started = Instant::now();
+            thread::sleep(Duration::from_millis(10));
+            let ended = Instant::now();
+            let mut latest = self.player.playback_snapshot();
+            latest.clock.sync_to(
+                Duration::from_secs(1) + ended.duration_since(self.origin),
+                ended,
+                crate::playback::PlaybackClockSource::Wall,
+            );
+            self.player.set_playback_snapshot_for_test(latest);
+            *self.pump_interval.lock().unwrap() = Some((started, ended));
+            false
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows", feature = "wgpu"))]
+    fn render_ticks_sample_before_pump_or_at_explicit_display_target() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+        for timed in [false, true] {
+            let mut p = live_danmaku_presenter();
+            let origin = Instant::now();
+            p.player.set_playback_snapshot_for_test(PlaybackSnapshot {
+                clock: PlaybackClock::running_at(Duration::from_secs(1), origin),
+                generation: 1,
+                state: PlayerState::Playing,
+            });
+            let pump_interval = Arc::new(Mutex::new(None));
+            p.audio_output = Box::new(ClockReanchoringAudioProbe {
+                output: crate::audio::BufferedAudioOutput::new(AudioRingBufferConfig::default()),
+                player: p.player.clone(),
+                origin,
+                pump_interval: pump_interval.clone(),
+            });
+            let entered = Instant::now();
+            let target = entered + Duration::from_secs(1);
+            if timed {
+                p.render_tick_at(0.0, target).unwrap();
+            } else {
+                p.render_tick(0.0).unwrap();
+            }
+            let (pump_started, pump_ended) = pump_interval.lock().unwrap().unwrap();
+            let sampled = origin + p.current_media_time - Duration::from_secs(1);
+            if timed {
+                assert_eq!(sampled, target);
+            } else {
+                assert!(sampled >= entered);
+                assert!(
+                    sampled <= pump_started,
+                    "pump latency leaked into the untimed frame"
+                );
+                assert!(sampled < pump_ended);
+            }
+            assert_eq!(
+                p.current_danmaku.as_ref().unwrap().media_time,
+                p.current_media_time
+            );
+            assert!(!p.current_danmaku.as_ref().unwrap().items.is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "ios",
+        target_os = "tvos",
+        feature = "wgpu"
+    ))]
+    fn display_target_samples_one_clock_for_visuals_and_preserves_commands() {
         use crate::core::PlayerState;
         use crate::playback::PlaybackClock;
 
@@ -4154,13 +5321,15 @@ mod tests {
             generation: 2,
             state: PlayerState::Playing,
         };
-        presenter.current_overlay = Some(OverlayFrame {
+        presenter.current_overlay = Some(CurrentOverlay::Owned(OverlayFrame {
             pts: Duration::ZERO,
             viewport: OverlayViewport::new(640, 360),
             subtitle_planes: vec![],
             subtitle_alpha_planes: vec![],
             subtitle_changed: false,
-        });
+        }));
+        presenter.subtitle_resolution.source = Some(OverlayViewport::new(640, 360));
+        presenter.current_surface_metrics = Some(SurfaceMetrics::new(640, 360, 1.0));
         // Replaying the same display target after other work must not move it.
         for hz in [60.0, 120.0] {
             for frame in 1..=6 {
@@ -4206,10 +5375,14 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     struct CapturedComposition {
         has_overlay: bool,
         has_danmaku: bool,
+        danmaku_viewport: Option<DanmakuViewport>,
+        danmaku_time: Option<Duration>,
+        danmaku_generation: Option<u64>,
+        danmaku_items: usize,
         width: u32,
         height: u32,
     }
@@ -4253,6 +5426,10 @@ mod tests {
                 Some(CapturedComposition {
                     has_overlay: context.overlay.is_some(),
                     has_danmaku: context.danmaku.is_some(),
+                    danmaku_viewport: context.danmaku.map(|plan| plan.viewport),
+                    danmaku_time: context.danmaku.map(|plan| plan.media_time),
+                    danmaku_generation: context.danmaku.map(|plan| plan.generation),
+                    danmaku_items: context.danmaku.map_or(0, |plan| plan.items.len()),
                     width,
                     height,
                 });
@@ -4402,6 +5579,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }
     }
 
@@ -4532,6 +5710,99 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
+    fn subtitle_supersampling_keeps_bitmap_pixels_and_supplies_missing_canvas() {
+        let mut state = SubtitleFrameState::default();
+        state.push(subtitle_frame(Duration::ZERO, Some(Duration::from_secs(3))));
+        let mut overlay = empty_overlay();
+        overlay.viewport = OverlayViewport::new(1280, 720);
+        let style = SubtitleAssStyle {
+            play_res_width: 640,
+            play_res_height: 360,
+            ..SubtitleAssStyle::default()
+        };
+        state.append_to_overlay(Duration::from_secs(1), &mut overlay, &style);
+        let plane = &overlay.subtitle_planes[0];
+        assert_eq!(plane.rgba.len(), 4);
+        assert_eq!(plane.scaled_rect(1280, 720), (0, 0, 2, 2));
+    }
+
+    #[test]
+    fn subtitle_state_says_what_the_text_cues_say_now() {
+        let mut state = SubtitleFrameState::default();
+        state.push(text_subtitle_frame(
+            3,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(3)),
+            "  first line  ",
+        ));
+        let mut ass = DecodedSubtitleFrame::new(
+            4,
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(4)),
+        );
+        ass.push_text(SubtitleTextSegment::new(
+            SubtitleTextFormat::Ass,
+            "7,0,Default,,0,0,0,,{\\pos(100,80)}second\\Nline",
+        ));
+        state.push(PlayerSubtitleFrame {
+            frame: ass,
+            pts: Some(Duration::from_secs(2)),
+            media_time: Duration::from_secs(2),
+            late_by: None,
+            generation: 1,
+        });
+
+        let words = |at: u64| -> Vec<String> {
+            state
+                .spoken_at(Duration::from_millis(at))
+                .into_iter()
+                .map(|cue| cue.text)
+                .collect()
+        };
+        assert_eq!(words(500), Vec::<String>::new());
+        assert_eq!(words(1500), vec!["first line".to_string()]);
+        assert_eq!(
+            words(2500),
+            vec!["first line".to_string(), "second\nline".to_string()]
+        );
+        assert_eq!(words(3500), vec!["second\nline".to_string()]);
+    }
+
+    #[test]
+    fn subtitle_delay_keeps_a_cue_until_it_has_shown() {
+        let mut state = SubtitleFrameState {
+            lead: Duration::from_secs(2),
+            ..SubtitleFrameState::default()
+        };
+        state.push(text_subtitle_frame(
+            3,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(2)),
+            "early",
+        ));
+        // The next cue arrives at 2.5 s; with subtitles 2 s late the first
+        // still has to show until 4 s on the media's clock.
+        state.push(text_subtitle_frame(
+            3,
+            Duration::from_millis(2500),
+            Some(Duration::from_secs(4)),
+            "late",
+        ));
+        assert_eq!(state.spoken.len(), 2);
+        assert_eq!(state.frames.len(), 2);
+        // At 3.5 s the timeline is at 1.5 s: the first cue.
+        let at = Duration::from_millis(3500).saturating_sub(state.lead);
+        assert_eq!(
+            state
+                .spoken_at(at)
+                .into_iter()
+                .map(|cue| cue.text)
+                .collect::<Vec<_>>(),
+            vec!["early".to_string()]
+        );
+    }
+
+    #[test]
     fn subtitle_state_expires_old_frames_and_empty_frame_clears_track() {
         let mut state = SubtitleFrameState::default();
         state.push(subtitle_frame(
@@ -4615,6 +5886,262 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         #[cfg(not(feature = "libass"))]
         assert!(!overlay.subtitle_planes.is_empty());
         assert!(overlay.subtitle_changed);
+    }
+
+    #[cfg(feature = "libass")]
+    #[test]
+    fn supersampling_preserves_text_and_ass_size_with_and_without_user_overrides() {
+        for ass in [false, true] {
+            for override_mask in [0, crate::subtitle::SUBTITLE_OVERRIDE_ALL] {
+                let mut state = SubtitleFrameState::default();
+                state.push(if ass {
+                    ass_subtitle_frame(
+                        2,
+                        1,
+                        Duration::ZERO,
+                        Duration::from_secs(2),
+                        1,
+                        Arc::new(AssTrackResources::new(
+                            2,
+                            Arc::<[u8]>::from(ass_test_header().as_bytes()),
+                            Arc::<[SubtitleFontAttachment]>::from([]),
+                        )),
+                    )
+                } else {
+                    text_subtitle_frame(
+                        2,
+                        Duration::ZERO,
+                        Some(Duration::from_secs(2)),
+                        "Sharper subtitles",
+                    )
+                });
+                let style = SubtitleAssStyle {
+                    play_res_width: 640,
+                    play_res_height: 360,
+                    font_scale: 1.25,
+                    style: SubtitleStyleConfig {
+                        override_mask,
+                        ..SubtitleStyleConfig::default()
+                    },
+                    ..SubtitleAssStyle::default()
+                };
+                let mut normal = empty_overlay();
+                state.append_to_overlay(Duration::from_millis(500), &mut normal, &style);
+                let mut high = empty_overlay();
+                high.viewport = OverlayViewport::new(1280, 720);
+                state.append_to_overlay(Duration::from_millis(500), &mut high, &style);
+                let bounds = |overlay: &OverlayFrame| {
+                    let parts = &overlay.subtitle_alpha_planes;
+                    assert!(!parts.is_empty());
+                    // libass pads bitmaps for SIMD alignment. Compare visible
+                    // coverage, not that transparent allocation padding.
+                    let mut bounds = [
+                        f64::INFINITY,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NEG_INFINITY,
+                    ];
+                    for part in parts {
+                        for y in 0..part.placement.height as usize {
+                            for x in 0..part.placement.width as usize {
+                                if part.alpha[y * part.stride + x] < 8 {
+                                    continue;
+                                }
+                                let x = part.placement.x as f64 + x as f64;
+                                let y = part.placement.y as f64 + y as f64;
+                                bounds[0] = bounds[0].min(x);
+                                bounds[1] = bounds[1].min(y);
+                                bounds[2] = bounds[2].max(x + 1.0);
+                                bounds[3] = bounds[3].max(y + 1.0);
+                            }
+                        }
+                    }
+                    bounds
+                };
+                for (normal, high) in bounds(&normal).into_iter().zip(bounds(&high)) {
+                    assert!(
+                        (normal - high / 2.0).abs() <= 3.0,
+                        "ass={ass} override={override_mask}: normal={normal}, high={high}"
+                    );
+                }
+                // Returning to native resolution must invalidate libass's atlas.
+                let mut restored = empty_overlay();
+                state.append_to_overlay(Duration::from_millis(500), &mut restored, &style);
+                assert!(restored.subtitle_changed);
+                assert_eq!(bounds(&restored), bounds(&normal));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
+    fn headless_subtitles_render_only_at_capture_size() {
+        use crate::core::PlayerState;
+        use crate::playback::PlaybackClock;
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.current_media_time = Duration::from_millis(500);
+        presenter.export_danmaku_viewport = Some(DanmakuViewport::new(640, 360));
+        let resources = Arc::new(AssTrackResources::new(
+            2,
+            Arc::<[u8]>::from(ass_test_header().as_bytes()),
+            Arc::from([]),
+        ));
+        presenter.subtitles.push(ass_subtitle_frame(
+            2,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(3),
+            0,
+            resources,
+        ));
+        let first = presenter.capture_overlay(640, 360);
+        assert!(!first.subtitle_alpha_planes.is_empty());
+
+        for millis in [600, 700, 800] {
+            let pts = Duration::from_millis(millis);
+            presenter.update_overlay(pts, 1, 1920, 1080);
+            presenter.apply_playback_snapshot(
+                &PlaybackSnapshot {
+                    clock: PlaybackClock::paused_at(pts),
+                    generation: 1,
+                    state: PlayerState::Paused,
+                },
+                None,
+            );
+            presenter.refresh_current_overlay();
+            assert!(presenter.current_overlay.is_none());
+            assert_eq!(presenter.stats.overlay_frames, 0);
+            assert_eq!(
+                presenter.subtitle_resolution.source,
+                Some(OverlayViewport::new(1920, 1080))
+            );
+            assert_eq!(
+                presenter.current_danmaku_viewport,
+                presenter.export_danmaku_viewport
+            );
+            let capture = presenter.capture_overlay(640, 360);
+            assert!(!capture.subtitle_alpha_planes.is_empty());
+            assert!(
+                !capture.subtitle_changed,
+                "playback must not invalidate the export's libass canvas"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
+    fn subtitle_overlay_follows_surface_attachment_while_paused() {
+        use crate::core::{FlutterTextureHandle, FlutterTextureKind};
+
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::new(Mutex::new(None)),
+        });
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.subtitles.push(text_subtitle_frame(
+            2,
+            Duration::from_millis(500),
+            Some(Duration::from_secs(3)),
+            "Paused subtitle",
+        ));
+        presenter.update_overlay(Duration::from_secs(1), 1, 640, 360);
+        presenter.set_subtitle_scale(1.25);
+        assert!(presenter.current_overlay.is_none());
+        assert!(presenter.subtitles.text_renderer.renderer.is_none());
+
+        let surface = PlatformSurface::FlutterTexture(FlutterTextureHandle::new(
+            FlutterTextureKind::Unknown,
+            1,
+            640,
+            360,
+            1.0,
+        ));
+        presenter.attach_surface(surface).unwrap();
+        let overlay = presenter.current_overlay.as_ref().unwrap();
+        assert_eq!(overlay.pts, Duration::from_secs(1));
+        assert!(!overlay.subtitle_alpha_planes.is_empty());
+        presenter.resize_surface(1280, 720, 2.0).unwrap();
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+
+        presenter.detach_surface().unwrap();
+        assert!(presenter.current_overlay.is_none());
+        presenter.set_subtitle_delay(2_000_000);
+        assert!(presenter.current_overlay.is_none());
+        assert!(
+            presenter
+                .capture_overlay(320, 180)
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+        presenter.set_subtitle_delay(0);
+        assert!(
+            !presenter
+                .capture_overlay(320, 180)
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+        presenter.attach_surface(surface).unwrap();
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
+    }
+
+    #[cfg(all(feature = "libass", any(target_os = "macos", feature = "wgpu")))]
+    #[test]
+    fn subtitle_quality_toggles_refresh_paused_frames_without_accumulating_scale() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.current_surface_metrics = Some(SurfaceMetrics::new(640, 360, 1.0));
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.subtitles.push(text_subtitle_frame(
+            2,
+            Duration::ZERO,
+            Some(Duration::from_secs(3)),
+            "Paused subtitle",
+        ));
+        presenter.update_overlay(Duration::from_secs(1), 1, 640, 360);
+        assert_eq!(
+            presenter.current_overlay.as_ref().unwrap().viewport,
+            OverlayViewport::new(1280, 720)
+        );
+        presenter.set_subtitle_supersampling(false);
+        assert_eq!(
+            presenter.current_overlay.as_ref().unwrap().viewport,
+            OverlayViewport::new(640, 360)
+        );
+        presenter.set_subtitle_supersampling(true);
+        for _ in 0..3 {
+            presenter.refresh_current_overlay();
+            assert_eq!(
+                presenter.current_overlay.as_ref().unwrap().viewport,
+                OverlayViewport::new(1280, 720)
+            );
+        }
+        presenter.set_subtitle_supersampling(false);
+        assert_eq!(
+            presenter.current_overlay.as_ref().unwrap().viewport,
+            OverlayViewport::new(640, 360)
+        );
+        assert!(
+            !presenter
+                .current_overlay
+                .as_ref()
+                .unwrap()
+                .subtitle_alpha_planes
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "libass")]
@@ -4783,6 +6310,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         assert_eq!(danmaku_generation, 5);
         assert_eq!(generation, 8);
+    }
+
+    #[test]
+    fn uploaded_frame_keeps_generation_advanced_by_a_danmaku_edit() {
+        // Playback generation 3 is on screen; loading danmaku advances the
+        // presenter to 4 and a layout is prepared for 4.
+        let mut generation = 3;
+        let mut danmaku_generation = 1;
+        bump_generation(&mut generation, &mut danmaku_generation);
+        assert_eq!(generation, 4);
+
+        // A frame decoded for playback generation 3 arrives after the edit. The
+        // layout prepared for 4 must stay valid, so the generation stays at 4.
+        assert_eq!(generation_after_upload(generation, 3), 4);
+        // The formula this replaced, frame.max(danmaku_generation).max(1), went
+        // back to 3 here and rejected the prepared layout for one refresh.
+        assert_eq!(3u64.max(danmaku_generation).max(1), 3);
+
+        // A frame from a newer playback generation still advances it.
+        assert_eq!(generation_after_upload(4, 6), 6);
     }
 
     #[test]
@@ -5077,6 +6624,53 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
+    #[cfg(all(
+        feature = "wgpu",
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
+    fn export_resumes_video_decode_within_the_foreground_attempt_budget() {
+        let mut config = PresenterConfig::default();
+        config.player.renderer = RendererBackendPreference::WgpuFallback;
+        let mut presenter = PresenterRuntime::new(config).unwrap();
+
+        // A spent budget is not re-probed by export frames either, and the
+        // export keeps returning without an error.
+        presenter.audio_only_tick_active = true;
+        presenter.video_decode_resume_attempts = MAX_VIDEO_DECODE_RESUME_ATTEMPTS;
+        for _ in 0..3 {
+            assert!(
+                presenter
+                    .export_frame_texture(320, 180, 1.0)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(presenter.audio_only_tick_active);
+            assert_eq!(
+                presenter.video_decode_resume_attempts,
+                MAX_VIDEO_DECODE_RESUME_ATTEMPTS
+            );
+        }
+
+        // A new background window lets the next export resume at once,
+        // without waiting for a display surface.
+        presenter.audio_only_tick().unwrap();
+        assert!(
+            presenter
+                .export_frame_texture(320, 180, 1.0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!presenter.audio_only_tick_active);
+        assert!(!presenter.resume_pending);
+        assert_eq!(presenter.video_decode_resume_attempts, 0);
+    }
+
+    #[test]
     #[cfg(feature = "wgpu")]
     fn stop_keeps_the_video_decode_resume_owed_to_the_reused_worker() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
@@ -5217,6 +6811,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: crate::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }])
         .unwrap();
         let mut stale_engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
@@ -5262,6 +6857,337 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             presenter.danmaku_planner.last_requested.is_none(),
             "the hidden state must not enqueue empty replacement layouts"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", feature = "wgpu"))]
+    fn live_danmaku_presenter() -> PresenterRuntime {
+        let viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        let timeline = DanmakuTimeline::new(
+            (0..30)
+                .map(|i| crate::danmaku::DanmakuItem {
+                    id: i + 1,
+                    pts: Duration::from_secs(i),
+                    text: "实时调整弹幕".into(),
+                    mode: DanmakuMode::Scroll,
+                    font_size: 25.0,
+                    color: crate::danmaku::DanmakuColor::WHITE,
+                    opacity: 1.0,
+                    is_self: false,
+                    special: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut presenter = PresenterRuntime::new(PresenterConfig {
+            danmaku: Some(timeline),
+            ..PresenterConfig::default()
+        })
+        .unwrap();
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::new(Mutex::new(None)),
+        });
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.current_danmaku_viewport = Some(viewport);
+        presenter.current_danmaku_prepared = Some(CurrentDanmakuPrepared {
+            request: AsyncDanmakuPlanRequest {
+                key: DanmakuPlanKey {
+                    media_time: presenter.current_media_time,
+                    viewport,
+                    generation: presenter.current_generation,
+                },
+            },
+            prepared: presenter
+                .danmaku
+                .prepare(viewport, presenter.current_generation),
+            rasterizer: presenter.danmaku.rasterizer_clone(),
+            window_start: Duration::ZERO,
+            window_end: Duration::from_secs(10),
+        });
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        presenter
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn live_opacity_with_unchanged_delay_keeps_layout_and_atlas() {
+        let mut presenter = live_danmaku_presenter();
+        let original = presenter.current_danmaku.as_ref().unwrap().clone();
+        let generation = presenter.current_generation;
+        for opacity in [0.8, 0.2, 0.5, 0.0, 1.0] {
+            let mut config = presenter.danmaku.config().clone();
+            config.opacity = opacity;
+            presenter.set_danmaku_config(config);
+            // The application sends both on every slider update.
+            presenter.set_danmaku_global_offset(0);
+            assert_eq!(presenter.current_generation, generation);
+            assert!(presenter.danmaku_planner.last_requested.is_none());
+            let plan = presenter.current_danmaku.as_ref().unwrap();
+            if opacity == 0.0 {
+                assert!(plan.items.is_empty());
+            } else {
+                assert_eq!(plan.items.len(), original.items.len());
+                assert_eq!(
+                    plan.atlas.as_ref().unwrap().version,
+                    original.atlas.as_ref().unwrap().version
+                );
+                for (glyph, before) in plan.items.iter().zip(&original.items) {
+                    assert_eq!(glyph.rect, before.rect);
+                    assert_eq!(glyph.color_rgba, [1.0, 1.0, 1.0, opacity]);
+                }
+            }
+        }
+        presenter.set_danmaku_global_offset(100_000);
+        assert!(
+            presenter.current_generation > generation,
+            "a real delay change must still invalidate the timeline"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn live_font_size_previews_reuse_atlas_then_replace_while_paused() {
+        let mut presenter = live_danmaku_presenter();
+        let original = presenter.current_danmaku.as_ref().unwrap().clone();
+        let base_size = presenter.danmaku.config().font_size;
+        let generation = presenter.current_generation;
+        for font_size in [22.0, 38.0, 24.0, 36.0, 40.0] {
+            let mut config = presenter.danmaku.config().clone();
+            config.font_size = font_size;
+            presenter.set_danmaku_config(config);
+            presenter.set_danmaku_global_offset(0);
+            let plan = presenter.current_danmaku.as_ref().unwrap();
+            assert_eq!(presenter.current_generation, generation);
+            assert!(
+                presenter.danmaku_planner.last_requested.is_none(),
+                "pointer events must not each shape a new font size"
+            );
+            assert_eq!(plan.items.len(), original.items.len());
+            assert_eq!(
+                plan.atlas.as_ref().unwrap().version,
+                original.atlas.as_ref().unwrap().version
+            );
+            assert_eq!(plan.items[0].tex_rect, original.items[0].tex_rect);
+            assert!(
+                (plan.items[0].rect[2] / original.items[0].rect[2] - font_size / base_size).abs()
+                    < 1e-5
+            );
+        }
+        // Opacity changes during the size preview must not submit that size early.
+        let mut config = presenter.danmaku.config().clone();
+        config.opacity = 0.5;
+        presenter.set_danmaku_config(config);
+        assert_eq!(
+            presenter
+                .danmaku_planner
+                .shared
+                .0
+                .lock()
+                .unwrap()
+                .config
+                .font_size,
+            base_size
+        );
+        let previous_x = presenter.current_danmaku.as_ref().unwrap().items[0].rect[0];
+        presenter.current_media_time += Duration::from_millis(100);
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        assert!(presenter.current_danmaku.as_ref().unwrap().items[0].rect[0] < previous_x);
+
+        // No clock/video advance: the final replacement must finish while paused.
+        presenter
+            .danmaku_font_size_update
+            .as_mut()
+            .unwrap()
+            .settle_at = Instant::now();
+        presenter.request_current_danmaku_plan_for_current_time();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presenter.danmaku_plan_replacement_pending && Instant::now() < deadline {
+            presenter.refresh_stale_danmaku_plan();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!presenter.danmaku_plan_replacement_pending);
+        assert_eq!(
+            presenter
+                .current_danmaku_prepared
+                .as_ref()
+                .unwrap()
+                .prepared
+                .font_size(),
+            40.0
+        );
+        let plan = presenter.current_danmaku.as_ref().unwrap();
+        assert!(!plan.is_empty());
+        assert_eq!(plan.items[0].color_rgba[3], 0.5);
+        assert_eq!(plan.media_time, presenter.current_media_time);
+    }
+
+    #[test]
+    fn continuous_font_input_has_a_bounded_prepare_deadline() {
+        let start = Instant::now();
+        let mut pending = None;
+        for millis in (0..500).step_by(16) {
+            DanmakuFontSizeUpdate::retarget(&mut pending, start + Duration::from_millis(millis));
+        }
+        assert!(pending.unwrap().ready(start + Duration::from_millis(500)));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn font_size_drag_refreshes_time_window_and_seek_flushes_pending_size() {
+        let mut presenter = live_danmaku_presenter();
+        let mut config = presenter.danmaku.config().clone();
+        config.font_size = 40.0;
+        presenter.set_danmaku_config(config);
+        // A drag near the old window boundary can still request the next
+        // time window using its cached font size, without waiting for idle.
+        presenter.current_media_time = Duration::from_secs(9);
+        presenter.request_current_danmaku_plan_for_current_time();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presenter
+            .current_danmaku_prepared
+            .as_ref()
+            .unwrap()
+            .window_end
+            <= Duration::from_secs(10)
+            && Instant::now() < deadline
+        {
+            presenter.apply_ready_danmaku_plans();
+            thread::sleep(Duration::from_millis(5));
+        }
+        presenter.current_media_time = Duration::from_secs(11);
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        assert!(!presenter.current_danmaku.as_ref().unwrap().is_empty());
+        presenter.bump_danmaku_generation();
+        assert!(presenter.danmaku_font_size_update.is_none());
+        assert_eq!(
+            presenter
+                .danmaku_planner
+                .shared
+                .0
+                .lock()
+                .unwrap()
+                .config
+                .font_size,
+            40.0
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", feature = "wgpu"))]
+    fn danmaku_resize_retains_motion_and_replaces_layout_while_paused() {
+        let viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        let timeline = DanmakuTimeline::new(vec![crate::danmaku::DanmakuItem {
+            id: 1,
+            pts: Duration::ZERO,
+            text: "持续移动的弹幕".into(),
+            mode: DanmakuMode::Scroll,
+            font_size: 25.0,
+            color: crate::danmaku::DanmakuColor::WHITE,
+            opacity: 1.0,
+            is_self: false,
+            special: None,
+        }])
+        .unwrap();
+        let mut presenter = PresenterRuntime::new(PresenterConfig {
+            danmaku: Some(timeline),
+            ..PresenterConfig::default()
+        })
+        .unwrap();
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::new(Mutex::new(None)),
+        });
+        presenter.current_media_time = Duration::from_secs(1);
+        presenter.current_danmaku_viewport = Some(viewport);
+        presenter.current_danmaku_prepared = Some(CurrentDanmakuPrepared {
+            request: AsyncDanmakuPlanRequest {
+                key: DanmakuPlanKey {
+                    media_time: presenter.current_media_time,
+                    viewport,
+                    generation: presenter.current_generation,
+                },
+            },
+            prepared: presenter
+                .danmaku
+                .prepare(viewport, presenter.current_generation),
+            rasterizer: presenter.danmaku.rasterizer_clone(),
+            window_start: Duration::ZERO,
+            window_end: Duration::from_secs(10),
+        });
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        let original = presenter.current_danmaku.as_ref().unwrap().clone();
+        let stale = presenter.current_danmaku_prepared.as_ref().unwrap().clone();
+        let mut previous_x = original.items[0].rect[0] / viewport.width as f32;
+        for (step, (width, height, scale)) in [(1152, 648, 1.8), (1024, 576, 1.6), (960, 540, 1.5)]
+            .into_iter()
+            .enumerate()
+        {
+            presenter.resize_surface(width, height, scale).unwrap();
+            let immediate = presenter.current_danmaku.as_ref().unwrap();
+            assert!(
+                !immediate.is_empty(),
+                "resize must never clear the visible plan"
+            );
+            presenter.current_media_time = Duration::from_millis(1100 + step as u64 * 100);
+            presenter.refresh_current_danmaku_plan_from_prepared();
+            let plan = presenter.current_danmaku.as_ref().unwrap();
+            assert_eq!(
+                plan.viewport,
+                DanmakuViewport::with_scale(width, height, scale as f32)
+            );
+            assert!(Arc::ptr_eq(
+                plan.atlas.as_ref().unwrap(),
+                original.atlas.as_ref().unwrap()
+            ));
+            let x = plan.items[0].rect[0] / width as f32;
+            assert!(
+                x < previous_x,
+                "retained comments must keep moving during resize"
+            );
+            previous_x = x;
+            assert!(
+                presenter.danmaku_planner.last_requested.is_none(),
+                "animation must not rasterize every intermediate size"
+            );
+        }
+        let stale_result = AsyncDanmakuPlanResult {
+            request: stale.request,
+            prepared: stale.prepared,
+            rasterizer: stale.rasterizer,
+            window_start: stale.window_start,
+            window_end: stale.window_end,
+            elapsed: Duration::ZERO,
+        };
+        assert!(!presenter.danmaku_plan_result_is_current(&stale_result));
+        // No video frames or clock advancement: a paused resize must still
+        // request, accept, and display a replacement at the final dimensions.
+        presenter.danmaku_resize_settle_at = Some(Instant::now());
+        presenter.request_current_danmaku_plan_for_current_time();
+        assert_eq!(
+            presenter.danmaku_planner.last_requested.unwrap().viewport,
+            presenter.current_danmaku_viewport.unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while presenter.danmaku_plan_replacement_pending && Instant::now() < deadline {
+            presenter.refresh_stale_danmaku_plan();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!presenter.danmaku_plan_replacement_pending);
+        let plan = presenter.current_danmaku.as_ref().unwrap();
+        assert!(!plan.is_empty());
+        assert_eq!(plan.media_time, presenter.current_media_time);
+        assert_eq!(
+            presenter
+                .current_danmaku_prepared
+                .as_ref()
+                .unwrap()
+                .request
+                .key
+                .viewport,
+            plan.viewport
+        );
+        // A seek/generation change must not bring the retained old comments back.
+        presenter.current_generation += 1;
+        presenter.refresh_current_danmaku_plan_from_prepared();
+        assert!(presenter.current_danmaku.is_none());
     }
 
     #[test]
@@ -5350,6 +7276,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             color: crate::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
+            special: None,
         }])
         .unwrap();
         let mut fallback_engine = DfmLayoutEngine::new(timeline, DanmakuLayoutConfig::default());
@@ -5376,7 +7303,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         let first_x = presenter.current_danmaku.as_ref().unwrap().items[0].rect[0];
 
         let mut config = DanmakuLayoutConfig::default();
-        config.font_size += 4.0;
+        // Font-size-only updates now preview the retained layout without a
+        // generation change. Exercise a full relayout for this fallback test.
+        config.scroll_duration_seconds += 4.0;
         presenter.set_danmaku_config(config);
         assert!(presenter.danmaku_plan_replacement_pending);
         assert!(presenter.current_danmaku_prepared.is_some());
@@ -5476,6 +7405,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     #[test]
+    #[cfg(feature = "wgpu")]
+    fn mute_keeps_the_volume_and_applies_changes_on_unmute() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+
+        presenter.set_volume(0.6);
+        presenter.set_muted(true);
+        assert!(presenter.muted());
+        assert_eq!(presenter.audio_output.volume(), 0.0);
+        assert!((presenter.volume() - 0.6).abs() < 0.000_001);
+
+        presenter.set_volume(0.3);
+        assert_eq!(presenter.audio_output.volume(), 0.0);
+        assert!((presenter.volume() - 0.3).abs() < 0.000_001);
+
+        presenter.set_muted(false);
+        assert!(!presenter.muted());
+        assert!((presenter.audio_output.volume() - 0.3).abs() < 0.000_001);
+    }
+
+    #[test]
     fn surface_dimensions_are_converted_to_full_output_danmaku_viewport() {
         let viewport = surface_metrics_to_viewport(SurfaceMetrics::new(1600, 900, 2.0));
 
@@ -5527,9 +7476,306 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             Some(CapturedComposition {
                 has_overlay: true,
                 has_danmaku: false,
+                danmaku_viewport: None,
+                danmaku_time: None,
+                danmaku_generation: None,
+                danmaku_items: 0,
                 width: 320,
                 height: 180,
             })
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn headless_capture_includes_danmaku_at_capture_size_without_changing_surface_plan() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        presenter.renderer = Box::new(CaptureCompositionProbe {
+            captured: Arc::clone(&captured),
+        });
+        let mut item = danmaku_item(1, 0.0, "headless capture");
+        item.mode = DanmakuMode::Top;
+        presenter.set_danmaku_timeline(DanmakuTimeline::new(vec![item]).unwrap());
+        let surface_viewport = DanmakuViewport::with_scale(1280, 720, 2.0);
+        presenter.current_danmaku_viewport = Some(surface_viewport);
+        presenter.current_danmaku = Some(DanmakuRenderPlan::empty(
+            Duration::from_secs(5),
+            presenter.current_generation,
+            surface_viewport,
+        ));
+        assert!(presenter.current_surface_metrics.is_none());
+
+        for (width, height) in [(320, 180), (640, 480), (320, 180)] {
+            let rgba = presenter
+                .capture_frame_rgba_with_danmaku(width, height)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rgba.len(), width as usize * height as usize * 4);
+            let composition = captured.lock().unwrap().unwrap();
+            assert!(composition.has_overlay);
+            assert!(composition.danmaku_items > 0);
+            assert_eq!(
+                composition.danmaku_viewport,
+                Some(DanmakuViewport::new(width, height))
+            );
+            assert_eq!(
+                composition.danmaku_time,
+                Some(presenter.player.current_media_time())
+            );
+            assert_eq!(
+                composition.danmaku_generation,
+                Some(presenter.current_generation)
+            );
+            assert_eq!(presenter.current_danmaku_viewport, Some(surface_viewport));
+            let surface_plan = presenter.current_danmaku.as_ref().unwrap();
+            assert_eq!(surface_plan.viewport, surface_viewport);
+            assert_eq!(surface_plan.media_time, Duration::from_secs(5));
+        }
+
+        presenter.set_danmaku_enabled(false);
+        presenter.capture_frame_rgba_with_danmaku(320, 180).unwrap();
+        assert!(!captured.lock().unwrap().unwrap().has_danmaku);
+        assert!(presenter.capture_frame_rgba_with_danmaku(0, 180).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn capture_danmaku_windows_follow_time_seek_and_track_offsets() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.set_danmaku_timeline(
+            DanmakuTimeline::new(vec![
+                danmaku_item(1, 1.0, "early"),
+                danmaku_item(2, 100.0, "late"),
+            ])
+            .unwrap(),
+        );
+        let viewport = DanmakuViewport::new(640, 360);
+        presenter.current_media_time = Duration::from_secs(2);
+        let early = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert!(!early.is_empty());
+        let prepared_window = |presenter: &PresenterRuntime| {
+            let capture = presenter.capture_danmaku.as_ref().unwrap();
+            (capture.viewport, capture.window_start, capture.window_end)
+        };
+        let prepared_at = prepared_window(&presenter);
+        presenter.current_media_time = Duration::from_millis(2500);
+        let moving = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert_eq!(prepared_window(&presenter), prepared_at);
+
+        // A 1 px resize keeps the prepared layout and its lanes, retargeted.
+        let nudged = DanmakuViewport::new(641, 360);
+        let retargeted = presenter.capture_danmaku_plan(nudged).unwrap();
+        assert_eq!(prepared_window(&presenter), prepared_at);
+        assert_eq!(retargeted.viewport, nudged);
+        assert_eq!(retargeted.items[0].item_id, moving.items[0].item_id);
+        assert_eq!(moving.items[0].item_id, early.items[0].item_id);
+        assert!(moving.items[0].rect[0] < early.items[0].rect[0]);
+
+        presenter.current_media_time = Duration::from_secs(101);
+        let late = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert!(!late.is_empty());
+        assert_ne!(late.items[0].item_id, early.items[0].item_id);
+        presenter.current_media_time = Duration::from_secs(2);
+        presenter.bump_danmaku_generation();
+        let sought = presenter.capture_danmaku_plan(viewport).unwrap();
+        assert_eq!(sought.items[0].item_id, early.items[0].item_id);
+        assert_eq!(sought.generation, presenter.current_generation);
+
+        presenter.set_danmaku_global_offset(5_000_000);
+        assert!(presenter.capture_danmaku_plan(viewport).unwrap().is_empty());
+        presenter.clear_danmaku();
+        assert!(presenter.capture_danmaku_plan(viewport).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "wgpu",
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
+    fn exported_native_texture_is_composited_immutable_and_outlives_presenter() {
+        use crate::renderer::external_texture_test::read_pixels;
+        use crate::renderer::pipeline::{VideoRenderPipeline, VideoUniforms};
+        use crate::renderer::wgpu::WgpuRenderer;
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        renderer
+            .upload_nv12(64, 36, &[16; 64 * 36], &[128; 64 * 18], uniforms)
+            .unwrap();
+        let mut config = PresenterConfig::default();
+        config.player.renderer = RendererBackendPreference::WgpuFallback;
+        let mut presenter = PresenterRuntime::new(config).unwrap();
+        presenter.renderer = Box::new(renderer);
+        let mut item = danmaku_item(1, 0.0, "EXTERNAL");
+        item.mode = DanmakuMode::Top;
+        presenter.set_danmaku_timeline(DanmakuTimeline::new(vec![item]).unwrap());
+        presenter
+            .subtitles
+            .push(subtitle_frame(Duration::ZERO, Some(Duration::from_secs(3))));
+        let expected = presenter
+            .capture_frame_rgba_with_danmaku(320, 180)
+            .unwrap()
+            .unwrap();
+        // Export plans danmaku in the background, like on-screen playback.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exports = 0;
+        let first = loop {
+            let frame = presenter
+                .export_frame_texture(320, 180, 1.0)
+                .unwrap()
+                .unwrap();
+            exports += 1;
+            if presenter
+                .current_danmaku
+                .as_ref()
+                .is_some_and(|plan| !plan.is_empty())
+            {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "export danmaku was not planned");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!((first.info().width, first.info().height), (320, 180));
+        assert_eq!(
+            presenter.current_danmaku_viewport,
+            Some(DanmakuViewport::new(320, 180)),
+            "without a surface, danmaku is planned at the export size"
+        );
+        presenter.clear_danmaku();
+        let expected_second = presenter.capture_frame_rgba(320, 180).unwrap().unwrap();
+        let second = presenter
+            .export_frame_texture(320, 180, 1.0)
+            .unwrap()
+            .unwrap();
+        exports += 1;
+        assert_eq!(presenter.stats().rendered_video_frames, exports);
+        assert_ne!(first.info().native_handle, second.info().native_handle);
+        let ticks = |presenter: &PresenterRuntime| {
+            presenter.presentation.to_json(Instant::now())["ticks"].as_u64()
+        };
+        assert_eq!(ticks(&presenter), Some(exports));
+        // Invalid sizes fail before any per-frame work.
+        assert!(presenter.export_frame_texture(0, 180, 1.0).is_err());
+        assert!(presenter.export_frame_texture(u32::MAX, 180, 1.0).is_err());
+        assert_eq!(ticks(&presenter), Some(exports));
+        assert_eq!(
+            presenter.current_danmaku_viewport,
+            Some(DanmakuViewport::new(320, 180))
+        );
+        drop(presenter);
+        assert_eq!(
+            read_pixels(&first),
+            expected,
+            "native consumer sees video, subtitle and danmaku after producer destruction"
+        );
+        assert_eq!(
+            read_pixels(&second),
+            expected_second,
+            "later exports neither overwrite nor hide retained frames"
+        );
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            fn fd_identity(fd: i32) -> Option<(libc::dev_t, libc::ino_t)> {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+                    return None;
+                }
+                let stat = unsafe { stat.assume_init() };
+                Some((stat.st_dev, stat.st_ino))
+            }
+            let handles = [first.info().native_handle, second.info().native_handle]
+                .map(|fd| (fd as i32, fd_identity(fd as i32).unwrap()));
+            drop(first);
+            drop(second);
+            for (fd, identity) in handles {
+                // Other tests may reuse a closed FD number concurrently.
+                assert_ne!(
+                    fd_identity(fd),
+                    Some(identity),
+                    "the released frame must no longer own its exported FD"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "wgpu")]
+    fn wgpu_headless_capture_composites_danmaku_pixels_and_preserves_screenshot_behavior() {
+        use crate::renderer::pipeline::{VideoRenderPipeline, VideoUniforms};
+        use crate::renderer::wgpu::WgpuRenderer;
+
+        let mut renderer = WgpuRenderer::new().unwrap();
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        renderer
+            .upload_nv12(64, 36, &[16; 64 * 36], &[128; 64 * 18], uniforms)
+            .unwrap();
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        presenter.renderer = Box::new(renderer);
+        let mut item = danmaku_item(1, 0.0, "CAPTURE");
+        item.mode = DanmakuMode::Top;
+        presenter.set_danmaku_timeline(DanmakuTimeline::new(vec![item]).unwrap());
+        presenter
+            .subtitles
+            .push(subtitle_frame(Duration::ZERO, Some(Duration::from_secs(3))));
+
+        let screenshot = presenter.capture_frame_rgba(320, 180).unwrap().unwrap();
+        let composed = presenter
+            .capture_frame_rgba_with_danmaku(320, 180)
+            .unwrap()
+            .unwrap();
+        assert_eq!(composed.len(), 320 * 180 * 4);
+        let bright_pixels =
+            |rgba: &[u8]| rgba.chunks_exact(4).filter(|pixel| pixel[0] > 150).count();
+        assert!(bright_pixels(&screenshot) > 0, "subtitle is captured");
+        assert!(
+            bright_pixels(&composed) > bright_pixels(&screenshot) + 100,
+            "danmaku adds visible pixels"
+        );
+        assert_eq!(
+            presenter.capture_frame_rgba(320, 180).unwrap().unwrap(),
+            screenshot
+        );
+
+        presenter.set_danmaku_enabled(false);
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            screenshot
+        );
+        presenter.set_danmaku_enabled(true);
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            composed
+        );
+        let mut config = presenter.danmaku_config().unwrap().clone();
+        config.opacity = 0.0;
+        presenter.set_danmaku_config(config);
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            screenshot
+        );
+        presenter.clear_danmaku();
+        assert_eq!(
+            presenter
+                .capture_frame_rgba_with_danmaku(320, 180)
+                .unwrap()
+                .unwrap(),
+            screenshot
         );
     }
 
@@ -5613,5 +7859,71 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         assert_eq!(presenter.danmaku_tracks().len(), 1);
         assert!(presenter.remove_danmaku_track(first_id));
         assert!(presenter.danmaku_tracks().is_empty());
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn diagnostics_snapshot_reports_every_section_with_nulls_for_unknowns() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let snapshot = presenter.diagnostics_snapshot();
+        assert_eq!(snapshot["schema"], crate::diagnostics::DIAGNOSTICS_SCHEMA);
+        assert!(snapshot["capturedAtUnixMs"].as_u64().unwrap() > 0);
+        for section in [
+            "playback",
+            "media",
+            "decoder",
+            "video",
+            "presenter",
+            "output",
+            "hdr",
+            "resources",
+            "upscaler",
+            "audio",
+            "buffers",
+            "timing",
+        ] {
+            assert!(
+                snapshot.get(section).is_some(),
+                "missing {section}: {snapshot}"
+            );
+        }
+        // Nothing is open: unknown values are null rather than zero.
+        assert_eq!(snapshot["playback"]["state"], "idle");
+        assert!(snapshot["playback"]["durationSeconds"].is_null());
+        assert_eq!(snapshot["playback"]["buffering"]["active"], false);
+        assert!(snapshot["media"]["video"].is_null());
+        assert!(snapshot["media"]["container"].is_null());
+        assert!(snapshot["decoder"].is_null());
+        assert!(snapshot["buffers"]["playback"].is_null());
+        assert!(snapshot["timing"]["scheduler"]["dropToleranceMs"].is_null());
+        assert!(snapshot["timing"]["clock"]["lastDriftMs"].is_null());
+        assert_eq!(snapshot["timing"]["scheduler"]["presentedFrames"], 0);
+        assert_eq!(snapshot["timing"]["presentation"]["newFramesPresented"], 0);
+        assert!(snapshot["timing"]["presentation"]["lastPresentAgoMs"].is_null());
+        assert_eq!(snapshot["output"]["requestedMode"], "sdr");
+        assert!(snapshot["output"]["fallbackReason"].is_string());
+        assert_eq!(snapshot["upscaler"]["requestedMode"], "off");
+        assert_eq!(snapshot["audio"]["recovery"]["state"], "stable");
+        assert!(snapshot["buffers"]["presenterVideoFrames"]["queued"].is_u64());
+
+        // The latest decoder transition becomes queryable instead of being
+        // available only to event listeners that were attached in time.
+        presenter.latest_video_decoder = Some(VideoDecoderEvent {
+            stage: "open_avcodec_to_software".to_string(),
+            requested_backend: DecoderBackend::VideoToolbox,
+            previous_backend: Some(DecoderBackend::VideoToolbox),
+            active_backend: DecoderBackend::Software,
+            fallback_count: 1,
+            codec: Some("hevc".to_string()),
+            pixel_format: Some("yuv420p10le".to_string()),
+            line_sizes: None,
+            reason: Some("unsupported profile".to_string()),
+        });
+        let snapshot = presenter.diagnostics_snapshot();
+        assert_eq!(snapshot["decoder"]["activeBackend"], "software");
+        assert_eq!(snapshot["decoder"]["requestedBackend"], "videotoolbox");
+        assert_eq!(snapshot["decoder"]["hardware"], false);
+        assert_eq!(snapshot["decoder"]["fellBack"], true);
+        assert_eq!(snapshot["decoder"]["reason"], "unsupported profile");
     }
 }

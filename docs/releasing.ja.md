@@ -1,4 +1,4 @@
-# Erika のリリース
+# liberika のリリース
 
 [中文](releasing.zh.md) · [English](releasing.md) · [ドキュメント](README.md)
 
@@ -11,16 +11,16 @@
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p erika -p erika_capi
-cargo clippy -p erika -p erika_capi --all-targets -- -D warnings
+cargo test --locked -p erika -p erika_capi
+cargo clippy --locked -p erika --all-targets --all-features --no-deps
 cd packages/erika_flutter
 dart pub publish --dry-run
 ```
 
-3. リリースする commit に tag を付けます。以下は次回バージョンの例です。実際の番号に置き換えてください。
+3. `Cargo.toml` の `[workspace.package].version` を更新し、`cargo update -w` 後の `Cargo.lock` も commit します。Release は Cargo version と異なる tag を拒否します。`main` の対象 commit にそのまま tag を付けます。tag で起動する `Release` が全 platform を build して公開するため、事前の試行実行は不要です。以下は次回バージョンの例です。実際の番号に置き換えてください。
 
 ```sh
-VERSION=0.2.2
+VERSION=0.3.8
 git tag "v${VERSION}"
 git push origin "v${VERSION}"
 ```
@@ -29,22 +29,32 @@ git push origin "v${VERSION}"
 
 ## 自動公開の流れ
 
-[release.yml](../.github/workflows/release.yml) は platform を並列 build します。iOS、tvOS、Android は architecture slice を個別に build して archive を組み立て、macOS arm64/x64 は universal に結合します。GitHub Release に 13 個の native/Flutter archive と `SHA256SUMS` を公開します。
+[release.yml](../.github/workflows/release.yml) は platform を並列 build します。iOS、tvOS、Android は architecture slice を個別に build して archive を組み立て、macOS arm64/x64 は universal に結合します。GitHub Release に 17 個の native/Flutter archive、2 個の Web archive と `SHA256SUMS` を公開します。
 
 [release-ecosystem.yml](../.github/workflows/release-ecosystem.yml) が続けて実行します：
 
 - 公開済みの checksum で Flutter/OHPM version と `native_artifacts.properties` を更新し、metadata を `main` に commit。
-- 内部 tag `erika_flutter-vX.Y.Z` を作成し、[Flutter OIDC 公開](../.github/workflows/flutter-package.yml)を開始。
+- 内部 tag `erika_flutter-vX.Y.Z` を作成し、[Flutter OIDC 公開](../.github/workflows/pub-publish.yml)を開始。
 - ArkTS HAR を build し OHPM に upload。
-- Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。ErikaSwift に更新・テスト・同じ version の公開を通知。
+- Swift XCFramework を組み立て、コア Release と `SHA256SUMS` に追加。liberika-swift に更新・テスト・同じ version の公開を通知。
+- npm パッケージ `@aimessoft/liberika-web` と `@aimessoft/liberika-web-nofont` を公開します。`Release` が Web アーカイブのビルド時に作成した 2 つの tarball を使い、バージョンは Cargo workspace から取ります。
 
 Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが作成するのはコア tag だけです。別 repository の tag と Swift 公開には secret `ERIKA_SWIFT_RELEASE_TOKEN` を使います。
 
-`workflow_dispatch` による手動 `Release` は build を確認し、Actions Artifact を保存します。GitHub Release の公開は tag で開始します。
+tag で build と GitHub Release の公開が始まります。手動の `workflow_dispatch` は build 失敗の調査用で、リリース手順ではありません。
+
+### npm の初回設定
+
+npm 公開は trusted publishing を使い、トークンを保存しません。リポジトリ変数 `NPM_PUBLISH` が `true` のときだけ実行されます。trusted publisher はパッケージの設定ページで構成するため、各パッケージの最初のバージョンは手動で公開します。
+
+1. npmjs.com で `aimessoft` 組織を作成し、アカウントの 2FA を有効にします。
+2. `Release` 実行の `liberika-web-npm` artifact をダウンロードし、2 つの tarball それぞれに `npm publish <tarball> --access public --registry https://registry.npmjs.org/` を実行します。ローカルでは `web build` の後に `python3 scripts/web_npm_package.py` と `npm pack` で同じ tarball が得られます。
+3. 両パッケージの Settings → Trusted Publisher で GitHub Actions を選び、`AimesSoft/liberika` と workflow ファイル名 `release-ecosystem.yml` を入力します。
+4. リポジトリの Settings → Variables に `NPM_PUBLISH=true` を追加します。以後のリリースは自動でアップロードされ、既存のバージョンはスキップされます。
 
 ## 公開する成果物
 
-完了したリリースは ZIP 14 個と `SHA256SUMS` を含みます。
+完了したリリースは ZIP 20 個と `SHA256SUMS` を含みます。
 
 | Platform | Archive 命名 | 数 |
 |---|---|---|
@@ -54,11 +64,13 @@ Flutter、OHPM、Swift の公開は並列実行できます。メンテナーが
 | Android | `erika-capi-android.zip` | 1 |
 | Flutter Android | `erika-flutter-android-{arm64-v8a,armeabi-v7a,x86_64,x86}.zip` | 4 |
 | OpenHarmony arm64 | `erika-capi-openharmony-arm64.zip` | 1 |
+| Web / WASM | `liberika-web-X.Y.Z.zip`、`liberika-web-nofont-X.Y.Z.zip` | 2 |
+| Linux x64 / ARM64 | `erika-capi-linux-{x64,arm64}-{bundled,system}.zip` | 4 |
 | Swift | `erika-swift-core-X.Y.Z.xcframework.zip` | 1 |
 
 C ABI bundle は library、`include/erika.h`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、依存 license、tag/commit を記録した `MANIFEST.txt` を含みます。iOS/tvOS は device + simulator XCFramework、Android 統合 bundle は 4 ABI の static/shared library と対応する `libc++_shared.so` を含みます。Flutter Android bundle は各 ABI の shared runtime のみを含みます。
 
-OpenHarmony は Native SDK 5.1.0、compatible SDK 18 を使います。Linux は現在ソースから build します。[Linux ガイド](linux.md)。
+OpenHarmony は Native SDK 5.1.0、compatible SDK 18 を使います。Linux の 4 組は [Linux workflow](../.github/workflows/linux.yml) を再利用し、Ubuntu 22.04 / glibc 2.35 でビルドしてクリーン環境の検証完了を待って公開します。bundled は FFmpeg と字幕スタックを内蔵し、system は FFmpeg SDK を配布せず、利用者が導入した ABI 互換 FFmpeg 8 共有ライブラリを使います。外部 FFmpeg のライセンスは構成によって異なります。両者とも完全静的ではなく、依存レポートを同梱します。Flutter Linux は `ERIKA_LIBRARY_DIR` を使い、自動ダウンロードはありません。[Linux ガイド](linux.ja.md) を参照してください。
 
 ## OHPM upload timeout
 
@@ -73,7 +85,7 @@ Flutter は package に固定された native tag を download し、SHA-256 を
 | `ERIKA_PREBUILT_TAG` | native version を指定。対応する checksum も設定。 |
 | `ERIKA_PREBUILT_SHA256` | カスタム tag の archive checksum。 |
 | `ERIKA_PREBUILT_SHA256_<ABI>` | 複数 ABI の Android は `ARM64_V8A`、`ARMEABI_V7A`、`X86_64`、`X86` を個別に設定。 |
-| `ERIKA_FORCE_SOURCE_BUILD=1` | ローカル Erika source を build。 |
+| `ERIKA_FORCE_SOURCE_BUILD=1` | ローカル liberika source を build。 |
 | `ERIKA_MACOS_ARCHS` | `universal`, `arm64`, `x86_64`, `arm64,x86_64` |
 
 C/C++ は bundle を展開し、`lib/` を link、`include/erika.h` を include します。macOS dylib は `@rpath/liberika_capi.dylib` を使います。[ネイティブ接続](integration.ja.md)。
@@ -87,4 +99,4 @@ bash packaging/bundle.sh erika-capi-macos-universal \
   dist/erika-capi-macos-universal.zip out/liberika_capi.dylib out/liberika_capi.a
 ```
 
-Erika は MPL-2.0、依存 library はそれぞれの license を維持します。公開 bundle に license、third-party notice、build source を残します。`lgpl` / `gpl-full` の設定は[ビルドガイド](building.ja.md#ライセンス-profile)で管理します。
+liberika は MPL-2.0、依存 library はそれぞれの license を維持します。公開 bundle に license、third-party notice、build source を残します。`lgpl` / `gpl-full` の設定は[ビルドガイド](building.ja.md#ライセンス-profile)で管理します。
