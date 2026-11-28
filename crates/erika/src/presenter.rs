@@ -33,7 +33,7 @@ use crate::core::{
     AudioOutputEvent, MediaRequest, PlatformSurface, PlaybackSnapshot, Player, PlayerAudioFrame,
     PlayerConfig, PlayerSubtitleFrame, PlayerVideoFrame, RenderFrameContext, RendererBackend,
     RendererBackendPreference, RendererRuntimeStats, SurfaceMetrics, TrackInfo, TrackSelection,
-    VideoDecoderEvent, VideoFrameImportFailure,
+    VideoDecoderEvent, VideoFrameImportFailure, pcm_audio_frame_playback_duration,
 };
 use crate::danmaku::{
     DANMAKU_DEBUG_BUCKETS, DanmakuColor, DanmakuConfigChange, DanmakuDebugBucket,
@@ -3980,10 +3980,8 @@ impl PresenterRuntime {
                     if frame.generation != self.player.playback_generation() {
                         continue;
                     }
-                    let frame_duration = audio_frame_playback_duration(&frame.frame, rate);
-                    if !self.push_audio(frame) {
-                        break;
-                    }
+                    let frame_duration = pcm_audio_frame_playback_duration(&frame.frame, rate);
+                    self.push_audio(frame);
                     pumped_duration = pumped_duration.saturating_add(frame_duration);
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -4051,7 +4049,7 @@ impl PresenterRuntime {
         should_report
     }
 
-    fn push_audio(&mut self, frame: PlayerAudioFrame) -> bool {
+    fn push_audio(&mut self, frame: PlayerAudioFrame) {
         if !self.audio_configured {
             self.player.invalidate_audio_clock();
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
@@ -4060,7 +4058,7 @@ impl PresenterRuntime {
                     trace::LogLevel::Warn,
                     format!("Erika presenter audio configure failed: {error}"),
                 );
-                return false;
+                return;
             }
             self.audio_configured = true;
             self.last_audio_clock_report = None;
@@ -4073,12 +4071,11 @@ impl PresenterRuntime {
                     trace::LogLevel::Warn,
                     format!("Erika presenter audio push failed: {error}"),
                 );
-                return false;
+                return;
             }
         }
 
         self.ensure_audio_started();
-        true
     }
 
     fn ensure_audio_started(&mut self) {
@@ -4210,17 +4207,6 @@ fn audio_transition_bridge(
         .and_then(|snapshot| snapshot.queued_duration)
         .map(|duration| duration.saturating_add(queued_output_duration))
         .filter(|duration| !duration.is_zero())
-}
-
-fn audio_frame_playback_duration(frame: &crate::ffmpeg::PcmAudioFrame, rate: f64) -> Duration {
-    if frame.format.sample_rate == 0 || frame.frames == 0 {
-        return Duration::ZERO;
-    }
-    // Keep the pacing estimate aligned with the audio processors, which clamp
-    // SoundTouch playback rates to this supported range.
-    let rate = normalize_playback_rate(rate).clamp(0.25, 16.0);
-    let seconds = frame.frames as f64 / f64::from(frame.format.sample_rate) / rate;
-    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
 }
 
 #[cfg(test)]
@@ -6530,15 +6516,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         };
 
         assert_eq!(
-            audio_frame_playback_duration(&frame, f64::MIN_POSITIVE),
+            pcm_audio_frame_playback_duration(&frame, f64::MIN_POSITIVE),
             Duration::from_secs(4)
         );
         assert_eq!(
-            audio_frame_playback_duration(&frame, 64.0),
+            pcm_audio_frame_playback_duration(&frame, 64.0),
             Duration::from_secs_f64(1.0 / 16.0)
         );
         assert_eq!(
-            audio_frame_playback_duration(&frame, f64::NAN),
+            pcm_audio_frame_playback_duration(&frame, f64::NAN),
             Duration::from_secs(1)
         );
 
@@ -6549,7 +6535,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             samples: Vec::new(),
         };
         assert_eq!(
-            audio_frame_playback_duration(&zero_rate, 1.0),
+            pcm_audio_frame_playback_duration(&zero_rate, 1.0),
             Duration::ZERO
         );
 
@@ -6559,7 +6545,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             frames: 0,
             samples: Vec::new(),
         };
-        assert_eq!(audio_frame_playback_duration(&empty, 1.0), Duration::ZERO);
+        assert_eq!(
+            pcm_audio_frame_playback_duration(&empty, 1.0),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -6581,7 +6570,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 frames: pcm_frames,
                 samples: vec![0.0; pcm_frames * 2],
             };
-            let frame_duration = audio_frame_playback_duration(&frame, playback_rate);
+            let frame_duration = pcm_audio_frame_playback_duration(&frame, playback_rate);
             let mut pumped_duration = Duration::ZERO;
             let mut pumped_frames = 0usize;
             while pumped_duration < AUDIO_PUMP_DURATION_LIMIT {
@@ -6711,7 +6700,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     #[cfg(feature = "wgpu")]
     #[test]
-    fn pump_audio_admits_single_oversized_frame_and_stops_on_push_failure() {
+    fn pump_audio_counts_oversized_and_failed_frames_against_the_budget() {
         use crate::audio::{
             AudioError, AudioOutputState, AudioRingBufferStats, BufferedAudioOutput,
         };
@@ -6742,7 +6731,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         assert_eq!(presenter.stats.pushed_audio_frames, 1);
         assert_eq!(presenter.audio_frames.len(), 1);
 
-        // 2. Push failure stops pumping for this tick without draining remaining frames.
+        // A failing output drains two 200 ms frames before reaching the 350 ms limit.
         struct FailingAudioOutput;
         impl AudioOutputBackend for FailingAudioOutput {
             fn configure(&mut self, _format: PcmFormat) -> crate::audio::Result<()> {
@@ -6785,8 +6774,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 frame: PcmAudioFrame {
                     format,
                     pts: Some(Duration::ZERO),
-                    frames: 40,
-                    samples: vec![0.0; 80],
+                    frames: 9_600,
+                    samples: vec![0.0; 19_200],
                 },
                 generation,
             })
@@ -6794,9 +6783,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
 
         failing_presenter.pump_audio();
-        assert_eq!(failing_presenter.stats.audio_failures, 1);
+        assert_eq!(failing_presenter.stats.audio_failures, 2);
         assert_eq!(failing_presenter.stats.pushed_audio_frames, 0);
-        assert_eq!(failing_presenter.audio_frames.len(), 2);
+        assert_eq!(failing_presenter.audio_frames.len(), 1);
     }
 
     #[test]

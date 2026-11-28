@@ -2939,7 +2939,7 @@ fn pcm_audio_frame_duration(frame: &PcmAudioFrame) -> Duration {
     Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
 }
 
-fn pcm_audio_frame_playback_duration(frame: &PcmAudioFrame, rate: f64) -> Duration {
+pub(crate) fn pcm_audio_frame_playback_duration(frame: &PcmAudioFrame, rate: f64) -> Duration {
     if frame.format.sample_rate == 0 || frame.frames == 0 {
         return Duration::ZERO;
     }
